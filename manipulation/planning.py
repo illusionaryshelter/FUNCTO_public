@@ -84,6 +84,27 @@ def _fixed_spline_grid(*, intervals, native_dt, interpolation_steps, interpolati
 # END incompatible grids never change dt, controls, or boundary derivatives.
 
 
+# BEGIN a requested maximum spacing derives one exact native output grid.
+def _derived_spline_grid(*, intervals, native_dt, interpolation_steps, interpolation_dt):
+    """Choose exact subdivisions within the requested float32 spacing bound.
+
+    ``interpolation_dt`` is a maximum spacing at request admission. A power
+    of two subdivision preserves the represented knot duration exactly; the
+    resulting grid is then checked by the same strict actual-clock validator
+    used by native, event, finger and exported-curve consumers.
+    """
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        limit = np.float32(interpolation_dt)
+        knot_dt = np.float32(np.float32(native_dt) * np.float32(interpolation_steps))
+    if not np.isfinite([limit, knot_dt]).all() or min(limit, knot_dt) <= 0:
+        raise ValueError("Spline timing requires finite positive native float32 intervals")
+    needed = max(1, int(np.ceil(float(knot_dt) / float(limit))))
+    subdivisions = 1 << (needed - 1).bit_length()
+    return _fixed_spline_grid(intervals=intervals, native_dt=native_dt,
+        interpolation_steps=interpolation_steps, interpolation_dt=float(knot_dt) / subdivisions)
+# END decimal request spacings are not themselves required to divide a knot.
+
+
 @dataclass(frozen=True)
 class PlanningBudget:
     """Explicit local resource and numerical-work limits, for a single request.
@@ -96,6 +117,8 @@ class PlanningBudget:
     and bounded search share the checked scene/native allocation budgets.
     ``maximum_trajectory_dt`` fixes both native time bounds for this request:
     process feasibility and evidence stops take precedence over compression.
+    ``interpolation_dt`` is the requested maximum sample spacing until time
+    binding replaces it with the exact selected spacing for all consumers.
     """
 
     ik_seeds: int = 8
@@ -171,10 +194,10 @@ class PlanningBudget:
                 raise ValueError(f"{name} must be finite and positive")
         if not np.isfinite(self.search_seconds) or self.search_seconds < 0:
             raise ValueError("search_seconds must be finite and nonnegative")
-        # BEGIN admit the exact grid before any native buffer allocation.
+        # BEGIN derive and admit the actual grid before native buffer allocation.
         # The selected cubic has degree+1 virtual intervals. Output sampling
         # must preserve its original physical clock, including nonzero dq0.
-        grid = _fixed_spline_grid(intervals=self.knots + 4,
+        grid = _derived_spline_grid(intervals=self.knots + 4,
             native_dt=self.maximum_trajectory_dt, interpolation_steps=self.interpolation_steps,
             interpolation_dt=self.interpolation_dt)
         maximum_count = grid["valid_count"]
@@ -664,10 +687,6 @@ def _candidate_sample_times(trajectory, budget):
         for left, right, count in zip(trajectory.times[:-1], trajectory.times[1:], counts)]), trajectory.duration]
 
 
-# BEGIN confirmation retains the original regular and dense query times.
-# END no extra grid density, retiming, or expanded capacity is introduced.
-
-
 def _reference_clock_issues(problem, trajectory, timestep):
     """Report required device occurrences outside the unchanged curve domain.
 
@@ -719,8 +738,7 @@ def _initial_timing(problem, budget):
     # native dt upward by at most a few float32 ulps, retaining suffix coverage
     # for continuations, and derive output_dt through exact power-of-two
     # division. The unchanged grid validator still checks every multiplication.
-    output_limit = float(np.float32(budget.interpolation_dt))
-    maximum = _fixed_spline_grid(intervals=budget.knots+4,
+    maximum = _derived_spline_grid(intervals=budget.knots+4,
         native_dt=budget.maximum_trajectory_dt, interpolation_steps=budget.interpolation_steps,
         interpolation_dt=budget.interpolation_dt)
     proposed_dt = min(source_duration, maximum["duration"])/((budget.knots+4)*budget.interpolation_steps)
@@ -737,10 +755,12 @@ def _initial_timing(problem, budget):
         native_dt = np.nextafter(native_dt, np.float32(np.inf))
     if not 0 < float(native_dt) <= maximum["native_dt"]:
         raise ValueError("Source-time proposal has no exact representable device clock within the budget")
-    needed = max(1, int(np.ceil(float(knot_dt)/output_limit)))
-    subdivisions = 1 << (needed-1).bit_length()
-    output_dt = float(knot_dt)/subdivisions
-    selected = replace(budget, maximum_trajectory_dt=float(native_dt), interpolation_dt=output_dt)
+    # BEGIN source binding uses the same spacing derivation as budget admission.
+    actual = _derived_spline_grid(intervals=budget.knots+4, native_dt=float(native_dt),
+        interpolation_steps=budget.interpolation_steps, interpolation_dt=budget.interpolation_dt)
+    selected = replace(budget, maximum_trajectory_dt=actual["native_dt"],
+                       interpolation_dt=actual["interpolation_dt"])
+    # END every later consumer receives the already selected actual spacing.
     # END capacity and strict native/dense clock equality remain mandatory.
     return selected, _ProgressMap((seconds-seconds[0])/source_duration, progress.copy())
 # END no search path or candidate geometry can subsequently retime this binding.
@@ -966,7 +986,7 @@ def _obligation_contract(problem):
                         "yaw_axis", "yaw_tolerance_rad"),
         # END continuation cannot silently replace a yaw interval with a full pose.
         "coordinate_events": ("progress", "source", "target_coordinate", "tolerance", "kind", "coordinate_mode", "coordinate_origin"),
-        "supports": ("progress", "source", "margin", "gap_tolerance", "normal_tolerance"),
+        "supports": ("progress", "source", "margin", "gap_tolerance", "normal_tolerance", "hard_components"),
         "pose_relations": ("start", "end", "source", "pose_bounds"),
         "mechanisms": ("end", "source", "directions"),
         "interiors": ("start", "end", "source", "margin"),
@@ -2226,7 +2246,8 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                              progress, joint_position, joint_names, *, trajectory_time,
                              normalized_time, query_counts=None, component_diagnostics=None,
                              query_role="acceptance", scene_evidence_out=None,
-                             optimizer_candidate_evidence=False):
+                             optimizer_candidate_evidence=False, local_models=None,
+                             geometry_evidence_out=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2237,8 +2258,27 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     """
     import torch
     from .optimizer_device_checks import constant_tensor
+    pair_evidence = [] if geometry_evidence_out is not None else None
     def evaluate(*args, **kwargs):
-        return scene.evaluate(*args, **kwargs, query_role=query_role)
+        return scene.evaluate(*args, **kwargs, query_role=query_role, local_models=local_models,
+                              geometry_evidence_out=pair_evidence)
+
+    # BEGIN retain physical query identity through same-time mode expansion.
+    def retain_pair_evidence(exact_count, left_columns=(), right_columns=()):
+        if geometry_evidence_out is None:
+            return
+        for row in pair_evidence:
+            batch, column = row["state_index"]
+            if column < exact_count:
+                source, side = column, 0
+            elif column < exact_count+len(left_columns):
+                source = int(left_columns[column-exact_count])
+                side = -1 if bool(left[batch, source]) else 0
+            else:
+                source = int(right_columns[column-exact_count-len(left_columns)])
+                side = 1 if bool(right[batch, source]) else 0
+            geometry_evidence_out.append({**row, "query_index": [batch, source], "side": side})
+    # END geometry proofs consume the same pair query as hard residuals.
     # BEGIN classify scene evidence without changing the hard scene sum.
     # The recovery consumer needs actual collision components, not the mixed
     # process_scene constraint (which also includes missing model support,
@@ -2262,11 +2302,14 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                         if name.startswith(prefix)), torch.zeros_like(value))
                 # END conditional unknown and missing model data are not forbidden space.
                 # END no category changes the original hard aggregate or gradient.
-                # BEGIN pending registered-actor proposals preserve other hard requirements.
+                # BEGIN original scene components determine hard candidate feasibility.
                 if optimizer_candidate_evidence:
                     # Every observed-model component retains its own hard
                     # verdict before aggregation or optimizer preferences.
-                    invalid = ~torch.isfinite(value.detach())
+                    # BEGIN classification values remain independent of local cost.
+                    hard = sum((term.detach() for name, term in components.items()
+                                if not name.startswith("conditional/")), torch.zeros_like(value))
+                    invalid = torch.zeros_like(value, dtype=torch.bool)
                     for name, term in components.items():
                         if name.startswith("conditional/"):
                             continue
@@ -2275,11 +2318,15 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                         invalid = invalid | (term > 0)
                     if not components:
                         # An aggregate-only scene still supplies its hard value.
+                        hard = value.detach()
                         invalid = invalid | (value.detach() > 0)
+                        invalid = invalid | ~torch.isfinite(value.detach())
                     # Evaluate each component before reducing modes so small
                     # violations remain visible beside large residuals.
                     scene_evidence_out["optimizer_hard_invalid"] = invalid.to(value.dtype)
-                # END candidate eligibility is separate from the unchanged differentiable cost.
+                    scene_evidence_out["optimizer_hard_value"] = hard
+                    # END the positive softplus value cannot reject a clear state.
+                # END hard evidence remains separate from the fixed local geometry objective.
             if component_diagnostics is not None:
                 for name, residual in components.items():
                     flat = residual.detach().reshape(-1)
@@ -2311,6 +2358,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
                                 evaluated_states=int(progress.numel()))
         result = evaluate(spheres, position, quaternion, progress, joint_position,
                           joint_names, trajectory_time=trajectory_time)
+        retain_pair_evidence(progress.shape[1])
         return result
     left = torch.zeros_like(progress, dtype=torch.bool)
     right = torch.zeros_like(progress, dtype=torch.bool)
@@ -2359,6 +2407,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
         expanded_progress, expanded(joint_position), joint_names,
         trajectory_time=expanded(trajectory_time),
         contact_permission_progress=permission_progress)
+    retain_pair_evidence(progress.shape[1], left_columns, right_columns)
     exact_count, left_count = progress.shape[1], left_columns.numel()
     exact_terms = terms[:, :exact_count]
     left_terms = exact_terms.scatter(1, left_columns[None].expand(progress.shape[0], -1),
@@ -2412,6 +2461,14 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
     # END a standalone manager uses the same zero-multiplier objective.
 
     managers = []
+    # BEGIN all native optimizer rollouts consume one fixed local block model.
+    from .local_geometry_model import LocalGeometryModels
+    geometry_models = LocalGeometryModels()
+    # END the core captures actual base states before initial cost/gradient.
+    # BEGIN a short-lived event context selects the task allowed set for IK.
+    # Reference IK leaves this empty and retains its original pose objective.
+    ik_goal_ids = ()
+    # END the same native IK instance owns both explicitly selected purposes.
     # BEGIN collision witnesses retain physical time, including plateau interiors.
     collision_witnesses = np.empty(0, dtype=float)
 
@@ -2452,6 +2509,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             transition_model.robot_model.compute_jacobian = True
             self._scene = scene.clone_for_rollout()
             self._joint_names = tuple(transition_model.joint_names)
+            self._tool_index = transition_model.robot_model.tool_frames.index(problem.tool_link)
             # BEGIN ordinary reference IK does not certify a task trajectory.
             # The retained private hand clock supplies native self-collision
             # geometry, but nominal pose samples need neither scene coverage
@@ -2460,7 +2518,6 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             if self._process_mode.startswith("seed_"):
                 return
             # END do not allocate coverage or anchor FK for reference IK.
-            self._tool_index = transition_model.robot_model.tool_frames.index(problem.tool_link)
             self.bind_request_data()
             # A separate native FK instance owns the anchor buffers.  Reusing
             # the main rollout FK would overwrite values needed by backward.
@@ -2523,6 +2580,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
         def optimization_constraints(self):
             return functional_constraints if self._process_mode == "trajectory_optimizer" else None
 
+        @property
+        def local_geometry_models(self):
+            return geometry_models if self._process_mode == "trajectory_optimizer" else None
+
         def optimizer_evidence(self, trajectories):
             """Read hard evidence and objective from this same rollout.
 
@@ -2535,7 +2596,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             collection = constraints.constraints
             if self._optimizer_evidence is None:
                 raise RuntimeError("Optimizer has no same-query hard-constraint evidence")
-            source, feasible, signed, eligible, scene_source = self._optimizer_evidence
+            source, feasible, signed, scene_source = self._optimizer_evidence
             if ("functional_augmented_lagrangian" not in collection.names
                     or collection.values[collection.names.index("functional_augmented_lagrangian")] is not source
                     or "process_scene" not in collection.names
@@ -2555,14 +2616,12 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                         finite = torch.isfinite(detached).all(-1)
                         valid = finite & (detached <= 0).all(-1)
                         feasible = feasible & valid
-                        # BEGIN all native hard channels keep their verdict.
-                        eligible = eligible & valid
-                        # END no channel receives a separate confirmation path.
-                    if name != "functional_augmented_lagrangian":
+                    # BEGIN incumbent ranking is independent of changing block models.
+                    if name not in {"functional_augmented_lagrangian", "process_scene"}:
                         fixed_objective = fixed_objective+detached.sum(-1)
+                    # END actual geometry determines eligibility, not this score.
             feasible = feasible & torch.isfinite(fixed_objective)
-            eligible = eligible & torch.isfinite(fixed_objective)
-            return eligible, feasible, signed, fixed_objective
+            return feasible, signed, fixed_objective
         # END these tensors preserve query identity and never add a cost term.
 
         # BEGIN bind diagnostics only to the exact completed native metric query.
@@ -2604,14 +2663,36 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END optimizer calls retain their original differentiable time grid.
             collection = super().compute_costs(state, cost_collection, goal, **kwargs)
             # END reference IK receives the same physical time as its optimizer.
-            # BEGIN native IK remains an initializer even if its reference collides.
-            # Native pose and physical joint-domain evaluation remain intact.
-            # Only complete candidate curves receive the
-            # scene/process penalties below; a reference IK success is never
-            # a planning, goal-completion or execution authorization.
-            if not self._process_mode or self._process_mode.startswith("seed_"):
+            # BEGIN event IK minimizes violations of its continuous allowed set.
+            # Native pose tracking is disabled by the event caller. The
+            # ordinary reference query retains its original objective. Static
+            # scene qualification is performed on the returned event states;
+            # path history and dynamics belong to the completed trajectory.
+            if self._process_mode.startswith("seed_"):
+                if ik_goal_ids:
+                    q = state.joint_state.position
+                    tool = state.tool_poses
+                    orientation = orientation_vjp.apply(q, tool.quaternion.detach(),
+                        state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach())
+                    p, r = problem.transform_tool_pose(
+                        native_layout.apply(tool.position)[:, :, self._tool_index],
+                        orientation[:, :, self._tool_index])
+                    event_progress = getattr(problem, ik_goal_ids[0][0])[ik_goal_ids[0][1]].progress
+                    progress = q.new_full(q.shape[:2], event_progress)
+                    times = seed_parameter.to(q).expand(q.shape[:2])*clock["duration"]
+                    terms = problem.residuals(p, r, progress, q, self._joint_names,
+                        joint_velocity=torch.zeros_like(q), trajectory_time=times,
+                        point_goal_ids=ik_goal_ids, direction_mode="point")
+                    process = sum((value for name, value in terms.items()
+                        if not name.startswith(("function_pose:", "function_coordinate:", "support:", "stop:"))),
+                        torch.zeros_like(progress))
+                    goals = problem.goal_residual(p, r, progress, goal_ids=ik_goal_ids,
+                                                  normalized=self._process_mode == "seed_optimizer")
+                    value = (process.square()+goals.square().sum(-1)
+                             if self._process_mode == "seed_optimizer" else process+goals.sum(-1))
+                    collection.add(value[..., None]*budget.constraint_weight, "event_allowed_set")
                 return collection
-            # END full trajectory constraints still run in both optimizer/metrics.
+            # END no nominal full-pose centre can replace the event declaration.
             q, dq = state.joint_state.position, state.joint_state.velocity
             batch, horizon, _ = q.shape
             tool = state.tool_poses
@@ -2685,17 +2766,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # BEGIN every supported functional event has exactly one optimizer owner.
             process_terms = problem.residuals(position, quaternion, progress, q, self._joint_names,
                 joint_velocity=dq, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear,
-                tool_angular_velocity=tool_angular,
-                # BEGIN delivery metrics omit only support gap and normal.
-                for_acceptance=self._process_mode == "trajectory_metrics")
-                # END nominal optimization retains every original requirement.
+                tool_angular_velocity=tool_angular)
             process_value = sum((value for name, value in process_terms.items()
                 if self._process_mode != "trajectory_optimizer"
                 or not name.startswith(("function_pose:", "function_coordinate:", "support:"))),
                 torch.zeros_like(progress))
-            # A support-only request still supplies a tensor after its old
-            # square penalty is removed. Its four signed requirements now
-            # belong to the same AL owner as pose/coordinate events below.
+            # A support-only request still supplies a tensor. Its declared
+            # hard rows belong to the same AL owner as pose/coordinate events.
             # END optimization owns all targets; metrics use delivery requirements.
             # BEGIN optimizer and success metrics consume the identical online scene.
             valid = torch.arange(horizon, device=q.device)[None, :] < counts[:, None]
@@ -2727,7 +2804,8 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 # BEGIN the caller selects the query path under one nonpenetration rule.
                 query_role="optimization" if self._process_mode == "trajectory_optimizer" and context is None else "acceptance",
                 scene_evidence_out=scene_evidence_out,
-                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer")
+                optimizer_candidate_evidence=self._process_mode == "trajectory_optimizer",
+                local_models=geometry_models if self._process_mode == "trajectory_optimizer" and context is None else None)
             scene_indices = scene_columns[None].expand(batch, -1)
             scene_value = scene_value.new_zeros(progress.shape).scatter(1, scene_indices, scene_value)
             if scene_evidence_out is not None:
@@ -2735,12 +2813,11 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                     scene_evidence_out[name] = evidence.new_zeros(progress.shape).scatter(1, scene_indices, evidence)
             # END restore scalar layouts before the unchanged task/scene reduction.
             # END ordinary optimizer and proposal metric calls remain unchanged.
-            # END metrics and optimization retain the same collision zero set.
+            # END original hard components and fixed local objectives are separate.
             values = [("skill_process", process_value), ("process_scene", scene_value)]
-            # BEGIN retain collision gradients for small penetration residuals.
-            # The scene already returns nonnegative hard residuals. A
-            # second square suppresses their gradient near zero; only the
-            # original skill penalty keeps its squared optimizer objective.
+            # BEGIN use the local scene's actual scalar and matching derivative.
+            # Scene objectives include their own geometric scaling. Task
+            # process violations retain the existing squared penalty.
             if self._process_mode == "trajectory_optimizer":
                 values = [("skill_process", process_value.square()),
                           ("process_scene", scene_value)]
@@ -2759,46 +2836,29 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 feasible = torch.isfinite(original_process).all(-1) & (original_process <= 0).all(-1)
                 for residual in signed.values():
                     feasible = feasible & torch.isfinite(residual.detach()) & (residual.detach() <= 0)
-                # BEGIN retention uses delivery requirements without another task query.
-                # Complete support residuals remain in strict optimization
-                # feasibility above. Their retained body/footprint conditions
-                # are already available in the same signed event evaluation.
-                # All non-support process requirements retain their original
-                # unweighted values, including drive coupling and stops.
-                acceptance_process = sum((value for name, value in process_terms.items()
-                    if not name.startswith("support:")), torch.zeros_like(progress))
-                acceptance_process = torch.where(active, acceptance_process, 0.).detach()
-                eligible = (torch.isfinite(acceptance_process).all(-1)
-                            & (acceptance_process <= 0).all(-1))
-                acceptance_keys = set(problem.functional_acceptance_keys)
-                for name, residual in signed.items():
-                    if name in acceptance_keys:
-                        detached = residual.detach()
-                        eligible = eligible & torch.isfinite(detached) & (detached <= 0)
-                # END only support gap/normal differ from the optimizer's target set.
                 # BEGIN preserve every original hard scene term.
                 # Use where for inactive samples; multiplication by zero would
                 # not suppress a nonfinite inactive value. Mode-side reduction
                 # has already retained every active hard violation.
                 hard_invalid = torch.where(active, scene_evidence_out["optimizer_hard_invalid"], 0.)
-                eligible = eligible & (hard_invalid <= 0).all(-1)
+                feasible = feasible & (hard_invalid <= 0).all(-1)
                 # BEGIN strict scene feasibility uses original unweighted hard residuals.
-                raw_scene = torch.where(active, scene_value.detach(), 0.)
+                raw_scene = torch.where(active, scene_evidence_out["optimizer_hard_value"], 0.)
                 feasible = feasible & torch.isfinite(raw_scene).all(-1) & (raw_scene <= 0).all(-1)
-                # END permission to confirm proposals remains independent of this strict gate.
+                # END local objective values do not replace original scene feasibility.
                 self._optimizer_evidence = (augmented_cost, feasible,
-                    {name: value.detach() for name, value in signed.items()}, eligible, None)
+                    {name: value.detach() for name, value in signed.items()}, None)
                 # END the aggregate scene tensor identity is bound below, after folding.
                 # END the core consumes this evidence before any other forward.
                 # END original tolerance and first-arrival identity belong to the problem.
-                # BEGIN retain a gradient toward source-declared pose equalities.
-                # The problem owns equality-axis selection and its complete
-                # endpoint-family reference; free pose axes gain no target.
+                # BEGIN task preferences follow the declared optimization phase.
+                # Process relations remain active; quality work additionally
+                # includes soft support and goal preferences. Hard rows are above.
                 values.append(("skill_pose_equality_preference", problem.optimizer_preferences(
                     position, quaternion, progress, trajectory_time=trajectory_time,
                     tool_linear_velocity=tool_linear, tool_angular_velocity=tool_angular,
                     phase=phase)))
-                # END retain a gradient toward source-declared pose equalities.
+                # END a preference value cannot change task feasibility.
                 # A position-tracking gripper has an exact physical command,
                 # even inside its numerical acceptance band. Preserve a
                 # gradient toward that command to avoid stopping on the
@@ -2852,15 +2912,27 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             return ProcessCostManagerCfg(**values, process_mode=data_dict.get("process_mode", ""))
 
     def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, new_constraints):
-        nonlocal problem, scene, progress_map, anchors, budget, functional_constraints, collision_witnesses
+        nonlocal problem, scene, progress_map, anchors, budget, functional_constraints, collision_witnesses, ik_goal_ids, geometry_models
         problem, scene, progress_map, anchors, budget = new_problem, new_scene, new_progress, new_anchors, new_budget
         functional_constraints = new_constraints
         # BEGIN a resident backend must never inherit another request's collision times.
         collision_witnesses = np.empty(0, dtype=float)
+        ik_goal_ids = ()
+        geometry_models = LocalGeometryModels()
         # END semantic anchors are rebuilt from the newly bound request.
         for manager in managers:
             manager.bind_request_data()
     ProcessCostManagerCfg.bind_request = staticmethod(bind_request)
+    # BEGIN event identities bind one point query without copying task data.
+    def bind_ik_goals(goal_ids):
+        nonlocal ik_goal_ids
+        selected = tuple(tuple(identity) for identity in goal_ids)
+        progress_values = {getattr(problem, name)[index].progress for name, index in selected}
+        if len(progress_values) > 1:
+            raise ValueError("One event IK query requires a single exact declared progress")
+        ik_goal_ids = selected
+    ProcessCostManagerCfg.bind_ik_goals = staticmethod(bind_ik_goals)
+    # END clearing this context restores ordinary reference IK semantics.
     # BEGIN add bounded exact times only between completed eager native solves.
     def add_collision_witnesses(parameters):
         nonlocal collision_witnesses
@@ -3346,10 +3418,10 @@ class _CuroboPlanner:
             robot=deepcopy(robot_dict), optimizer_configs=[ik_optimizer],
             metrics_rollout=configuration("metrics_base.yml", "seed_metrics"),
             device_cfg=self.device_cfg, self_collision_check=False, num_seeds=budget.ik_seeds, seed_solver_num_seeds=budget.ik_seeds,
-            # BEGIN material yaw families generate bounded complete-pose IK centres.
-            max_batch_size=1, max_goalset=budget.ik_seeds+1,
+            # BEGIN one pose buffer serves reference IK and allowed-set event IK.
+            max_batch_size=1, max_goalset=1,
             use_cuda_graph=False,
-            # END the native seed budget still counts joint branches, not target centres.
+            # END the native seed budget counts alternative joint configurations.
             position_tolerance=problem.numerical.position_m,
             orientation_tolerance=problem.numerical.rotation_rad,
             cost_manager_config_instance_type=self._manager_type,
@@ -3651,8 +3723,6 @@ class _CuroboPlanner:
     # BEGIN reject an immutable infeasible entrance before running native IK.
     def initial_state_diagnostics(self):
         """Test measured q/dq and online collision geometry before proposing motion."""
-        # BEGIN frozen-world confirmation belongs to planning, not device supervision.
-        # END robot_validation supplies only the registered robot model here.
         limits = self._verification_native.get_cost("cspace").config.joint_limits
         columns = [limits.joint_names.index(name) for name in self.joint_names]
         q, dq = self.start.position[:, None], self.start.velocity[:, None]
@@ -3677,7 +3747,7 @@ class _CuroboPlanner:
                 self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
                 progress, q, self.joint_names, trajectory_time=q.new_zeros(q.shape[:2]),
                 normalized_time=q.new_zeros(q.shape[:2]),
-                # BEGIN measured entrance uses the same candidate confirmation rule.
+                # BEGIN measured entrance uses the same registered-entity scene query.
                 component_diagnostics=scene_components)
             residuals = {name: float(value.max().item()) for name, value in components.items()}
         failed = [name for name, value in residuals.items() if not np.isfinite(value) or value > 0]
@@ -3769,8 +3839,9 @@ class _CuroboPlanner:
                 count = self.budget.trajectory_seeds
                 seeds = controls[None, None].expand(1, count, -1, -1).contiguous()
                 self.reference_ik_queries, self.reference_ik_distinct_counts, self.reference_ik_chains = [], [], []
-                self.reference_seed_fits, self.goal_ik_fit_hints = [fit], []
+                self.reference_seed_fits = [deepcopy(fit) for _ in range(count)]
                 self.initial_seed_strategies = self.seed_strategies = ["recorded_joint_reference"]*count
+                seeds = self._fit_event_seeds(seeds, parameters, [q]*count)
                 self.physical_domain.validate(seeds)
                 return seeds, []
         from .planning_ik import select_ik_chains
@@ -3875,50 +3946,60 @@ class _CuroboPlanner:
             controls.append(control)
             self.reference_seed_fits.append(fit)
         seeds = torch.stack(controls)[None]
-        pool = self._build_goal_ik_candidates(seeds)
-        self.goal_ik_fit_hints = []
-        for branch in range(count):
-            samples, postures = list(control_u), list(targets[branch])
-            for parameter, entry in sorted(pool.items()):
-                # BEGIN functional poses are soft initializer hints, not search connections.
-                # Actual membership in the declared task allowed set matters;
-                # nominal-centre IK convergence and missing scene coverage do
-                # not erase this proposal. Keep their full evidence below.
-                # OMPL retains its separate task/model-valid connection rule.
-                candidates = [row for row in entry["candidates"]
-                              if row["report"]["task_satisfied"]
-                              and np.isfinite(row["joint_position"]).all()]
-                if not candidates or parameter == 0.:
-                    continue
-                rank = min(branch, len(candidates)-1)
-                samples.append(float(parameter))
-                postures.append(candidates[rank]["joint_position"])
-                self.goal_ik_fit_hints.append({"event_u": float(parameter), "branch": branch,
-                    "rank": rank, "source": "functional_pose_ik",
-                    "proposal_report": deepcopy(candidates[rank]["report"]),
-                    "scope": "Soft observation at the exact event time; no interpolation equality or scene acceptance"})
-                # END the fitted complete curve still requires every original constraint.
-            if len(samples) == len(control_u):
-                continue
-            control, fit = self.physical_domain.fit_reference(np.asarray(samples),
-                self.device_cfg.to_device(np.asarray(postures)), prior_controls=seeds[0, branch],
-                velocity_bounds=velocity_bounds)
-            self.reference_seed_fits[branch]["functional_hint_fit"] = fit
-            for hint in self.goal_ik_fit_hints:
-                if hint["branch"] == branch:
-                    hint["applied"] = control is not None
-            if control is None:
-                # A numerical failure to fit optional hints must not erase the
-                # preceding initializer or remove the actual hard event goals.
-                self.initial_seed_strategies[branch] += "+functional_hint_fit_failed"
-                continue
-            seeds[0, branch] = control
-            self.initial_seed_strategies[branch] += "+ranked_functional_ik"
+        seeds = self._fit_event_seeds(seeds, control_u, targets)
         self.physical_domain.validate(seeds)
         self.seed_strategies = list(self.initial_seed_strategies)
         return seeds.contiguous(), success_counts
     # END q0/dq0, native clock, hard task checks and admitted seed count are fixed.
 
+    # BEGIN event equalities constrain initialization, not the later allowed set.
+    def _fit_event_seeds(self, seeds, reference_progress, reference_positions):
+        """Select time-connectable event states and fit their joint equalities.
+
+        Entry q/dq and the physical clock remain fixed. Reference observations
+        enter the quadratic objective only. A missing event chain or failed
+        equality fit is recorded, while the independently constructed original
+        curve remains available to the main task-space optimizer.
+        """
+        from .planning_ik import select_ik_chains
+        pool = self._build_goal_ik_candidates(seeds)
+        entries = [(u, entry) for u, entry in sorted(pool.items()) if u > 0.]
+        self.goal_ik_event_fits, self.goal_ik_chains = [], []
+        if not entries:
+            return seeds
+        parameters = np.asarray([u for u, _ in entries])
+        candidates = [np.asarray([row["joint_position"] for row in entry["candidates"]], dtype=float)
+                      .reshape(-1, len(self.joint_names)) for _, entry in entries]
+        reports = [[row["report"] for row in entry["candidates"]] for _, entry in entries]
+        velocity_bounds = self._seed_velocity_bounds()
+        self.goal_ik_chains = select_ik_chains(candidates, reports,
+            self.start.position.detach().cpu().numpy(), parameters*self.formal_clock["duration"],
+            velocity_bounds, count=seeds.shape[1], joint_tolerance=self.problem.numerical.joint,
+            query_kind="functional")
+        if not self.goal_ik_chains:
+            self.goal_ik_event_fits.append({"applied": False, "event_u": parameters.tolist(),
+                "reason": "no_complete_time_connectable_event_chain"})
+            return seeds
+        for branch in range(seeds.shape[1]):
+            chain = self.goal_ik_chains[min(branch, len(self.goal_ik_chains)-1)]
+            target = np.asarray(chain["joint_positions"])
+            control, fit = self.physical_domain.fit_reference(reference_progress,
+                self.device_cfg.to_device(np.asarray(reference_positions[branch])),
+                prior_controls=seeds[0, branch], velocity_bounds=velocity_bounds,
+                event_progress=parameters, event_positions=target)
+            self.reference_seed_fits[branch]["event_fit"] = fit
+            self.goal_ik_event_fits.append({"branch": branch, "event_u": parameters.tolist(),
+                "joint_positions": target.tolist(), "applied": control is not None,
+                "candidate_indices": chain["candidate_indices"], "fit": deepcopy(fit),
+                "proposal_reports": [deepcopy(rows[index]) for rows, index in
+                                     zip(reports, chain["candidate_indices"])],
+                "scope": "Initial curve event equalities; main optimization retains task-space allowed sets"})
+            if control is not None:
+                seeds[0, branch] = control
+                self.initial_seed_strategies[branch] += "+event_equalities"
+        self.seed_strategies = list(self.initial_seed_strategies)
+        return seeds.contiguous()
+    # END every proposed curve retains full trajectory qualification afterward.
 
 
         # END schedule changes require a separately bound planning request.
@@ -3985,7 +4066,7 @@ class _CuroboPlanner:
         def goals_at_time(parameter):
             return tuple(goals_by_time.get(float(parameter), ()))
 
-        # BEGIN native confirmation consumes the same search/request deadlines.
+        # BEGIN entity geometry queries consume the same search/request deadlines.
         def check_search():
             self.check_request()
             if time.monotonic() >= deadline:
@@ -4065,7 +4146,7 @@ class _CuroboPlanner:
                 # BEGIN OMPL shares the native registered-sphere self-collision contract.
                 native = self._verification_native.compute_costs(native_state)
                 terms.update({f"native:{name}": value for name, value in zip(native.names, native.values)})
-                # BEGIN expensive confirmation/setup cannot escape the deadline.
+                # BEGIN geometry queries and setup consume the same request deadline.
                 check_search()
                 # END all task, unknown, contact and unresolved terms remain hard.
                 # BEGIN all existing tensors precede one exact boolean host read.
@@ -4246,20 +4327,17 @@ class _CuroboPlanner:
     # END OMPL has no schedule replacement return value or side effect.
 
     # BEGIN bounded true-goal proposals retain static evidence before continuity.
-    def _functional_goal(self, target, yaw_angles=None):
-        """Convert one explicitly declared functional pose into native link coordinates.
+    def _functional_goal(self, target):
+        """Express the declared nominal material pose in native link coordinates.
 
-        The centre is an IK proposal only. All other goals and the original
-        allowed tolerances are checked separately; no reference sample becomes
-        a hard goal and no full pose is invented for a coordinate/support goal.
+        Native requests require a pose buffer. The constrained route evaluates
+        the event's continuous allowed set in its cost manager; this nominal
+        pose only supplies the native request's buffer and frame layout.
         """
         from scipy.spatial.transform import Rotation
-        # BEGIN rotate the material frame before applying its offset TCP relation.
-        # Native layout is [batch,horizon,tool,goalset,component]. The trajectory
-        # request omits yaw_angles and still supplies a single nominal centre;
-        # its actual constraints are the continuous material-frame allowed set.
-        poses = target.target[None] if yaw_angles is None else target.target_poses(yaw_angles)
-        poses = poses @ np.linalg.inv(target.tool_from_function)
+        # BEGIN apply the complete material-to-TCP and calibration transforms.
+        # Native layout is [batch,horizon,tool,goalset,component].
+        poses = target.target[None] @ np.linalg.inv(target.tool_from_function)
         position = self.device_cfg.to_device(poses[:, :3, 3][None])
         quaternion = self.device_cfg.to_device(
             Rotation.from_matrix(poses[:, :3, :3]).as_quat()[:, [3, 0, 1, 2]][None])
@@ -4267,7 +4345,7 @@ class _CuroboPlanner:
         return self.GoalToolPose(tool_frames=[self.problem.tool_link],
             position=position[:, None, None].contiguous(),
             quaternion=quaternion[:, None, None].contiguous())
-        # END each sampled centre has a consistent object, TCP and link pose.
+        # END the buffer preserves the declaration's complete frame relation.
 
     def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids=()):
         """Rank bounded IK proposals with the same online geometry as trajectory metrics."""
@@ -4307,7 +4385,7 @@ class _CuroboPlanner:
                 task = self.problem.residuals(p, r, progress, q, self.joint_names,
                     # BEGIN seed qualification uses the same task set as curve delivery.
                     joint_velocity=zero, trajectory_time=times, point_goal_ids=goal_ids,
-                    direction_mode="point", for_acceptance=True)
+                    direction_mode="point")
                     # END nominal support preferences cannot become static rejection rules.
                 task = {name: value for name, value in task.items() if not name.startswith("stop:")}
                 # BEGIN reuse the existing static query for bounded rejection reasons.
@@ -4339,63 +4417,51 @@ class _CuroboPlanner:
         return ranked, reports
 
     def _build_goal_ik_candidates(self, reference_seeds):
-        """Retain bounded CPU proposals at actual full-pose functional events.
+        """Solve each actual event's allowed set with the existing native IK.
 
-        One existing-size IK batch is queried per distinct event time. When
-        several full-pose events share that time, the first supplies a nominal
-        IK centre and all same-time goals remain part of static screening. This
-        is a finite proposal set, not a complete search of their intersection.
-        Coordinate/support goals never acquire an invented full TCP target.
-        Native calls remain on the same tracked solver and frozen clock.
+        All exact same-time pose, coordinate and support declarations enter
+        the shared point objective. A nominal pose only fills the native goal
+        buffer while its tracking cost is disabled. The returned states retain
+        independent task and scene qualification before curve construction.
         """
         self.goal_ik_candidates = {}
         controls = reference_seeds[0].detach().cpu().numpy()
-        # BEGIN measured start FK chooses a yaw proposal within each declared interval.
-        preferred_tool_pose = None
-        if any(goal.yaw_axis is not None and goal.yaw_tolerance_rad > 0 for goal in self.problem.pose_events):
-            from scipy.spatial.transform import Rotation
-            with self.torch.no_grad():
-                initial = self._verification_fk.compute_kinematics(self.start)
-                slot = initial.tool_poses.tool_frames.index(self.problem.tool_link)
-                p0, r0 = self.problem.transform_tool_pose(initial.tool_poses.position[0, 0, slot],
-                                                        initial.tool_poses.quaternion[0, 0, slot])
-                preferred_tool_pose = np.eye(4)
-                preferred_tool_pose[:3, 3] = p0.detach().cpu().numpy()
-                preferred_tool_pose[:3, :3] = Rotation.from_quat(r0.detach().cpu().numpy()[[1, 2, 3, 0]]).as_matrix()
-        # END current robot feedback supplies no current object truth.
-        targets = sorted(enumerate(self.problem.pose_events), key=lambda item: (item[1].progress, item[0]))
-        for _, target in targets:
-            if target.progress < self.problem.start_progress:
-                continue
-            u = float(self.progress_map.anchor_parameters([target.progress])[0, 0])
-            if u in self.goal_ik_candidates:
-                continue
-            # BEGIN native IK warm starts use actual curve states at the event time.
+        # BEGIN enumerate event data rather than a particular target geometry.
+        events = {}
+        for name in ("pose_events", "coordinate_events", "supports"):
+            for index, target in enumerate(getattr(self.problem, name)):
+                if self.problem.start_progress <= target.progress <= self.problem.end_progress:
+                    events.setdefault(target.progress, []).append((name, index))
+        for progress, identities in sorted(events.items()):
+            self.check_request()
+            goal_ids = tuple(identities)
+            u = float(self.progress_map.anchor_parameters([progress])[0, 0])
             previous = self.physical_domain.evaluate(controls, np.asarray([u]))[:, 0]
-            # END interpolation of free coefficients would omit the fixed boundaries.
             self.seed_parameter.fill_(u)
-            yaw_angles = target.proposal_yaw_angles(self.budget.ik_seeds, preferred_tool_pose)
-            result = self.ik.solve_pose(self._functional_goal(target, yaw_angles), current_state=self.start,
-                seed_config=self.device_cfg.to_device(previous[None]).contiguous(),
-                return_seeds=self.budget.ik_seeds)
+            pose = next((self.problem.pose_events[index] for name, index in goal_ids
+                         if name == "pose_events"), None)
+            native_goal = self._goal(progress) if pose is None else self._functional_goal(pose)
+            self._manager_type.bind_ik_goals(goal_ids)
+            self.ik.disable_tool_pose_tracking()
+            try:
+                result = self.ik.solve_pose(native_goal, current_state=self.start,
+                    seed_config=self.device_cfg.to_device(previous[None]).contiguous(),
+                    return_seeds=self.budget.ik_seeds)
+            finally:
+                self._manager_type.bind_ik_goals(())
+                self.ik.enable_tool_pose_tracking()
             candidates = self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy()
             success = result.success[0].detach().cpu().numpy()
-            # One physical event query cannot borrow a merely nearby event.
-            # The general helper's numerical neighbor band is for projection;
-            # this pool retains exact declared occurrence identity.
-            goal_ids = tuple((name, index) for name, index in
-                             self.problem.goal_requirements_at(target.progress)
-                             if getattr(self.problem, name)[index].progress == target.progress)
-            selected, reports = self._rank_ik_candidates(candidates, success, previous, u, goal_ids)
-            self.goal_ik_candidates[u] = {"progress": float(target.progress), "u": u,
+            # An allowed-set solve does not claim convergence to a pose centre.
+            selected, reports = self._rank_ik_candidates(candidates, np.zeros_like(success), previous, u, goal_ids)
+            for index, report in enumerate(reports):
+                report.update(candidate_source="event_allowed_set_ik", allowed_set_ik_success=bool(success[index]))
+            self.goal_ik_candidates[u] = {"progress": float(progress), "u": u,
                 "time_s": u*self.formal_clock["duration"], "goal_ids": [list(value) for value in goal_ids],
-                # BEGIN record finite centres independently from continuous task acceptance.
-                "target_yaw_proposals_rad": yaw_angles.tolist(),
-                "native_goalset_indices": result.goalset_index[0].detach().cpu().numpy()[selected].tolist(),
-                # END native success and actual task satisfaction remain separate evidence.
                 "candidates": [{"joint_position": candidates[index].tolist(), "report": reports[index]}
                                for index in selected],
-                "scope": "Finite full-pose IK proposals; every OMPL prefix and final trajectory must recheck them"}
+                "scope": "Task allowed-set IK states; scene qualification and complete curve validation remain explicit"}
+        # END a finite candidate pool reports its coverage without changing goals.
         return self.goal_ik_candidates
     # END static candidates cannot manufacture release history or trajectory feasibility.
 
@@ -4524,9 +4590,9 @@ class _CuroboPlanner:
         """
         from curobo._src.solver.solve_mode import SolveMode
         from curobo._src.solver.solve_state import SolveState
-        # BEGIN candidate acceptance owns its model-only collision confirmation.
+        # BEGIN use the candidate clock and its explicitly bound relation model.
         candidate_scene = self.scene if candidate_scene is None else candidate_scene
-        # END no confirmation object is installed in an optimization rollout.
+        # END observed fields remain shared with the bound planning scene.
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         pairs = mapping.anchor_parameters(self.anchors)
         # BEGIN a supplied curve uses its own physical grid and task anchors.
@@ -4583,12 +4649,12 @@ class _CuroboPlanner:
                 metrics = rollout.compute_metrics_from_state(native)
             self.check_request()
             constraints = metrics.costs_and_constraints.constraints
-            # BEGIN exact-curve confirmation owns the same query's collision evidence.
+            # BEGIN exact-curve metrics retain the same query's collision evidence.
             rollout.metrics_constraint_manager.bind_scene_evidence(metrics)
             collision_residuals = _collision_metric_residuals(metrics)
             # BEGIN confirmed metrics retain support gaps from that same query.
             scene_update_residuals = _scene_update_metric_residuals(metrics)
-            # BEGIN entity confirmation cannot erase an unrelated coverage failure.
+            # BEGIN entity collisions and observation coverage retain separate evidence.
             coverage_residuals = _coverage_metric_residuals(metrics)
             conditional_unknown_residuals = _conditional_unknown_metric_residuals(metrics)
             # END all categories belong to these same completed candidate queries.
@@ -4613,7 +4679,7 @@ class _CuroboPlanner:
             "collision_residuals": {f"interpolated:{name}": value for name, value in collision_residuals.items()},
             # BEGIN expose candidate-scoped support evidence beside collision evidence.
             "scene_update_residuals": {f"interpolated:{name}": value for name, value in scene_update_residuals.items()},
-            # BEGIN preserve search eligibility after sphere collision confirmation.
+            # BEGIN retain observation categories for the existing bounded search.
             "coverage_residuals": {f"interpolated:{name}": value for name, value in coverage_residuals.items()},
             "conditional_unknown_residuals": {f"interpolated:{name}": value
                 for name, value in conditional_unknown_residuals.items()},
@@ -4622,26 +4688,127 @@ class _CuroboPlanner:
             # END the original metrics determine feasibility and severity.
             "native_metrics": {"success": feasible, "interpolated": {"constraints": residuals}},
             "scene_components": context["scene_components"],
-            # BEGIN retain raw broad-phase positives and native confirmation evidence.
+            # BEGIN retain the actual registered-entity query classification.
             "observed_geometry": deepcopy(candidate_scene.last_query_report),
-            # END corrected metrics do not erase the original suspected collision.
+            # END the report distinguishes intersections, separation and unresolved pairs.
             "optimizer": {"unchanged_from_seed": True, "maximum_control_update": 0.}}
         return report, times/trajectory.duration, len(times)+len(pairs)
 
+    # BEGIN one exact-curve scene callback supplies interval proof and hard evidence.
+    def _candidate_geometry(self, trajectory, candidate_scene, *, remaining_points):
+        """Check continuous entity separation on the candidate's physical clock.
+
+        Scene queries evaluate the original polynomial and its release anchors.
+        The motion bound only determines where further geometry is needed;
+        collision, contact and observation residuals retain scene semantics.
+        """
+        from .interval_geometry import SceneMotionBounds, check_interval_geometry
+        mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
+        motion = SceneMotionBounds.from_scene(candidate_scene, tool_link=self.problem.tool_link,
+                                              T_link_tool=self.problem.tool_transform)
+        columns = [trajectory.joint_names.index(name) for name in self.joint_names]
+        release_progress = [relation.interval[1] for owner in candidate_scene.owners
+                            for relation in owner.attachments if relation.release_condition_id is not None
+                            and self.problem.start_progress <= relation.interval[1] <= self.problem.end_progress]
+        release_times = (mapping.anchor_parameters(release_progress)[:, 0]*trajectory.duration
+                         if release_progress else np.empty(0))
+        hard, categories, details = [], {}, {}
+
+        def query(times_s, *, point_budget):
+            # Every call includes the same curve's release FK when a later
+            # owner pose needs it. Repeated anchors consume real query work.
+            times = np.unique(np.r_[np.asarray(times_s, float), release_times])
+            if len(times) > point_budget:
+                return {"states": [], "query_points": 0, "capacity_exhausted": True}
+            self.check_request()
+            q, dq, _, progress = trajectory.sample(times)
+            tensor = self.device_cfg.to_device
+            with self.torch.no_grad():
+                js = self.JointState(position=tensor(q[:, columns])[None].contiguous(),
+                    velocity=tensor(dq[:, columns])[None].contiguous(), joint_names=list(self.joint_names))
+                state = self._verification_fk.compute_kinematics(js)
+                native = self._RobotState(joint_state=js, cuda_robot_model_state=state)
+                tool = state.tool_poses.tool_frames.index(self.problem.tool_link)
+                position, quaternion = self.problem.transform_tool_pose(
+                    state.tool_poses.position[:, :, tool], state.tool_poses.quaternion[:, :, tool])
+                evidence, scene_channels, query_details = [], {}, {}
+                values = _scene_boundary_evaluate(candidate_scene, self.problem, mapping,
+                    self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
+                    tensor(progress)[None], js.position, self.joint_names,
+                    trajectory_time=tensor(times)[None], normalized_time=tensor(times/trajectory.duration)[None],
+                    component_diagnostics=query_details, scene_evidence_out=scene_channels,
+                    geometry_evidence_out=evidence)
+                # Keep the most severe original component and its own time;
+                # a later smaller violation must not replace that witness.
+                for name, entry in query_details.items():
+                    previous = details.get(name)
+                    if previous is None or (np.isfinite(previous["maximum"]) and (
+                            not np.isfinite(entry["maximum"]) or entry["maximum"] > previous["maximum"])):
+                        details[name] = entry
+                values = values.detach().cpu().numpy()[0]
+                hard.extend(values.tolist())
+                for name, value in scene_channels.items():
+                    numbers = value.detach().cpu().numpy().ravel()
+                    previous = categories.get(name, 0.)
+                    categories[name] = (float("inf") if not np.isfinite(numbers).all()
+                                        else max(previous, float(numbers.max())))
+            states = {}
+            for row in evidence:
+                index = row["query_index"][1]
+                key = (float(times[index]), row["side"])
+                pair = {name: value for name, value in row.items()
+                        if name not in {"state_index", "query_index", "time_s", "side"}}
+                state = states.setdefault(key, {"time_s": key[0], "side": key[1],
+                    "progress": float(progress[index]), "residuals": {"scene": float(values[index])}, "pairs": []})
+                state["pairs"].append(pair)
+            self.check_request()
+            return {"states": list(states.values()), "query_points": len(times), "capacity_exhausted": False}
+
+        report = check_interval_geometry(trajectory, motion, query,
+            max_query_points=max(0, remaining_points), spatial_step_m=self.budget.validation_spatial_step_m)
+        report["hard_scene_residual"] = (float("inf") if not np.isfinite(hard).all()
+                                         else max(hard, default=0.))
+        report["scene_categories"] = categories
+        report["scene_components"] = details
+        return report
+    # END unresolved intervals report their scope separately from actual scene violations.
+
     def evaluate_candidate(self, trajectory, *, native_report=None, candidate_scene=None):
-        """One acceptance boundary; completed native metrics are reused verbatim."""
+        """Combine sampled task metrics, exact joint bounds and interval geometry."""
+        scene = self.scene if candidate_scene is None else candidate_scene
         if native_report is None:
-            attempt, parameters, points = self._candidate_metrics(trajectory, candidate_scene)
+            attempt, parameters, points = self._candidate_metrics(trajectory, scene)
         else:
             attempt, parameters, points = deepcopy(native_report), np.array([0., 1.]), 0
         validation = self._candidate_domain_validation(trajectory)
         residuals = {**attempt["residuals"], **trajectory.residuals}
-        attempt.update(residuals=residuals, accepted=bool(attempt["accepted"])
-            and all(np.isfinite(value) and value <= 0 for value in residuals.values()))
+        accepted = bool(attempt["accepted"]) and all(
+            np.isfinite(value) and value <= 0 for value in residuals.values())
+        if accepted:
+            # Native metrics have already queried the output grid and exact
+            # anchors; reserve only the remaining finite validation work.
+            prior_points = points if native_report is None else len(trajectory.times)+len(
+                _ProgressMap(trajectory.progress_u, trajectory.progress_s).anchor_parameters(self.anchors))
+            geometry = self._candidate_geometry(trajectory, scene,
+                remaining_points=self.budget.max_validation_points-prior_points)
+            points += geometry["query_points"]
+            attempt["continuous_geometry"] = geometry
+            validation["continuous_geometry"] = geometry
+            residuals["interval:process_scene"] = geometry["hard_scene_residual"]
+            categories = geometry["scene_categories"]
+            for target, category, component in (
+                    ("collision_residuals", "collision", "scene_collision"),
+                    ("scene_update_residuals", "scene_update", "scene_update"),
+                    ("coverage_residuals", "coverage", "unknown_forbidden"),
+                    ("conditional_unknown_residuals", "conditional_unknown", "conditional_unknown")):
+                attempt.setdefault(target, {})[f"interval:{component}"] = categories.get(category, 0.)
+            attempt.setdefault("scene_components", {}).update(geometry["scene_components"])
+            accepted = all(np.isfinite(value) and value <= 0 for value in residuals.values())
+        attempt.update(residuals=residuals, accepted=accepted)
         validation.update(u=parameters, violations=np.full(parameters.shape,
-            max(residuals.values(), default=0.)), scope="same native online metrics and exact candidate polynomial")
+            max(residuals.values(), default=0.)), scope="sampled task metrics, exact joint domain and reported geometry intervals")
         self.delivery_candidate = trajectory
-        self.last_validation = validation if attempt["accepted"] else None
+        self.last_validation = validation if accepted else None
         return trajectory, attempt, points
     # END native basis conversion is proposal generation, never an acceptance prerequisite.
 
@@ -4704,8 +4871,10 @@ class _CuroboPlanner:
 
 
     def select_candidate(self, result):
-        """Select the first native-feasible seed; export is a single later delivery step."""
+        """Select a candidate after sampled metrics, joint bounds and interval queries."""
         reports, selected, selected_key = [], None, None
+        interval_points = 0
+        selected_trajectory = None
         for index in range(result.num_seeds):
             metrics = self.native_diagnostics(result, index)
             residuals = {f"{label}:{name}": value for label in ("rollout", "interpolated")
@@ -4730,18 +4899,28 @@ class _CuroboPlanner:
                       # END existing feasible candidates still take precedence.
                       "seed_provenance": self.seed_strategies[index],
                       "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}}
+            # BEGIN an interval witness participates in the ordinary recovery decision.
+            trajectory = None
+            if accepted:
+                trajectory = self._native_curve(_trajectory_candidate(result, index))
+                trajectory, report, points = self.evaluate_candidate(trajectory, native_report=report)
+                interval_points += points
+                accepted = report["accepted"]
+                severity = (sum(max(0., value) for value in report["residuals"].values())
+                            if all(np.isfinite(list(report["residuals"].values()))) else float("inf"))
             reports.append(report)
             key = (not accepted, severity, index)
             if selected_key is None or key < selected_key:
-                selected, selected_key = index, key
+                selected, selected_key, selected_trajectory = index, key, trajectory
             if accepted:
                 break
+            # END unproven intervals remain explicit evidence, not invented intersections.
         report = reports[selected]
         candidate = _trajectory_candidate(result, selected)
-        trajectory = self._native_curve(candidate)
+        trajectory = self._native_curve(candidate) if selected_trajectory is None else selected_trajectory
         # BEGIN select from completed metrics of the same observed model.
         return candidate, trajectory, {**report, "selected_seed_index": selected,
-                                       "candidates": reports}
+                                       "candidates": reports, "interval_query_points": interval_points}
         # END selection neither changes geometry nor repeats a rejected query.
 
 
@@ -4804,11 +4983,12 @@ class _CuroboPlanner:
             "numerical_tolerances": asdict(self.problem.numerical)}
 
     def export(self, result, native_report):
-        """Reuse completed native metrics at the common candidate boundary."""
-        trajectory, attempt, points = self.evaluate_candidate(self._native_curve(result), native_report=native_report)
-        if not attempt["accepted"]:
-            raise MotionPlanningError("output_inconsistent", "Accepted native curve failed exact output/domain consistency")
-        return trajectory, points
+        """Deliver the exact curve already qualified during candidate selection."""
+        # BEGIN selection completes every query before the recovery decision.
+        if not native_report["accepted"] or self.last_validation is None:
+            raise MotionPlanningError("output_inconsistent", "Delivery requires a qualified selected candidate")
+        return self.delivery_candidate, 0
+        # END export performs no repeated geometry or polynomial computation.
 
 
 # BEGIN one resident native backend with typed refusal and explicit ownership.
@@ -5241,11 +5421,20 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             reference_ik_chains=deepcopy(planner.reference_ik_chains),
             reference_seed_fits=deepcopy(planner.reference_seed_fits))
         diagnostics["functional_ik_candidates"] = deepcopy(getattr(planner, "goal_ik_candidates", {}))
-        diagnostics["functional_ik_fit_hints"] = deepcopy(planner.goal_ik_fit_hints)
+        diagnostics["functional_ik_event_fits"] = deepcopy(planner.goal_ik_event_fits)
+        diagnostics["functional_ik_chains"] = deepcopy(planner.goal_ik_chains)
         diagnostics["joint_reference"] = deepcopy(planner.joint_reference_report)
         # BEGIN one reference verdict, one main solve and one mutually exclusive recovery.
+        def select_candidate(result):
+            candidate, curve, report = planner.select_candidate(result)
+            points = report.get("interval_query_points", 0)
+            if points:
+                consumed["validation_passes"] += 1
+                consumed["validation_queries"] += points
+            return candidate, curve, report
+
         reference_result = planner.evaluate_reference(seeds)
-        native_result, trajectory, attempt = planner.select_candidate(reference_result)
+        native_result, trajectory, attempt = select_candidate(reference_result)
         if joint_reference is not None and planner.joint_reference_report is not None:
             same = (trajectory.joint_names == joint_reference.joint_names
                     and np.array_equal(trajectory.times, joint_reference.times)
@@ -5261,7 +5450,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "main_solve"
-            native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+            native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
             diagnostics["attempts"].append(deepcopy(attempt))
             check()
             observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
@@ -5302,7 +5491,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     # END no extra full solve is authorized by task residuals alone.
                     check("trajectory_solves")
                     consumed["trajectory_solves"] += 1
-                    native_result, trajectory, attempt = planner.select_candidate(planner.optimize(seeds))
+                    native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
                     diagnostics["attempts"].append(deepcopy(attempt))
                     check()
         # END mixed failures retain ordinary optimization and recovery.
@@ -5318,12 +5507,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         stage = "delivery"
         check()
         trajectory, points = planner.export(native_result, attempt)
-        # BEGIN reused native evidence does not spend another geometry-query pass.
-        # export still checks the exact polynomial's limits and entrance, but
-        # evaluate_candidate(native_report=...) reuses the completed native
-        # geometry verdict and reports zero new queries. Charge a pass only
-        # when actual queries were performed, as in candidate confirmation;
-        # qualify_candidate below still checks the unchanged wall/work budget.
+        # BEGIN delivery reuses the candidate qualified before recovery routing.
+        # Selection has already charged interval queries. Export returns that
+        # exact curve and its completed validation; reported new work, if any,
+        # remains subject to the same request ledger.
         if points:
             consumed["validation_passes"] += 1
             consumed["validation_queries"] += points

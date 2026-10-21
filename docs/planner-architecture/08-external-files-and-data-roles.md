@@ -1,12 +1,12 @@
 # 外部文件与数据职责
 
-库实现基线：`9e8b365`。本文说明 FUNCTO 现有技能、观测、规划和执行接口的持久化数据。本文的库接口对应该代码提交；第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+库实现基线：`IMPLEMENTATION_COMMIT_PENDING`（当前工作区实现，提交时替换为实际代码提交）。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
 所有属于 skill representation 的内容完整保留，包括源演示区域、轨迹、物体与工具相对关系、功能坐标、任务几何、交互事件和释放事件。由仿真示教提取的这些数据也属于合法技能输入。Grounding 将这些源知识与当前图像、深度及明确坐标关系结合，产生当前功能区域和参考；任务编译把绑定结果、事件、任务条件及机器人入口状态组织为 `PlanningProblem`；规划器再联合机器人模型、场景碰撞模型与资源预算求解关节轨迹。
 
-禁止求解额外使用的是**仿真实际运行环境中产生的真值**，即本次待执行或正在执行环境的真实物体/目标位姿、真实分割、接触和成功效果等特权状态。它们进入独立事后评价。当前 RGB-D、机器人编码器反馈、已知模型与标定通过各自传感或声明接口参与计算。
+禁止求解额外使用的是**仿真实际运行环境中产生的真值**，即本次待执行或正在执行环境的真实物体/目标位姿、真实分割、接触和成功效果等特权状态。它们进入独立事后评价。当前 RGB-D、机器人编码器反馈、运动学和标定通过各自传感或声明接口参与计算。当前固定机器人的官方本体及官方固定末端执行器 mesh 可跨任务复用，其位姿由反馈与运动学确定；任务物体、环境和其他对象的 mesh/CAD 不属于该许可，任务实体使用现场 RGB-D TSDF 及其支持域。
 
 数据职责由生产过程和实际消费者确定。源物体位姿表示示教运动；当前物体位姿可能是观测估计、名义预测，也可能是运行环境直接提供的特权状态，三者须分别说明。源接触事件用于表达技能时序，当前接触效果另由允许的观察或事后评价记录。JSON、NPZ、文件名中的 `report` 以及保存时间均不能单独决定用途。
 
@@ -49,10 +49,10 @@
 | 文件 | 内容与含义 | 直接读取及计算 |
 |---|---|---|
 | `input-manifest.json` | 工作根目录、技能段、候选及图像/场景路径 | 记录入口选择明确任务与文件；清单本身不是几何 |
-| `scene.json` | 当前对象身份、功能绑定、入口、目标、名义附着、任务点与支撑要求 | `prepare_candidate/build_planning_problem` 或实验 `build_problem`；形成参考和硬要求 |
+| `scene.json` | 当前对象身份、功能绑定、入口、目标、名义附着、任务点、支撑几何与任务容差 | `prepare_candidate/build_planning_problem` 或实验 `build_problem`；形成完整参考、明确硬要求及软偏好 |
 | `feedback.json`、`robot_feedback.json` | 具名机器人 `q/dq`、手指状态、设备时间和标定 FK | 固定规划入口、机器人/手指几何与执行续接 |
 | `robot-fixture.json`、纯运动学 YAML/URDF | 关节树、坐标、标定、关节限制及明确实体对策略 | cuRobo FK/IK、Pinocchio FK 和设备绑定 |
-| robot-only 模型及其引用的官方机器人组件 | 已知机器人原形状、局部变换、原生逐实体配对、固定安装身份及手指机构拓扑 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape` 与 `tool_geometry_names`；规划、实际机器人检查、图像过滤及完整工具成员声明 |
+| robot-only 模型及其引用的官方机器人组件 | 当前固定机器人的官方原形状、局部变换、原生逐实体配对、固定安装身份及固定手指机构拓扑 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape` 与 `tool_geometry_names`；跨任务复用，供规划、机器人检查、图像过滤及工具成员声明 |
 | `contact-bindings.json` | 必填 `contacts/source`，可选 `grasp_activations/initial_support_relations`；完整源任务特征、有限目标区域、实体身份及活动区间 | `load_contact_bindings` → `ContactRule`、原抓取条件绑定及初始支撑关系；原任务特征和当前区域分别保留 |
 | `observed-owner.json` 与所引用原始场 | 已保存实体模型、局部坐标、位姿路径与固定附着 | `load_observed_owner` 直接读取，后续技能复用相同场 |
 | `unknown-policy.json`、`fine-regions` JSON（可选） | 未知空间的明确处理策略；指定局部细化请求 | 场景构造和覆盖查询；策略允许尝试不表示该区域已观测为空 |
@@ -73,9 +73,9 @@
 | `2026-10-19-put-planner-audit/prepared-inputs/relations.json` | 当前到源物体坐标对应 `J`、声明的 TCP 到物体变换 `A` | `generate_reference` 生成刚性一致的参考；`PoseEventRequirement.tool_from_function` 使用同一 `A` |
 | 同一 `prepared-inputs/feedback.json` | 从已保存抓取末态接续的机器人 `q/dq`、标定 TCP 位姿及具名关节 | 参考入口、`PlanningProblem.start_q/start_dq` 与坐标标定 |
 | 同一 `prepared-inputs/scene.json` | 支撑平面、有限边界、源任务点、接触面及其原容差 | `SupportRequirement` 与附着条件 |
-| [位姿要求任务声明](../../../sim-version-plans/2026-10-20-put-pose-goals-replay/plan.md) | 用户指定的位置容差 2 mm、姿态容差 1° | 适配器将数值绑定到两个 `PoseEventRequirement`，并在 `source.tolerance_source` 记录来源 |
+| 同一 `prepared-inputs/scene.json` 的 `pose_event_tolerances` 及[声明来源](../../../sim-version-plans/2026-10-21-yaw-tolerance/plan.md) | 材料原点距离 2 mm、消去自由 yaw 后总倾斜 1°、yaw 容差 π | 两个 `PoseEventRequirement` 读取数值；yaw 轴为观测支撑法向在目标材料坐标中的表示，来源随任务保存 |
 
-表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-连续参考的显式位姿要求)。原 `SupportRequirement` 与这两个要求分别保存并共同参与规划消费。
+表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；C 的原点由实体表示坐标确定，坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-目标坐标中的可设置-yaw-容差)。原 `SupportRequirement` 与这两个要求分别保存，`hard_components` 默认 body/footprint，gap/normal 按原阈值提供 `quality` 阶段偏好；当前生产调用固定使用 `feasibility` 阶段。
 
 `prepared-inputs/reference.npz` 保存参考采样及来源记录；当前目标构造实际查询内存中的连续 `object_path`。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点与机器人稳定尾段最后样本分别记录。
 
@@ -84,6 +84,8 @@
 `recorded_task_planning.save_curve` 生成 `trajectory.npz` 与同名 JSON。NPZ 保存关节名称、时间、位置、速度和进度等数组；JSON 保存分类、执行绑定、问题和场景、事件、验收与设备限制。`load_saved_trajectory` 读取二者恢复正式执行输入。`diagnostic-trajectory.*` 保存拒绝候选的诊断数据，其执行资格与正式曲线不同。
 
 `planning-report.json`、场景快照 NPZ、自过滤与分区文件记录计算结果。场景绑定中的 owner query 保存用于复现的几何及坐标；某文件以后被显式加载时，它同时成为该后续阶段的输入。来源路径和实际文件读取须分别说明。
+
+任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。事件 IK 报告保存原目标身份、物理时刻、候选关节状态及独立任务/场景结论；诊断中的 `functional_ik_chains` 保存有限事件序列，`functional_ik_event_fits` 保存事件等式拟合结果和实际插值误差。参考样本、所选事件状态与最终曲线分别记录。`LocalGeometryModels` 属于一次数值求解中的临时优化记录，来源是相同观测场和本块实际候选姿态；场景持久化仍保存原 TSDF 样本和关系声明。
 
 场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存原条件与实体关系的模型对应，独立于实际接触与效果记录。
 

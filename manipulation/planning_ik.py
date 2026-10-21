@@ -88,7 +88,7 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
 
 def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s,
-                     velocity_limits, *, count, joint_tolerance):
+                     velocity_limits, *, count, joint_tolerance, query_kind="reference"):
     """Connect qualified reference anchors and interpolate missing seed samples.
 
     Inputs retain the caller's candidate indices. ``previous`` is the measured
@@ -109,6 +109,14 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     With no qualified anchor, return no reference chain: the caller owns its
     independent measured-state initializer. Every emitted chain still needs
     whole-curve optimization and validation.
+
+    ``query_kind='functional'`` instead requires a task-qualified state at
+    every supplied event and rejects connections whose average velocity is
+    outside any joint's signed model bounds. Native pose-centre convergence
+    is irrelevant to these continuous allowed sets. Static scene failures
+    remain explicit proposal quality; the whole curve still owns acceptance.
+    Reference samples are soft observations and do not impose those mandatory
+    interpolation nodes or a hard velocity test on a reference polyline.
 
     Dynamic programming retains at most ``count`` paths at each last candidate.
     Failed static task/model check counts rank proposals first, without
@@ -131,7 +139,8 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
             or times[0] <= 0 or np.any(np.diff(times) <= 0)
             or bounds.shape != (2, start.shape[1]) or not np.isfinite(bounds).all()
             or np.any(bounds[0] >= bounds[1]) or type(count) is not int or count < 1
-            or not np.isfinite(joint_tolerance) or joint_tolerance <= 0):
+            or not np.isfinite(joint_tolerance) or joint_tolerance <= 0
+            or query_kind not in {"reference", "functional"}):
         raise ValueError("IK chains need finite measured start, increasing physical times and ordered velocity bounds")
     scales = np.max(np.abs(bounds), axis=0)
     if np.any(scales <= 0):
@@ -149,17 +158,22 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 raise ValueError("IK chain candidates require an explicit candidate_source")
             if source != "native_ik" and row["native_pose_ik_success"]:
                 raise ValueError("A recovery source cannot claim native pose IK success")
+        # BEGIN task events use their actual allowed-set qualification.
         qualified = [int(index) for index in np.flatnonzero(np.isfinite(values).all(axis=-1))
-                     if rows[index]["candidate_source"] == "native_ik"
-                     and rows[index]["native_pose_ik_success"]]
+                     if (rows[index]["task_satisfied"] if query_kind == "functional" else
+                         rows[index]["candidate_source"] == "native_ik"
+                         and rows[index]["native_pose_ik_success"])]
         retained = []
         for index in sorted(qualified,
-                            key=lambda index: (*_tier(rows[index], "reference"), *_quality(rows[index]), index)):
+                            key=lambda index: (*_tier(rows[index], query_kind), *_quality(rows[index]), index)):
             if retained and np.any(np.max(np.abs(values[retained]-values[index]), axis=-1) <= joint_tolerance):
                 continue
             retained.append(index)
         if retained:
             layers.append((query, retained))
+        elif query_kind == "functional":
+            return []
+        # END a missing event candidate cannot be replaced by interpolation.
     if not layers:
         return []
     # END all discarded native results remain in the caller's original query reports.
@@ -181,8 +195,16 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
             options = []
             for preceding_index, paths in states.items():
                 preceding = start[0] if layer == 0 else pools[layers[layer-1][0]][preceding_index]
+                # BEGIN integrate the signed joint-speed bounds over this edge.
+                # This is a necessary condition at fixed physical times; a
+                # passing edge still needs continuous curve validation.
+                displacement = pools[query][index]-preceding
+                if query_kind == "functional" and (np.any(displacement < bounds[0]*dt)
+                                                     or np.any(displacement > bounds[1]*dt)):
+                    continue
+                # END no collision proxy or task-specific margin is used.
                 with np.errstate(over="ignore", invalid="ignore"):
-                    scaled_velocity = (pools[query][index]-preceding)/(scales*dt)
+                    scaled_velocity = displacement/(scales*dt)
                     edge = float(dt*np.dot(scaled_velocity, scaled_velocity)/normalizer)
                 if not np.isfinite(edge):
                     continue

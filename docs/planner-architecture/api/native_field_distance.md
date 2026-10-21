@@ -1,6 +1,6 @@
 # `manipulation/native_field_distance.py` 实现契约
 
-代码基线：`9e8b365`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_transform`
@@ -74,9 +74,69 @@ np.eye
 np.asarray
 ```
 
+## `native_pair_lower_bound`
+
+[定义位置](../../../manipulation/native_field_distance.py#L33)。
+
+输入签名：
+
+```python
+def native_pair_lower_bound(first, first_pose, second, second_pose, direction):
+```
+
+实现说明：
+
+> Return a whole-entity distance lower bound along a proposed direction.
+>
+> The direction may come from a numerical distance solver. Its quality can
+> affect tightness only: both support intervals retain their outward error.
+
+显式输出分支：
+
+```python
+0.0
+max(0.0, float(np.nextafter((gap - error) / (length * (1 + _GAMMA)), -np.inf)))
+```
+
+读取的对象属性：
+
+```python
+np.asarray
+np.linalg.norm
+np.linalg
+np.nextafter
+np.inf
+```
+
+写入目标：
+
+```python
+direction
+length
+a
+b
+gap
+error
+value
+```
+
+直接调用符号：
+
+```python
+np.asarray
+float
+np.linalg.norm
+native_projection_bounds
+_transform
+max
+sum
+abs
+np.nextafter
+```
+
 ## `_projection_gap`
 
-[定义位置](../../../manipulation/native_field_distance.py#L32)。
+[定义位置](../../../manipulation/native_field_distance.py#L51)。
 
 输入签名：
 
@@ -171,7 +231,7 @@ abs
 
 ## `_local_interval`
 
-[定义位置](../../../manipulation/native_field_distance.py#L59)。
+[定义位置](../../../manipulation/native_field_distance.py#L78)。
 
 输入签名：
 
@@ -215,12 +275,12 @@ np.nextafter
 
 ## `query_native_field`
 
-[定义位置](../../../manipulation/native_field_distance.py#L66)。
+[定义位置](../../../manipulation/native_field_distance.py#L85)。
 
 输入签名：
 
 ```python
-def query_native_field(geometry, native_pose, field, field_pose, *, precision_m=0.0001, permission=None, check_request=None):
+def query_native_field(geometry, native_pose, field, field_pose, *, precision_m=0.0001, permission=None, check_request=None, native_bounds=None):
 ```
 
 实现说明：
@@ -232,6 +292,12 @@ def query_native_field(geometry, native_pose, field, field_pose, *, precision_m=
 > is the unchanged native shape. B is never accepted as robot material.
 > Feasible native witnesses retain interval enclosures of the constructed
 > point. Their midpoint is used only for display and a local derivative.
+>
+> ``native_bounds`` optionally supplies the same entity's (local, world)
+> projection bounds. The scene owns local bounds with its immutable model
+> and world bounds only for this query pose. A standalone query computes
+> these bounds directly. Returned distance bounds concern unpermitted point
+> pairs at this pose; changing a contact permission changes that domain.
 
 显式输出分支：
 
@@ -239,7 +305,7 @@ def query_native_field(geometry, native_pose, field, field_pose, *, precision_m=
 report('clear', None, intersection=False, empty=True)
 report('intersection', 0.0, intersection=True)
 report('unresolved', unresolved_lower)
-report('clear', 0.0, intersection=False)
+report('clear', lower, intersection=False)
 ```
 
 读取的对象属性：
@@ -247,12 +313,13 @@ report('clear', 0.0, intersection=False)
 ```python
 np.isfinite
 np.asarray
-np.eye
 np.inf
 field.root
+np.eye
 field.nodes
 heapq.heappop
 node.cell
+field._boundary_only_cells
 field.occupied_points
 np.maximum
 np.minimum
@@ -286,14 +353,15 @@ precision
 native_pose
 field_pose
 transform
-native_local
-native_world
 pending
 serial
 upper
 witness
 visits
 unresolved_lower
+separated_lower
+native_local
+native_world
 lower
 _
 native_box
@@ -347,13 +415,14 @@ np.isfinite
 ValueError
 np.asarray
 _transform
-_native_bounds
-np.eye
 count
 report
+_native_bounds
+np.eye
 push
 heapq.heappop
 check_request
+min
 field.occupied_points
 transform_points
 transform_point_error
@@ -372,7 +441,6 @@ np.abs
 np.linalg.norm
 np.abs(world).sum
 np.abs(target).sum
-min
 np.min
 int
 np.argmax
@@ -383,7 +451,7 @@ field.split
 
 ## `query_native_field.report`
 
-[定义位置](../../../manipulation/native_field_distance.py#L88)。
+[定义位置](../../../manipulation/native_field_distance.py#L115)。
 
 输入签名：
 
@@ -434,7 +502,7 @@ np.asarray(b).tolist
 
 ## `query_native_field.push`
 
-[定义位置](../../../manipulation/native_field_distance.py#L105)。
+[定义位置](../../../manipulation/native_field_distance.py#L143)。
 
 输入签名：
 
@@ -472,6 +540,7 @@ wa
 wb
 policy
 lower
+separated_lower
 diameter
 ```
 
@@ -482,6 +551,7 @@ permission.excludes_cells
 world_bounds
 permission.boxes
 box_distance
+min
 max
 _projection_gap
 float

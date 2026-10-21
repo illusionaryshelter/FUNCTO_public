@@ -1,11 +1,11 @@
 # `manipulation/observed_collision.py` 实现契约
 
-代码基线：`9e8b365`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_world`
 
-[定义位置](../../../manipulation/observed_collision.py#L12)。
+[定义位置](../../../manipulation/observed_collision.py#L13)。
 
 输入签名：
 
@@ -44,24 +44,22 @@ quaternion_rotate
 
 ## `pair_residual`
 
-[定义位置](../../../manipulation/observed_collision.py#L18)。
+[定义位置](../../../manipulation/observed_collision.py#L19)。
 
 输入签名：
 
 ```python
-def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, permission=None, check_request=None, precision_m=0.0001, zero=None):
+def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *, permission=None, check_request=None, precision_m=0.0001, zero=None, native_bounds=None):
 ```
 
 实现说明：
 
-> Query one rigid pair and attach a local rigid-motion derivative.
+> Return the original classification residual and actual query evidence.
 >
 > Confirmed penetration has classification value one; clear and unresolved
 > queries have value zero. The value is not a metric penetration depth.
-> A common-point penetration uses a local zero-section normal from the
-> observed field. Native witnesses retain their interval bounds; their
-> midpoint supplies only a local rigid-motion direction. The direction
-> neither estimates penetration nor supplies candidate acceptance evidence.
+> Local optimization models are captured separately from this same evidence
+> at block boundaries. No derivative is attached to the classification.
 >
 > ``zero`` may be one scalar from a batch's differentiable zero baseline.
 > A standalone call constructs that baseline from its two position tensors.
@@ -69,10 +67,7 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 显式输出分支：
 
 ```python
-(zero, result)
-(zero, result)
-(zero + 1.0, result)
-(zero + 1.0 - (signed - signed.detach()), result)
+(zero + 1.0 if result['status'] == 'intersection' else zero, result)
 ```
 
 读取的对象属性：
@@ -80,16 +75,6 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 ```python
 first_pose[0].sum
 second_pose[0].sum
-second.local_zero
-torch.as_tensor
-second_pose[0].dtype
-second_pose[0].device
-((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum
-first.local_zero
-first_pose[0].dtype
-first_pose[0].device
-((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum
-signed.detach
 ```
 
 写入目标：
@@ -97,17 +82,9 @@ signed.detach
 ```python
 native_first
 query
+options
 result
 zero
-status
-first_local
-second_local
-boundary
-_
-target
-normal
-signed
-result['direction']
 ```
 
 直接调用符号：
@@ -117,20 +94,73 @@ isinstance
 query
 first_pose[0].sum
 second_pose[0].sum
+```
+
+## `pair_local_model`
+
+[定义位置](../../../manipulation/observed_collision.py#L49)。
+
+输入签名：
+
+```python
+def pair_local_model(first, first_matrix, second, second_matrix, result):
+```
+
+实现说明：
+
+> Capture one local model from an already completed pair query.
+>
+> The scene invokes this only on a block's actual base state. The local zero
+> point and normal belong to an original supported field; neither the
+> unknown support boundary nor a bounding volume supplies a surface.
+
+显式输出分支：
+
+```python
+None
+None
+LocalPairModel(tuple(map(float, point)), tuple(map(float, target)), tuple(map(float, normal)), surface_on_second, float(field.voxel_size))
+```
+
+读取的对象属性：
+
+```python
+second.local_zero
+first.local_zero
+field.voxel_size
+```
+
+写入目标：
+
+```python
+first_local
+second_local
+boundary
+_
+target
+normal
+point
+surface_on_second
+field
+result['direction']
+```
+
+直接调用符号：
+
+```python
 inverse_points
 second.local_zero
-quaternion_rotate
-torch.as_tensor
-((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum
-_world
+isinstance
 first.local_zero
-((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum
-signed.detach
+LocalPairModel
+tuple
+map
+float
 ```
 
 ## `query_region_intersection`
 
-[定义位置](../../../manipulation/observed_collision.py#L75)。
+[定义位置](../../../manipulation/observed_collision.py#L78)。
 
 输入签名：
 
@@ -265,7 +295,7 @@ node.lower.copy
 
 ## `query_minimum_height`
 
-[定义位置](../../../manipulation/observed_collision.py#L150)。
+[定义位置](../../../manipulation/observed_collision.py#L153)。
 
 输入签名：
 
@@ -365,7 +395,7 @@ witness.tolist
 
 ## `query_minimum_height.push`
 
-[定义位置](../../../manipulation/observed_collision.py#L167)。
+[定义位置](../../../manipulation/observed_collision.py#L170)。
 
 输入签名：
 

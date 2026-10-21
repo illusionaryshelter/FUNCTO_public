@@ -1,4 +1,4 @@
-"""Optimization directions and decisions from the same observed implicit sets."""
+"""Actual observed-set decisions and local models captured from their evidence."""
 
 # BEGIN geometry decisions are independent of the differentiable local direction.
 import numpy as np
@@ -7,6 +7,7 @@ import torch
 from .implicit_distance import inverse_points, query_distance
 from .native_field_distance import query_native_field
 from .planning_problem import quaternion_rotate
+from .local_geometry_model import LocalPairModel
 
 
 def _world(point, pose):
@@ -16,15 +17,14 @@ def _world(point, pose):
 
 
 def pair_residual(first, first_pose, first_matrix, second, second_pose, second_matrix, *,
-                  permission=None, check_request=None, precision_m=1e-4, zero=None):
-    """Query one rigid pair and attach a local rigid-motion derivative.
+                  permission=None, check_request=None, precision_m=1e-4, zero=None,
+                  native_bounds=None):
+    """Return the original classification residual and actual query evidence.
 
     Confirmed penetration has classification value one; clear and unresolved
     queries have value zero. The value is not a metric penetration depth.
-    A common-point penetration uses a local zero-section normal from the
-    observed field. Native witnesses retain their interval bounds; their
-    midpoint supplies only a local rigid-motion direction. The direction
-    neither estimates penetration nor supplies candidate acceptance evidence.
+    Local optimization models are captured separately from this same evidence
+    at block boundaries. No derivative is attached to the classification.
 
     ``zero`` may be one scalar from a batch's differentiable zero baseline.
     A standalone call constructs that baseline from its two position tensors.
@@ -33,43 +33,46 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
     from .implicit_distance import ObservedField
     native_first = not isinstance(first, ObservedField)
     query = query_native_field if native_first else query_distance
+    options = {"native_bounds": native_bounds} if native_first else {}
     result = query(
         first, first_matrix, second, second_matrix,
-        precision_m=precision_m, permission=permission, check_request=check_request)
+        precision_m=precision_m, permission=permission, check_request=check_request, **options)
     # BEGIN scene batches may share their already differentiable zero baseline.
     if zero is None:
         zero = first_pose[0].sum() * 0 + second_pose[0].sum() * 0
     # END the supplied baseline changes no geometric evidence or local direction.
-    status = result["status"]
-    if status == "clear":
-        return zero, result
-    if status == "unresolved":
-        # The scene reports uncertainty separately. It is not collision
-        # evidence and receives no fabricated penetration or direction.
-        return zero, result
+    return (zero + 1. if result["status"] == "intersection" else zero), result
+    # END classification values never become optimizer objectives or directions.
+
+
+# BEGIN local directions are fixed records of the original observed geometry.
+def pair_local_model(first, first_matrix, second, second_matrix, result):
+    """Capture one local model from an already completed pair query.
+
+    The scene invokes this only on a block's actual base state. The local zero
+    point and normal belong to an original supported field; neither the
+    unknown support boundary nor a bounding volume supplies a surface.
+    """
+    from .implicit_distance import ObservedField
+    if result["status"] != "intersection":
+        return None
     first_local = inverse_points(result["witness_first"], first_matrix)
     second_local = inverse_points(result["witness_second"], second_matrix)
-    # The query established a common point in the represented sets. Keep its
-    # local coordinate for a rigid derivative and seek the observed boundary.
     boundary = second.local_zero(second_local)
     if boundary is not None:
         _, target, normal = boundary
-        normal = quaternion_rotate(second_pose[1], torch.as_tensor(
-            normal, dtype=second_pose[0].dtype, device=second_pose[0].device))
-        signed = ((_world(first_local, first_pose) - _world(target, second_pose)) * normal).sum()
+        point, surface_on_second, field = first_local, True, second
     else:
-        boundary = None if native_first else first.local_zero(first_local)
+        boundary = first.local_zero(first_local) if isinstance(first, ObservedField) else None
         if boundary is None:
             result["direction"] = "unavailable"
-            return zero + 1., result
+            return None
         _, target, normal = boundary
-        normal = quaternion_rotate(first_pose[1], torch.as_tensor(
-            normal, dtype=first_pose[0].dtype, device=first_pose[0].device))
-        signed = ((_world(second_local, second_pose) - _world(target, first_pose)) * normal).sum()
+        point, surface_on_second, field = second_local, False, first
     result["direction"] = "local_zero_section_normal"
-    return zero + 1. - (signed - signed.detach()), result
-    # END local directions never certify a native or observed point's membership.
-# END the derivative never changes the classification, threshold or occupied sets.
+    return LocalPairModel(tuple(map(float, point)), tuple(map(float, target)),
+                          tuple(map(float, normal)), surface_on_second, float(field.voxel_size))
+# END no trial query can update the frozen optimization model.
 
 
 def query_region_intersection(field, pose, normals, bounds, *, precision_m=1e-6, check_request=None):

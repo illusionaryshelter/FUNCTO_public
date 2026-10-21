@@ -116,7 +116,7 @@ def test_zero_width_yaw_stays_exact_and_serializes_through_binding():
     assert restored.component_tolerances["yaw"] == 0
 
 
-def test_native_goalset_rotates_material_frame_before_offset_tcp_conversion():
+def test_native_nominal_buffer_preserves_complete_material_tcp_conversion():
     requirement = event(target=pose(Rotation.from_euler("xyz", [.2, -.3, .4]), (.4, .1, .2)),
                         tool_from_function=pose(Rotation.from_euler("x", .2), (.08, .01, -.02)))
     task = problem(requirement)
@@ -125,17 +125,12 @@ def test_native_goalset_rotates_material_frame_before_offset_tcp_conversion():
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.problem, planner.GoalToolPose = task, SimpleNamespace
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
-    angles = np.array([-np.pi, .3, 1.2])
-    native = planner._functional_goal(requirement, angles)
-    assert native.position.shape == (1, 1, 1, 3, 3)
-    for index, angle in enumerate(angles):
-        q = native.quaternion[0, 0, 0, index].numpy()
-        link = pose(Rotation.from_quat(q[[1, 2, 3, 0]]), native.position[0, 0, 0, index].numpy())
-        material = task.base_pose@link@task.tool_transform@requirement.tool_from_function
-        np.testing.assert_allclose(material, requirement.target@pose(Rotation.from_euler("z", angle)), atol=1e-14)
-    assert np.linalg.norm(native.position[0, 0, 0, 0]-native.position[0, 0, 0, 1]) > .05
-    nominal = planner._functional_goal(requirement)
-    assert nominal.position.shape[-2] == 1
+    native = planner._functional_goal(requirement)
+    assert native.position.shape == (1, 1, 1, 1, 3)
+    q = native.quaternion[0, 0, 0, 0].numpy()
+    link = pose(Rotation.from_quat(q[[1, 2, 3, 0]]), native.position[0, 0, 0, 0].numpy())
+    material = task.base_pose@link@task.tool_transform@requirement.tool_from_function
+    np.testing.assert_allclose(material, requirement.target, atol=1e-14)
 
 
 def test_yaw_interval_disables_native_single_pose_convergence():
@@ -150,17 +145,11 @@ def test_yaw_interval_disables_native_single_pose_convergence():
     planner.trajopt.enable_tool_pose_tracking.assert_not_called()
 
 
-def test_proposals_include_current_yaw_and_do_not_change_continuous_acceptance():
+def test_free_yaw_allowed_set_accepts_arbitrary_continuous_angles():
     requirement = event()
-    current = pose(Rotation.from_euler("z", 2.2))
-    angles = requirement.proposal_yaw_angles(2, current)
-    assert len(angles) == 3 and np.min(np.abs(angles-2.2)) < 1e-14
-    assert np.all(angles >= -np.pi) and np.all(angles < np.pi)
-    # A point absent from the finite proposal grid is still a legal task pose.
-    values = requirement.errors_numpy(pose(Rotation.from_euler("z", -.7)))
-    assert all(values[name] <= bound for name, bound in requirement.component_tolerances.items())
-    limited = replace(requirement, yaw_tolerance_rad=.5)
-    assert .5 in limited.proposal_yaw_angles(2, current)
+    for angle in (-np.pi, -.713529, .238214, 2.98732):
+        values = requirement.errors_numpy(pose(Rotation.from_euler("z", angle)))
+        assert all(values[name] <= bound for name, bound in requirement.component_tolerances.items())
 
 
 def test_grounding_preserves_entry_yaw_freedom_and_source_full_pose():

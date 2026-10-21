@@ -62,7 +62,6 @@ def manager_fixture(monkeypatch):
             problem = SimpleNamespace(tool_link="tool", start_progress=0., end_progress=1.,
                 mechanisms=(), stop_progress=(), transform_tool_pose=lambda p, r: (p, r),
                 transform_robot_spheres=lambda value: value, functional_constraint_keys=(),
-                functional_acceptance_keys=(),
                 functional_inequalities=lambda *args, **kwargs: ({}, {}),
                 residuals=lambda p, *args, **kwargs: {"process": p[..., 0] * 0},
                 optimizer_preferences=lambda p, *args, **kwargs: p[..., 0] * 0)
@@ -72,11 +71,12 @@ def manager_fixture(monkeypatch):
         configuration = _process_manager_type(problem, scene,
             _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,
             PlanningBudget(constraint_weight=777., max_task_anchors=capacity),
-            clock={"duration": 2.})
+            clock={"duration": 2.}, seed_parameter=torch.zeros((1, 1)))
         config = configuration.create({"process_mode": mode}, device_cfg=device)
         manager = config.class_type(device)
         manager.initialize_from_config(config, transition)
-        yield SimpleNamespace(manager=manager, scene=scene, kinematics=kinematics, problem=problem)
+        yield SimpleNamespace(manager=manager, scene=scene, kinematics=kinematics,
+                              problem=problem, configuration=configuration)
 
     yield factory
 
@@ -131,7 +131,7 @@ def evaluate_manager(factory, mode, counts):
             assert not evidence[..., 1:].any()
         else:
             assert fixture.manager._optimizer_evidence[-1] is costs.values[costs.names.index("process_scene")]
-            assert not fixture.manager._optimizer_evidence[3].any()
+            assert not fixture.manager._optimizer_evidence[1].any()
         return seen, dict(fixture.manager._query_counts), gradient
 
 

@@ -921,7 +921,8 @@ class PlanningBuilderTest(unittest.TestCase):
         self.assertGreater(request.evaluate(p, q, torch.tensor([[event.progress]])).item(), .3)
         lifted = pose((.02, .03, 2e-5)) @ skill["scene"]["holding"]["T_carrier_eef"]
         p, q = components(np.array([[lifted]]))
-        self.assertGreater(event.evaluate(p, q, request.numerical).item(), 1e-5)
+        self.assertEqual(event.evaluate(p, q, request.numerical).item(), 0.)
+        self.assertGreater(event.raw_inequalities(p, q, request.numerical)["gap"].item(), 1e-5)
 
     def test_explicit_evidence_prerequisite_does_not_imply_a_stop(self):
         skill = grasp_input()

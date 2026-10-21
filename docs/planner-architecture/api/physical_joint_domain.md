@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_domain.py` 实现契约
 
-代码基线：`9e8b365`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `JointDomainInitializationError`
@@ -594,26 +594,30 @@ self._curve_map.evaluate
 
 ## `CubicJointDomain.fit_reference`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L194)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L195)。
 
 输入签名：
 
 ```python
-def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
+def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None, *, event_progress=None, event_positions=None):
 ```
 
 实现说明：
 
-> Fit soft samples on this clock, optionally enforcing model velocity.
+> Fit soft references while interpolating explicitly supplied events.
 >
 > Returns [controls,joints] or None with a construction report. Velocity
 > bounds apply only to this initializer, not to the optimizer domain or
 > its recovery directions for trajectories with existing violations.
+> Event times use this curve's normalized physical clock; positions use
+> its joint column order. Their equality rows also constrain the rounded
+> fit's recovery anchor. Actual interpolation errors are returned for the
+> caller's task-space FK check; this domain retains only joint bounds.
 
 显式输出分支：
 
 ```python
-fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls, velocity_bounds)
+fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls, velocity_bounds, event_progress=event_progress, event_positions=event_positions)
 ```
 
 读取的对象属性：
@@ -634,7 +638,7 @@ fit_cubic_reference
 
 ## `CubicJointDomain.recovery_step`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L204)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L212)。
 
 输入签名：
 
@@ -670,7 +674,7 @@ recover_position_step
 
 ## `CubicJointDomain.coefficients`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L209)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L217)。
 
 输入签名：
 
@@ -709,7 +713,7 @@ self._relative_coefficients
 
 ## `CubicJointDomain._relative_coefficients`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L216)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L224)。
 
 输入签名：
 
@@ -748,7 +752,7 @@ action.to
 
 ## `CubicJointDomain.extrema`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L220)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L228)。
 
 输入签名：
 
@@ -845,7 +849,7 @@ values.amax
 
 ## `CubicJointDomain.feasible`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L258)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L266)。
 
 输入签名：
 
@@ -896,7 +900,7 @@ torch.isfinite(high).all
 
 ## `CubicJointDomain._construct_anchor`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L264)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L272)。
 
 输入签名：
 
@@ -1027,7 +1031,7 @@ self.validate
 
 ## `CubicJointDomain.initialize`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L312)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L320)。
 
 输入签名：
 

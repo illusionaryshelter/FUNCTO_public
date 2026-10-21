@@ -22,6 +22,7 @@ from manipulation.physical_joint_domain import (
     CubicJointDomain, JointDomainInitializationError, JointPositionDomain,
 )
 from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+from manipulation.local_geometry_model import LocalGeometryModels, LocalPairModel
 
 
 class AnalyticRollout:
@@ -48,6 +49,56 @@ class AnalyticRollout:
             get_sum_cost_and_constraint=lambda sum_horizon: costs))
 
 
+# BEGIN real block records exercise both native rollout entry points on CPU.
+class AnalyticGeometryRollout(AnalyticRollout):
+    """A translating point against a unit sphere, with exact radial witnesses.
+
+    The analytic query here supplies the test's actual base tangent. Production
+    LocalPairModel and LocalGeometryModels own the scalar and frozen lifecycle;
+    the unchanged native optimizer owns every cost and gradient callback.
+    """
+
+    def __init__(self, domain, owner, models):
+        super().__init__(domain, 1)
+        self.constraint_manager = self
+        self.optimization_constraints = owner
+        self.local_geometry_models = models
+        self.used_records = []
+
+    def evaluate_action(self, action, use_cuda_graph=False):
+        self.domain.validate(action)
+        self.evaluations.append(action.detach().clone())
+        models = self.local_geometry_models
+        values, record_ids = [], []
+        quaternion = action.new_tensor([1., 0., 0., 0.])
+        for row in range(len(action)):
+            state = models.state(models.state_key(row, 0., .5, .5))
+            if models.captures_row(row):
+                radial = torch.tensor([float(action[row, 0, 0].detach()), .3, 0.], dtype=torch.float64)
+                normal = tuple((radial/radial.norm()).tolist())
+                state.pairs["sphere"] = LocalPairModel((0., 0., 0.), normal, normal, True, .1)
+            model = state.pairs["sphere"]
+            coordinate = action[row, 0, 0]
+            point = torch.stack((coordinate, coordinate*0+.3, coordinate*0))
+            values.append(model.value((point, quaternion), (torch.zeros_like(point), quaternion)))
+            record_ids.append(id(model))
+        if not models.capturing:
+            self.used_records.append(tuple(record_ids))
+        fixed = ((action-1.)**2).sum((-1, -2))
+        costs = fixed+torch.stack(values)
+        result = SimpleNamespace(costs_and_constraints=SimpleNamespace(
+            get_sum_cost_and_constraint=lambda sum_horizon: costs))
+        feasible = action[:, 0, 0].detach().square()+.3**2 >= 1.
+        self.evidence = result, feasible, fixed.detach()
+        return result
+
+    def optimizer_evidence(self, result):
+        original, feasible, fixed = self.evidence
+        assert original is result
+        return feasible, {}, fixed
+# END hard feasibility remains separate from the sphere tangent objective.
+
+
 class NativeComponentTest(unittest.TestCase):
     device = DeviceCfg("cpu")
 
@@ -62,6 +113,107 @@ class NativeComponentTest(unittest.TestCase):
             device_cfg=self.device, config=SimpleNamespace(use_cuda_graph=False),
             optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
         return solver, optimizer, rollouts
+
+    # BEGIN local geometry has its own lifecycle even with no functional keys.
+    def make_geometry_solver(self, count=1):
+        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
+        owner, models = FunctionalAugmentedLagrangian(()), LocalGeometryModels()
+        rollouts = [AnalyticGeometryRollout(domain, owner, models) for _ in range(2)]
+        optimizer = LBFGSOpt(LBFGSOptCfg(
+            device_cfg=self.device, num_iters=4, inner_iters=2, history=2,
+            line_search_scale=[0., .2, 1.], step_scale=.98,
+            use_cuda_kernel_step_direction=False, use_cuda_kernel_line_search=False), rollouts)
+        solver = SimpleNamespace(core=SimpleNamespace(
+            device_cfg=self.device, config=SimpleNamespace(use_cuda_graph=False),
+            optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(count)
+        return optimizer, rollouts, owner, models
+
+    def test_initial_and_regular_callbacks_share_frozen_models_across_particles(self):
+        optimizer, rollouts, owner, models = self.make_geometry_solver(2)
+        core = optimizer._core
+        seed = torch.tensor([.25, .6]).view(2, 1, 1)
+        core._begin_functional_solve(seed)
+        self.assertEqual(owner.keys, ())
+        # BEGIN the shared native layout requires exactly one capture query.
+        self.assertEqual([len(rollout.evaluations) for rollout in rollouts], [1, 0])
+        # END the initial callback consumes the ordinary rollout's records.
+        trials = torch.tensor([.1, .3, .7, .2, .8, 1.2]).view(2, 3, 1)
+        ordinary = core._compute_cost_constraint_and_gradient(trials)
+        initial = core._compute_cost_constraint_and_gradient_initial(trials)
+        for actual, expected in zip(ordinary, initial):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertIs(rollouts[0].local_geometry_models, rollouts[1].local_geometry_models)
+        ids = rollouts[0].used_records[-1]
+        self.assertEqual(ids, rollouts[1].used_records[-1])
+        self.assertEqual(len(set(ids[:3])), 1)
+        self.assertEqual(len(set(ids[3:])), 1)
+        self.assertNotEqual(ids[0], ids[3])
+        self.assertFalse(models.capturing)
+
+    def test_geometry_only_block_refresh_restarts_exactly_the_changed_seed(self):
+        optimizer, _, owner, _ = self.make_geometry_solver(2)
+        core, history = optimizer._core, optimizer._qn
+        seed = torch.tensor([.25, .6]).view(2, 1, 1)
+        core._begin_functional_solve(seed)
+        state = core._create_initial_iteration_state(seed)
+        state.exploration_action[0].fill_(.5)
+        state.current_iteration.fill_(2)
+        core._iterations.fill_(2)
+        for name in ("s", "y", "rho", "alpha"):
+            getattr(history, name).fill_(3.)
+        core._al_blocks_remaining = 2
+        with patch.object(core, "_restart_changed_objective", wraps=core._restart_changed_objective) as restart:
+            core._finish_functional_block(state)
+        self.assertEqual(restart.call_count, 1)
+        self.assertEqual(restart.call_args.args[-1].tolist(), [True, False])
+        for name in ("s", "y", "rho", "alpha"):
+            self.assertEqual(float(getattr(history, name)[:, 0].abs().sum()), 0.)
+            self.assertTrue(bool((getattr(history, name)[:, 1] == 3.).all()))
+        self.assertEqual(core._iterations.tolist(), [2, 2])
+        self.assertEqual([row["outer_updates"] for row in owner.snapshot()["seeds"]], [0, 0])
+        self.assertEqual(core._history_resets.tolist(), [1, 0])
+        self.assertEqual(float(state.exploration_action[0]), .5)
+
+    def test_unchanged_geometry_and_empty_functional_keys_keep_history(self):
+        optimizer, _, _, _ = self.make_geometry_solver()
+        core, history = optimizer._core, optimizer._qn
+        seed = torch.full((1, 1, 1), .25)
+        core._begin_functional_solve(seed)
+        state = core._create_initial_iteration_state(seed)
+        for name in ("s", "y", "rho", "alpha"):
+            getattr(history, name).fill_(3.)
+        before = {name: getattr(history, name).clone() for name in ("s", "y", "rho", "alpha")}
+        core._al_blocks_remaining = 2
+        with patch.object(core, "_restart_changed_objective", wraps=core._restart_changed_objective) as restart, \
+                patch.object(core, "_compute_cost_constraint_and_gradient",
+                             wraps=core._compute_cost_constraint_and_gradient) as gradients:
+            self.assertIs(core._finish_functional_block(state), state)
+        self.assertEqual(restart.call_count, 0)
+        self.assertEqual(gradients.call_count, 0)
+        for name, saved in before.items():
+            torch.testing.assert_close(getattr(history, name), saved, rtol=0, atol=0)
+
+    def test_interrupted_geometry_refresh_discards_only_its_pending_records(self):
+        optimizer, rollouts, _, models = self.make_geometry_solver()
+        core = optimizer._core
+        seed = torch.full((1, 1, 1), .25)
+        core._begin_functional_solve(seed)
+        key = models.state_key(0, 0., .5, .5)
+        original = models.state(key).pairs["sphere"]
+        # BEGIN interrupt after the sole capture has populated pending records.
+        evaluate = rollouts[0].evaluate_action
+        def interrupted(*args, **kwargs):
+            evaluate(*args, **kwargs)
+            raise TimeoutError("capture deadline")
+        with patch.object(rollouts[0], "evaluate_action", side_effect=interrupted):
+            with self.assertRaisesRegex(TimeoutError, "capture deadline"):
+                core._refresh_local_geometry(torch.full_like(seed, .7))
+        # END the previous block survives a partially completed capture.
+        self.assertFalse(models.capturing)
+        self.assertIs(models.state(key).pairs["sphere"], original)
+    # END refresh never changes hard evidence, native budgets or peer histories.
 
     # BEGIN block updates exercise the real CPU native optimizer, not a fake loop.
     def attach_functional_objective(self, rollouts, owner, residual):
@@ -84,7 +236,7 @@ class NativeComponentTest(unittest.TestCase):
                 source, signed, fixed = rollout.evidence
                 self.assertIs(source, result)
                 feasible = torch.isfinite(signed["event"]) & (signed["event"] <= 0)
-                return feasible, feasible, {key: value.detach() for key, value in signed.items()}, fixed.detach()
+                return feasible, {key: value.detach() for key, value in signed.items()}, fixed.detach()
 
             rollout.evaluate_action = evaluate
             rollout.optimizer_evidence = evidence
@@ -165,41 +317,40 @@ class NativeComponentTest(unittest.TestCase):
         pointers = {name: getattr(core, name).data_ptr() for name in core._candidate_buffers}
         snapshot = core._capture_state()
         core._begin_functional_solve(torch.ones((1, 1, 1)))
-        self.assertFalse(bool(core._candidate_rank.any()))
+        self.assertFalse(bool(core._candidate_valid.any()))
         self.assertEqual(pointers, {name: getattr(core, name).data_ptr() for name in core._candidate_buffers})
         self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
         core._restore_capture_state(snapshot)
-        self.assertEqual(core._candidate_rank.tolist(), [2])
+        self.assertEqual(core._candidate_valid.tolist(), [True])
         torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.25]]]))
         # END CUDA capture owns these exact addresses, not replacement tensors.
 
-    # BEGIN candidate evidence ranks cannot exchange safety for a cheaper objective.
-    def test_candidate_rank_precedes_objective_independently_for_each_seed(self):
+    # BEGIN a lower objective cannot replace a feasible candidate with a failure.
+    def test_candidate_feasibility_precedes_objective_independently_for_each_seed(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
         optimizer.update_num_problems(2)
         core = optimizer._core
         actions = torch.tensor([.1, .2, .3, .4, .5, .6]).view(6, 1, 1)
-        eligible = torch.ones(6, dtype=torch.bool)
-        core._retain_sampled_candidate(actions, eligible,
-            torch.tensor([False, False, False, False, True, False]),
+        core._retain_sampled_candidate(actions,
+            torch.tensor([True, True, False, False, True, False]),
             torch.tensor([5., 3., 4., -100., 20., -200.]))
-        self.assertEqual(core._candidate_rank.tolist(), [1, 2])
+        self.assertEqual(core._candidate_valid.tolist(), [True, True])
         torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([.2, .5]))
-        # A stronger candidate wins despite its larger fixed objective. The
-        # other seed's cheap pending candidates cannot overwrite its rank 2.
-        core._retain_sampled_candidate(-actions, eligible,
+        # Infeasible cheap candidates cannot overwrite either incumbent, and
+        # a feasible but more expensive candidate does not replace seed zero.
+        core._retain_sampled_candidate(-actions,
             torch.tensor([False, True, False, False, False, False]),
             torch.tensor([-100., 50., -200., -1000., -2000., -3000.]))
-        self.assertEqual(core._candidate_rank.tolist(), [2, 2])
-        torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([-.2, .5]))
-        core._retain_sampled_candidate(actions, eligible, eligible,
-            torch.tensor([60., 40., 50., 22., 21., 23.]))
+        self.assertEqual(core._candidate_valid.tolist(), [True, True])
         torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([.2, .5]))
-        torch.testing.assert_close(core._candidate_objective, torch.tensor([40., 20.]))
+        core._retain_sampled_candidate(actions, torch.ones(6, dtype=torch.bool),
+            torch.tensor([6., 4., 2., 22., 21., 23.]))
+        torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([.3, .5]))
+        torch.testing.assert_close(core._candidate_objective, torch.tensor([2., 20.]))
 
-    def test_candidate_rank_rejects_nonfinite_values_and_inconsistent_hard_evidence(self):
+    def test_candidate_retention_rejects_nonfinite_values_and_failed_hard_evidence(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
@@ -208,25 +359,16 @@ class NativeComponentTest(unittest.TestCase):
         core._retain_sampled_candidate(
             torch.tensor([float("nan"), .2, .3, .4, .5, .6]).view(6, 1, 1),
             torch.tensor([True, True, False, True, True, False]),
-            torch.tensor([True, True, True, False, True, True]),
             torch.tensor([0., float("inf"), -100., 2., float("nan"), -100.]))
-        self.assertEqual(core._candidate_rank.tolist(), [0, 1])
+        self.assertEqual(core._candidate_valid.tolist(), [False, True])
         torch.testing.assert_close(core._candidate_action[1], torch.tensor([[.4]]))
         self.assertTrue(bool(torch.isinf(core._candidate_objective[0])))
 
-    def test_native_result_retains_pending_confirmation_without_claiming_feasibility(self):
+    def test_native_result_retains_common_sampled_feasibility(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, rollouts = self.make_solver(domain, 1)
         owner = FunctionalAugmentedLagrangian(("event",))
         self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
-        for rollout in rollouts:
-            original = rollout.optimizer_evidence
-
-            def pending(result, original=original):
-                hard, _, signed, objective = original(result)
-                return hard, torch.zeros_like(hard), signed, objective
-
-            rollout.optimizer_evidence = pending
         bind_solver_components(solver, domain)
         optimizer.config.num_iters = optimizer.config.inner_iters
         seed = torch.full((1, 1, 1), -.5)
@@ -236,9 +378,7 @@ class NativeComponentTest(unittest.TestCase):
         self.assertTrue(bool((result <= 0).all()))
         torch.testing.assert_close(result, optimizer._core._candidate_action)
         report = optimizer._core.solve_diagnostics[0]
-        self.assertEqual(report["retained_candidate_rank"], 1)
-        self.assertFalse(report["sampled_feasible_candidate"])
-        self.assertTrue(report["pending_collision_confirmation"])
+        self.assertTrue(report["sampled_feasible_candidate"])
         self.assertIsNotNone(report["retained_candidate_objective"])
         self.assertEqual(report["iterations"], optimizer.config.num_iters)
         self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)

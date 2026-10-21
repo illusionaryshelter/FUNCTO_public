@@ -138,7 +138,8 @@ class FunctionalAugmentedLagrangianTests(unittest.TestCase):
         surface = SupportSurface(np.zeros(3), np.eye(3)[:, :2], [0., 0., 1.],
                                  [[-.1, -.1], [.1, -.1], [.1, .1], [-.1, .1]])
         return SupportRequirement(progress, np.eye(4), body, contact, [0., 0., -1.],
-                                  surface, gap, normal, .002, "Explicit synthetic finite support")
+                                  surface, gap, normal, .002, "Explicit synthetic finite support",
+                                  hard_components=("gap", "body", "footprint", "normal"))
 
     def test_support_components_preserve_physical_zero_sets_and_gradient_directions(self):
         event = self.support_event()

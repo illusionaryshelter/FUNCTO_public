@@ -1,22 +1,28 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`9e8b365`。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`（当前工作区实现，提交时替换为实际代码提交）。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
 `_CuroboPlanner._candidate_metrics` 消费 `JointTrajectory` 和本候选场景，沿原多项式计算机器人 FK、任务残差、同一观测场的场景分项。`_candidate_sample_times` 保留原多项式各区间端点，并按 `interpolation_dt` 分割区间；原生候选直接保留此前普通与密集计算的实际硬残差。确切任务锚点和已加入的碰撞见证单独采样，并计入同一查询容量。调用方提供的原曲线使用自己的区间、时间采样与任务锚点，没有先前原生网格。
 
-这些轨迹指标由 `ProcessCostManager` 的 `trajectory_metrics` 模式计算，并调用 `PlanningProblem.residuals(..., for_acceptance=True)`。`SupportRequirement` 在其精确事件位姿上验收整体高度 body 和有限投影范围 footprint；间距 gap 和法向 normal 保留在原名义优化模型及分析接口中。`PoseEventRequirement` 按 `component_tolerances` 验收位置、旋转以及有界 yaw；旋转在有轴时表示剩余倾斜，yaw 容差 π 时没有 yaw 验收分项。静态功能 IK 调用相同 `for_acceptance=True` 接口。过程关系、关节耦合、显式停止和场景条件分别计算。优化期间候选资格由同次前向结果中的非支持过程残差和 `functional_acceptance_keys` 计算，与这里的任务子集对应。
+这些轨迹指标由 `ProcessCostManager` 的 `trajectory_metrics` 模式计算，并调用同一 `PlanningProblem.residuals`。`SupportRequirement` 按实例的 `hard_components` 验收，默认硬项为整体高度 body 和有限投影范围 footprint；gap/normal 依原阈值提供 `quality` 阶段偏好，当前生产求解采用 `feasibility` 阶段。`PoseEventRequirement` 按 `component_tolerances` 验收材料原点距离、完整旋转或剩余倾斜，以及声明为有限范围的 yaw。事件 IK、搜索和优化候选保留读取相同硬集合，完整轨迹另按实际时间和速度评价过程历史、关节耦合与显式停止。
 
-当前 `validation_joint_step` 用于 OMPL 连接检查；`validation_spatial_step_m` 虽属于 `PlanningBudget` 并校验为正数，但没有生产消费者。`geometry_motion_bound.py` 提供独立运动界计算及其单元回归，当前候选验收没有调用该模块。本次验收的几何计算范围由上述有限时间网格和确切锚点定义。
+普通任务指标与连续关节域通过后，`evaluate_candidate` 调用 `_candidate_geometry`，以同一原曲线继续检查几何时间区间。`SceneMotionBounds.from_scene` 绑定完整机器人关节树、官方实体局部范围、原 owner TSDF 范围、工具标定和声明附着。`geometry_motion_bound` 中的局部包围球仅把关节转动上界转为实体点运动上界；实际碰撞查询仍使用原形状。机械臂速度由保存的 Hermite 多项式导数的 Bernstein 包络给界，名义手指曲线在其有效时间范围内提供手指速度，独立 owner 路径由原插值或机构坐标速率提供界。释放后的实体按该候选释放位姿保持静止。
 
-候选使用同一已知机器人与观测任务实体。任务场景配对在优化与验收中使用同一非穿透规则，`query_role='acceptance'` 只标识报告的调用阶段。已确认体积交叠产生值为 1 的分类残差；场配对的未决保留为报告，不产生碰撞硬成本，也不被视为已分离。原生自身配对仍使用原结构策略与数值边界；任务接触、初始支撑及覆盖条件各自计算。所有实际非 conditional 正分项都表示相应硬条件未满足。普通与密集样本共享同一模型，验收结论限于所查询的已表示集合、记录时刻和明确条件。
+`check_interval_geometry` 以进度映射折点、实体路径折点、关系事件及手指模型有效边界划分时间。端点证据的 `geometry_entity_key` 将机器人、任务实体和背景分别标为 `robot/<ID>`、`owner/<ID>`、`background`；速度表和配对缓存使用相同键。对区间长度 `Δt`，记两个实体的点速度上界为 `v_A,v_B`，令 `L=v_A+v_B`；端点完整实体距离下界为 `d_0,d_1`。`max(d_0,d_1)>LΔt` 或 `min(d_0,d_1)>LΔt/2` 可证明本区间分离。声明刚性组合体的内部对和空已表示集合分别保存其依据。有限接触许可只提供当前未许可点对域的距离，区间检查将这种变化域记录为 `dynamic_permission`。
+
+未取得上述证明的区间按实体最大位移继续二分，直到位移上界不超过 `validation_spatial_step_m`、时间无法再分或共享查询容量用尽，保留为 `unresolved_intervals`。新增查询调用原多项式、完整 FK 和相同场景，同时带入该曲线所需释放锚点及同一物理时刻的关系左右侧；进度平台只在入口使用左侧、出口使用右侧。查询发现实际交叠后，保存见证并将其余待查区间记为 `not_checked_after_intersection`。`proved_intervals`、`confirmed_intersections`、`unresolved_intervals`、实际查询数量与时刻共同构成报告。
+
+报告范围 `continuous_declared_geometry_model` 指输入数值所描述的连续运动与实体模型。该模型界的含义独立于设备浮点 FK 舍入和实际控制跟踪误差。空间细分截止、未知运动或容量不足均保留未决状态；它们不被解释为连续分离，也不新增碰撞拒绝。新增实际场景正残差以 `interval:process_scene` 进入原验收条件和恢复路径。`validation_joint_step` 继续用于 OMPL 连接检查。
+
+候选使用固定机器人官方实体与原观测任务场。任务配对在优化与验收中使用同一非穿透规则，`query_role='acceptance'` 令场景聚合实际硬分项。优化所使用的固定局部 softplus 与接触偏好不属于该聚合。已确认体积交叠产生分类残差 1，场配对未决保留原状态。原生自身配对按原结构策略与数值边界检查，任务接触、初始支撑和覆盖条件分别计算。非 conditional 正分项表示其对应硬条件未满足。
 
 每个验收样本以实际进度确定附着。工具与附着实体、同一 TCP 上共同附着实体的内部配对不进入碰撞查询；各成员原几何继续完成对外配对。`internal_assembly_pair_count` 保存内部配对样本数，工具成员由快照中的 `tool_geometry_names` 明确给出。
 
 `_candidate_domain_validation` 独立检查保存曲线的入口 `q0,dq0` 及连续关节范围。`cubic_position_report` 对每个标量三次段求位置极值；速度范围来自导数极值；`cubic_derivative_report` 检查每段两端的加速度，并分别包含内部结点左右极限。`JointTrajectory.sample` 通过保存的 `CubicHermiteSpline` 返回 `q,dq,ddq,s`，在内部结点采用右段导数，在最终端点采用左极限。
 
-`evaluate_candidate` 汇总模型条件、上述任务验收条件和连续关节域。已有完整 `native_report` 时使用其同一曲线的已完成验收证据，并继续检查保存多项式及入口；返回报告记录本次是否发生新查询及其数量。所有验收分项要求有限数且残差不大于零。有限采样几何验收的含义由采样规则、源几何和未知策略共同确定；连续关节极值检查具有独立的解析范围。
+`evaluate_candidate` 汇总已完成任务指标、连续关节域和区间几何报告。已有 `native_report` 时复用普通与密集指标，并继续检查保存多项式及入口；区间查询消费剩余 `max_validation_points` 容量，包括重复计算的必要释放锚点。所有实际硬残差须为有限数且不大于零。成功候选仍可携带未决几何区间，其范围和原因随结果保存。`select_candidate` 在选择可交付候选前完成这些计算，实际区间碰撞可以进入原有限恢复流程；`export` 返回已完成验收的 `delivery_candidate` 与零新增查询数。
 
 ## 2. 结果结构与输入身份
 

@@ -24,7 +24,7 @@ RETIRED = {
  'scene_surface_batch', 'native_voxel_sources', 'voxel_layers', 'mapper_surface',
  'online_contact', 'contact_geometry', 'native_owner_geometry',
  'prismatic_self_collision', 'collision_path', 'holding_contact',
- 'robot_coverage', 'geometry_motion_bound', 'online_native_confirmation',
+ 'robot_coverage', 'online_native_confirmation',
  'adapter-prepare_recorded_task', 'adapter-recorded_owner_geometry',
  'adapter-recorded_observation', 'adapter-robot_coverage_fixture',
  'adapter-contact_fixture', 'adapter-run_recorded_simulation',
@@ -104,7 +104,9 @@ def main():
     for module, chapter in [('implicit_distance','02'), ('observed_mapping','02'),
                             ('observed_robot','02'), ('observed_collision','02'),
                             ('observed_coverage','02'), ('grasp_region','03'),
-                            ('native_field_distance','02'), ('tool_geometry','02')]:
+                            ('native_field_distance','02'), ('tool_geometry','02'),
+                            ('local_geometry_model','02'), ('geometry_motion_bound','05'),
+                            ('interval_geometry','05')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:
             modules.append(row)

@@ -2,6 +2,7 @@
 
 # BEGIN qualification, whole-chain continuity and explicit recovery are separate contracts.
 from itertools import product
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -258,19 +259,21 @@ def test_actual_task_and_online_checks_rank_reference_ik_without_hardening_its_p
     # END no model evidence is invented for a skipped reference proposal.
 
 
-def test_static_functional_screening_requests_delivery_acceptance_subset(monkeypatch):
+def test_static_functional_screening_uses_the_common_hard_contract(monkeypatch):
     planner, _ = _static_planner(monkeypatch)
     received = []
     original = planner.problem.residuals
 
     def residuals(*args, **kwargs):
-        received.append(kwargs["for_acceptance"])
+        received.append(kwargs)
         return original(*args, **kwargs)
 
     planner.problem.residuals = residuals
     planner._rank_ik_candidates([[.1, 0., 0.]], [False], [[0., 0., 0.]], .4,
                                (("pose_events", 0),))
-    assert received == [True]
+    assert len(received) == 1
+    assert received[0]["direction_mode"] == "point"
+    assert "for_acceptance" not in received[0]
 
 
 def test_functional_static_pool_keeps_allowed_pose_when_nominal_center_ik_failed(monkeypatch):
@@ -338,7 +341,7 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     planner.budget = SimpleNamespace(ik_seeds=2)
     planner.joint_names = ("x", "y", "z")
     # BEGIN the fixture supplies actual typed pose declarations to the proposal API.
-    planner.problem = SimpleNamespace(start_progress=0., pose_events=[
+    planner.problem = SimpleNamespace(start_progress=0., end_progress=1., supports=(), coordinate_events=(), pose_events=[
         PoseEventRequirement(s, np.eye(4), np.eye(4), .01, .02, "declared event") for s in (.4, .4, .8)])
     # END complete poses have exactly one nominal yaw proposal.
     planner.problem.goal_requirements_at = lambda phase: tuple(
@@ -352,7 +355,9 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     from manipulation.physical_joint_domain import CubicJointDomain
     planner.physical_domain = CubicJointDomain(torch.full((3,), -2.), torch.full((3,), 2.),
         planner.start.position, torch.zeros((1, 3)), 3./10., 6)
-    planner._functional_goal = lambda target, yaw_angles: target
+    planner._functional_goal = lambda target: target
+    planner._manager_type = SimpleNamespace(bind_ik_goals=Mock())
+    planner.check_request = Mock()
     queries = []
 
     def solve(target, **kwargs):
@@ -361,7 +366,8 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
             [[[.1, 0., 0.], [.7, 0., 0.]]], dtype=torch.float64)), success=torch.ones((1, 2), dtype=torch.bool),
             goalset_index=torch.zeros((1, 2, 1), dtype=torch.long))
 
-    planner.ik = SimpleNamespace(solve_pose=solve, get_active_js=lambda value: value)
+    planner.ik = SimpleNamespace(solve_pose=solve, get_active_js=lambda value: value,
+        disable_tool_pose_tracking=Mock(), enable_tool_pose_tracking=Mock())
     planner._rank_ik_candidates = lambda values, success, previous, u, goals: (
         np.array([1, 0]), [{"static": "first"}, {"static": "second"}])
     pool = planner._build_goal_ik_candidates(torch.zeros((1, 1, 6, 3), dtype=torch.float64))
@@ -373,4 +379,6 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     assert pool[.2]["time_s"] == pytest.approx(.6)
     assert pool[.2]["candidates"][0]["joint_position"] == [.7, 0., 0.]
     assert len(pool[.2]["candidates"]) == 2
+    assert planner.ik.disable_tool_pose_tracking.call_count == 2
+    assert planner.ik.enable_tool_pose_tracking.call_count == 2
 # END mocked queries test orchestration, not CUDA geometry or actual IK convergence.

@@ -116,9 +116,9 @@ class ImplicitDistanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "clear")
         self.assertEqual(result["queries"], 0)
 
-    def test_penetration_value_and_local_direction_have_separate_meanings(self):
+    def test_penetration_evidence_and_fixed_local_objective_are_separate(self):
         import torch
-        from manipulation.observed_collision import pair_residual
+        from manipulation.observed_collision import pair_residual, pair_local_model
         first = torch.zeros(3, dtype=torch.float64, requires_grad=True)
         second = torch.tensor([.07, 0., 0.], dtype=torch.float64)
         quaternion = torch.tensor([1., 0., 0., 0.], dtype=torch.float64)
@@ -129,11 +129,17 @@ class ImplicitDistanceTests(unittest.TestCase):
             self.field, (second, quaternion), target)
         self.assertEqual(record["status"], "intersection")
         self.assertEqual(residual.item(), 1.)
+        # BEGIN only the actual local scalar supplies an optimization derivative.
+        model = pair_local_model(self.field, np.eye(4), self.field, target, record)
         self.assertEqual(record["direction"], "local_zero_section_normal")
         residual.backward()
+        self.assertEqual(torch.count_nonzero(first.grad).item(), 0)
+        first.grad.zero_()
+        model.value((first, quaternion), (second, quaternion)).backward()
         # Descent moves the left box away from the box translated to its right.
         self.assertGreater(first.grad[0].item(), 0.)
         self.assertTrue(torch.isfinite(first.grad).all())
+        # END the hard value and its zero gradient remain classification evidence.
 
     def test_touching_supported_faces_do_not_establish_volume_overlap(self):
         for value in (-1., 0.):

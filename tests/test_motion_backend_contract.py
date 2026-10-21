@@ -62,7 +62,7 @@ class Native:
         self.route = "constrained"
         self.functional_constraints = SimpleNamespace(keys=("event",))
         self.reference_ik_distinct_counts = self.reference_ik_queries = self.reference_ik_chains = []
-        self.reference_seed_fits = self.goal_ik_fit_hints = []
+        self.reference_seed_fits = self.goal_ik_event_fits = self.goal_ik_chains = []
         self.joint_reference_report = None
         self.initial_seed_strategies = self.seed_strategies = ["test", "test"]
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
@@ -133,27 +133,14 @@ def test_feasible_reference_delivers_once_without_optimization():
 
 
 # BEGIN exercise the real serialization handoff after native candidate selection.
-def test_real_candidate_binding_roundtrips_online_geometry_and_rejects_mutation():
+def test_real_candidate_binding_preserves_observed_geometry_and_rejects_mutation(tmp_path):
+    import json
     from manipulation.execution_binding import check_result
-    from manipulation.online_geometry import FrozenESDF, OnlinePlanningScene
-    from manipulation.planning_scene import ObservedSpace
+    from manipulation.observed_mapping import FrozenObservedField
+    from test_native_scene_contract import make_scene
 
-    shape = (7, 7, 7)
-    observed = np.ones(shape, dtype=bool)
-    # BEGIN serialization retains an explicit empty obstacle source.
-    from observed_geometry_fixtures import point_source
-    field = FrozenESDF.from_source(point_source(), origin=[-.3]*3, shape=shape, voxel_size=.1,
-        owner_ids=("background",),
-        source="fixed observed test field")
-    # END observed-free evidence is independently serialized by coverage.
-    coverage = ObservedSpace(observed, origin=[-.3]*3, voxel_size=.1,
-        observation_ids=("frame",), reference_frame="world")
-    scene = OnlinePlanningScene(background=field, owners=(), coverage=coverage,
-        reference_frame="world", robot_sphere_materials=("body",),
-        robot_geometry_source="native test spheres", has_gripper=False,
-        unknown_policy={"outside_regions": "forbid", "conditional_regions": []})
-    scene.bind_online_robot(robot_sphere_geometry=[{"link_name": "tool", "sphere_indices": [0],
-        "centers_local": [[0., 0., 0.]], "radii": [.01]}], robot_self_collision_pairs=[])
+    # BEGIN the native candidate retains the current unified scene record.
+    scene = make_scene(tmp_path)
     native = Native([True])
     backend = MotionBackend({}, robot_validator=object())
     try:
@@ -161,14 +148,17 @@ def test_real_candidate_binding_roundtrips_online_geometry_and_rejects_mutation(
             result = backend.plan(problem(), scene)
         assert result.success and native.calls.count("export") == 1
         binding = check_result(result)
-        restored = OnlinePlanningScene.from_binding(binding["scene"])
-        spheres = np.array([[0., 0., 0., .01]])
-        assert restored.query_state(spheres, np.eye(4), .5) == scene.query_state(spheres, np.eye(4), .5)
-        result.execution_binding["scene"]["robot_sphere_geometry"][0]["radii"][0] = .02
+        assert binding["scene"] == json.loads(json.dumps(scene.to_execution_binding()))
+        restored = FrozenObservedField.from_record(binding["scene"]["background"])
+        np.testing.assert_array_equal(restored.values, scene.background.values)
+        np.testing.assert_array_equal(restored.observed, scene.background.observed)
+        np.testing.assert_array_equal(restored.weights, scene.background.weights)
+        result.execution_binding["scene"]["background"]["origin"][0] += .01
         with pytest.raises(ValueError, match="validated input binding"):
             check_result(result)
     finally:
         backend.close()
+    # END field serialization retains raw samples and mutation detection.
 # END accepted evidence names exactly the field record handed to execution.
 
 
@@ -329,7 +319,7 @@ def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(st
             if stage == "reference" or len(selections) == 2:
                 report.update(residuals={"interpolated:process_scene": .04},
                     coverage_residuals={"interpolated:unknown_forbidden": .04},
-                    scene_components=unknown, native_confirmation={"status": "completed"})
+                    scene_components=unknown, observed_geometry={"status": "completed"})
             return candidate, curve, report
 
         native.select_candidate = confirmed

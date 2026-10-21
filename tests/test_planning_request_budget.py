@@ -144,20 +144,20 @@ class PlanningRequestBudgetTest(unittest.TestCase):
             for row in rejected.request_ledger["binding_records"]))
     # END an explicit physical quota never replenishes samples, solves or time.
 
-    # BEGIN reused delivery metrics cannot spend a second native-query pass.
-    def test_confirmed_last_solve_can_deliver_without_recharging_reused_geometry(self):
+    # BEGIN interval queries consume the existing request budget before delivery.
+    def test_interval_checked_last_solve_delivers_without_recharging_geometry(self):
         for solves in (1, 2):
             with self.subTest(solves=solves):
                 native = Native([False] * solves + [True], collision=True)
                 select = native.select_candidate
                 query_counts = iter([0] + [11] * solves)
 
-                def confirmed(accepted):
+                def interval_checked(accepted):
                     candidate, curve, report = select(accepted)
-                    report['confirmation_validation_points'] = next(query_counts)
+                    report['interval_query_points'] = next(query_counts)
                     return candidate, curve, report
 
-                native.select_candidate = confirmed
+                native.select_candidate = interval_checked
                 result, backend = run_native(native,
                     budget=replace(self.budget, maximum_trajectory_solves=solves, trajectory_seeds=1))
                 try:
@@ -171,16 +171,16 @@ class PlanningRequestBudgetTest(unittest.TestCase):
                 finally:
                     backend.close()
 
-    def test_real_excess_native_confirmation_still_exhausts_the_original_budget(self):
+    def test_excess_interval_queries_exhaust_the_original_validation_budget(self):
         native = Native([False, False, True], collision=True)
         select = native.select_candidate
 
-        def confirmed(accepted):
+        def interval_checked(accepted):
             candidate, curve, report = select(accepted)
-            report['confirmation_validation_points'] = 11
+            report['interval_query_points'] = 11
             return candidate, curve, report
 
-        native.select_candidate = confirmed
+        native.select_candidate = interval_checked
         result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
         try:
             self.assertFalse(result.success)
@@ -207,7 +207,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
             self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 8)
         finally:
             backend.close()
-    # END native checks stay bounded; polynomial consistency and wall time remain required.
+    # END delivery reuse retains the existing cumulative work limits.
 
 
 if __name__ == "__main__":

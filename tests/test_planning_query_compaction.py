@@ -25,7 +25,8 @@ def test_boundary_compaction_keeps_batched_plateaus_release_witness_and_tie_grad
 
     # BEGIN both direct oracle and production callback declare their query role.
     def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                 contact_permission_progress, query_role="acceptance"):
+                 contact_permission_progress, query_role="acceptance", local_models=None,
+                 geometry_evidence_out=None):
         assert query_role == "acceptance"
         # END this numerical oracle leaves geometry-role selection to its caller.
         seen.append((s.detach().clone(), joints.detach().clone(), trajectory_time.detach().clone(),

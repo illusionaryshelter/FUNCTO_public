@@ -181,6 +181,21 @@ class ObservedField:
                              if len(self.cells) else np.empty((0, 8)))
         centers = self.cell_origins + self.voxel_size / 2
         self.tree = cKDTree(centers) if len(centers) else None
+        # BEGIN local surface directions index supported zero-bearing cells.
+        # Occupied interior cells remain in the collision tree. They cannot
+        # displace a more distant observed zero from the direction query's
+        # finite candidate list. A constant-zero cell has no surface normal.
+        minimum = self._cell_values.min(axis=1) if len(self.cells) else np.empty(0)
+        maximum = self._cell_values.max(axis=1) if len(self.cells) else np.empty(0)
+        # A nonconstant nonnegative trilinear cell is strictly positive at
+        # every interior point: all eight interpolation weights are positive.
+        # Its occupied zero subset has no volume interior. Keep that subset
+        # for surface tasks and report its possible contact as unresolved.
+        self._boundary_only_cells = (minimum == 0) & (maximum > 0)
+        self._zero_cell_ids = np.flatnonzero((minimum <= 0) & (maximum >= 0)
+                                           & (minimum < maximum))
+        self._zero_tree = cKDTree(centers[self._zero_cell_ids]) if len(self._zero_cell_ids) else None
+        # END this additional index never changes occupied cells or their tree.
         self.nodes = []
         # BEGIN batch the same initial slab bounds without changing tree order.
         # A small batch bounds temporary interpolation storage independently
@@ -206,12 +221,19 @@ class ObservedField:
             return identity
 
         self.root = build(self.tree.tree) if self.tree is not None else None
+        # BEGIN both immutable indices account for their own retained arrays.
         for array in (self.values, self.observed, self.origin, self.valid_cells,
-                      self.cells, self.cell_origins, self._cell_values):
+                      self.cells, self.cell_origins, self._cell_values, self._zero_cell_ids,
+                      self._boundary_only_cells):
             array.flags.writeable = False
         self.storage_nbytes = sum(a.nbytes for a in (
             self.values, self.observed, self.valid_cells, self.cells,
-            self.cell_origins, self._cell_values)) + 256 * len(self.nodes)
+            self.cell_origins, self._cell_values, self._zero_cell_ids,
+            self._boundary_only_cells)) + 256 * len(self.nodes)
+        if self._zero_tree is not None:
+            self._zero_tree.data.flags.writeable = False
+            self.storage_nbytes += self._zero_tree.data.nbytes + self._zero_tree.indices.nbytes
+        # END the occupied representation retains its existing storage account.
 
     # BEGIN vectorized initial bounds retain scalar tighten arithmetic.
     def _initial_cell_bounds(self):
@@ -413,15 +435,15 @@ class ObservedField:
 
     def local_zero(self, point):
         """Find a local zero-section point solely for an optimization direction."""
-        if self.tree is None:
+        # BEGIN query the surface candidate index, retaining original cell IDs.
+        if self._zero_tree is None:
             return None
-        _, indices = self.tree.query(np.asarray(point), k=min(8, len(self.cells)))
+        _, indices = self._zero_tree.query(np.asarray(point), k=min(8, len(self._zero_cell_ids)))
         best = None
-        for identity in np.atleast_1d(indices):
-            identity = int(identity)
+        for candidate in np.atleast_1d(indices):
+            identity = int(self._zero_cell_ids[candidate])
             values = self._cell_values[identity]
-            if values.min() > 0 or values.max() < 0:
-                continue
+            # END all candidates contain a supported nonconstant zero section.
             lower = self.cell_origins[identity]
             seeds = []
             for a, b in _EDGES:
@@ -467,15 +489,20 @@ def query_distance(first, first_pose, second, second_pose, *,
     if first.root is None or second.root is None:
         return {"status": "clear", "lower_m": None, "upper_m": None, "empty_set": True,
                 "intersection": False, "queries": 0, "witness_first": None,
-                "witness_second": None, "scope": "represented_observed_occupancy"}
+                "witness_second": None, "scope": "represented_observed_occupancy",
+                "distance_scope": "unpermitted_point_pairs_at_query_pose"}
     poses = (np.asarray(first_pose, float), np.asarray(second_pose, float))
     fields = (first, second)
     pending, serial = [], count()
     upper, witness = math.inf, None
     unresolved_lower = math.inf
+    # BEGIN every separated branch contributes to the complete-domain bound.
+    separated_lower = math.inf
+    # END this is a distance record, not a positive-clearance requirement.
     visits = 0
 
     def push(a, b):
+        nonlocal separated_lower
         if permission is not None and permission.excludes_cells(a.cell, b.cell):
             return
         wa, wb = world_bounds(a.lower, a.upper, poses[0]), world_bounds(b.lower, b.upper, poses[1])
@@ -483,7 +510,9 @@ def query_distance(first, first_pose, second, second_pose, *,
         if policy == "permitted":
             return
         lower = box_distance(wa, wb)
-        if lower == 0:
+        if lower > 0:
+            separated_lower = min(separated_lower, lower)
+        else:
             # BEGIN expose unpermitted domains before refining permission seams.
             # A mixed box contains both permitted and unpermitted points. FIFO
             # expansion exposes its interior children; choosing the smallest
@@ -502,6 +531,14 @@ def query_distance(first, first_pose, second, second_pose, *,
         if lower > 0:
             continue
         if a.cell >= 0 and b.cell >= 0:
+            # BEGIN zero-only boundary material cannot establish volume overlap.
+            # Spatial bounds already failed to prove separation. Retain that
+            # boundary uncertainty, then inspect the other cell pairs; a
+            # lower-dimensional zero must not starve a volume intersection.
+            if first._boundary_only_cells[a.cell] or second._boundary_only_cells[b.cell]:
+                unresolved_lower = min(unresolved_lower, lower)
+                continue
+            # END constant-zero cells retain their full represented volume.
             domain_upper = math.inf
             local_a, local_b = first.occupied_points(a), second.occupied_points(b)
             pa, pb = transform_points(local_a, poses[0]), transform_points(local_b, poses[1])
@@ -552,7 +589,8 @@ def query_distance(first, first_pose, second, second_pose, *,
                     return {"status": "intersection", "lower_m": 0., "upper_m": 0.,
                             "intersection": True, "queries": visits,
                             "witness_first": point.tolist(), "witness_second": point.tolist(),
-                            "scope": "represented_observed_occupancy"}
+                            "scope": "represented_observed_occupancy",
+                            "distance_scope": "unpermitted_point_pairs_at_query_pose"}
             if ((domain_upper <= precision
                  and np.min(overlap_high - overlap_low) <= precision)
                     or max(np.linalg.norm(a.upper - a.lower),
@@ -572,13 +610,20 @@ def query_distance(first, first_pose, second, second_pose, *,
         for child in children:
             push(child, b) if axis == 0 else push(a, child)
     unresolved = np.isfinite(unresolved_lower)
+    # BEGIN a clear result retains the minimum over all separated domains.
+    # Fully permitted domains contribute no finite distance. If permissions
+    # remove every domain, zero is a valid bound and does not mean contact.
+    lower = unresolved_lower if unresolved else separated_lower
+    lower = float(lower) if np.isfinite(lower) else 0.
+    # END finite permission regions remain specific to this query's pose.
     return {"status": "unresolved" if unresolved else "clear",
-            "lower_m": unresolved_lower if unresolved else 0.,
+            "lower_m": lower,
             "upper_m": upper if np.isfinite(upper) else None,
             "intersection": None if unresolved else False,
             "queries": visits,
             "witness_first": None if witness is None else witness[0].tolist(),
             "witness_second": None if witness is None else witness[1].tolist(),
-            "scope": "represented_observed_occupancy"}
+            "scope": "represented_observed_occupancy",
+            "distance_scope": "unpermitted_point_pairs_at_query_pose"}
     # END unresolved domains never become positive collision evidence.
 # END every definitive result refers to the same supported implicit sets.

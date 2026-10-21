@@ -1,4 +1,4 @@
-"""Support targets remain in optimization while delivery uses its own subset."""
+"""One support declaration serves hard checks and complementary soft guidance."""
 
 # BEGIN exercise real task/manager contracts with a small analytic joint tree.
 from types import SimpleNamespace
@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation
 
 from manipulation.curobo_solver_components import PhysicalGradientCore
 from manipulation.execution_binding import bind_candidate
+from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
 from manipulation.goals import SupportSurface
 from manipulation.planning import JointTrajectory
 from manipulation.planning_problem import (
@@ -45,19 +46,26 @@ def support_problem(case):
 
 
 @pytest.mark.parametrize("case", ["gap", "normal", "body", "footprint"])
-def test_support_nominal_value_and_gradient_survive_acceptance_subset(case):
+def test_support_hard_checks_and_soft_guidance_preserve_source_geometry(case):
     problem = support_problem(case)
     position = torch.zeros((1, 3, 3), dtype=torch.float64, requires_grad=True)
     quaternion = torch.tensor([1., 0., 0., 0.], dtype=torch.float64).expand(1, 3, 4)
     p, r = problem.transform_tool_pose(position, quaternion)
     progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
-    nominal = problem.residuals(p, r, progress)["support:0"]
-    accepted = problem.residuals(p, r, progress, for_acceptance=True)["support:0"]
+    accepted = problem.residuals(p, r, progress)["support:0"]
+    # BEGIN support preferences retain their declared quality-stage scope.
+    preference = problem.optimizer_preferences(p, r, progress, phase="quality")
+    assert not problem.optimizer_preferences(p, r, progress, phase="feasibility").any()
+    # END geometric measurements and hard residuals remain phase-independent.
     signed, _ = problem.functional_inequalities(p, r, progress)
-    assert set(signed) == {f"support:0:{key}" for key in ("gap", "body", "footprint", "normal")}
-    assert set(problem.functional_acceptance_keys) == {"support:0:body", "support:0:footprint"}
-    assert nominal[0, 1] > 0
+    assert set(signed) == {"support:0:body", "support:0:footprint"}
+    assert set(signed) == set(problem.functional_constraint_keys)
     assert bool((accepted <= 0).all()) is (case in {"gap", "normal"})
+    projected = problem.goal_residual(p, r, progress, goal_ids=(("supports", 0),))
+    torch.testing.assert_close(projected.sum(-1)[0, 1], accepted[0, 1])
+    if case in {"gap", "normal"}:
+        assert preference[0, 1] > 0
+    raw = problem.supports[0].raw_inequalities(p, r, problem.numerical)[case]
     # Independent expected violations establish the units and event selection.
     expected = {
         "gap": .039,
@@ -65,11 +73,16 @@ def test_support_nominal_value_and_gradient_survive_acceptance_subset(case):
         "body": .002 - problem.numerical.position_m,
         "footprint": .12 + .02 - .1 + .002 - problem.numerical.position_m,
     }[case]
-    torch.testing.assert_close(nominal[0, 1], nominal.new_tensor(expected), rtol=1e-10, atol=1e-12)
-    gradient = torch.autograd.grad(nominal.sum(), position)[0]
-    assert not gradient[:, (0, 2)].any()
+    torch.testing.assert_close(raw[0, 1], raw.new_tensor(expected), rtol=1e-10, atol=1e-12)
+    if case in {"gap", "normal"}:
+        scale = (problem.supports[0].gap_tolerance if case == "gap" else
+                 2*np.sin(problem.numerical.rotation_rad/2))
+        torch.testing.assert_close(preference[0, 1], preference.new_tensor((expected/scale)**2),
+                                   rtol=1e-10, atol=1e-12)
     expected_axis = {"gap": (2, 1.), "body": (2, -1.), "footprint": (0, 1.)}
     if case in expected_axis:
+        gradient = torch.autograd.grad(raw[0, 1], position)[0]
+        assert not gradient[:, (0, 2)].any()
         axis, value = expected_axis[case]
         torch.testing.assert_close(gradient[0, 1, axis], gradient.new_tensor(value))
 
@@ -93,22 +106,21 @@ def test_manager_retention_metrics_and_binding_share_support_delivery_subset(cas
             costs = fixture.manager.compute_costs(state)
             values = dict(zip(costs.names, costs.values))
             if mode == "trajectory_optimizer":
-                augmented, feasible, signed, eligible, _ = fixture.manager._optimizer_evidence
-                assert not feasible.any()  # All four inputs violate a nominal target.
-                assert bool(eligible.all()) is expected
-                assert augmented.sum() > 0
-                assert len(signed) == 4
-                # Retention uses the manager's actual flags. An otherwise
-                # deliverable curve survives with rank one despite a gap or
-                # normal target that the original optimizer still pursues.
+                augmented, feasible, signed, _ = fixture.manager._optimizer_evidence
+                assert bool(feasible.all()) is expected
+                assert bool(augmented.sum() > 0) is (not expected)
+                assert len(signed) == 2
+                assert values["skill_pose_equality_preference"].sum().item() == 0.
+                # Preference violations preserve the same feasible candidate
+                # rank used when every declared hard condition is satisfied.
                 tracker = SimpleNamespace(config=SimpleNamespace(num_problems=1, num_particles=1),
                     action_horizon=3, action_dim=2,
                     _candidate_action=torch.full_like(q, 99.),
                     _candidate_objective=torch.full((1,), float("inf")),
-                    _candidate_rank=torch.zeros(1, dtype=torch.uint8))
-                PhysicalGradientCore._retain_sampled_candidate(tracker, q, eligible, feasible,
+                    _candidate_valid=torch.zeros(1, dtype=torch.bool))
+                PhysicalGradientCore._retain_sampled_candidate(tracker, q, feasible,
                     torch.zeros(1))
-                assert int(tracker._candidate_rank[0]) == (1 if expected else 0)
+                assert bool(tracker._candidate_valid[0]) is expected
             else:
                 violations = values["skill_process"].detach().numpy().reshape(-1)
                 assert bool((violations <= 0).all()) is expected
@@ -126,7 +138,79 @@ def test_manager_retention_metrics_and_binding_share_support_delivery_subset(cas
         # Serialization retains the exact source tolerances and feature data.
         assert binding["problem"]["supports"][0]["normal_tolerance"] == .0001
         assert binding["problem"]["supports"][0]["contact_points"] == problem.supports[0].contact_points.tolist()
+        assert binding["problem"]["supports"][0]["hard_components"] == ["body", "footprint"]
     else:
         with pytest.raises(ValueError, match="completed accepted"):
             bind_candidate(trajectory, **arguments)
 # END optimization, candidate retention and delivery consume explicit meanings.
+
+
+# BEGIN phase regression uses actual pose derivatives and the original AL terms.
+@pytest.mark.parametrize("case", ["gap", "normal"])
+def test_feasibility_excludes_support_quality_gradient_at_a_hard_feasible_pose(case):
+    problem = support_problem(case)
+    position = torch.zeros((1, 3, 3), dtype=torch.float64, requires_grad=True)
+    angle = torch.zeros((1, 3), dtype=torch.float64, requires_grad=True)
+    quaternion = torch.stack((torch.cos(angle/2), torch.sin(angle/2), angle*0, angle*0), -1)
+    p, r = problem.transform_tool_pose(position, quaternion)
+    progress = torch.tensor([[0., .5, 1.]], dtype=torch.float64)
+    times = torch.tensor([[0., 1., 2.]], dtype=torch.float64)
+    signed, _ = problem.functional_inequalities(p, r, progress, trajectory_time=times)
+    augmented = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
+    augmented.bind(progress)
+    hard_cost = sum(augmented.terms(signed).values()).sum()
+    assert hard_cost.item() == 0.
+    preferences = {phase: problem.optimizer_preferences(p, r, progress,
+        trajectory_time=times, phase=phase) for phase in ("feasibility", "quality")}
+    assert not preferences["feasibility"].any()
+    assert preferences["quality"][0, 1] > 0
+    assert not preferences["quality"][:, (0, 2)].any()
+    first = torch.autograd.grad(hard_cost+preferences["feasibility"].sum(),
+        (position, angle), retain_graph=True)
+    for derivative in first:
+        torch.testing.assert_close(derivative, torch.zeros_like(derivative), rtol=0, atol=0)
+    second = torch.autograd.grad(hard_cost+preferences["quality"].sum(), (position, angle))
+    for derivative in second:
+        assert not derivative[:, (0, 2)].any()
+    # Lowering a lifted face and reducing a positive tilt are the original
+    # geometric preference directions at this same hard-feasible event pose.
+    if case == "gap":
+        assert second[0][0, 1, 2] > 0
+    else:
+        assert second[1][0, 1] > 0
+# END phase selection changes optional gradients, not support acceptance.
+
+
+# BEGIN changing a task declaration changes every hard consumer together.
+@pytest.mark.parametrize("case", ["gap", "normal"])
+def test_explicit_support_hard_components_and_continuation_identity(case):
+    from dataclasses import replace
+    from manipulation.planning import _obligation_contract
+    problem = support_problem(case)
+    problem.supports = (replace(problem.supports[0], hard_components=("gap", "body", "footprint", "normal")),)
+    position = torch.zeros((1, 1, 3), dtype=torch.float64, requires_grad=True)
+    angle = torch.zeros((1, 1), dtype=torch.float64, requires_grad=True)
+    quaternion = torch.stack((torch.cos(angle/2), torch.sin(angle/2), angle*0, angle*0), -1)
+    p, r = problem.transform_tool_pose(position, quaternion)
+    progress = torch.tensor([[.5]], dtype=torch.float64)
+    assert problem.evaluate(p, r, progress).item() > 0
+    assert problem.goal_residual(p, r, progress, goal_ids=(("supports", 0),)).sum().item() > 0
+    assert len(problem.functional_constraint_keys) == 4
+    signed, _ = problem.functional_inequalities(p, r, progress)
+    augmented = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
+    augmented.bind(progress)
+    hard_cost = sum(augmented.terms(signed).values()).sum()
+    derivatives = []
+    for phase in ("feasibility", "quality"):
+        preference = problem.optimizer_preferences(p, r, progress, phase=phase)
+        assert preference.item() == 0.
+        derivatives.append(torch.autograd.grad(hard_cost+preference.sum(),
+            (position, angle), retain_graph=True))
+    for first, second in zip(*derivatives):
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+    if case == "gap":
+        assert derivatives[0][0][0, 0, 2] > 0
+    else:
+        assert derivatives[0][1][0, 0] > 0
+    assert _obligation_contract(problem)["supports"][0]["hard_components"] == ["gap", "body", "footprint", "normal"]
+# END the declared input, not a query purpose, determines the feasible set.

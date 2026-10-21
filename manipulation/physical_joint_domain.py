@@ -191,15 +191,23 @@ class CubicJointDomain(JointPositionDomain):
         """
         return self._curve_map.evaluate(actions, progress, derivative)
 
-    def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
-        """Fit soft samples on this clock, optionally enforcing model velocity.
+    # BEGIN event joint samples are seed interpolation data, not optimizer locks.
+    def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None,
+                      *, event_progress=None, event_positions=None):
+        """Fit soft references while interpolating explicitly supplied events.
 
         Returns [controls,joints] or None with a construction report. Velocity
         bounds apply only to this initializer, not to the optimizer domain or
         its recovery directions for trajectories with existing violations.
+        Event times use this curve's normalized physical clock; positions use
+        its joint column order. Their equality rows also constrain the rounded
+        fit's recovery anchor. Actual interpolation errors are returned for the
+        caller's task-space FK check; this domain retains only joint bounds.
         """
         return fit_cubic_reference(self, self._curve_map, progress, joint_targets,
-                                   prior_controls, velocity_bounds)
+            prior_controls, velocity_bounds, event_progress=event_progress,
+            event_positions=event_positions)
+    # END main optimization can change the seed within the original task set.
 
     def recovery_step(self, base, gradient, step_limits, scales):
         """Find a curve-feasible direction without boxing its free coefficients."""

@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`9e8b365`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_validate_reports`
@@ -292,7 +292,7 @@ int
 输入签名：
 
 ```python
-def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s, velocity_limits, *, count, joint_tolerance):
+def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s, velocity_limits, *, count, joint_tolerance, query_kind='reference'):
 ```
 
 实现说明：
@@ -318,6 +318,14 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 > independent measured-state initializer. Every emitted chain still needs
 > whole-curve optimization and validation.
 >
+> ``query_kind='functional'`` instead requires a task-qualified state at
+> every supplied event and rejects connections whose average velocity is
+> outside any joint's signed model bounds. Native pose-centre convergence
+> is irrelevant to these continuous allowed sets. Static scene failures
+> remain explicit proposal quality; the whole curve still owns acceptance.
+> Reference samples are soft observations and do not impose those mandatory
+> interpolation nodes or a hard velocity test on a reference polyline.
+>
 > Dynamic programming retains at most ``count`` paths at each last candidate.
 > Failed static task/model check counts rank proposals first, without
 > removing the only available transferred-reference chain. Edges then
@@ -331,6 +339,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 显式输出分支：
 
 ```python
+[]
 []
 result
 ```
@@ -405,6 +414,7 @@ options
 preceding_index
 paths
 preceding
+displacement
 scaled_velocity
 edge
 cost

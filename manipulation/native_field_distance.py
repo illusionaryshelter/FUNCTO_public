@@ -29,6 +29,25 @@ def _native_bounds(geometry, transform):
     return np.asarray(intervals, dtype=float).T
 
 
+# BEGIN full native-entity separation from certified support projections.
+def native_pair_lower_bound(first, first_pose, second, second_pose, direction):
+    """Return a whole-entity distance lower bound along a proposed direction.
+
+    The direction may come from a numerical distance solver. Its quality can
+    affect tightness only: both support intervals retain their outward error.
+    """
+    direction = np.asarray(direction, float)
+    length = float(np.linalg.norm(direction))
+    if length == 0.:
+        return 0.
+    a = native_projection_bounds(first, _transform(first_pose), direction)
+    b = native_projection_bounds(second, _transform(second_pose), direction)
+    gap = max(0., float(b[0] - a[1]), float(a[0] - b[1]))
+    error = _GAMMA * sum(abs(float(value)) for value in (*a, *b))
+    return max(0., float(np.nextafter((gap-error)/(length*(1+_GAMMA)), -np.inf)))
+# END no overlap of projection intervals is interpreted as penetration.
+
+
 def _projection_gap(geometry, transform, box):
     """Certify a lower bound using a direction proposed by Coal.
 
@@ -64,7 +83,8 @@ def _local_interval(world, pose):
 
 
 def query_native_field(geometry, native_pose, field, field_pose, *,
-                       precision_m=1e-4, permission=None, check_request=None):
+                       precision_m=1e-4, permission=None, check_request=None,
+                       native_bounds=None):
     """Check penetration over unpermitted native and observed point pairs.
 
     A finite contact permission constrains both endpoints. When its boundary
@@ -72,6 +92,12 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
     is the unchanged native shape. B is never accepted as robot material.
     Feasible native witnesses retain interval enclosures of the constructed
     point. Their midpoint is used only for display and a local derivative.
+
+    ``native_bounds`` optionally supplies the same entity's (local, world)
+    projection bounds. The scene owns local bounds with its immutable model
+    and world bounds only for this query pose. A standalone query computes
+    these bounds directly. Returned distance bounds concern unpermitted point
+    pairs at this pose; changing a contact permission changes that domain.
     """
     # BEGIN positive clearance is not part of represented-entity collision.
     precision = float(precision_m)
@@ -79,18 +105,20 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
         raise ValueError("Penetration queries need positive finite numerical precision")
     native_pose, field_pose = np.asarray(native_pose, float), np.asarray(field_pose, float)
     transform = _transform(native_pose)
-    native_local = _native_bounds(geometry, _transform(np.eye(4)))
-    native_world = _native_bounds(geometry, transform)
     pending, serial = [], count()
     upper, witness, visits = np.inf, None, 0
     unresolved_lower = np.inf
+    # BEGIN retain bounds from every separated search domain, not one leaf.
+    separated_lower = np.inf
+    # END permitted or empty domains do not contribute a finite distance.
 
     def report(status, lower, *, intersection=None, empty=False):
         output = dict(status=status, lower_m=lower,
             upper_m=None if not np.isfinite(upper) else float(upper),
             intersection=intersection, queries=visits,
             witness_first=None, witness_second=None,
-            scope="known_native_and_represented_observed_set")
+            scope="known_native_and_represented_observed_set",
+            distance_scope="unpermitted_point_pairs_at_query_pose")
         if witness is not None:
             a, b = witness
             output.update(witness_first=((a[0] + a[1]) / 2).tolist(),
@@ -102,7 +130,18 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
             output["empty_set"] = True
         return output
 
+    # BEGIN empty observations need no shape support queries.
+    if field.root is None:
+        return report("clear", None, intersection=False, empty=True)
+    if native_bounds is None:
+        native_local = _native_bounds(geometry, _transform(np.eye(4)))
+        native_world = _native_bounds(geometry, transform)
+    else:
+        native_local, native_world = native_bounds
+    # END reuse concerns only geometry bounds, never query classification.
+
     def push(native_box, node, partitioned=False):
+        nonlocal separated_lower
         if permission is not None and permission.excludes_cells(-1, node.cell):
             return
         wa = native_world if not partitioned else world_bounds(*native_box, native_pose)
@@ -112,9 +151,11 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
             return
         lower = box_distance(wa, wb)
         if lower > 0:
+            separated_lower = min(separated_lower, lower)
             return
         lower = max(lower, _projection_gap(geometry, transform, wb))
         if lower > 0:
+            separated_lower = min(separated_lower, lower)
             return
         # K intersect B is empty if the full native set is separated from B.
         # The converse is deliberately not asserted.
@@ -125,8 +166,6 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
             0. if policy == "mixed" else diameter, next(serial),
             native_box, node, wa, wb, policy, partitioned))
 
-    if field.root is None:
-        return report("clear", None, intersection=False, empty=True)
     push(native_local, field.nodes[field.root])
     while pending:
         lower, _, _, _, native_box, node, wa, wb, policy, partitioned = heapq.heappop(pending)
@@ -134,6 +173,13 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
         if check_request is not None and visits % 64 == 1:
             check_request()
         if node.cell >= 0:
+            # BEGIN a supported nonconstant nonnegative cell has only boundary occupancy.
+            # It remains available to surface queries. This volume query
+            # records possible boundary contact and continues other domains.
+            if field._boundary_only_cells[node.cell]:
+                unresolved_lower = min(unresolved_lower, lower)
+                continue
+            # END an identically zero cell still represents occupied volume.
             domain_upper = np.inf
             local_points = field.occupied_points(node)
             points = transform_points(local_points, field_pose)
@@ -209,6 +255,12 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
                 push(native_box, child, partitioned)
     if np.isfinite(unresolved_lower):
         return report("unresolved", unresolved_lower)
-    return report("clear", 0., intersection=False)
+    # BEGIN the minimum retained bound covers the complete remaining domain.
+    # With no finite separated branch, permissions or empty intersections
+    # removed every domain; zero remains a valid lower bound and is not a
+    # claim that the physical entities touch.
+    lower = float(separated_lower) if np.isfinite(separated_lower) else 0.
+    return report("clear", lower, intersection=False)
+    # END no positive geometric clearance is added to the collision rule.
     # END numerical uncertainty is reported separately from penetration.
 # END every definitive result concerns actual native/observed point pairs.

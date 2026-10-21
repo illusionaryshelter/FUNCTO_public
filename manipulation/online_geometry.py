@@ -20,7 +20,11 @@ from .implicit_distance import PairPermission, transform_points
 from .observed_mapping import FrozenObservedField
 from .observed_robot import DifferentiableRobotKinematics
 from .robot_geometry_check import RobotGeometryChecker
-from .observed_collision import pair_residual
+from .observed_collision import pair_residual, pair_local_model
+from .local_geometry_model import LocalContactModel
+# BEGIN scene-owned immutable and per-query native projection bounds.
+from .native_field_distance import _native_bounds, _transform, native_pair_lower_bound
+# END support computations retain the registered native entity.
 from .planning_problem import PosePath, quaternion_rotate, quaternion_conjugate, quaternion_multiply
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
                              PrismaticGripper, _tensor, _interval, _world_points)
@@ -83,6 +87,13 @@ class OnlinePlanningScene:
             raise ValueError("Tool members, fixed installations and scene owners need registered unique identities")
         self.required_robot_links = tuple(dict.fromkeys(
             frame for frame, _, _, _ in robot_model._geometries.values()))
+        # BEGIN one local projection range per immutable registered entity.
+        self._native_local_bounds = {}
+        for name, (_, geometry, _, _) in robot_model._geometries.items():
+            bounds = _native_bounds(geometry, _transform(np.eye(4)))
+            bounds.flags.writeable = False
+            self._native_local_bounds[name] = bounds
+        # END rollout clones share these pose-independent model bounds.
         self.contacts = tuple(contacts)
         self.gripper, self.has_gripper = gripper, has_gripper
         self.unknown_policy = deepcopy(unknown_policy)
@@ -387,20 +398,54 @@ class OnlinePlanningScene:
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time,
                    active_contact_rule_ids=None, contact_permission_progress=None,
-                   owner_poses=None, query_role="acceptance"):
+                   owner_poses=None, query_role="acceptance", local_models=None,
+                   objectives_out=None, geometry_evidence_out=None):
         """Return same-state residuals and retain distance/coverage diagnostics.
 
         ``robot_spheres`` is an empty native-kinematics output. Registered
-        native entities carry all robot geometry. Query roles identify the
-        caller in diagnostics; both roles use the same nonpenetration rule.
+        native entities carry all robot geometry. Both query roles return the
+        same hard components. Optimization additionally fills independent
+        continuous objectives using an explicitly captured block model.
         """
         if query_role not in {"optimization", "acceptance"}:
             raise ValueError("Observed geometry requires an explicit query role")
+        if query_role == "optimization" and local_models is None:
+            raise ValueError("Optimization requires explicitly captured local geometry models")
         if self.kinematics is None or joint_position is None:
             raise ValueError("Observed robot geometry must be bound to its named joint tree")
         # BEGIN caller role does not introduce a geometric clearance.
-        costs = {}
+        costs, objectives = {}, {}
         permission_progress = progress if contact_permission_progress is None else contact_permission_progress
+        # BEGIN complete pair evidence is an explicit interval-verification output.
+        # Unlike display diagnostics, this list includes every required pair
+        # and every skipped relation at each physical query state.
+        if geometry_evidence_out is not None:
+            evidence_time, evidence_progress, evidence_permission = (
+                value.detach().cpu().numpy() for value in
+                (trajectory_time, progress, permission_progress))
+
+        def record_pair(index, component, first, second, evidence, *, geometry_entity_key,
+                        permission_kind="none"):
+            if geometry_evidence_out is not None:
+                geometry_evidence_out.append({"state_index": list(index),
+                    "time_s": float(evidence_time[index]),
+                    "progress": float(evidence_progress[index]),
+                    "permission_progress": float(evidence_permission[index]),
+                    "component": component, "first": first, "second": second,
+                    "geometry_entity_key": geometry_entity_key,
+                    "permission_kind": permission_kind, **evidence})
+        # END hard residuals and optional proof evidence have separate consumers.
+        # BEGIN bind fixed local records by seed, physical time and relation mode.
+        states = {}
+        if query_role == "optimization":
+            times_cpu, relation_cpu, permission_cpu = (
+                value.detach().cpu().numpy() for value in
+                (trajectory_time, progress, permission_progress))
+            for index in np.ndindex(tuple(progress.shape)):
+                key = local_models.state_key(index[0], times_cpu[index],
+                    relation_cpu[index], permission_cpu[index])
+                states[index] = local_models.state(key)
+        # END line-search particles share records, never current query witnesses.
         hand_state, coordinates, half = None, None, None
         complete_q, complete_names = joint_position, tuple(joint_names)
         if self.gripper is not None:
@@ -408,6 +453,7 @@ class OnlinePlanningScene:
                 trajectory_time=trajectory_time, measured=active_contact_rule_ids is not None)
             coordinates, half = hand_state.coordinates, hand_state.half
             costs["gripper/controller"] = hand_state.controller_residual
+            objectives["gripper/controller"] = hand_state.controller_residual
             costs["conditional/hand_geometry"] = hand_state.uncertain.to(progress.dtype)
             missing_names = [name for name in self.gripper.joint_names if name not in complete_names]
             if missing_names:
@@ -434,10 +480,13 @@ class OnlinePlanningScene:
         fields["background"] = self.background
         matrices = {name: _matrices(pose) for name, pose in poses.items()}
         robot_matrices = {name: _matrices(pose) for name, pose in robot_poses.items()}
+        # BEGIN finite contact queries reuse one full-batch actor conversion.
+        contact_actor_matrices = dict(matrices)
+        # END owner actors already have the exact required matrix batch.
         # BEGIN one batch zero retains every position and named-joint gradient.
         # Clear or skipped pairs still return a differentiable scalar. Form
         # that zero once over the batch, retaining each entity's connection
-        # before individual pair queries attach any penetration direction.
+        # before independent local objectives transform fixed material points.
         zero = complete_q.sum(-1) * 0
         for pose in (*poses.values(), *robot_poses.values()):
             zero = zero + pose[0].sum(-1) * 0
@@ -459,11 +508,16 @@ class OnlinePlanningScene:
                                      active.detach().cpu().numpy())
             if rule.required:
                 from .observed_collision import query_region_intersection
-                gaps, undecided = [], []
+                gaps, undecided, local_gaps = [], [], []
                 normals_cpu, bounds_cpu, _ = policies[rule.rule_id]
                 interval_active = policy["active"].detach().cpu().numpy()
                 target_field = fields[rule.target_owner]
                 target_matrices = matrices[rule.target_owner]
+                # BEGIN a robot feature uses TCP coordinates, not body coordinates.
+                if rule.actor not in contact_actor_matrices:
+                    contact_actor_matrices[rule.actor] = _matrices(actor_pose)
+                actor_matrices = contact_actor_matrices[rule.actor]
+                # END this conversion is outside the individual-state loop.
                 for index in np.ndindex(tuple(progress.shape)):
                     evidence = {"status": "inactive"}
                     if interval_active[index]:
@@ -472,23 +526,31 @@ class OnlinePlanningScene:
                         world_bounds = bounds_cpu[index]+world_normals @ target_matrix[:3, 3]
                         evidence = query_region_intersection(target_field, target_matrix,
                             world_normals, world_bounds, check_request=self.check_request)
-                    gap=progress[index]*0+float(evidence["status"]=="missing_contact")
-                    if evidence["status"]=="missing_contact":
-                        # A nearby zero supplies a local optimization direction;
-                        # the interval query above owns contact classification.
-                        actor_matrix=_matrices(actor_pose)[index]
+                    gap = zero[index] + float(evidence["status"] == "missing_contact")
+                    # BEGIN the actual base captures one original target zero.
+                    if (query_role == "optimization" and local_models.captures_row(index[0])
+                            and evidence["status"] == "missing_contact"):
+                        actor_matrix=actor_matrices[index]
                         local_center=np.mean(rule.feature_points,axis=0)
                         world_center=transform_points(local_center,actor_matrix)
                         target_center=(world_center-target_matrix[:3,3])@target_matrix[:3,:3]
                         boundary=target_field.local_zero(target_center)
                         if boundary is not None:
-                            point=progress.new_tensor(boundary[1])
-                            excess=torch.relu((policy["normals"][index]*point).sum(-1)-policy["bounds"][index])
-                            direction=torch.linalg.vector_norm(excess)
-                            gap=gap+direction-direction.detach()
+                            states[index].contacts[rule.rule_id] = LocalContactModel(
+                                tuple(map(float, boundary[1])))
+                        else:
+                            evidence["direction"] = "unavailable"
+                    if query_role == "optimization":
+                        local = states[index].contacts.get(rule.rule_id)
+                        local_gaps.append(zero[index] if local is None else local.value(
+                            policy["normals"][index], policy["bounds"][index]))
+                    # END contact classification never enters the local scalar.
                     gaps.append(gap)
                     undecided.append(float(evidence["status"] == "unresolved"))
-                costs[f"contact/{rule.rule_id}"] = normal*policy["active"].to(normal.dtype)*(1-uncertain)+torch.stack(gaps).reshape(progress.shape)
+                normal_cost = normal*policy["active"].to(normal.dtype)*(1-uncertain)
+                costs[f"contact/{rule.rule_id}"] = normal_cost+torch.stack(gaps).reshape(progress.shape)
+                if query_role == "optimization":
+                    objectives[f"contact/{rule.rule_id}"] = normal_cost+torch.stack(local_gaps).reshape(progress.shape)
                 costs[f"unresolved/contact/{rule.rule_id}"] = progress.new_tensor(undecided).reshape(progress.shape)
                 costs[f"conditional/contact/{rule.rule_id}"] = uncertain
         # A pair owns only its declared feature regions; no rule can exempt
@@ -498,6 +560,9 @@ class OnlinePlanningScene:
                          else hand_state.uncertain.detach().cpu().numpy())
         unmodelled = (set() if hand_state is None else
                      set(self.robot_validator.checker.geometry_depending_on(self.gripper.joint_names)))
+        # BEGIN uncertainty belongs to registered robot entities, not display names.
+        unmodelled_entity_keys = {f"robot/{name}" for name in unmodelled}
+        # END a scene owner may retain the same name as a robot component.
         # BEGIN native self checks use the same validator pair contract.
         report = {"query_role": query_role, "collision_rule": "nonpenetration", "pair_queries": 0,
                   "status_counts": {}, "nonclear_pairs": [],
@@ -519,9 +584,26 @@ class OnlinePlanningScene:
             undecided = value
             for row in evidence["pairs"]:
                 first_id, second_id = row["first"], row["second"]
+                entity_key = {"first": f"robot/{first_id}", "second": f"robot/{second_id}"}
                 if uncertain_cpu[index] and ({first_id, second_id} & unmodelled):
+                    record_pair(index, "collision/robot/self", first_id, second_id,
+                        {"status": "unmodelled_motion", "lower_m": None}, geometry_entity_key=entity_key)
                     continue
                 status = row["relation"]
+                # BEGIN full support projections certify native separation.
+                lower = None
+                if geometry_evidence_out is not None:
+                    lower = native_pair_lower_bound(
+                        self.robot_model._geometries[first_id][1],
+                        np.asarray(evidence["geometry_poses"][first_id], float),
+                        self.robot_model._geometries[second_id][1],
+                        np.asarray(evidence["geometry_poses"][second_id], float),
+                        row["normal_first_to_second"])
+                record_pair(index, "collision/robot/self", first_id, second_id,
+                    {**row, "status": {"separated": "clear", "penetrating": "intersection",
+                                       "numerical_boundary": "unresolved"}[status],
+                     "lower_m": lower, "distance_scope": "full_entities"}, geometry_entity_key=entity_key)
+                # END Coal's raw distance tolerance is never used as an error bound.
                 report["pair_queries"] += 1
                 report["status_counts"][status] = report["status_counts"].get(status, 0) + 1
                 if status == "numerical_boundary":
@@ -542,6 +624,7 @@ class OnlinePlanningScene:
             self_costs.append(value)
             self_unresolved.append(undecided)
         costs["collision/robot/self"] = torch.stack(self_costs).reshape(progress.shape)
+        objectives["collision/robot/self"] = costs["collision/robot/self"]
         costs["unresolved/robot/self"] = torch.stack(self_unresolved).reshape(progress.shape)
         # END camera coverage and task margins cannot change self legality.
         pairs = []
@@ -573,8 +656,13 @@ class OnlinePlanningScene:
             [relation.active(attachment_progress) for relation in owner.attachments])
             if owner.attachments else np.zeros(attachment_progress.shape, bool)
             for owner in self.owners}
+        # BEGIN world ranges belong to this call's exact entity/state poses.
+        native_world_bounds = {}
+        # END no range survives into a later trajectory query.
         for component, first_id, second_id, first, second, first_pose, second_pose, fm, sm, actor, target in pairs:
             residuals = []
+            entity_key = {"first": f"robot/{first_id}" if actor == "robot" else f"owner/{first_id}",
+                          "second": "background" if target == "background" else f"owner/{second_id}"}
             rules = [rule for rule in self.contacts
                      if ((actor == "robot" and rule.actor == "robot" and rule.target_owner == target
                           and rule.robot_body == first_id)
@@ -586,8 +674,10 @@ class OnlinePlanningScene:
                     self.check_request()
                 # BEGIN each pair reuses this state's batch zero, including skips.
                 state_zero = zero[index]
-                if uncertain_cpu[index] and (first_id in unmodelled or second_id in unmodelled):
+                if uncertain_cpu[index] and unmodelled_entity_keys.intersection(entity_key.values()):
                     residuals.append(state_zero)
+                    record_pair(index, component, first_id, second_id,
+                        {"status": "unmodelled_motion", "lower_m": None}, geometry_entity_key=entity_key)
                     continue
                 held_internal = (target in attached and attached[target][index]
                     and ((actor == "robot" and first_id in self.tool_geometry_names)
@@ -595,6 +685,10 @@ class OnlinePlanningScene:
                 if held_internal:
                     residuals.append(state_zero)
                     report["internal_assembly_pair_count"] += 1
+                    record_pair(index, component, first_id, second_id,
+                        {"status": "internal_assembly", "lower_m": None},
+                        geometry_entity_key=entity_key,
+                        permission_kind="declared_rigid_assembly")
                     continue
                 # END skipped pairs retain zero derivatives to all entity positions.
                 regions = []
@@ -610,10 +704,28 @@ class OnlinePlanningScene:
                 for model in support:
                     if model.relation.interval[0] <= progress_cpu[index] < model.relation.interval[1]:
                         permission = model.permission(sm[index], additional=permission)
+                # BEGIN prepare a world range only for an actual nonempty query.
+                native_bounds = None
+                if actor == "robot" and second.root is not None:
+                    key = (first_id, index)
+                    if key not in native_world_bounds:
+                        native_world_bounds[key] = _native_bounds(first, _transform(fm[index]))
+                    native_bounds = (self._native_local_bounds[first_id], native_world_bounds[key])
+                # END different partners share only the entity's geometric range.
                 value, evidence = pair_residual(first, (first_pose[0][index], first_pose[1][index]), fm[index],
                     second, (second_pose[0][index], second_pose[1][index]), sm[index],
-                    permission=permission, check_request=self.check_request, zero=state_zero)
+                    permission=permission, check_request=self.check_request, zero=state_zero,
+                    native_bounds=native_bounds)
                 residuals.append(value)
+                record_pair(index, component, first_id, second_id, evidence,
+                    geometry_entity_key=entity_key,
+                    permission_kind="none" if permission is None else "finite_region")
+                # BEGIN capture uses this same hard query only at the block base.
+                if query_role == "optimization" and local_models.captures_row(index[0]):
+                    local = pair_local_model(first, fm[index], second, sm[index], evidence)
+                    if local is not None:
+                        states[index].pairs[(component, first_id, second_id)] = local
+                # END fresh trial classifications never replace local records.
                 report["pair_queries"] += 1
                 status = evidence["status"]
                 report["status_counts"][status] = report["status_counts"].get(status, 0)+1
@@ -622,13 +734,29 @@ class OnlinePlanningScene:
                         "component": component, "state_index": list(index), **evidence})
             value = torch.stack(residuals).reshape(progress.shape)
             costs[component] = costs.get(component, torch.zeros_like(progress))+value
+            # BEGIN a frozen pair remains in the objective after a clear trial.
+            if query_role == "optimization":
+                local_values = []
+                for index in np.ndindex(tuple(progress.shape)):
+                    local = states[index].pairs.get((component, first_id, second_id))
+                    local_values.append(zero[index] if local is None else local.value(
+                        (first_pose[0][index], first_pose[1][index]),
+                        (second_pose[0][index], second_pose[1][index])))
+                objectives[component] = objectives.get(component, torch.zeros_like(progress)) + \
+                    torch.stack(local_values).reshape(progress.shape)
+            # END the geometric check list retains every original external pair.
             # Field uncertainty remains in status_counts and nonclear_pairs.
             # Only confirmed penetration contributes a collision residual.
         # END a zero-distance unresolved domain is not a clearance violation.
         # END assembly membership only removes internal pairs while Attachment is active.
         for model in self._initial_support_models.values():
-            costs.update(model.components(poses[model.relation.actor], poses[model.relation.target_owner],
-                                         progress, check_request=self.check_request))
+            support_components = model.components(poses[model.relation.actor], poses[model.relation.target_owner],
+                                                  progress, check_request=self.check_request)
+            costs.update(support_components)
+            # The supported-height metric has a physical scalar and derivative;
+            # its separate unresolved status remains hard evidence only.
+            support_key = f"initial_support/{model.relation.relation_id}"
+            objectives[support_key] = support_components[support_key]
         # BEGIN only moving scene owners consume the declared unknown-space policy.
         from .observed_coverage import query_coverage
         report["owner_coverage"] = {}
@@ -654,15 +782,21 @@ class OnlinePlanningScene:
             report["owner_coverage"][owner.owner_id] = rows
         # END robot camera coverage cannot enter a refusal or recovery component.
         self.last_query_report = report
+        if objectives_out is not None:
+            objectives_out.update(objectives or {"observed_geometry": zero})
         return costs or {"observed_geometry": torch.zeros_like(progress)}
 
     def evaluate(self, *args, **kwargs):
         output = kwargs.pop("components_out", None)
-        components = self.components(*args, **kwargs)
+        # BEGIN every consumer receives hard evidence separately from preference.
+        objectives = {}
+        components = self.components(*args, **kwargs, objectives_out=objectives)
         if output is not None:
             output.update(components)
-        return torch.stack([value for name, value in components.items()
+        selected = objectives if kwargs.get("query_role", "acceptance") == "optimization" else components
+        return torch.stack([value for name, value in selected.items()
                             if not name.startswith("conditional/")]).sum(0)
+        # END missing/unknown/undecided states do not masquerade as smooth costs.
 
     def estimated_workspace_allocation(self, batch, horizon):
         fields = [self.background, *(owner.query for owner in self.owners)]

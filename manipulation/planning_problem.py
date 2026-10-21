@@ -902,13 +902,6 @@ class MechanismRequirement:
 @dataclass
 class SupportRequirement:
     """A finite observed support and a specific material face at one event."""
-    # BEGIN support geometry retains its optimization and delivery meanings.
-    # Every source-declared component remains a nominal optimization target.
-    # Delivery checks the body half-space and finite footprint; contact gap
-    # and normal alignment remain available for post-plan analysis. This is
-    # one component contract for all skills, never a task-specific tolerance.
-    acceptance_components = ("body", "footprint")
-    # END source points, transforms, events and numerical declarations remain.
     progress: float
     tool_from_carrier: np.ndarray
     body_points: np.ndarray
@@ -919,6 +912,11 @@ class SupportRequirement:
     normal_tolerance: float
     margin: float
     source: object
+    # BEGIN one explicit component declaration serves every hard consumer.
+    # Other components retain their geometry and thresholds as quality-stage
+    # preferences. The declaration is serialized with the complete task data.
+    hard_components: tuple[str, ...] = ("body", "footprint")
+    # END no caller-specific acceptance subset or skill-dependent rule exists.
 
     def __post_init__(self):
         from .goals import SupportSurface, _points
@@ -930,6 +928,12 @@ class SupportRequirement:
         _support_arguments(self.surface, self.margin, self.gap_tolerance, self.normal_tolerance)
         if not isinstance(self.surface, SupportSurface) or not self.source:
             raise ValueError("Support constraints need observed finite geometry and a source")
+        # BEGIN validate the finite vocabulary at the task declaration boundary.
+        self.hard_components = tuple(self.hard_components)
+        if (len(set(self.hard_components)) != len(self.hard_components)
+                or not set(self.hard_components) <= {"gap", "body", "footprint", "normal"}):
+            raise ValueError("Support hard components must be distinct declared geometry components")
+        # END an empty hard set explicitly makes the complete support a preference.
 
     # BEGIN retain all source-declared support inequalities for optimization.
     def raw_inequalities(self, position, quaternion, numerical):
@@ -975,17 +979,14 @@ class SupportRequirement:
         return {name: value/(normal_scale if name == "normal" else length_scale)
                 for name, value in self.raw_inequalities(position, quaternion, numerical).items()}
 
-    def evaluate(self, position, quaternion, numerical, *, for_acceptance=False):
-        """Sum nominal requirements, or the two retained delivery components.
-
-        The default preserves the complete optimization value and gradient.
-        Acceptance omits gap and normal alignment without changing either
-        declared tolerance or any body/footprint calculation.
-        """
+    # BEGIN support feasibility has one meaning in IK, search and trajectories.
+    def evaluate(self, position, quaternion, numerical):
+        """Sum positive violations of the explicitly declared hard components."""
         import torch
         components = self.raw_inequalities(position, quaternion, numerical)
-        selected = self.acceptance_components if for_acceptance else components
-        return sum(torch.relu(components[name]) for name in selected)
+        return sum((torch.relu(components[name]) for name in self.hard_components),
+                   position[..., 0]*0.)
+    # END raw measurements remain available for all four source components.
     # END no centering target, contact permission or physical tolerance is added.
 
 
@@ -1109,46 +1110,6 @@ class PoseEventRequirement:
         return {name: value.detach().numpy() for name, value in self.error_components(
             torch.as_tensor(poses[..., :3, 3].copy(), dtype=torch.float64),
             torch.as_tensor(_quaternion(poses), dtype=torch.float64)).items()}
-
-    def target_poses(self, yaw_angles):
-        """Construct complete material targets at declared yaw proposal angles.
-
-        The target material origin stays fixed. Tool/link targets must be
-        obtained afterward using the complete attachment/calibration chain;
-        a rotated material frame generally translates an offset TCP.
-        """
-        angles = np.asarray(yaw_angles, dtype=float).reshape(-1)
-        if not np.isfinite(angles).all() or not len(angles):
-            raise ValueError("Yaw proposals must be a finite nonempty sequence")
-        if self.yaw_axis is None:
-            if np.any(angles != 0):
-                raise ValueError("A complete pose target has no declared yaw interval")
-            return np.repeat(self.target[None], len(angles), axis=0)
-        if np.any(np.abs(angles) > self.yaw_tolerance_rad):
-            raise ValueError("Yaw proposals must stay inside the declared interval")
-        result = np.repeat(self.target[None], len(angles), axis=0)
-        result[:, :3, :3] = self.target[:3, :3] @ Rotation.from_rotvec(angles[:, None]*self.yaw_axis).as_matrix()
-        return result
-
-    def proposal_yaw_angles(self, count, preferred_tool_pose):
-        """Sample finite IK centres; continuous component tolerances accept states.
-
-        The projected current posture supplies one centre. The existing IK
-        seed count also sizes a uniform yaw grid, avoiding another search
-        configuration. A full revolution excludes its duplicate endpoint.
-        This gives at most count+1 targets, not count+1 independent IK solves.
-        """
-        if type(count) is not int or count < 1:
-            raise ValueError("Yaw proposal count must be positive")
-        if self.yaw_axis is None or self.yaw_tolerance_rad == 0:
-            return np.zeros(1)
-        bound = self.yaw_tolerance_rad
-        preferred = float(self.errors_numpy(preferred_tool_pose)["signed_yaw"])
-        preferred = np.clip(preferred, -bound, bound)
-        angles = np.r_[preferred, np.linspace(-bound, bound, count, endpoint=bound < np.pi)]
-        if bound == np.pi:
-            angles = (angles+np.pi) % (2*np.pi)-np.pi
-        return np.unique(angles)
 
     def evaluate(self, position, quaternion):
         import torch
@@ -1554,14 +1515,8 @@ class PlanningProblem:
 
     def residuals(self, position, quaternion, progress, joint_position=None,
                   joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None,
-                  tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory",
-                  for_acceptance=False):
-        """Nonnegative nominal or acceptance violations, without cancellation.
-
-        Only SupportRequirement distinguishes the two calculations: its gap
-        and normal target remain in optimization and are omitted at delivery.
-        Every other requirement uses its original value, mask and tolerance.
-        """
+                  tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory"):
+        """Nonnegative hard violations for the declared point or trajectory scope."""
         import torch
         if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
             raise ValueError("Pose arrays must align with the complete progress horizon")
@@ -1616,9 +1571,8 @@ class PlanningProblem:
             selected = mask.to(torch.int64).argmax(-1, keepdim=True)
             event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
             event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
-            # BEGIN one event pose uses the declared evaluation purpose.
-            value = requirement.evaluate(event_position, event_quaternion, self.numerical,
-                                         for_acceptance=for_acceptance)
+            # BEGIN all consumers read the same explicit support hard components.
+            value = requirement.evaluate(event_position, event_quaternion, self.numerical)
             # END no event, task geometry or physical allowance is rewritten.
             value = torch.where(mask.any(-1, keepdim=True), value, 0.)
             # A caller may use a different progress dtype; retain the original
@@ -1679,23 +1633,7 @@ class PlanningProblem:
             + [f"support:{index}:{component}"
                for index, requirement in enumerate(self.supports)
                if requirement.progress >= self.start_progress
-               for component in ("gap", "body", "footprint", "normal")])
-
-    # BEGIN candidate retention reads the same delivery subset as metrics.
-    @property
-    def functional_acceptance_keys(self):
-        """Original functional identities that can reject a delivered curve.
-
-        The optimizer still receives functional_constraint_keys in full.
-        Building the support subset from typed requirements avoids parsing a
-        skill name or changing pose/coordinate-event acceptance elsewhere.
-        """
-        support_keys = {f"support:{index}:{component}"
-                        for index, requirement in enumerate(self.supports)
-                        for component in ("gap", "body", "footprint", "normal")
-                        if component not in requirement.acceptance_components}
-        return tuple(key for key in self.functional_constraint_keys if key not in support_keys)
-    # END support contact diagnostics cannot indirectly reject retained curves.
+               for component in requirement.hard_components])
 
     def functional_inequalities(self, position, quaternion, progress, *, trajectory_time=None):
         """Return signed event residuals and their single physical query masks.
@@ -1709,9 +1647,9 @@ class PlanningProblem:
         taking the absolute error. Those values are
         ``error/original_tolerance-1`` for positive bounds. Exact zero yaw uses
         ``error/numerical.rotation_rad``; this scale preserves the zero-width
-        allowed set. A support event instead supplies four
-        signed physical inequalities divided by its shared positive scales;
-        their zero sets remain the original finite-support requirements.
+        allowed set. A support event supplies its declared hard physical
+        inequalities divided by positive scales; their zero sets remain the
+        original finite-support requirements.
 
         The first actual event instant is used even when progress pauses or an
         exact anchor duplicates a regular sample. A missing required event is
@@ -1755,7 +1693,8 @@ class PlanningProblem:
             event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
             event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
             components = requirement.normalized_inequalities(event_position, event_quaternion, self.numerical)
-            for component, value in components.items():
+            for component in requirement.hard_components:
+                value = components[component]
                 key = f"support:{index}:{component}"
                 signed[key] = torch.where(mask.any(-1), value.squeeze(-1), float("nan"))
                 masks[key] = mask
@@ -1769,8 +1708,9 @@ class PlanningProblem:
         """Guide process relations and optional quality-stage goal centering.
 
         Functional feasibility is supplied only by the signed inequality AL
-        terms. ``quality`` additionally prefers the original goal center inside
-        the same enforced tolerance. Process equations and directional commands
+        terms. ``quality`` additionally evaluates soft support components and
+        prefers the original goal center inside the same enforced tolerance.
+        Process equations and directional commands
         retain their existing semantics in both phases; this method never
         changes the independently evaluated acceptance residuals.
         """
@@ -1778,6 +1718,21 @@ class PlanningProblem:
         if phase not in {"feasibility", "quality"}:
             raise ValueError("Optimization phase must be feasibility or quality")
         result = torch.zeros_like(progress)
+        # BEGIN support quality preferences follow the declared optimization phase.
+        # Evaluate the hard-component complement at the unique event pose in
+        # quality work. The feasibility phase uses the declared hard rows;
+        # original support geometry, thresholds and quality scales stay fixed.
+        for requirement in self.supports if phase == "quality" else ():
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            selected = mask.to(torch.int64).argmax(-1, keepdim=True)
+            event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
+            event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
+            components = requirement.normalized_inequalities(event_position, event_quaternion, self.numerical)
+            preference = sum((torch.relu(value).square() for name, value in components.items()
+                              if name not in requirement.hard_components), event_position[..., 0]*0.)
+            preference = torch.where(mask.any(-1, keepdim=True), preference, 0.)
+            result = result+torch.zeros_like(progress).scatter(-1, selected, preference)
+        # END the complete support representation is shared by both phases.
         for requirement in self.pose_relations:
             exact = np.isfinite(requirement.pose_bounds).all(axis=1) & (requirement.pose_bounds[:, 0] == requirement.pose_bounds[:, 1])
             if exact.any():
@@ -1957,11 +1912,13 @@ class PlanningProblem:
         return tuple((name, index) for name in ("pose_events", "coordinate_events", "supports")
                      for index, goal in enumerate(getattr(self, name)) if abs(goal.progress-progress) <= 1e-7)
 
-    def goal_residual(self, position, quaternion, progress, *, goal_ids):
+    def goal_residual(self, position, quaternion, progress, *, goal_ids, normalized=False):
         """Differentiable violations of allowed goal sets for initialization only.
 
-        Winding acceptance still requires the complete ordered candidate path;
-        a local coordinate query is only a modulo-angle seed screening query.
+        ``normalized`` divides each physical excess by its declaration's
+        positive conditioning scale for event IK. Both forms have exactly the
+        same allowed set. Winding acceptance still requires the complete
+        ordered candidate path; a local query has no winding history.
         """
         import torch
         pieces = []
@@ -1972,18 +1929,18 @@ class PlanningProblem:
             if collection == "pose_events":
                 # BEGIN local projection uses the continuous declared yaw interval.
                 values = goal.error_components(position, quaternion)
-                pieces.extend(torch.relu(values[name]-bound)[..., None]
+                pieces.extend((torch.relu(values[name]-bound)/
+                               ((bound if bound > 0 else self.numerical.rotation_rad) if normalized else 1.))[..., None]
                               for name, bound in goal.component_tolerances.items())
-                # END the finite IK proposal grid never becomes the allowed set.
+                # END component bounds define the complete continuous allowed set.
             elif collection == "coordinate_events":
-                pieces.append(goal.evaluate(position, quaternion, progress)[..., None])
+                pieces.append((goal.evaluate(position, quaternion, progress)/
+                               (goal.tolerance if normalized else 1.))[..., None])
             else:
-                # BEGIN retain independent support directions for Newton projection.
-                # All four nonnegative rows vanish exactly when their former
-                # sum vanished. Summation hid independent active gradients;
-                # it was a reporting scalar, not a system of goal equations.
-                pieces.extend(torch.relu(value)[..., None] for value in
-                    goal.raw_inequalities(position, quaternion, self.numerical).values())
+                # BEGIN boundary projection uses the same declared hard rows.
+                values = (goal.normalized_inequalities(position, quaternion, self.numerical)
+                          if normalized else goal.raw_inequalities(position, quaternion, self.numerical))
+                pieces.extend(torch.relu(values[name])[..., None] for name in goal.hard_components)
                 # END original thresholds, free tangent and yaw remain unchanged.
         return torch.cat(pieces, -1) if pieces else position[..., :0]
 

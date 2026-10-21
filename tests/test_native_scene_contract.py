@@ -53,11 +53,21 @@ def make_scene(tmp_path, *, gap=.001, fixed=(), occupied_background=False, polic
 
 
 def evaluate(scene, role="acceptance"):
+    from manipulation.local_geometry_model import LocalGeometryModels
     q = torch.tensor([[[.04, -.02]]], dtype=torch.float64, requires_grad=True)
-    return scene.components(None, torch.zeros((1, 1, 3), dtype=torch.float64),
+    arguments = (None, torch.zeros((1, 1, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64),
-        torch.zeros((1, 1), dtype=torch.float64), q, ("left_slide", "right_slide"),
-        trajectory_time=torch.zeros((1, 1)), query_role=role)
+        torch.zeros((1, 1), dtype=torch.float64), q, ("left_slide", "right_slide"))
+    options = dict(trajectory_time=torch.zeros((1, 1)), query_role=role)
+    # BEGIN optimization tests explicitly capture the same actual base state.
+    if role == "optimization":
+        models = LocalGeometryModels()
+        models.begin_capture(1, 1)
+        options["local_models"] = models
+        scene.components(*arguments, **options)
+        models.finish_capture()
+    # END query role never silently creates a candidate-dependent objective.
+    return scene.components(*arguments, **options)
 
 
 def test_native_structure_gap_is_independent_of_task_acceptance_margin(tmp_path):

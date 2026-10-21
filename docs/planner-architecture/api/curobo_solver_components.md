@@ -1,6 +1,6 @@
 # `manipulation/curobo_solver_components.py` 实现契约
 
-代码基线：`9e8b365`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `PhysicalLineSearch`
@@ -132,7 +132,7 @@ class PhysicalGradientCore(GradientOptCore):
 类字段：
 
 ```python
-_candidate_buffers = ('_candidate_action', '_candidate_objective', '_candidate_rank')
+_candidate_buffers = ('_candidate_action', '_candidate_objective', '_candidate_valid')
 _progress_buffers = ('_exhausted', '_stalled_steps', '_effective_updates', '_iterations', '_history_skips', '_history_resets', '_last_displacement', '_last_curvature')
 ```
 
@@ -414,8 +414,7 @@ trajectories
 costs
 cost
 g_x
-hard_eligible
-sampled_feasible
+feasible
 signed
 objective
 self._last_functional_signed
@@ -549,8 +548,9 @@ action.detach().view_as
 action.detach
 self._candidate_objective.fill_
 self._candidate_objective
-self._candidate_rank.zero_
-self._candidate_rank
+self._candidate_valid.zero_
+self._candidate_valid
+self._refresh_local_geometry
 ```
 
 写入目标：
@@ -558,6 +558,7 @@ self._candidate_rank
 ```python
 manager
 self._functional_constraints
+self._local_geometry_models
 self._candidate_tracking
 self._last_functional_signed
 ```
@@ -574,31 +575,112 @@ action.detach().view_as
 action.detach
 self._candidate_objective.fill_
 float
-self._candidate_rank.zero_
+self._candidate_valid.zero_
+self._refresh_local_geometry
 ```
 
-## `PhysicalGradientCore._retain_sampled_candidate`
+## `PhysicalGradientCore._refresh_local_geometry`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L211)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L214)。
 
 输入签名：
 
 ```python
-def _retain_sampled_candidate(self, action, hard_eligible, sampled_feasible, objective):
+def _refresh_local_geometry(self, action):
 ```
 
 实现说明：
 
-> Keep one action per seed, preferring stronger sampled evidence.
+> Capture original geometry evidence at repeated actual seed bases.
 >
-> Rank 0 has no candidate; positive ranks record the caller's hard
-> eligibility and sampled-feasibility flags. The caller's eligibility
-> checks delivery requirements; sampled feasibility additionally tracks
-> the unchanged nominal optimization targets. In particular, support
-> gap and normal errors cannot discard an otherwise eligible curve.
-> Ordinary/dense final metrics still decide acceptance. Within one rank,
-> the unchanged parameter-free objective orders all line-search trials,
-> including points which Wolfe did not select. One slot bounds storage.
+> CuRobo SolverCore constructs every rollout of one optimizer from the
+> same ``optimizer_rollout_configs[i]``. FUNCTO binds the same cubic
+> clock and process manager to those instances. Their geometry query
+> layouts therefore coincide, and the ordinary rollout captures the
+> model shared by initial and ordinary gradient callbacks. Capture
+> values never enter ranking or a line search.
+
+显式输出分支：
+
+```python
+torch.zeros(count, dtype=torch.bool, device=action.device)
+torch.as_tensor(changed, dtype=torch.bool, device=action.device)
+```
+
+读取的对象属性：
+
+```python
+self._local_geometry_models
+self.config.num_problems
+self.config
+self.config.num_particles
+torch.zeros
+torch.bool
+action.device
+action.detach().view
+action.detach
+self.action_horizon
+self.action_dim
+base[:, None].expand(-1, particles, -1, -1).contiguous().flatten
+base[:, None].expand(-1, particles, -1, -1).contiguous
+base[:, None].expand
+models.begin_capture
+torch.no_grad
+self._check_request
+self.rollout_fn.evaluate_action
+self.rollout_fn
+models.finish_capture
+models.abort_capture
+torch.as_tensor
+```
+
+写入目标：
+
+```python
+models
+count
+particles
+base
+repeated
+changed
+```
+
+直接调用符号：
+
+```python
+torch.zeros
+action.detach().view
+action.detach
+base[:, None].expand(-1, particles, -1, -1).contiguous().flatten
+base[:, None].expand(-1, particles, -1, -1).contiguous
+base[:, None].expand
+models.begin_capture
+torch.no_grad
+self._check_request
+self.rollout_fn.evaluate_action
+models.finish_capture
+models.abort_capture
+torch.as_tensor
+```
+
+## `PhysicalGradientCore._retain_sampled_candidate`
+
+[定义位置](../../../manipulation/curobo_solver_components.py#L247)。
+
+输入签名：
+
+```python
+def _retain_sampled_candidate(self, action, feasible, objective):
+```
+
+实现说明：
+
+> Retain one sampled-feasible candidate per seed by a fixed objective.
+>
+> All task and geometry hard evidence uses the common declaration.
+> The objective omits changing multipliers and local collision models,
+> so candidates from different blocks can be compared. Final curve
+> validation still owns acceptance.
 
 显式输出分支：
 
@@ -614,27 +696,24 @@ action.detach().view
 action.detach
 self.action_horizon
 self.action_dim
-hard_eligible.view
+feasible.view
 torch.isfinite(actions).flatten(2).all
 torch.isfinite(actions).flatten
 torch.isfinite
 objective.detach().view
 objective.detach
 torch.where
-sampled_feasible.view(count, particles).to
-sampled_feasible.view
-torch.uint8
-ranks.amax
 ranked.min
 actions.gather(1, index[:, None, None, None].expand(-1, 1, self.action_horizon, self.action_dim)).squeeze
 actions.gather
 index[:, None, None, None].expand
-self._candidate_rank
+valid.any
+self._candidate_valid
 self._candidate_objective
 self._candidate_action.copy_
 self._candidate_action
 self._candidate_objective.copy_
-self._candidate_rank.copy_
+self._candidate_valid.logical_or_
 torch.no_grad
 ```
 
@@ -646,8 +725,6 @@ particles
 actions
 valid
 values
-ranks
-rank
 ranked
 value
 index
@@ -660,30 +737,28 @@ improved
 ```python
 action.detach().view
 action.detach
-hard_eligible.view
+feasible.view
 torch.isfinite(actions).flatten(2).all
 torch.isfinite(actions).flatten
 torch.isfinite
 objective.detach().view
 objective.detach
 torch.where
-sampled_feasible.view(count, particles).to
-sampled_feasible.view
-ranks.amax
 float
 ranked.min
 actions.gather(1, index[:, None, None, None].expand(-1, 1, self.action_horizon, self.action_dim)).squeeze
 actions.gather
 index[:, None, None, None].expand
+valid.any
 self._candidate_action.copy_
 self._candidate_objective.copy_
-self._candidate_rank.copy_
+self._candidate_valid.logical_or_
 torch.no_grad
 ```
 
 ## `PhysicalGradientCore._finish_functional_block`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L242)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L271)。
 
 输入签名：
 
@@ -715,7 +790,7 @@ state
 ```python
 self._al_blocks_remaining
 self._functional_constraints
-owner.keys
+self._candidate_tracking
 self.config.num_problems
 self.config
 self.config.num_particles
@@ -738,6 +813,7 @@ self.rollout_fn.constraint_manager
 self._retain_sampled_candidate
 value.view
 raw_signed.items
+self._refresh_local_geometry
 owner.update
 changed.any
 self._compute_cost_constraint_and_gradient
@@ -762,7 +838,6 @@ base
 repeated
 action
 trajectories
-eligible
 feasible
 raw_signed
 objective
@@ -793,6 +868,7 @@ self.rollout_fn.constraint_manager.optimizer_evidence
 self._retain_sampled_candidate
 value.view
 raw_signed.items
+self._refresh_local_geometry
 owner.update
 bool
 changed.any
@@ -810,7 +886,7 @@ self._restart_changed_objective
 
 ## `PhysicalGradientCore._restart_changed_objective`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L289)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L321)。
 
 输入签名：
 
@@ -887,7 +963,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._restart_changed_objective.copy_rows`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L291)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L323)。
 
 输入签名：
 
@@ -926,7 +1002,7 @@ value.reshape_as
 
 ## `PhysicalGradientCore._reset_progress`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L330)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L362)。
 
 输入签名：
 
@@ -966,7 +1042,7 @@ range
 
 ## `PhysicalGradientCore._guarded_step_direction`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L337)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L369)。
 
 输入签名：
 
@@ -1127,7 +1203,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._guarded_opt_step`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L382)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L414)。
 
 输入签名：
 
@@ -1230,7 +1306,7 @@ torch.zeros_like
 
 ## `PhysicalGradientCore.solve_diagnostics`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L406)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L438)。
 
 输入签名：
 
@@ -1261,10 +1337,10 @@ self.config
 self._candidate_tracking
 self._functional_constraints.snapshot
 self._functional_constraints
-self._candidate_rank.detach().cpu().tolist
-self._candidate_rank.detach().cpu
-self._candidate_rank.detach
-self._candidate_rank
+self._candidate_valid.detach().cpu().tolist
+self._candidate_valid.detach().cpu
+self._candidate_valid.detach
+self._candidate_valid
 self._candidate_objective.detach().cpu().tolist
 self._candidate_objective.detach().cpu
 self._candidate_objective.detach
@@ -1281,7 +1357,7 @@ reports
 row
 index
 duals
-ranks
+valid
 objective
 report
 ```
@@ -1298,9 +1374,9 @@ sum
 list
 range
 self._functional_constraints.snapshot
-self._candidate_rank.detach().cpu().tolist
-self._candidate_rank.detach().cpu
-self._candidate_rank.detach
+self._candidate_valid.detach().cpu().tolist
+self._candidate_valid.detach().cpu
+self._candidate_valid.detach
 self._candidate_objective.detach().cpu().tolist
 self._candidate_objective.detach().cpu
 self._candidate_objective.detach
@@ -1310,7 +1386,7 @@ report.update
 
 ## `PhysicalGradientCore._recover_stalled`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L435)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L465)。
 
 输入签名：
 
@@ -1557,7 +1633,7 @@ self._exhausted.all
 
 ## `PhysicalGradientCore._create_initial_iteration_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L552)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L582)。
 
 输入签名：
 
@@ -1603,7 +1679,7 @@ action.clone
 
 ## `PhysicalGradientCore.update_num_problems`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L562)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L592)。
 
 输入签名：
 
@@ -1639,7 +1715,6 @@ torch.zeros
 self._reset_progress
 torch.zeros_like
 torch.full
-torch.uint8
 self._line_search_strategy
 self._initial_line_search_strategy
 ```
@@ -1656,7 +1731,7 @@ name
 dtype
 self._candidate_action
 self._candidate_objective
-self._candidate_rank
+self._candidate_valid
 self._line_search_strategy.safe_action
 self._initial_line_search_strategy.safe_action
 ```
@@ -1680,7 +1755,7 @@ float
 
 ## `PhysicalGradientCore._prepare_solve`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L597)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L627)。
 
 输入签名：
 
@@ -1734,7 +1809,7 @@ action.detach
 
 ## `PhysicalGradientCore.reinitialize`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L605)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L635)。
 
 输入签名：
 
@@ -1775,7 +1850,7 @@ super
 
 ## `PhysicalGradientCore.optimize`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L615)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L645)。
 
 输入签名：
 
@@ -1803,7 +1878,7 @@ self.outer_iters
 super().optimize
 self._candidate_tracking
 torch.where
-self._candidate_rank
+self._candidate_valid
 self._candidate_action
 ```
 
@@ -1829,7 +1904,7 @@ torch.where
 
 ## `PhysicalGradientCore._capture_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L641)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L671)。
 
 输入签名：
 
@@ -1898,7 +1973,7 @@ saved.element_size
 
 ## `PhysicalGradientCore._restore_capture_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L675)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L705)。
 
 输入签名：
 
@@ -1935,7 +2010,7 @@ tensor.copy_
 
 ## `PhysicalGradientCore._dispatch`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L681)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L711)。
 
 输入签名：
 
@@ -1996,7 +2071,7 @@ getattr
 
 ## `PhysicalGradientCore._replay_graph`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L717)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L747)。
 
 输入签名：
 
@@ -2064,7 +2139,7 @@ executor
 
 ## `PhysicalGradientCore.reset_cuda_graph`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L749)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L779)。
 
 输入签名：
 
@@ -2101,7 +2176,7 @@ self._device_checks.clear_constants
 
 ## `PhysicalGradientCore.reset_shape`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L755)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L785)。
 
 输入签名：
 
@@ -2136,7 +2211,7 @@ super
 
 ## `PhysicalGradientCore.extra_workspace_bytes`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L762)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L792)。
 
 输入签名：
 
@@ -2202,7 +2277,7 @@ value.element_size
 
 ## `PhysicalGradientCore.bind_domain`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L777)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L807)。
 
 输入签名：
 
@@ -2245,7 +2320,7 @@ self._reset_progress
 
 ## `LayoutGoalManager`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L789)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L819)。
 
 ```python
 class LayoutGoalManager(GoalManager):
@@ -2261,7 +2336,7 @@ class LayoutGoalManager(GoalManager):
 
 ## `LayoutGoalManager._get_padded_goalset_for_links`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L792)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L822)。
 
 输入签名：
 
@@ -2297,7 +2372,7 @@ super
 
 ## `bind_solver_components`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L804)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L834)。
 
 输入签名：
 
