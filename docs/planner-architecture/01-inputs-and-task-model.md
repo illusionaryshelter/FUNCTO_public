@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-库实现基线：`IMPLEMENTATION_COMMIT_PENDING`（当前工作区实现，提交时替换为实际代码提交）。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+库实现基线：`a2b3f686b866aea18af47c302bafb62e44212e22`（文档引用此实现提交；后续文档提交保持代码内容一致）。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 

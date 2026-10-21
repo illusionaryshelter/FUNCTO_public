@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-库实现基线：`IMPLEMENTATION_COMMIT_PENDING`（当前工作区实现，提交时替换为实际代码提交）。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+库实现基线：`a2b3f686b866aea18af47c302bafb62e44212e22`（文档引用此实现提交；后续文档提交保持代码内容一致）。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 

@@ -1,6 +1,6 @@
 # `manipulation/robot_geometry_check.py` 实现契约
 
-代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
+代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_name`

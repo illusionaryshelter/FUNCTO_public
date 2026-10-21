@@ -1,6 +1,6 @@
 # 附着、接触与手指
 
-代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
+代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
 
 ## 1. 实体观测与固定关系
 
