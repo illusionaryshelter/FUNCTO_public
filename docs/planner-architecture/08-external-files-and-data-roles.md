@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`c84b34a`（连续初始化 A/B 实际实现提交；本次仅文档更新引用该代码基线，文档提交与实现提交分别记录）。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -64,7 +64,7 @@
 
 ### 4.1 已生成参考到规划要求的实际文件路径
 
-当前 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 通过 `reference_inputs()` 调用 `generate_reference`，随后由 `build_problem()` 直接构造 `PlanningProblem`。该路线使用源技能包中的 `representation`，工具参考、物体参考及目标取样共用返回的连续路径对象。具体职责如下。
+当前 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 通过 `reference_inputs()` 调用 `generate_reference`，随后由 `build_problem()` 直接构造 `PlanningProblem`。该路线使用源技能包中的 `representation`，名义工具、物体运动及目标取样共用返回的连续组合路径对象；显式工具边界经 `reference_phase` 进入阶段元数据，在规划物理时钟上由 `BoundToolReference` 生成实际工具参考。具体职责如下。
 
 | 文件或任务声明 | 内容与含义 | 直接消费与输出 |
 |---|---|---|
@@ -95,7 +95,7 @@
 
 完成固定评分的候选报告以 `fixed_objective/objective_components` 保存统一网格上的普通参考和关节成本；`returned_candidate` 指向实际返回曲线的完整验收报告。`native_metrics.rollout/interpolated.ordinary_costs` 分别保存两种实际网格已完成的积分值。`qualified_candidate_elapsed_seconds` 表示该候选在请求内完成验收、复制和执行绑定的时刻，`elapsed_seconds` 表示整次请求耗时。若后续改善预算耗尽，`improvement_end` 保存停止阶段和原因，正式曲线继续使用此前已完成资格的绑定；最终 `request_ledger.consumed_planning` 保存全部实际工作。原始曲线与原生改善曲线的时长、进度映射和来源分别随各候选保存。
 
-`NativeReferenceCost` 的目标缓存由完整技能参考、请求标定和候选时钟生成，供同次求解的重复成本计算使用。`LocalGeometryModels` 属于一次数值求解中的临时优化记录，来源是相同观测场和本块实际候选姿态；场景持久化仍保存原 TSDF 样本和关系声明。原叶节点点集与数值查询复用记录是这些已有模型的计算中间量。
+`BoundToolReference` 独立持有名义阶段、显式边界、实际物理时钟与机器人入口位姿/速度；`NativeReferenceCost` 在普通有效网格上从它生成目标缓存，并使用请求标定转换到机器人基坐标。实验记录器在规划结果保存后保留同一绑定实例，`reference-bound.npz` 的 `tcp_poses_world` 为其物理时间输出，`nominal_tcp_poses_world` 为相同进度上的原名义路径。两者随本次时钟和代码基线分别保存。`LocalGeometryModels` 属于一次数值求解中的临时优化记录，来源是相同观测场和本块实际候选姿态；场景持久化仍保存原 TSDF 样本和关系声明。原叶节点点集与数值查询复用记录是这些已有模型的计算中间量。
 
 场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存原条件与实体关系的模型对应，独立于实际接触与效果记录。
 

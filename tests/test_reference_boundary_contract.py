@@ -15,6 +15,8 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from manipulation.motion import MotionModel, _inverse
 from manipulation.representation import build_representation, generate_reference
+from manipulation.planning_problem import PlanningProblem, reference_phase
+from manipulation.timed_reference import BoundToolReference
 
 
 def pose(position=(0., 0., 0.), angles=(0., 0., 0.)):
@@ -36,13 +38,33 @@ def interpolate_track(knots, poses, queries):
 
 
 def at_time(reference, name, times):
-    """Use each exported path's own physical interval, including release."""
+    """Sample the exported nominal composition on its source-time interval."""
     own = reference[name + "_timestamps"]
     query = np.asarray(times, dtype=float)
     if np.any(query < own[0]) or np.any(query > own[-1]):
         raise AssertionError("The test attempted to extrapolate a production path")
     progress = (query - own[0]) / (own[-1] - own[0])
     return reference[name + "_path"].sample_numpy(progress)
+
+
+# BEGIN physical corrections are evaluated by the actual timed consumer.
+def bound_at_time(reference, name, times):
+    """Bind one explicit stationary entrance and retain nominal event timing.
+
+    Zero twist is this analytic fixture's prescribed boundary condition. The
+    production planner instead passes its robot-feedback FK velocity. Object
+    motion here follows the same corrected TCP through the declared rigid A.
+    """
+    phase = reference_phase(reference, skill_id="analytic_motion", source="analytic reference fixture")
+    request = PlanningProblem(joint_names=("analytic_joint",), start_q=np.zeros(1),
+        start_dq=np.zeros(1), tool_link="analytic_tool", reference_frame="world",
+        base_pose=np.eye(4), tool_transform=np.eye(4), phases=(phase,))
+    clock = reference["eef_timestamps"]
+    bound = BoundToolReference(request, [0., 1.], [0., 1.], clock[-1]-clock[0],
+        reference["eef_boundaries"]["initial_pose"], np.zeros(6))
+    value = bound.sample_numpy(np.asarray(times)-clock[0])
+    return value if name == "eef" else value @ reference["A"]
+# END source geometry is distinct from its physically timed correction.
 
 
 class ReferenceBoundaryContractTest(unittest.TestCase):
@@ -97,22 +119,23 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
     def test_actual_start_and_interaction_are_distinct_boundaries(self):
         result = self.grounded()
         self.assertEqual(result["status"], "reference")
-        np.testing.assert_allclose(at_time(result, "object", self.times[0]), self.start_body, atol=2e-10)
-        np.testing.assert_allclose(at_time(result, "eef", self.times[0]),
+        np.testing.assert_allclose(bound_at_time(result, "object", self.times[0]), self.start_body, atol=2e-10)
+        np.testing.assert_allclose(bound_at_time(result, "eef", self.times[0]),
                                    self.start_body @ _inverse(self.A), atol=2e-10)
         target = self.function @ self.source_body(self.interaction) @ self.J
-        np.testing.assert_allclose(at_time(result, "object", self.interaction), target, atol=2e-10)
-        np.testing.assert_allclose(at_time(result, "eef", self.interaction),
+        np.testing.assert_allclose(bound_at_time(result, "object", self.interaction), target, atol=2e-10)
+        np.testing.assert_allclose(bound_at_time(result, "eef", self.interaction),
                                    target @ _inverse(self.A), atol=2e-10)
 
         # The initial correction is substantial and the interior changes too.
         # Keeping the target while changing the entry cannot be one rigid move.
         raw_entry = self.function @ self.source_body(self.times[0]) @ self.J
+        np.testing.assert_allclose(at_time(result, "object", self.times[0]), raw_entry, atol=2e-10)
         self.assertGreater(np.linalg.norm(self.start_body[:3, 3] - raw_entry[:3, 3]), .1)
         self.assertGreater(Rotation.from_matrix(self.start_body[:3, :3] @ raw_entry[:3, :3].T).magnitude(), .1)
         middle = 1.63
         raw_middle = self.function @ self.source_body(middle) @ self.J
-        self.assertGreater(np.linalg.norm(at_time(result, "object", middle)[:3, 3] - raw_middle[:3, 3]), .01)
+        self.assertGreater(np.linalg.norm(bound_at_time(result, "object", middle)[:3, 3] - raw_middle[:3, 3]), .01)
         rigidly_moved_target = self.start_body @ _inverse(raw_entry) @ target
         self.assertGreater(np.linalg.norm(rigidly_moved_target - target), .1)
 
@@ -120,7 +143,7 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
         moved_function = pose((.21, .46, .57), (.45, -.3, .8))
         original, changed = self.grounded(), self.grounded(T_world_function=moved_function)
         for result in (original, changed):
-            np.testing.assert_allclose(at_time(result, "object", self.times[0]), self.start_body, atol=2e-10)
+            np.testing.assert_allclose(bound_at_time(result, "object", self.times[0]), self.start_body, atol=2e-10)
         changed_target = moved_function @ self.source_body(self.interaction) @ self.J
         np.testing.assert_allclose(at_time(changed, "object", self.interaction), changed_target, atol=2e-10)
         self.assertGreater(np.linalg.norm(at_time(original, "object", self.interaction) - changed_target), .1)
@@ -133,6 +156,7 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
         query = np.unique(np.r_[np.linspace(self.times[0], self.release, 43), self.interaction])
         for name in ("object", "eef"):
             np.testing.assert_allclose(at_time(sparse, name, query), at_time(dense, name, query), atol=3e-9)
+            np.testing.assert_allclose(bound_at_time(sparse, name, query), bound_at_time(dense, name, query), atol=3e-9)
             for result in (sparse, dense):
                 np.testing.assert_allclose(at_time(result, name, result[name + "_timestamps"]),
                                            result[name + "_poses"], atol=2e-10)
@@ -148,6 +172,7 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
         query = np.unique(np.r_[np.linspace(self.times[0], self.release, 37), self.interaction])
         for changed in (source_changed, current_changed):
             np.testing.assert_allclose(at_time(changed, "eef", query), at_time(original, "eef", query), atol=3e-9)
+            np.testing.assert_allclose(bound_at_time(changed, "eef", query), bound_at_time(original, "eef", query), atol=3e-9)
         np.testing.assert_allclose(at_time(source_changed, "object", query), at_time(original, "object", query), atol=3e-9)
         np.testing.assert_allclose(at_time(current_changed, "object", query),
                                    at_time(original, "object", query) @ current_chart, atol=3e-9)
@@ -170,7 +195,7 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
                 np.testing.assert_allclose(summary["approach_direction"],
                                            displacement / np.linalg.norm(displacement), atol=2e-10)
                 result = self.grounded(rep, J=_inverse(chart) @ self.J)
-                np.testing.assert_allclose(result["boundary_checks"]["object"]["nominal_goal"], expected_goal, atol=2e-10)
+                np.testing.assert_allclose(result["object_boundaries"]["goals"][0]["pose"], expected_goal, atol=2e-10)
                 np.testing.assert_allclose(self.function @ summary["interaction_pose"] @ _inverse(chart) @ self.J,
                                            expected_goal, atol=2e-10)
     # END changing a body chart cannot silently change the source event or target.
@@ -196,13 +221,15 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
             for name in ("object", "eef"):
                 np.testing.assert_allclose(at_time(result, name, query), at_time(full, name, query), atol=2e-10)
 
-    def test_no_attachment_preserves_only_the_adapted_object_output(self):
+    def test_no_attachment_preserves_nominal_object_and_explicit_entry(self):
         result = self.grounded(A=None, T_world_eef=None)
         self.assertNotEqual(result["status"], "reference")
         self.assertIn("eef_poses", result["missing"])
         self.assertNotIn("eef_path", result)
         self.assertNotIn("eef_poses", result)
-        np.testing.assert_allclose(at_time(result, "object", self.times[0]), self.start_body, atol=2e-10)
+        np.testing.assert_allclose(result["object_boundaries"]["initial_pose"], self.start_body, atol=2e-10)
+        np.testing.assert_allclose(at_time(result, "object", self.times[0]),
+                                   self.function @ self.source_body(self.times[0]) @ self.J, atol=2e-10)
         np.testing.assert_allclose(at_time(result, "object", self.interaction),
                                    self.function @ self.source_body(self.interaction) @ self.J, atol=2e-10)
 
@@ -221,11 +248,18 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.grounded(T_world_eef=wrong_eef)
 
-    def test_coincident_entry_and_interaction_cannot_overwrite_conflicting_boundaries(self):
+    def test_entrance_event_keeps_nominal_suffix_without_a_measured_target_gate(self):
         rep = self.representation()
         rep["interaction_time"] = float(self.times[0])
-        with self.assertRaises(ValueError):
-            self.grounded(rep)
+        # BEGIN a soft reference event cannot reject a new measured entrance.
+        result = self.grounded(rep)
+        goal = result["eef_boundaries"]["goals"][0]
+        self.assertEqual(goal["progress"], 0.)
+        self.assertGreater(np.linalg.norm(goal["pose"]-result["eef_boundaries"]["initial_pose"]), .1)
+        query = np.linspace(self.times[0], self.release, 13)
+        np.testing.assert_allclose(bound_at_time(result, "eef", query),
+                                   at_time(result, "eef", query), atol=1e-12)
+        # END this suffix has no future declared join for a new C1 correction.
 
     def test_release_limits_production_paths_but_retains_original_evidence(self):
         rep = self.representation()
@@ -253,7 +287,7 @@ class ReferenceBoundaryContractTest(unittest.TestCase):
         actual_eef = pose((-.2, .3, .9), (.4, -.1, .2))
         result = generate_reference(rep, T_world_function=self.function, T_world_eef=actual_eef)
         self.assertEqual(result["status"], "reference")
-        np.testing.assert_allclose(at_time(result, "eef", self.times[0]), actual_eef, atol=2e-10)
+        np.testing.assert_allclose(bound_at_time(result, "eef", self.times[0]), actual_eef, atol=2e-10)
         target = self.function @ interpolate_track(self.times, self.displacements, self.interaction)
         np.testing.assert_allclose(at_time(result, "eef", self.interaction), target, atol=2e-10)
         missing = generate_reference(rep, T_world_function=self.function)

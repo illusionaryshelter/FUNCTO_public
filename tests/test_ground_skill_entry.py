@@ -93,8 +93,8 @@ def test_current_attachment_tool_identity_cannot_conflict_with_feedback(tmp_path
 # END the test requires no additional observations or model calls.
 
 
-# BEGIN the formal command must pass real entry evidence into the new consumer.
-def test_successful_entry_uses_actual_feedback_and_preserves_independent_goal(tmp_path, monkeypatch):
+# BEGIN the formal export preserves nominal geometry and explicit tool boundaries.
+def test_successful_entry_exports_nominal_path_and_declared_tool_boundaries(tmp_path, monkeypatch):
     from scipy.spatial.transform import Rotation
     package, scene = inputs(tmp_path)
     actual, function = np.eye(4), np.eye(4)
@@ -118,11 +118,31 @@ def test_successful_entry_uses_actual_feedback_and_preserves_independent_goal(tm
     report = ground_skill(package, scene, output, instruction="Use the observed container")
     assert report["status"] == "completed" and report["reference_status"] == "reference"
     with np.load(output / "reference.npz", allow_pickle=False) as saved:
-        np.testing.assert_allclose(saved["eef_poses"][0], actual, atol=1e-12)
+        nominal_start = saved["eef_poses"][0].copy()
+        assert np.linalg.norm(nominal_start - actual) > .1
         np.testing.assert_allclose(saved["eef_poses"][-1], function, atol=1e-12)
-        assert np.linalg.norm(saved["bound_eef_poses"][0] - actual) > .1
-    assert report["reference_boundary_checks"]["eef"]["status"] == "passed"
-    np.testing.assert_allclose(np.load(output / "planner-reference-samples.npy")[0], actual, atol=1e-12)
+        np.testing.assert_allclose(saved["eef_poses"], saved["bound_eef_poses"], atol=1e-12)
+    declaration = report["reference_boundary_checks"]["eef"]
+    assert declaration["status"] == "declared_for_physical_time_binding"
+    np.testing.assert_allclose(declaration["initial_pose"], actual, atol=1e-12)
+    np.testing.assert_allclose(declaration["nominal_interaction"], function, atol=1e-12)
+    assert report["planning_reference"]["status"] == "nominal_path_and_boundaries"
+    boundary = report["reference_boundaries"]["eef"]
+    np.testing.assert_allclose(boundary["initial_pose"], actual, atol=1e-12)
+    np.testing.assert_allclose(boundary["goals"][0]["pose"], function, atol=1e-12)
+    assert boundary["goals"][0]["progress"] == 1.
+    np.testing.assert_allclose(np.load(output / "planner-reference-samples.npy")[0], nominal_start, atol=1e-12)
     html = (output / "index.html").read_text()
-    assert '"kind": "actual_start"' in html and '"kind": "nominal_goal"' in html
-# END a complete image pipeline cannot silently drop current robot feedback.
+    panels = json.loads(html.split("const panels=", 1)[1].split(";const images=", 1)[0])
+    for panel in panels[1:]:
+        markers = {row["kind"]: row for row in panel["markers"]}
+        assert set(markers) == {"declared_entrance", "nominal_start", "nominal_event"}
+        calibration = json.loads((scene / panel["id"] / "calibration.json").read_text())
+        K = np.asarray(calibration["K"])
+        for name, pose in (("declared_entrance", actual), ("nominal_start", nominal_start),
+                           ("nominal_event", function)):
+            pixel = K @ pose[:3, 3]
+            np.testing.assert_allclose(markers[name]["pixel"], pixel[:2]/pixel[2], atol=1e-12)
+        assert markers["nominal_event"]["progress"] == 1.
+    assert "物体名义路径" in html and "工具名义路径" in html
+# END the real generator, native path adapter and HTML consume one boundary schema.

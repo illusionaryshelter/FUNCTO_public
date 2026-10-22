@@ -111,7 +111,8 @@ def main():
                             ('observed_coverage','02'), ('grasp_region','03'),
                             ('native_field_distance','02'), ('tool_geometry','02'),
                             ('local_geometry_model','02'), ('geometry_motion_bound','05'),
-                            ('interval_geometry','05'), ('reference_tracking','04')]:
+                            ('interval_geometry','05'), ('reference_tracking','04'),
+                            ('timed_reference','01'), ('reference_visualization','01')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:
             modules.append(row)

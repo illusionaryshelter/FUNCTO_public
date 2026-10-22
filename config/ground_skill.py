@@ -168,7 +168,7 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
             if any(feedback[field] != skill["metadata"][field] for field in ("tool_id", "tool_frame")):
                 raise ValueError("Grasp reference needs an explicit source/current tool-frame calibration")
         frame = transfer.get("reference_frame")
-        # BEGIN bind the actual observed entry to the sole reference consumer.
+        # BEGIN retain nominal skill geometry and declare its observed entrance.
         # The saved tool pose and current A already determine the held body;
         # requiring another body observation would duplicate existing evidence.
         reference = generate_reference(skill["representation"],
@@ -180,8 +180,10 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
         record.update(reference_status=reference["status"], reference_missing=reference["missing"],
                       reference_summaries=_plain(reference["summaries"]), relations=_plain(relations),
                       reference_boundary_checks=_plain(reference["boundary_checks"]),
+                      reference_boundaries={name: _plain(reference[name + "_boundaries"])
+                          for name in ("object", "eef") if name + "_boundaries" in reference},
                       reference_scope=reference["scope"], reference_method=reference.get("method"))
-        # END only checked two-boundary paths can enter the planner adapter.
+        # END physical correction binds later to the robot feedback and planner clock.
         if "eef_poses" in reference:
             from manipulation.planning_problem import reference_phase
             phase = reference_phase(reference, skill_id=skill["metadata"]["skill_id"],
@@ -190,7 +192,7 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
             # inventing task tolerances or executing a robot trajectory.
             sample = phase.reference.sample_numpy(np.linspace(0., 1., 21))
             np.save(output / "planner-reference-samples.npy", sample, allow_pickle=False)
-            record["planning_reference"] = dict(status="bound_to_native_PosePath", samples=len(sample),
+            record["planning_reference"] = dict(status="nominal_path_and_boundaries", samples=len(sample),
                 task_request="not_compiled: independent numerical task conditions were not supplied")
         record["stages"].append(stage)
         record["status"] = "completed"

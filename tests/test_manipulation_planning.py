@@ -841,7 +841,9 @@ class NativeCubicClockTests(unittest.TestCase):
         planner._goal = lambda progress: progress
         bind_analytic_ik_screening(planner)
         seeds, success_counts = planner.reference_seeds()
-        np.testing.assert_allclose(requested, np.interp(clock, mapping.u, mapping.s), atol=1e-14)
+        # BEGIN IK goals consume physical time so reference corrections survive holds.
+        np.testing.assert_allclose(requested, clock*planner.formal_clock["duration"], atol=1e-14)
+        # END the bound reference owns the time-to-progress conversion.
         np.testing.assert_array_equal(requested_parameters, clock.astype(np.float32).astype(float))
         self.assertEqual(seeds.shape, (1, 1, count, 1))
         self.assertEqual(success_counts, [2]*count)
@@ -1328,7 +1330,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         # stand-in is needed to exercise the actual integration boundary.
         from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
         self.config_type = _process_manager_type(None, None, None, None, None,
-            functional_constraints=FunctionalAugmentedLagrangian(()))
+            functional_constraints=FunctionalAugmentedLagrangian(()), bound_reference=None)
         # END configuration ownership tests do not invent functional requirements.
         self.raw = {
             "self_collision_cfg": {"weight": 5000., "convert_to_binary": True},
@@ -1455,7 +1457,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             config_type = _process_manager_type(problem, scene,
                 _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,
                 PlanningBudget(constraint_weight=777., max_task_anchors=capacity),
-                clock={"duration": 2.}, seed_parameter=torch.tensor([[.3]]))
+                clock={"duration": 2.}, seed_parameter=torch.tensor([[.3]]), bound_reference=None)
             data = {"process_mode": mode}
             if mode.endswith("optimizer"):
                 data["self_collision_cfg"] = {"weight": 8., "convert_to_binary": False}
@@ -1482,7 +1484,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
             budget = PlanningBudget(constraint_weight=777., max_task_anchors=256)
             fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping,
-                (.55, .65), budget, FunctionalAugmentedLagrangian(()))
+                (.55, .65), budget, FunctionalAugmentedLagrangian(()), None)
             self.assertEqual(manager._anchor_u.data_ptr(), pointer)
             self.assertEqual(manager._anchor_count, 2)
             manager.compute_costs(fixture.state)
@@ -1491,7 +1493,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             torch.testing.assert_close(manager._anchor_u[:, :2], torch.tensor([[.55, .65]]))
             with self.assertRaisesRegex(ValueError, "Task anchors"):
                 fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping,
-                    np.linspace(0., 1., 257), budget, FunctionalAugmentedLagrangian(()))
+                    np.linspace(0., 1., 257), budget, FunctionalAugmentedLagrangian(()), None)
     # END overflow still fails admission; no original event witness is dropped.
 
     # BEGIN actual collision promotion retains gradients and request ownership.
@@ -1556,7 +1558,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             mapping = _ProgressMap(np.array([0., .25, .75, 1.]), np.array([0., .5, .5, 1.]))
             augmented = FunctionalAugmentedLagrangian(("event",))
             budget = PlanningBudget(constraint_weight=777., max_task_anchors=4)
-            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented)
+            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented, None)
             augmented.update({"event": torch.tensor([.25])})
             before, pointer = augmented.snapshot(), augmented._multiplier_buffer.data_ptr()
             fixture.config_type.add_collision_witnesses([.4, .6, .4])
@@ -1569,7 +1571,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "anchor capacity"):
                 fixture.config_type.add_collision_witnesses([.3])
             self.assertEqual(fixture.manager._anchor_count, 4)
-            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented)
+            fixture.config_type.bind_request(fixture.problem, fixture.scene, mapping, (0., 1.), budget, augmented, None)
             np.testing.assert_array_equal(fixture.config_type.query_anchor_parameters(), [[0., 0.], [1., 1.]])
             self.assertEqual(fixture.manager._anchor_count, 2)
 
@@ -1632,7 +1634,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                 fixture.manager.bind_scene_evidence(later)
                 fixture.config_type.bind_request(fixture.problem, fixture.scene,
                     _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), (.55,),
-                    PlanningBudget(max_task_anchors=2), FunctionalAugmentedLagrangian(()))
+                    PlanningBudget(max_task_anchors=2), FunctionalAugmentedLagrangian(()), None)
                 with self.assertRaisesRegex(RuntimeError, "no same-query"):
                     fixture.manager.bind_scene_evidence(later)
         torch.testing.assert_close(results["trajectory_optimizer"][0], results["trajectory_metrics"][0], rtol=0, atol=0)
@@ -1676,7 +1678,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             augmented = FunctionalAugmentedLagrangian(keys)
             fixture.config_type.bind_request(fixture.problem, fixture.scene,
                 _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), (0., 1.),
-                PlanningBudget(constraint_weight=777., max_task_anchors=4), augmented)
+                PlanningBudget(constraint_weight=777., max_task_anchors=4), augmented, None)
             costs = fixture.manager.compute_costs(fixture.state)
             old_cost = costs.values[costs.names.index("skill_process")]
             al_cost = costs.values[costs.names.index("functional_augmented_lagrangian")]
@@ -1946,7 +1948,7 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
                      patch.object(RobotCostManager, "compute_costs", autospec=True,
                                   side_effect=native_cost) as native_evaluate:
                     config_type = _process_manager_type(problem, scene, mapping, (0., 1.),
-                        PlanningBudget(max_task_anchors=2), clock={"duration": 1.}, seed_parameter=torch.tensor([[.4]]))
+                        PlanningBudget(max_task_anchors=2), clock={"duration": 1.}, seed_parameter=torch.tensor([[.4]]), bound_reference=None)
                     config = config_type.create({"process_mode": mode}, device_cfg=self.device_cfg)
                     manager = self.manager(config, transition)
                     collection = manager.compute_costs(state)
@@ -2100,6 +2102,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                     planner.check_request = Mock()
                     with patch("torch.cuda._lazy_init", side_effect=AssertionError("source preflight must stay CPU-only")), \
                          patch("manipulation.planning._bounded_robot_configuration", return_value=(robot, {})), \
+                         patch("manipulation.planning._reference_entrance", return_value=(np.eye(4), np.zeros(6))), \
                          patch("manipulation.planning._planning_workspace_bytes", side_effect=RuntimeError("source admitted")) as storage:
                         with self.assertRaisesRegex(RuntimeError if admitted else ValueError,
                                 "source admitted" if admitted else "source URDF|joint locks|ancestor"):

@@ -2435,7 +2435,7 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
 
 
 def _process_manager_type(problem, scene, progress_map, anchors, budget,
-                          *, clock=None, seed_parameter=None, robot_dict=None,
+                          *, bound_reference, clock=None, seed_parameter=None, robot_dict=None,
                           phase="feasibility", functional_constraints=None):
     """Build V2's documented manager extension after GPU use is requested.
 
@@ -2687,14 +2687,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                 batch, horizon = joint.position.shape[:2]
                 counts = (torch.full((batch,), horizon, dtype=torch.long, device=joint.position.device)
                           if self._dense_counts is None or context is not None else self._dense_counts)
-                mapping = progress_map if context is None else context["mapping"]
-                duration = clock["duration"] if context is None else context["duration"]
+                reference = bound_reference if context is None else context["bound_reference"]
                 # All rows of a native request use its one frozen grid; an
                 # explicit candidate context supplies its own physical times.
                 key = (horizon, id(self._dense_counts), id(context))
                 if key != self._reference_grid_key:
                     times = _joint_state_sample_times(joint, counts) if context is None else context["times"]
-                    self._reference_cost.bind(times[:1], counts[:1], mapping, duration)
+                    self._reference_cost.bind(times[:1], counts[:1], reference)
                     self._reference_grid_key = key
                 collection = super().compute_costs(state, cost_collection, None, **kwargs)
                 weights = self._reference_cost.time_weights(batch)
@@ -2971,10 +2970,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             values = {item.name: getattr(base, item.name) for item in fields(base) if item.name != "class_type"}
             return ProcessCostManagerCfg(**values, process_mode=data_dict.get("process_mode", ""))
 
-    def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, new_constraints):
+    def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, new_constraints,
+                     new_bound_reference):
         nonlocal problem, scene, progress_map, anchors, budget, functional_constraints, collision_witnesses, ik_goal_ids, geometry_models, optimizer_geometry_scope
+        nonlocal bound_reference
         problem, scene, progress_map, anchors, budget = new_problem, new_scene, new_progress, new_anchors, new_budget
         functional_constraints = new_constraints
+        bound_reference = new_bound_reference
         # BEGIN a resident backend must never inherit another request's collision times.
         collision_witnesses = np.empty(0, dtype=float)
         ik_goal_ids = ()
@@ -3330,6 +3332,45 @@ def _bind_optimizer_constraint_config(trajectory_optimizer, trajectory_metrics):
 # END no second joint-residual implementation is needed.
 
 
+# BEGIN physical reference entrance uses the fixed official robot and feedback.
+def _reference_entrance(problem, scene, robot_validator):
+    """Return calibrated TCP pose and world twist from named measured q/dq.
+
+    Pinocchio's forward velocity equals its geometric Jacobian times dq.
+    LOCAL_WORLD_ALIGNED expresses velocity at the link origin in robot-base
+    axes. Base calibration rotates both vectors into the reference frame;
+    the TCP lever arm adds omega cross offset to the linear velocity.
+    Independently controlled fingers are already verified not to be TCP
+    ancestors. Their absent velocity columns therefore have no TCP effect.
+    The official fixed robot model is reused across tasks; this computation
+    reads neither task-object geometry nor simulator environment state.
+    """
+    import pinocchio as pin
+    checker = robot_validator.checker
+    positions, _ = robot_validator._planning_positions(problem.start_q, problem.joint_names,
+        time_s=0., gripper=scene.gripper)
+    q, dq = pin.neutral(checker.model), np.zeros(checker.model.nv)
+    measured_rates = dict(zip(problem.joint_names, problem.start_dq))
+    for name, position in zip(robot_validator.joint_names, positions):
+        joint = checker.model.joints[checker.model.getJointId(name)]
+        q[joint.idx_q] = position
+        if name in measured_rates:
+            dq[joint.idx_v] = measured_rates[name]
+    data = checker.model.createData()
+    pin.forwardKinematics(checker.model, data, q, dq)
+    pin.updateFramePlacements(checker.model, data)
+    frame = checker._frame_id(robot_validator.tool_frame)
+    velocity = pin.getFrameVelocity(checker.model, data, frame, pin.ReferenceFrame.LOCAL_WORLD_ALIGNED)
+    world_link = robot_validator.T_reference_base @ data.oMf[frame].homogeneous
+    world_tool = world_link @ robot_validator.T_frame_tcp
+    rotation = robot_validator.T_reference_base[:3, :3]
+    angular = rotation @ velocity.angular
+    offset = world_link[:3, :3] @ robot_validator.T_frame_tcp[:3, 3]
+    linear = rotation @ velocity.linear + np.cross(angular, offset)
+    return world_tool, np.r_[linear, angular]
+# END the returned velocity is measured robot kinematics, not a target error.
+
+
 class _CuroboPlanner:
     """Resident native solvers with request-local online constraint inputs."""
 
@@ -3437,6 +3478,12 @@ class _CuroboPlanner:
                     raise ValueError("An independently controlled finger cannot be an ancestor of the native TCP")
                 joint = int(checker.model.parents[joint])
         # END source identity is established before allocating GPU solvers.
+        # BEGIN bind the tool reference after the actual event/hold clock.
+        from .timed_reference import BoundToolReference
+        entrance_pose, entrance_twist = _reference_entrance(problem, scene, robot_validator)
+        self.bound_reference = BoundToolReference(problem, self.progress_map.u, self.progress_map.s,
+            initial_clock["duration"], entrance_pose, entrance_twist)
+        # END the same physical-time reference serves IK and ordinary costs.
         self.validation_storage = {"encoded_record_bytes_upper": 0}
         workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
         _require_planning_host_memory(workspace.cpu_live_bytes,
@@ -3486,6 +3533,7 @@ class _CuroboPlanner:
         # END the core binds/reset parameters before evaluating an independent seed layout.
         self._manager_type = _process_manager_type(
             problem, scene, self.progress_map, self.anchors, budget,
+            bound_reference=self.bound_reference,
             clock=self.formal_clock, seed_parameter=self.seed_parameter, robot_dict=self.robot_dict,
             functional_constraints=self.functional_constraints)
         self.phase = "feasibility"
@@ -3691,7 +3739,8 @@ class _CuroboPlanner:
         self._bind_formal_clock()
         self._initialize_verification_constraints()
         self._bind_physical_domains()
-        self._manager_type.bind_request(problem, scene, self.progress_map, self.anchors, budget, self.functional_constraints)
+        self._manager_type.bind_request(problem, scene, self.progress_map, self.anchors, budget,
+                                       self.functional_constraints, self.bound_reference)
 
     # BEGIN resident native solvers rebind only request values and optimizer state.
     def _bind_online_robot(self):
@@ -3740,8 +3789,15 @@ class _CuroboPlanner:
             velocity=problem.start_dq[columns][None], device_cfg=self.device_cfg)
         self._bind_online_robot()
         from .functional_augmented_lagrangian import FunctionalAugmentedLagrangian
+        # BEGIN resident requests bind their own entrance twist and physical time.
+        from .timed_reference import BoundToolReference
+        entrance_pose, entrance_twist = _reference_entrance(problem, scene, self.robot_validator)
+        self.bound_reference = BoundToolReference(problem, mapping.u, mapping.s,
+            grid["duration"], entrance_pose, entrance_twist)
+        # END a prior reference cannot survive a new robot feedback binding.
         self.functional_constraints = FunctionalAugmentedLagrangian(problem.functional_constraint_keys)
-        self._manager_type.bind_request(problem, scene, mapping, anchors, budget, self.functional_constraints)
+        self._manager_type.bind_request(problem, scene, mapping, anchors, budget,
+                                       self.functional_constraints, self.bound_reference)
         self._verification_scene = scene.clone_for_rollout()
         self.trajopt.config.minimum_trajectory_dt = budget.maximum_trajectory_dt
         self.trajopt.config.maximum_trajectory_dt = budget.maximum_trajectory_dt
@@ -3905,9 +3961,10 @@ class _CuroboPlanner:
         # END repeated close() cannot overwrite a later caller setting.
         # END release native callback cycles at the request lifecycle boundary.
 
-    def _goal(self, progress):
-        s = self.device_cfg.to_device([[float(progress)]])
-        position, quaternion = self.problem.reference_to_link_pose(*self.problem.sample_reference(s))
+    def _goal(self, time_s):
+        """Create native link goals from the same physical-time TCP reference."""
+        times = self.device_cfg.to_device([[float(time_s)]])
+        position, quaternion = self.problem.reference_to_link_pose(*self.bound_reference.sample(times))
         return self.GoalToolPose(tool_frames=[self.problem.tool_link],
                                  position=position[:, :, None, None].contiguous(),
                                  quaternion=quaternion[:, :, None, None].contiguous())
@@ -4032,9 +4089,8 @@ class _CuroboPlanner:
         position_limits = np.stack((self.position_domain.lower.detach().cpu().numpy(),
                                     self.position_domain.upper.detach().cpu().numpy()))
         query_index = len(self.reference_ik_queries)
-        progress = float(np.interp(u, self.progress_map.u, self.progress_map.s))
         self.seed_parameter.fill_(float(u))
-        result = self._solve_ik(self._goal(progress), previous, optional=optional)
+        result = self._solve_ik(self._goal(u*self.formal_clock["duration"]), previous, optional=optional)
         if result is None:
             return None
         values = self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy()
@@ -4865,7 +4921,7 @@ class _CuroboPlanner:
             self.seed_parameter.fill_(u)
             pose = next((self.problem.pose_events[index] for name, index in goal_ids
                          if name == "pose_events"), None)
-            native_goal = self._goal(progress) if pose is None else self._functional_goal(pose)
+            native_goal = self._goal(u*self.formal_clock["duration"]) if pose is None else self._functional_goal(pose)
             self._manager_type.bind_ik_goals(goal_ids)
             self.ik.disable_tool_pose_tracking()
             try:
@@ -4993,6 +5049,18 @@ class _CuroboPlanner:
         return trajectory, candidate_scene, mapping
 
     # BEGIN all delivered candidates are ranked on one request-wide quadrature grid.
+    def _reference_for_candidate(self, trajectory):
+        """Bind the original reference inputs to this candidate's actual clock.
+
+        A supplied joint trajectory retains its own time/progress map. Its
+        reference is constructed from the same nominal skill and measured
+        entrance, without retiming the candidate or carrying another clock's
+        correction coefficients into its ordinary objective.
+        """
+        from .timed_reference import BoundToolReference
+        return BoundToolReference(self.problem, trajectory.progress_u, trajectory.progress_s,
+            trajectory.duration, self.bound_reference.initial_pose, self.bound_reference.initial_twist)
+
     def _candidate_objective(self, trajectory):
         """Evaluate fixed ordinary costs using this curve's physical derivatives.
 
@@ -5015,7 +5083,8 @@ class _CuroboPlanner:
         manager = next(item for item in rollout._cost_manager_list
                        if getattr(item, "_process_mode", "") == "reference_objective")
         manager._candidate_query = {"times": tensor(times)[None], "mapping": mapping,
-                                    "duration": trajectory.duration}
+                                    "duration": trajectory.duration,
+                                    "bound_reference": self._reference_for_candidate(trajectory)}
         manager._reference_grid_key = None
         try:
             self.check_request()
@@ -5057,6 +5126,7 @@ class _CuroboPlanner:
         anchor_q, anchor_dq, _, _ = trajectory.sample(pairs[:, 0]*trajectory.duration)
         tensor = self.device_cfg.to_device
         context = {"scene": candidate_scene, "mapping": mapping, "duration": trajectory.duration,
+            "bound_reference": self._reference_for_candidate(trajectory),
             "times": tensor(times)[None], "progress": tensor(progress)[None],
             "anchor_u": tensor(pairs[:, 0])[None], "anchor_s": tensor(pairs[:, 1])[None],
             # BEGIN actual anchor q/dq and time share the original double pair.

@@ -1,6 +1,6 @@
 # `manipulation/planning_diagnostics.py` 实现契约
 
-代码基线：`c84b34a`。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `AttemptWitnesses`

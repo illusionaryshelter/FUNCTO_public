@@ -87,7 +87,7 @@ def manager_fixture(monkeypatch):
         configuration = _process_manager_type(problem, scene,
             _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,
             PlanningBudget(constraint_weight=777., max_task_anchors=capacity),
-            clock={"duration": 2.}, seed_parameter=torch.zeros((1, 1)))
+            clock={"duration": 2.}, seed_parameter=torch.zeros((1, 1)), bound_reference=None)
         config = configuration.create({"process_mode": mode}, device_cfg=device)
         manager = config.class_type(device)
         manager.initialize_from_config(config, transition)

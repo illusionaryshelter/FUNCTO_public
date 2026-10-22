@@ -18,6 +18,7 @@ from manipulation.planning_problem import (PlanningProblem, PoseEventRequirement
     PosePath, PoseProcessRequirement, reference_phase)
 from manipulation.planning_scene import CollisionOwner
 from manipulation.representation import build_representation, generate_reference
+from manipulation.timed_reference import BoundToolReference
 
 
 def pose(x=0., y=0., z=0., angle=0.):
@@ -37,7 +38,7 @@ def problem(phase, **requirements):
 
 
 def sample(problem, progress):
-    """Convert the actual solver-facing tensors using independent SciPy math."""
+    """Convert nominal reference tensors using independent SciPy math."""
     p, q = problem.sample_reference(torch.tensor(progress, dtype=torch.float64))
     result = np.broadcast_to(np.eye(4), (*p.shape[:-1], 4, 4)).copy()
     result[..., :3, 3] = p.numpy()
@@ -56,7 +57,7 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
             L_G=pose(.1), interaction_time=5.7, events=[event])
         # BEGIN an actual tool entrance is independent of source-reference samples.
         reference = generate_reference(rep, T_world_function=pose(.7, .2), T_world_eef=pose(.4, -.1, .6, .2))
-        # END planner handoff preserves the adapted path and independent task goals.
+        # END the handoff preserves nominal geometry and independent task goals.
         phase = reference_phase(reference, skill_id="analytic_grasp", source="observed transformed reference")
         empty = problem(phase)
         self.assertIsNone(empty.terminal_pose_target)
@@ -79,6 +80,21 @@ class ReferencePlanningHandoffTest(unittest.TestCase):
         np.testing.assert_allclose(compiled.progress_to_source_time(phase.reference.progress), reference["eef_timestamps"])
         np.testing.assert_array_equal(compiled.start_q, [.37])
         np.testing.assert_array_equal(compiled.start_dq, [-.02])
+        # BEGIN the actual planner clock owns the declared physical correction.
+        # This kinematic fixture explicitly chooses a stationary tool entrance;
+        # production derives its velocity from the fixed robot and named dq.
+        entrance = reference["eef_boundaries"]["initial_pose"]
+        duration = 2.8
+        bound = BoundToolReference(compiled, [0., 1.], [0., 1.], duration,
+                                   entrance, np.zeros(6))
+        event = reference["eef_boundaries"]["goals"][0]
+        actual = bound.sample_numpy([0., duration*event["progress"]])
+        np.testing.assert_allclose(actual[0], entrance, atol=1e-12)
+        np.testing.assert_allclose(actual[1], event["pose"], atol=1e-12)
+        self.assertGreater(np.linalg.norm(sample(compiled, 0.)-entrance), .1)
+        self.assertIs(compiled.terminal_pose_target, goal)
+        np.testing.assert_array_equal(goal.target, target)
+        # END a reference boundary does not replace an independently typed goal.
 
     def held_reference(self):
         rep = build_representation(kind="manipulation", frame_indices=[5, 40], timestamps=[5., 7.],

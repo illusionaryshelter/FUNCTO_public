@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`c84b34a`（连续初始化 A/B 实际实现提交；本次仅文档更新引用该代码基线，文档提交与实现提交分别记录）。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
 
 ## 1. 请求生命周期与资源分配
 
@@ -92,15 +92,15 @@ QP 答案转为实际动作 dtype 后，连续极值重新按原界检查。构�
 
 ### 5.1 连续参考与固定时间平均
 
-`reference_tracking.NativeReferenceCost` 读取 `PlanningProblem.sample_reference`，沿当前候选已绑定的物理时间采样完整工具参考。设 B 为机器人基坐标系，E 为标定 TCP，`P(u)` 为该候选的进度映射，`T` 为其物理时长。在普通有效采样时刻 `t_i`，候选 TCP 原点为 `p_E(q(t_i))`，参考为 `p_E*(P(t_i/T))`；二者均在 B 系表达。`θ_i` 为这两个 TCP 姿态之间的 SO(3) 最小转角。参考目标的离散时间平均为
+`reference_tracking.NativeReferenceCost` 读取该候选实际时钟上的 `BoundToolReference`，沿普通有效物理时刻采样完整工具参考。设 B 为机器人基坐标系，E 为标定 TCP，`p_E(q(t_i))` 为候选在时刻 `t_i` 的 TCP 原点，`p_E*(t_i)` 为相同时刻的绑定参考；二者均由原标定表达在 B 中。绑定对象已持有该候选的进度映射、时长和机器人入口边界，其构造见[参考组件](01-inputs-and-task-model.md#21-实际物理时钟上的工具参考)。`θ_i` 为两个 TCP 姿态之间的 SO(3) 最小转角。参考目标的离散时间平均为
 
 ```text
-J_reference = Σ_i α_i [ (w_p/2) ‖p_E(q(t_i)) − p_E*(P(t_i/T))‖² + w_R θ_i² ]
+J_reference = Σ_i α_i [ (w_p/2) ‖p_E(q(t_i)) − p_E*(t_i)‖² + w_R θ_i² ]
 ```
 
 `physical_time_mean_weights` 用真实物理时间的梯形公式计算 `α_i`，在有效前缀上归一化为和 1；填充样本权重为零。确切事件与碰撞见证保留各自的硬要求查询作用。`w_p,w_R` 来自原轨迹配置的 `tool_pose_cfg.weight`。`ToolPoseCost` 采用等权 Lie 旋转三轴、零收敛带和 `use_grad_input=True`；其旋转核输出 `θ²/4`，所以内部整体旋转权重取 `4w_R`，得到上述前向尺度。
 
-`bind(sample_times,valid_count,progress_map,duration)` 在请求或网格变化时预先生成参考目标和积分权重；普通优化调用复用这些设备记录。原生成本调用将候选和时间展平成局部批次，显式目标索引保持每个时刻与其参考一一对应。`forward` 直接消费已有原生 FK 工具连杆位姿。`NativeRigidToolTransform` 将固定 `T_L_E` 合成到该连杆 L，位置导数包含 TCP 偏置产生的力矩项；姿态代价对基座系中无穷小转角的三维导数，经 cuRobo 的四元数导数编码返回同一 FK。该编码是已安装原生核的反向协议，坐标和固定工具标定与任务模型一致。
+`bind(sample_times,valid_count,bound_reference)` 在请求或网格变化时预先生成参考目标和积分权重；普通优化调用复用这些设备记录。参考 IK 的 `_goal` 使用同一个 `bound_reference.sample(times_s)`，再将 TCP 目标转换为原生连杆目标。保存候选的 `_reference_for_candidate` 按其自身物理时钟构造同规则绑定，供普通评分和完整指标上下文使用。原生成本调用将候选和时间展平成局部批次，显式目标索引保持每个时刻与其参考一一对应。`forward` 直接消费已有原生 FK 工具连杆位姿。`NativeRigidToolTransform` 将固定 `T_L_E` 合成到该连杆 L，位置导数包含 TCP 偏置产生的力矩项；姿态代价对基座系中无穷小转角的三维导数，经 cuRobo 的四元数导数编码返回同一 FK。该编码是已安装原生核的反向协议，坐标和固定工具标定与任务模型一致。
 
 `freeze_cspace_time_weights` 从原普通成本模板的副本出发，在本次 `native_dt` 上一次吸收原生 STATE 成本的时间缩放因子，并设置 `use_grad_input=True`。`FixedTimeStateCSpaceCost` 继续调用原生前向，只为成本建立固定 `dt` 的 `JointState` 视图，因为原生能量项仍显式包含 `dt`。位置、物理速度、加速度、jerk、力矩和实际查询时间保持原值。请求重绑从原模板重新构造成本。普通关节成本与参考成本共同乘以 `α_i`，所以优化网格、密集网格和最终评分使用同一组成本系数。
 

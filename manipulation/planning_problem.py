@@ -16,9 +16,9 @@ from copy import deepcopy
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-# BEGIN array and continuous paths share one free boundary parameter owner.
-from .motion import MotionModel, _inverse, _pose_array, _poses_array, free_transfer_parameters
-# END only the evaluation backend is different.
+# BEGIN nominal paths retain source composition; physical boundary binding is separate.
+from .motion import MotionModel, _inverse, _pose_array, _poses_array
+# END timed_reference owns the declared physical-time tool correction.
 
 
 def _tensor(value, like):
@@ -110,13 +110,13 @@ def _slerp(a, b, fraction):
 # END no threshold changes the interpolation law or its physical-time progress.
 
 
-def _interpolate(knots, values, progress):
+def _interpolate(knots, values, progress, *, side="right"):
     """Piecewise linear scalar/vector interpolation, preserving progress grad."""
     import torch
     keys, data = _tensor(knots, progress), _tensor(values, progress)
     if len(keys) == 1:
         return data[0].expand(*progress.shape, *data.shape[1:])
-    index = torch.searchsorted(keys, progress.contiguous(), right=True).clamp(1, len(keys)-1)
+    index = torch.searchsorted(keys, progress.contiguous(), right=side == "right").clamp(1, len(keys)-1)
     fraction = ((progress-keys[index-1])/(keys[index]-keys[index-1])).clamp(0, 1)
     extra = (None,) * (data.ndim-1)
     return data[index-1] + fraction[(...,)+extra] * (data[index]-data[index-1])
@@ -172,22 +172,23 @@ class PosePath:
             raise ValueError("Coordinates require a current mechanism model")
         self._quaternions = _quaternion(self.poses)
 
-    def sample(self, progress):
-        """Return position (...,3), quaternion (...,4), on the query device."""
+    # BEGIN nominal one-sided derivatives remain available at declared joins.
+    def sample(self, progress, *, side="right"):
+        """Return position/quaternion; ``side`` selects a knot's actual branch."""
         import torch
         if self.motion_model is None:
-            position = _interpolate(self.progress, self.poses[:, :3, 3], progress)
+            position = _interpolate(self.progress, self.poses[:, :3, 3], progress, side=side)
             keys = _tensor(self.progress, progress)
             values = _tensor(self._quaternions, progress)
             if len(keys) == 1:
                 quaternion = values[0].expand(*progress.shape, 4)
             else:
-                index = torch.searchsorted(keys, progress.contiguous(), right=True).clamp(1, len(keys)-1)
+                index = torch.searchsorted(keys, progress.contiguous(), right=side == "right").clamp(1, len(keys)-1)
                 fraction = ((progress-keys[index-1])/(keys[index]-keys[index-1])).clamp(0, 1)
                 quaternion = _slerp(values[index-1], values[index], fraction)
         else:
             model = self.motion_model
-            coordinate = _interpolate(self.progress, self.coordinates, progress)
+            coordinate = _interpolate(self.progress, self.coordinates, progress, side=side)
             base_p, base_q = _tensor(model.reference_pose[:3, 3], progress), _tensor(_quaternion(model.reference_pose), progress)
             axis = _tensor(model.axis, progress)
             if model.kind in {"revolute", "planar"}:
@@ -209,11 +210,12 @@ class PosePath:
         position = position + quaternion_rotate(quaternion, offset)
         quaternion = quaternion_multiply(quaternion, _tensor(_quaternion(self.attachment), progress))
         if self.parent is not None:
-            parent_position, parent_quaternion = self.parent.sample(progress)
+            parent_position, parent_quaternion = self.parent.sample(progress, side=side)
             position = parent_position + quaternion_rotate(parent_quaternion, position)
             quaternion = quaternion_multiply(parent_quaternion, quaternion)
         return position, quaternion
         # END autograd retains both parent motion and the rotating right offset.
+    # END the source path itself receives no boundary smoothing or time warp.
 
     def sample_numpy(self, progress):
         import torch
@@ -224,90 +226,6 @@ class PosePath:
         output[..., :3, :3] = Rotation.from_quat(
             quaternion.detach().numpy().reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape(*values.shape, 3, 3)
         return output
-
-
-# BEGIN continuous free-reference adaptation with actual entrance and event goals.
-class TransferredPosePath(PosePath):
-    """Adapt one material-frame path without interpolating composed outputs.
-
-    ``reference`` already owns its physical interpolation frame and normalized
-    time/phase map. ``goals`` contains explicit ``progress``/``pose`` records;
-    their nominal poses are geometry boundaries, not new robot task equalities.
-    Each interval uses motion.free_transfer_parameters, exactly as the array
-    transfer kernel does. Source and goal breakpoints remain visible to all
-    PosePath consumers, while arbitrary queries evaluate the original composed
-    reference followed by the analytic correction. After the last event, a new
-    entrance-only attachment preserves the remaining local reference motion.
-    An explicit event already satisfied at progress zero leaves this suffix
-    valid; absence of any event is not silently interpreted as that condition.
-    """
-
-    def __init__(self, reference, initial_pose, goals, source):
-        if not isinstance(reference, PosePath) or len(reference.progress) < 2:
-            raise ValueError("A transferred path needs a PosePath with a positive phase span")
-        if not source or not isinstance(goals, (list, tuple)) or not goals:
-            raise ValueError("A transferred path needs source evidence and explicit event goals")
-        initial = _pose_array(initial_pose, "actual initial pose")
-        normalized = []
-        for goal in goals:
-            if not isinstance(goal, dict):
-                raise ValueError("Each transfer goal needs progress and pose")
-            key = goal.get("progress")
-            if (isinstance(key, (bool, np.bool_)) or not isinstance(key, (int, float, np.number))
-                    or not np.isfinite(key) or not 0 <= key <= 1):
-                raise ValueError("Transfer goal progress must lie in [0,1]")
-            pose = _pose_array(goal["pose"], "transfer goal pose")
-            if float(key) == 0.:
-                if not np.allclose(pose, initial, atol=1e-8, rtol=0):
-                    raise ValueError("The initial transfer event conflicts with the actual entrance")
-            else:
-                normalized.append((float(key), pose))
-        normalized.sort(key=lambda item: item[0])
-        if any(a[0] == b[0] for a, b in zip(normalized, normalized[1:])):
-            raise ValueError("Transfer needs distinct positive-progress event goals")
-
-        self._reference = reference
-        starts, ends, parameters = [], [], []
-        begin, entrance = 0., initial
-        for end, goal in normalized:
-            starts.append(begin)
-            ends.append(end)
-            parameters.append(free_transfer_parameters(reference.sample_numpy(begin), entrance,
-                reference.sample_numpy(end), goal))
-            begin, entrance = end, goal
-        if begin < 1.:
-            starts.append(begin)
-            ends.append(1.)
-            parameters.append(free_transfer_parameters(reference.sample_numpy(begin), entrance))
-        self._interval_starts = np.asarray(starts)
-        self._interval_spans = np.asarray(ends) - self._interval_starts
-        self._right_positions = np.stack([item["right"][:3, 3] for item in parameters])
-        self._right_quaternions = np.stack([_quaternion(item["right"]) for item in parameters])
-        self._translations = np.stack([item["translation_correction"] for item in parameters])
-        corrections = np.repeat(np.eye(4)[None], len(parameters), axis=0)
-        corrections[:, :3, :3] = np.stack([item["rotation_correction"] for item in parameters])
-        self._correction_quaternions = _quaternion(corrections)
-        keys = np.unique(np.r_[reference.progress, [key for key, _ in normalized]])
-        # The stored poses are honest samples for existing diagnostics. They
-        # never become interpolation data for this subclass's sample method.
-        poses = self.sample_numpy(keys)
-        super().__init__(keys, poses, source=source)
-
-    def sample(self, progress):
-        """Evaluate the same boundary parameters with Torch progress gradients."""
-        import torch
-
-        keys = _tensor(self._interval_starts, progress)
-        index = (torch.searchsorted(keys, progress.contiguous(), right=True)-1).clamp(0, len(keys)-1)
-        weight = ((progress-keys[index])/_tensor(self._interval_spans, progress)[index]).clamp(0, 1)
-        position, quaternion = self._reference.sample(progress)
-        position = position + quaternion_rotate(quaternion, _tensor(self._right_positions, progress)[index])
-        quaternion = quaternion_multiply(quaternion, _tensor(self._right_quaternions, progress)[index])
-        position = position + weight[..., None]*_tensor(self._translations, progress)[index]
-        identity = _tensor([1., 0., 0., 0.], progress).expand(*progress.shape, 4)
-        correction = _slerp(identity, _tensor(self._correction_quaternions, progress)[index], weight)
-        return position, quaternion_multiply(correction, quaternion)
-# END references remain continuously composed before and after every event.
 
 
 @dataclass(frozen=True)
@@ -344,14 +262,16 @@ class MotionPhase:
 
 # BEGIN fixed-frame references enter the existing planner without new goals.
 def reference_phase(reference, *, skill_id, source):
-    """Adapt a generated geometric reference to the existing tool PosePath.
+    """Carry a generated nominal path and its physical boundary declaration.
 
     ``reference`` is the result of representation.generate_reference. Reuse
     its explicit eef_path, including the separately sampled parent, body
     correspondence and attachment. Rebuilding a path from composed EEF or
     object knots would cut rotating offsets and change intermediate poses.
 
-    The returned MotionPhase is reference data only. It declares neither a
+    The returned MotionPhase is reference data only. Its raw composed path
+    and metadata['reference_boundaries'] remain distinct until the physical
+    clock and measured tool twist are bound by BoundToolReference. It declares neither a
     task goal nor a physical attachment/collision permission. The caller must
     independently supply real robot state, typed requirements and scene
     evidence to PlanningProblem and the existing planning-scene binder. Pass
@@ -385,6 +305,9 @@ def reference_phase(reference, *, skill_id, source):
         "skill_id": skill_id, "reference_source": deepcopy(source), "reference_timestamps": times.copy(),
         "source_frame_indices": frames, "source_timestamps": original_times,
         "source_events": deepcopy(reference.get("events", [])),
+        # BEGIN the same explicit data binds ordinary tool tracking at physical time.
+        "reference_boundaries": deepcopy(reference["eef_boundaries"]),
+        # END source geometry never acquires an implicit zero entrance velocity.
         "scope": "Geometric reference only; task requirements and scene permissions are independent",
     })
 # END no source knot becomes a required waypoint or inferred tolerance.

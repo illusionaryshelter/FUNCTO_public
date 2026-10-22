@@ -12,7 +12,7 @@ import numpy as np
 
 from .grasp import validate_timeline
 from .motion import MotionModel, _errors, _inverse, _pose_array, _poses_array
-from .planning_problem import PosePath, TransferredPosePath
+from .planning_problem import PosePath
 
 
 def _timeline(timestamps):
@@ -175,7 +175,7 @@ def _component_path(value, times, path_times, *, source, parent=None, attachment
                     attachment=np.eye(4) if attachment is None else attachment)
 
 
-# BEGIN boundary-constrained consumer replaces the rigid-only success path.
+# BEGIN nominal composition and geometric boundary declarations have distinct outputs.
 def _right_path(parent, transform, source):
     """Sample the physical parent before applying a fixed attached relation."""
     return PosePath(parent.progress, np.repeat(np.eye(4)[None], len(parent.progress), axis=0),
@@ -189,35 +189,11 @@ def _require_same_pose(first, second, message):
         raise ValueError(message)
 
 
-def _boundary_record(path, current, goal, event_progress):
-    """Compare to supplied entry evidence and a separately bound nominal goal."""
-    start, event = path.sample_numpy(0.), path.sample_numpy(event_progress)
-    _require_same_pose(current, start, "Reference failed its actual entry boundary")
-    _require_same_pose(goal, event, "Reference failed its nominal interaction boundary")
-    p0, r0 = _errors(current[None], start[None])
-    pg, rg = _errors(goal[None], event[None])
-    return dict(status="passed", actual_start=current, adapted_start=start, nominal_goal=goal,
-                adapted_interaction=event, start_position_error_m=float(p0[0]),
-                start_rotation_error_rad=float(r0[0]), interaction_position_error_m=float(pg[0]),
-                interaction_rotation_error_rad=float(rg[0]),
-                scope="Geometric boundaries; not physical task or robot feasibility verification")
-
-
-def _adapt_boundary(path, current, event_progress, source):
-    """Use the shared transfer kernel; an event at entry must already agree."""
-    goal = path.sample_numpy(event_progress)
-    if len(path.progress) == 1:
-        _require_same_pose(current, goal, "Actual entry conflicts with the nominal interaction at entry")
-        return path
-    return TransferredPosePath(path, current,
-        [{"progress": event_progress, "pose": goal}], source=source)
-
-
 def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                        T_world_eef=None, T_world_body=None, motion_model=None,
                        source_coordinates=None, current_coordinates=None,
                        contact_motion=False, held_until_time=None):
-    """Adapt source motion to the actual entry AND nominal interaction pose.
+    """Bind complete nominal source motion and declare entry/event boundaries.
 
     J maps current body coordinates B_N into demonstrated coordinates B_D;
     # BEGIN A is the declared rigid attachment model, not physical truth.
@@ -225,23 +201,25 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     the modeled body pose. If both poses are supplied, they must use this same
     model; the equality does not verify physical holding or target arrival.
     # END no simulator body measurement is required to bind held motion.
-    Free object motion is adapted in a fixed material frame, independently of
-    the body's coordinate chart and the grasp. The original motion first binds
-    the nominal goal at interaction_time; that goal is not inferred from the
-    adapted output. All intermediate samples use the shared transfer kernel.
+    Free object motion is bound in a fixed material frame, independently of
+    the body's coordinate chart and the grasp. The original motion supplies
+    the nominal interaction goal. Returned paths retain this complete nominal
+    composition; their separately named boundaries enter BoundToolReference
+    only after the planner has bound physical time and measured TCP velocity.
 
     Grasp motion requires actual E. A scalar mechanism instead uses its current
     model and current coordinate, preserving its physical manifold and winding.
     Production object/tool paths stop at release or an earlier held_until_time.
     Full source evidence and unadapted bound diagnostics remain separately named.
-    Missing entry/interaction evidence cannot produce a production path. These
-    are geometric references, not collision, support or robot-execution proofs.
+    Missing entry/interaction evidence cannot produce a boundary declaration.
+    Reference geometry and its boundary data remain separate from task/scene
+    qualification and the eventual planned joint trajectory.
     """
     frames, times = validate_timeline(representation["frame_indices"], representation["timestamps"])
     result = dict(frame_indices=frames, timestamps=times,
         events=deepcopy(representation.get("events", [])), missing={}, summaries={},
         boundary_checks={}, status="missing",
-        scope="actual-entry and nominal-interaction geometric reference; not planned or executed")
+        scope="grounded nominal paths and explicit physical-time boundary declarations")
     kind = representation["kind"]
     if kind not in {"grasp", "manipulation"}:
         raise ValueError("Unknown representation kind")
@@ -292,7 +270,16 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
         result["bound_" + name + "_poses"] = path.sample_numpy(_progress(clock))
 
     def publish(name, path, current, nominal_goal):
-        result["boundary_checks"][name] = _boundary_record(path, current, nominal_goal, event_progress)
+        # BEGIN geometric production preserves the nominal path until clock binding.
+        source = {"generator": "generate_reference", "role": name,
+                  "interaction_time": float(interaction), "reference_clock": path_times.tolist()}
+        result[name + "_boundaries"] = {"initial_pose": np.asarray(current).copy(),
+            "goals": [{"progress": float(event_progress), "pose": np.asarray(nominal_goal).copy(),
+                       "source": source}], "source": source}
+        result["boundary_checks"][name] = {"status": "declared_for_physical_time_binding",
+            "initial_pose": np.asarray(current).copy(), "nominal_interaction": np.asarray(nominal_goal).copy(),
+            "interaction_progress": float(event_progress)}
+        # END no progress derivative is represented as measured physical velocity.
         result[name + "_path"] = path
         result[name + "_timestamps"] = path_times.copy()
         result[name + "_poses"] = path.sample_numpy(_progress(path_times))
@@ -313,11 +300,10 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
             raw = _component_path(result["H_g"], times, path_times,
                                   source="bound source grasp relation", parent=function_path(path_times))
             diagnostic("eef", raw, path_times)
-            adapted = _adapt_boundary(raw, current_eef, event_progress, "actual-entry grasp transfer")
-            publish("eef", adapted, current_eef, raw.sample_numpy(event_progress))
-            result["method"] = "shared free transfer at actual tool frame"
+            publish("eef", raw, current_eef, raw.sample_numpy(event_progress))
+            result["method"] = "nominal grasp relation with declared tool boundaries"
     else:
-        raw_body = adapted_body = None
+        raw_body = None
         if motion_model is not None:
             if not isinstance(motion_model, MotionModel) or motion_model.kind not in {"prismatic", "revolute"}:
                 raise ValueError("Scalar mechanism reference needs a current prismatic/revolute MotionModel")
@@ -346,8 +332,8 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                     if current_eef is not None:
                         _require_same_pose(current_eef, model_eef, "Current EEF conflicts with mechanism and attachment")
                     current_eef = model_eef
-                raw_body = adapted_body = mechanism_path(path_times)
-                result["coordinates"] = adapted_body.coordinates.copy()
+                raw_body = mechanism_path(path_times)
+                result["coordinates"] = raw_body.coordinates.copy()
                 diagnostic("object", mechanism_path(full_times), full_times)
                 result["method"] = "current mechanism coordinates and FK"
         elif "H_m" not in result or T_world_function is None or J is None:
@@ -372,17 +358,14 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
             raw_body = _right_path(raw_material, _inverse(L_body), "bound source body diagnostic")
             diagnostic("object", _right_path(material_path(full_times), _inverse(L_body),
                                               "full source binding diagnostic"), full_times)
-            adapted_material = _adapt_boundary(raw_material, current_body @ L_body, event_progress,
-                                                "actual-body entry and nominal interaction transfer")
-            adapted_body = _right_path(adapted_material, _inverse(L_body), "adapted physical body reference")
-            result["method"] = "shared free transfer in body-attached material frame"
-        if adapted_body is not None:
-            publish("object", adapted_body, current_body, raw_body.sample_numpy(event_progress))
+            result["method"] = "nominal material-frame motion with declared body/tool boundaries"
+        if raw_body is not None:
+            publish("object", raw_body, current_body, raw_body.sample_numpy(event_progress))
             if A is not None:
                 inverse_A = _inverse(result["A"])
                 raw_eef = _right_path(raw_body, inverse_A, "bound held tool diagnostic")
                 diagnostic("eef", raw_eef, path_times)
-                publish("eef", _right_path(adapted_body, inverse_A, "tool from adapted body and declared A"),
+                publish("eef", raw_eef,
                         current_eef, raw_eef.sample_numpy(event_progress))
             elif contact_motion and "C_D" in result and J is not None and current_eef is not None:
                 # Contact is an explicitly supplied time-varying source
@@ -390,17 +373,15 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                 relation = _inverse(result["J"]) @ result["C_D"]
                 raw_eef = _component_path(relation, times, path_times,
                     source="bound nonattached contact diagnostic", parent=raw_body)
-                adapted_eef = _component_path(relation, times, path_times,
-                    source="nonattached contact on adapted body", parent=adapted_body)
-                _require_same_pose(adapted_eef.sample_numpy(0.), current_eef,
+                _require_same_pose(current_body @ relation[0], current_eef,
                                    "Actual EEF conflicts with the supplied source contact relation")
                 diagnostic("eef", raw_eef, path_times)
-                publish("eef", adapted_eef, current_eef, raw_eef.sample_numpy(event_progress))
+                publish("eef", raw_eef, current_eef, raw_eef.sample_numpy(event_progress))
             else:
                 result["missing"]["eef_poses"] = ("Nonattached contact needs C_D, J and actual EEF"
                     if contact_motion else "EEF reference needs a declared attachment model A")
     if "eef_poses" in result or "object_poses" in result:
         result["status"] = "partial" if result["missing"] else "reference"
     return result
-# END no missing-boundary or rigid-only production reference remains.
+# END complete nominal paths and observed/modelled entrance data retain their roles.
 # END PRD fixed-frame representation and reference generation.

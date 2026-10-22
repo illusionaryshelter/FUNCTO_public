@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`c84b34a`（连续初始化 A/B 实际实现提交；本次仅文档更新引用该代码基线，文档提交与实现提交分别记录）。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。
 
 ## 1. 两种实体来源
 
@@ -63,6 +63,10 @@
 `RobotGeometryChecker` 用 URDF 建立 Pinocchio 关节树，以 `NativeSolid` 原凸组件顶点或 `NativePrimitive` 解析盒体/圆柱建立 Coal 碰撞实体。模型保留实体 ID、所属连杆、固定变换与官方来源。完整具名关节及基座标定确定各实体位姿。该模型对应当前固定机器人及其官方固定末端配置，可跨任务复用；任务物体、环境和其他对象的 mesh/CAD 不进入该许可范围。
 
 `query` 返回原生有符号距离、最近点、法向、FK 和关节域。`required`、`excluded`、`mechanical_contact` 是调用者明确提供的原模型配对语义。自碰撞使用 `separated`、`penetrating`、`numerical_boundary` 区分原生查询结果，保留 Coal 默认数值边界；该数值尺度不等于严格误差界，数值边界单列未决。
+
+同一检查器的 `_query_schema` 保存最近一次完整查询的结构：具名关节顺序及其模型列、对应官方位置界、所需帧到 Pinocchio frame ID 的映射，以及完整 `PairQuery` 元组。`PairQuery` 为冻结记录，其有向端点、策略和来源共同参与结构相等比较。查询结构改变时，`query` 重新验证完整关节覆盖、帧身份、配对端点与配对策略，验证完成后替换这一个记录；相同结构直接复用这些模型关系。每次实际关节值和基座标定仍在当前调用验证，当前关节限位、FK、几何位姿和距离见证由当前状态计算。
+
+`_native_pair_distances` 将最近一组有序配对组织为每块最多 128 对的 Pinocchio 几何工作区，每块最多包含 256 个实体。形状先于距离函数对象构造，整个块共同保存模型、工作数据和未求值的原始求解器副本。每次状态查询先恢复该副本，再写入当前 `oMg` 变换并调用 `pin.computeDistances`，按原配对顺序读取有符号距离、最近点与法向。配对端点或顺序改变时替换原工作区。`native_query_storage_nbytes` 按机器人实体数量、可能的配对数、块大小和原 EPA 容量计入资源准入；请求期限检查在进入查询及读取各配对结果时执行。
 
 `RobotStateValidator.required_pairs` 是原配对策略中所有 `required` 记录组成的元组。`OnlinePlanningScene._robot_self_components` 将该元组直接传给 `RobotGeometryChecker.query`，取得当前自碰撞条件需要的实体对证据；完整 `robot_pairs` 继续用于模型描述与快照保存。实体身份、几何形状和必检配对集合由原机器人配置确定。
 

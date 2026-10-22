@@ -185,11 +185,13 @@ result = import_point2pose_skill(
 
 整个原始区间逐帧核对 NPZ 与跟踪证据。失败记录、缺时间/world，或任一已绑定实例含 stale/missing/未知状态，返回 `status="missing_source_observations"` 与具体缺项，不写包、不跳帧。warning 候选可保留，完整逐帧原始证据随包保存；正常写入返回 `status="saved_observation_segment"`，该状态只表示保存成功，不表示追踪准确或执行成功。包来源分别标明 Point2Pose 估计运动、已给视觉区域和同步 EEF 记录。
 
-<!-- BEGIN the grounding command consumes actual robot entry evidence. -->
+<!-- BEGIN the grounding command preserves nominal paths and explicit boundaries. -->
 `ground_skill.py` 从当前场景的 `robot_feedback.json` 读取 `eef_pose`（世界坐标下工具控制坐标的位姿），传入 `generate_reference`。抓取参考使用该实际末端入口；持物操作结合当前 `A`（物体局部坐标到工具坐标的固定变换）得到实际物体入口。`A_context` 已声明的工具或世界坐标名称若与反馈冲突，在模型调用前拒绝；不要求增加重复观测。
 
-参考成功要求实际入口与源 `interaction_time` 所绑定的名义交互位姿同时通过。`reference.npz` 中 `object_poses/eef_poses` 是已适配且止于释放的参考，`bound_*` 仅为适配前诊断，原 `frame_indices/timestamps/H_m` 保留源证据。报告保存 `reference_boundary_checks`；网页显示实际末端、适配首点与独立目标。无 `interaction_time` 的观测包可以保存，但不能生成两端约束参考。完整机器人规划仍须提供真实关节状态、独立任务条件和场景证据。
-<!-- END field presence alone cannot establish a valid current reference. -->
+`generate_reference` 的 `object_path/eef_path` 是经 grounding 组合得到的完整名义路径，受控区间止于释放或明确持物终点；`reference.npz` 中同名 `*_poses` 数组是这些路径的采样。`bound_*` 继续保存原名义绑定诊断，`frame_indices/timestamps/H_m` 保留源证据。入口与源 `interaction_time` 对应目标分别写入 `object_boundaries/eef_boundaries`，包含世界位姿、阶段局部进度和来源；`reference_boundary_checks` 的状态为 `declared_for_physical_time_binding`。缺少交互时间时，输出记录该缺项。`reference_phase` 将工具边界声明写入阶段元数据，名义路径仍保留组合结构和机构坐标。
+
+规划器在实际物理时钟确定后构造 `BoundToolReference`，使用具名机器人 `q/dq`、官方运动学和标定得到入口 TCP 位姿与世界线/角速度，再按声明边界生成完整工具参考。参考 IK、普通轨迹成本及保存曲线评分读取同一绑定接口。grounding 网页显示源/目标区域、采样点、物体/工具名义路径、声明工具入口及名义事件目标；物理时间适配结果和任务资格由规划报告展示。
+<!-- END source-time geometry and physical-time planning reference have explicit consumers. -->
 
 ## 在线 SDF 取舍
 

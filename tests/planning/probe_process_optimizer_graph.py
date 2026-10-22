@@ -145,7 +145,9 @@ def main():
             planner.physical_domain, goal_buffer, seed)
         # Seed IK has the same independently timed native finger geometry but
         # deliberately omits the complete trajectory's scene/process terms.
-        ik_goal = planner._goal(problem.phase_count)
+        # BEGIN the bound reference goal API consumes physical seconds.
+        ik_goal = planner._goal(planner.formal_clock["duration"])
+        # END the probe continues to query its declared terminal pose.
         ik_state = SolveState(SolveMode.SINGLE, num_ik_seeds=1, batch_size=1,
             num_envs=1, num_goalset=1, tool_frames=ik_goal.tool_frames)
         current = planner.ik._fill_current_state_dt(planner.start)

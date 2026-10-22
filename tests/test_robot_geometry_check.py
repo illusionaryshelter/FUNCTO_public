@@ -171,3 +171,75 @@ def test_wrong_base_reflection_and_degenerate_solid_rejected(urdf):
     with pytest.raises(ValueError, match="full-dimensional"):
         checker(urdf, [NativeSolid("plane", "base", np.zeros((4, 3)), "invalid planar surface")])
 # END independent geometry diagnostics without CUDA, physics or scene state.
+
+
+# BEGIN schema reuse preserves fresh numerical work and original validation.
+def test_repeated_schema_reuses_names_and_frames_but_queries_each_new_state(urdf, monkeypatch):
+    from unittest.mock import Mock
+    import manipulation.robot_geometry_check as module
+
+    model = checker(urdf)
+    frame_id, name = model._frame_id, module._name
+    frames = Mock(wraps=frame_id)
+    names = Mock(wraps=name)
+    monkeypatch.setattr(model, "_frame_id", frames)
+    monkeypatch.setattr(module, "_name", names)
+    guard = Mock()
+    first = query(model, check_request=guard)
+    schema = model._query_schema
+    assert frames.call_count > 0 and names.call_count > 0
+    assert guard.call_count == 1 + len(first["pairs"])
+    frames.reset_mock(); names.reset_mock(); guard.reset_mock()
+
+    # query() constructs new equal PairQuery records and a new frame list.
+    # Equal declared values reuse metadata while the actual q changes.
+    second = query(model, joint_positions=[.08, -.03], check_request=guard)
+    assert model._query_schema is schema
+    frames.assert_not_called()
+    names.assert_not_called()
+    assert guard.call_count == 1 + len(second["pairs"])
+    assert second["joint_positions"] == [.08, -.03]
+    assert second["geometry_poses"] != first["geometry_poses"]
+    assert second["pairs"] != first["pairs"]
+
+    # Original numeric validation runs even for an identical request schema.
+    with pytest.raises(ValueError, match="finite"):
+        query(model, joint_positions=[np.nan, -.03])
+    reflection = np.eye(4)
+    reflection[0, 0] = -1
+    with pytest.raises(ValueError, match="proper rigid"):
+        query(model, T_reference_base=reflection)
+    assert model._query_schema is schema
+
+
+def test_schema_changes_keep_pair_policy_source_frame_and_named_order_validation(urdf):
+    from unittest.mock import Mock
+
+    model = checker(urdf)
+    reference = query(model)
+    original_schema = model._query_schema
+    invalid = [
+        ({"pairs": [PairQuery("left_shape", "unknown", "required", "source")]}, "Pair endpoints"),
+        ({"pairs": [PairQuery("left_shape", "right_shape", "unsupported", "source")]}, "Pair policy"),
+        ({"pairs": [PairQuery("left_shape", "right_shape", "required", "")]}, "pair policy source"),
+        ({"pairs": [PairQuery("left_shape", "right_shape", "required", "a"),
+                    PairQuery("right_shape", "left_shape", "excluded", "b")]}, "Duplicate"),
+        ({"frames": ["unknown"]}, "Unknown URDF frame"),
+        ({"joint_names": ["left_slide", "left_slide"]}, "every model joint exactly once")]
+    for changed, message in invalid:
+        guard = Mock()
+        with pytest.raises(ValueError, match=message):
+            query(model, **changed, check_request=guard)
+        assert model._query_schema is original_schema
+        guard.assert_called_once_with()
+
+    # The same endpoints with changed policy/source form a distinct schema.
+    changed = query(model, pairs=[PairQuery("left_shape", "right_shape", "excluded", "new explicit source")])
+    assert model._query_schema is not original_schema
+    assert changed["pairs"][0]["policy"] == "excluded"
+    assert changed["pairs"][0]["policy_source"] == "new explicit source"
+    assert changed["pairs"][0]["signed_distance_m"] == reference["pairs"][0]["signed_distance_m"]
+    shuffled = query(model, joint_names=["right_slide", "left_slide"], joint_positions=[-.02, .04])
+    assert shuffled["geometry_poses"] == reference["geometry_poses"]
+    assert shuffled["pairs"] == reference["pairs"]
+# END the bounded cache owns one complete schema and no state-dependent values.

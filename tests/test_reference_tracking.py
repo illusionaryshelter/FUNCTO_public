@@ -19,6 +19,7 @@ from manipulation.reference_tracking import (
     freeze_cspace_time_weights,
     physical_time_mean_weights,
 )
+from manipulation.timed_reference import BoundToolReference
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -56,6 +57,11 @@ def mapping(u=(0., 1.), s=(0., 1.)):
     return SimpleNamespace(u=np.array(u), s=np.array(s))
 
 
+def bound(request, clock, duration):
+    """Explicit analytic entrance; these phases declare no boundary correction."""
+    return BoundToolReference(request, clock.u, clock.s, duration, np.eye(4), np.zeros(6))
+
+
 def identity_quaternions(shape):
     result = torch.zeros(*shape, 4)
     result[..., 0] = 1.
@@ -77,7 +83,7 @@ def test_reference_binding_preserves_clock_hold_and_cropped_progress():
     request = problem()
     cost = NativeReferenceCost(request, DeviceCfg("cpu"), pose_weight=(2., 3.))
     times = torch.tensor([[0., 1., 2., 4., 4.]])
-    cost.bind(times, [4], mapping((0., .25, .5, 1.), (.2, .7, .7, 1.)), 4.)
+    cost.bind(times, [4], bound(request, mapping((0., .25, .5, 1.), (.2, .7, .7, 1.)), 4.))
     torch.testing.assert_close(cost.goal.position[:, 0, 0, 0, 0], torch.tensor([.2, .7, .7, 1., 1.]))
     torch.testing.assert_close(cost.native_cost.config.weight, torch.tensor([2., 12.]))
     assert cost.native_cost.config.use_grad_input
@@ -90,7 +96,7 @@ def test_reference_binding_preserves_clock_hold_and_cropped_progress():
 def test_task_and_time_rows_survive_seed_expansion_and_padding():
     request = problem()
     cost = NativeReferenceCost(request, DeviceCfg("cpu"), pose_weight=(2., 0.))
-    cost.bind(torch.tensor([[0., .2, 1., 1.], [0., .5, .8, 1.]]), [3, 4], mapping(), 1.)
+    cost.bind(torch.tensor([[0., .2, 1., 1.], [0., .5, .8, 1.]]), [3, 4], bound(request, mapping(), 1.))
     rows = torch.tensor([1, 0, 1, 0], dtype=torch.int32)
     targets = cost.goal.position.reshape(2, 4, 1, 3)[rows.long()]
     offsets = torch.tensor([.1, .2, -.3, .4])[:, None, None, None]
@@ -103,7 +109,7 @@ def test_task_and_time_rows_survive_seed_expansion_and_padding():
     torch.testing.assert_close(position.grad[..., 0], 2 * offsets[:, :, :, 0] * weight[..., None])
     assert position.grad[1, 3].abs().max().item() == 0.
     # Changing the bound grid recomputes references and weights explicitly.
-    cost.bind(torch.tensor([[0., 1.]]), [2], mapping(s=(.4, 1.)), 1.)
+    cost.bind(torch.tensor([[0., 1.]]), [2], bound(request, mapping(s=(.4, 1.)), 1.))
     torch.testing.assert_close(cost.goal.position[:, 0, 0, 0, 0], torch.tensor([.4, 1.]))
 
 
@@ -112,7 +118,7 @@ def test_reference_average_is_independent_of_constant_error_sample_density():
     scores = []
     for times in ([0., 1.], [0., .1, .6, 1.], [0., .25, .5, .75, 1.]):
         cost = NativeReferenceCost(request, DeviceCfg("cpu"), pose_weight=(2., 3.))
-        cost.bind(torch.tensor([times]), [len(times)], mapping(), 1.)
+        cost.bind(torch.tensor([times]), [len(times)], bound(request, mapping(), 1.))
         position = torch.zeros(3, len(times), 1, 3)
         position[..., 0] = .05
         quaternion = identity_quaternions((3, len(times), 1))
@@ -166,7 +172,7 @@ def test_nonzero_tcp_and_base_calibration_preserve_native_directional_derivative
                           pose((.3, .15, .4), (-.2, .4, .6))))
     request = problem(base=base, tcp=tcp, reference=reference)
     cost = NativeReferenceCost(request, DeviceCfg("cpu"), pose_weight=pose_weight)
-    cost.bind(torch.tensor([[0., .4, 1., 1.]]), [3], mapping(), 1.)
+    cost.bind(torch.tensor([[0., .4, 1., 1.]]), [3], bound(request, mapping(), 1.))
     axis = torch.tensor([.3, -.4, .5]); axis /= axis.norm()
     fixed = torch.tensor(Rotation.from_euler("xyz", [.2, -.4, .3]).as_quat()[[3, 0, 1, 2]], dtype=torch.float32)
     radius = torch.tensor([.15, -.1, .05])
@@ -297,7 +303,8 @@ def test_native_manager_rebind_and_cached_forward_keep_cost_lifecycle(monkeypatc
         get_state_bounds=lambda: limits,
     )
     clock = {"native_dt": .5, "duration": 1.}
-    config_type = _process_manager_type(request, None, mapping(), np.empty(0), None, clock=clock)
+    config_type = _process_manager_type(request, None, mapping(), np.empty(0), None, clock=clock,
+                                       bound_reference=bound(request, mapping(), clock["duration"]))
     raw = {"process_mode": "reference_objective", "cspace_cfg": {
         "weight": [3., 5., 7., 11., 13.], "cost_type": "STATE", "activation_distance": [0.] * 5,
         "squared_l2_regularization_weight": [2., 3., 5., 7., 11.],
@@ -346,10 +353,11 @@ def test_native_manager_rebind_and_cached_forward_keep_cost_lifecycle(monkeypatc
     # The explicit fixed-grid scorer uses candidate seconds rather than the
     # JointState dt retained for the native regularization coefficient scale.
     manager._candidate_query = {"times": torch.tensor([[0., .2, .8, 1.]]),
-                                "mapping": mapping(), "duration": 1.}
+                                "mapping": mapping(), "duration": 1.,
+                                "bound_reference": bound(request, mapping(), 1.)}
     manager._reference_grid_key = None
     candidate = manager.compute_costs(state)
     expected = NativeReferenceCost(request, device, pose_weight=(2., 3.)).bind(
-        manager._candidate_query["times"], [4], mapping(), 1.).forward(tools)[..., None]
+        manager._candidate_query["times"], [4], manager._candidate_query["bound_reference"]).forward(tools)[..., None]
     torch.testing.assert_close(candidate.values[candidate.names.index("continuous_reference")], expected)
 # END time, pose-origin and native-gradient contracts share production calls.

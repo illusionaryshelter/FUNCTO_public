@@ -1,6 +1,6 @@
 # `manipulation/representation.py` 实现契约
 
-代码基线：`c84b34a`。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_timeline`
@@ -511,99 +511,9 @@ max
 ValueError
 ```
 
-## `_boundary_record`
-
-[定义位置](../../../manipulation/representation.py#L192)。
-
-输入签名：
-
-```python
-def _boundary_record(path, current, goal, event_progress):
-```
-
-实现说明：
-
-> Compare to supplied entry evidence and a separately bound nominal goal.
-
-显式输出分支：
-
-```python
-dict(status='passed', actual_start=current, adapted_start=start, nominal_goal=goal, adapted_interaction=event, start_position_error_m=float(p0[0]), start_rotation_error_rad=float(r0[0]), interaction_position_error_m=float(pg[0]), interaction_rotation_error_rad=float(rg[0]), scope='Geometric boundaries; not physical task or robot feasibility verification')
-```
-
-读取的对象属性：
-
-```python
-path.sample_numpy
-```
-
-写入目标：
-
-```python
-start
-event
-p0
-r0
-pg
-rg
-```
-
-直接调用符号：
-
-```python
-path.sample_numpy
-_require_same_pose
-_errors
-dict
-float
-```
-
-## `_adapt_boundary`
-
-[定义位置](../../../manipulation/representation.py#L206)。
-
-输入签名：
-
-```python
-def _adapt_boundary(path, current, event_progress, source):
-```
-
-实现说明：
-
-> Use the shared transfer kernel; an event at entry must already agree.
-
-显式输出分支：
-
-```python
-path
-TransferredPosePath(path, current, [{'progress': event_progress, 'pose': goal}], source=source)
-```
-
-读取的对象属性：
-
-```python
-path.sample_numpy
-path.progress
-```
-
-写入目标：
-
-```python
-goal
-```
-
-直接调用符号：
-
-```python
-path.sample_numpy
-len
-_require_same_pose
-TransferredPosePath
-```
-
 ## `generate_reference`
 
-[定义位置](../../../manipulation/representation.py#L216)。
+[定义位置](../../../manipulation/representation.py#L192)。
 
 输入签名：
 
@@ -613,7 +523,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
 
 实现说明：
 
-> Adapt source motion to the actual entry AND nominal interaction pose.
+> Bind complete nominal source motion and declare entry/event boundaries.
 >
 > J maps current body coordinates B_N into demonstrated coordinates B_D;
 > # BEGIN A is the declared rigid attachment model, not physical truth.
@@ -621,17 +531,19 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
 > the modeled body pose. If both poses are supplied, they must use this same
 > model; the equality does not verify physical holding or target arrival.
 > # END no simulator body measurement is required to bind held motion.
-> Free object motion is adapted in a fixed material frame, independently of
-> the body's coordinate chart and the grasp. The original motion first binds
-> the nominal goal at interaction_time; that goal is not inferred from the
-> adapted output. All intermediate samples use the shared transfer kernel.
+> Free object motion is bound in a fixed material frame, independently of
+> the body's coordinate chart and the grasp. The original motion supplies
+> the nominal interaction goal. Returned paths retain this complete nominal
+> composition; their separately named boundaries enter BoundToolReference
+> only after the planner has bound physical time and measured TCP velocity.
 >
 > Grasp motion requires actual E. A scalar mechanism instead uses its current
 > model and current coordinate, preserving its physical manifold and winding.
 > Production object/tool paths stop at release or an earlier held_until_time.
 > Full source evidence and unadapted bound diagnostics remain separately named.
-> Missing entry/interaction evidence cannot produce a production path. These
-> are geometric references, not collision, support or robot-execution proofs.
+> Missing entry/interaction evidence cannot produce a boundary declaration.
+> Reference geometry and its boundary data remain separate from task/scene
+> qualification and the eventual planned joint trajectory.
 
 显式输出分支：
 
@@ -661,11 +573,10 @@ np.isfinite(current).all
 coordinates.copy
 current.copy
 motion_model.poses
-adapted_body.coordinates.copy
-adapted_body.coordinates
+raw_body.coordinates.copy
+raw_body.coordinates
 raw_body.sample_numpy
 raw_eef.sample_numpy
-adapted_eef.sample_numpy
 ```
 
 写入目标：
@@ -692,10 +603,8 @@ current_body
 current_eef
 result['missing']['eef_poses']
 raw
-adapted
 result['method']
 raw_body
-adapted_body
 result['missing']['object_poses']
 coordinates
 current
@@ -710,11 +619,9 @@ Qc
 L_body
 result['L_body_material']
 raw_material
-adapted_material
 inverse_A
 raw_eef
 relation
-adapted_eef
 result['status']
 ```
 
@@ -741,7 +648,6 @@ _require_same_pose
 _component_path
 function_path
 diagnostic
-_adapt_boundary
 publish
 raw.sample_numpy
 isinstance
@@ -752,18 +658,17 @@ coordinates.copy
 current.copy
 motion_model.poses
 mechanism_path
-adapted_body.coordinates.copy
+raw_body.coordinates.copy
 sample_poses
 material_path
 _right_path
 raw_body.sample_numpy
 raw_eef.sample_numpy
-adapted_eef.sample_numpy
 ```
 
 ## `generate_reference.function_path`
 
-[定义位置](../../../manipulation/representation.py#L287)。
+[定义位置](../../../manipulation/representation.py#L265)。
 
 输入签名：
 
@@ -793,7 +698,7 @@ _component_path
 
 ## `generate_reference.diagnostic`
 
-[定义位置](../../../manipulation/representation.py#L290)。
+[定义位置](../../../manipulation/representation.py#L268)。
 
 输入签名：
 
@@ -829,7 +734,7 @@ _progress
 
 ## `generate_reference.publish`
 
-[定义位置](../../../manipulation/representation.py#L294)。
+[定义位置](../../../manipulation/representation.py#L272)。
 
 输入签名：
 
@@ -844,6 +749,10 @@ def publish(name, path, current, nominal_goal):
 读取的对象属性：
 
 ```python
+path_times.tolist
+np.asarray(current).copy
+np.asarray
+np.asarray(nominal_goal).copy
 path_times.copy
 path.sample_numpy
 representation.get
@@ -852,6 +761,8 @@ representation.get
 写入目标：
 
 ```python
+source
+result[name + '_boundaries']
 result['boundary_checks'][name]
 result[name + '_path']
 result[name + '_timestamps']
@@ -863,7 +774,11 @@ result['summaries'][name]
 直接调用符号：
 
 ```python
-_boundary_record
+float
+path_times.tolist
+np.asarray(current).copy
+np.asarray
+np.asarray(nominal_goal).copy
 path_times.copy
 path.sample_numpy
 _progress
@@ -873,7 +788,7 @@ _sampled_summary
 
 ## `generate_reference.publish.sample`
 
-[定义位置](../../../manipulation/representation.py#L302)。
+[定义位置](../../../manipulation/representation.py#L289)。
 
 输入签名：
 
@@ -908,7 +823,7 @@ path.sample_numpy
 
 ## `generate_reference.mechanism_path`
 
-[定义位置](../../../manipulation/representation.py#L335)。
+[定义位置](../../../manipulation/representation.py#L321)。
 
 输入签名：
 
@@ -946,7 +861,7 @@ motion_model.poses
 
 ## `generate_reference.material_path`
 
-[定义位置](../../../manipulation/representation.py#L368)。
+[定义位置](../../../manipulation/representation.py#L354)。
 
 输入签名：
 

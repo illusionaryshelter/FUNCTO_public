@@ -198,6 +198,13 @@ class RobotGeometryChecker:
         # This workspace is used only by query(), whose explicit native pairs
         # all require raw evidence regardless of their acceptance policy.
         self._native_distance_batches = None
+        # BEGIN retain one validated request layout for this fixed robot model.
+        # Joint names, requested frames and frozen PairQuery records identify
+        # only read-only model relationships. A changed layout is validated
+        # before replacing this entry. Numerical states, calibration, FK,
+        # distance results and native solver histories remain query-local.
+        self._query_schema = None
+        # END repeated states reuse metadata, never geometric evidence.
         # Reserve before any lazy query allocation. Each unordered native pair
         # can occur once. A block has at most 256 unique geometries; its dense
         # Pinocchio pair map therefore cannot grow quadratically with the full
@@ -258,37 +265,54 @@ class RobotGeometryChecker:
         if check_request is not None:
             check_request()
         names = tuple(joint_names)
-        if (any(not isinstance(name, str) for name in names)
-                or len(names) != len(set(names)) or set(names) != set(self.joint_names)):
-            raise ValueError("joint_names must contain every model joint exactly once")
+        # BEGIN prepare the complete named layout only when its schema changes.
+        schema = self._query_schema
+        same_names = schema is not None and names == schema["joint_names"]
+        if same_names:
+            columns, limits = schema["joint_columns"], schema["joint_limits"]
+        else:
+            if (any(not isinstance(name, str) for name in names)
+                    or len(names) != len(set(names)) or set(names) != set(self.joint_names)):
+                raise ValueError("joint_names must contain every model joint exactly once")
+            columns = tuple(self._q_columns[name] for name in names)
+            limits = tuple(self.joint_limits[name] for name in names)
+        # END each call still validates its actual joint values and calibration.
         values = np.asarray(joint_positions)
         if values.shape != (len(names),) or values.dtype.kind not in "iuf" or not np.isfinite(values).all():
             raise ValueError("joint_positions must be one finite scalar per named joint")
         world_base = _rigid_pose(T_reference_base)
         q = pin.neutral(self.model)
         violations = {}
-        for name, value in zip(names, values):
-            q[self._q_columns[name]] = value
-            lower, upper = self.joint_limits[name]
+        for name, value, column, (lower, upper) in zip(names, values, columns, limits):
+            q[column] = value
             if value < lower or value > upper:
                 violations[name] = {"position": float(value), "lower": lower, "upper": upper}
-        selected_frames = tuple(dict.fromkeys((self.base_frame, *frames,
-                                              *(value[0] for value in self._geometries.values()))))
-        frame_ids = {name: self._frame_id(name) for name in selected_frames}
-        pair_list, identities = [], set()
-        for pair in pairs:
-            if pair.first not in self._geometries or pair.second not in self._geometries or pair.first == pair.second:
-                raise ValueError("Pair endpoints must be two distinct explicit geometry names")
-            identity = frozenset((pair.first, pair.second))
-            if identity in identities:
-                raise ValueError("Duplicate unordered geometry pair")
-            # BEGIN query permitted mechanical contacts without deleting evidence.
-            if pair.policy not in ("required", "excluded", "diagnostic", "mechanical_contact"):
-                raise ValueError("Pair policy must be required, excluded, diagnostic, or mechanical_contact")
-            # END permission affects acceptance, never the underlying distance.
-            _name(pair.source, "pair policy source")
-            identities.add(identity)
-            pair_list.append(pair)
+        # BEGIN the last complete immutable schema owns frame and pair validation.
+        # PairQuery is frozen and its validated fields are strings. Tuple
+        # equality therefore retains endpoint direction, policy and source,
+        # including newly supplied records with the same declared values.
+        requested_frames, pair_list = tuple(frames), tuple(pairs)
+        if (not same_names or requested_frames != schema["frames"]
+                or pair_list != schema["pairs"]):
+            selected_frames = tuple(dict.fromkeys((self.base_frame, *requested_frames,
+                                                  *(value[0] for value in self._geometries.values()))))
+            frame_ids = {name: self._frame_id(name) for name in selected_frames}
+            identities = set()
+            for pair in pair_list:
+                if pair.first not in self._geometries or pair.second not in self._geometries or pair.first == pair.second:
+                    raise ValueError("Pair endpoints must be two distinct explicit geometry names")
+                identity = frozenset((pair.first, pair.second))
+                if identity in identities:
+                    raise ValueError("Duplicate unordered geometry pair")
+                if pair.policy not in ("required", "excluded", "diagnostic", "mechanical_contact"):
+                    raise ValueError("Pair policy must be required, excluded, diagnostic, or mechanical_contact")
+                _name(pair.source, "pair policy source")
+                identities.add(identity)
+            schema = {"joint_names": names, "joint_columns": columns, "joint_limits": limits,
+                      "frames": requested_frames, "frame_ids": frame_ids, "pairs": pair_list}
+            self._query_schema = schema
+        frame_ids = schema["frame_ids"]
+        # END FK, pair order and cold native distance queries keep their original path.
         pin.forwardKinematics(self.model, self._data, q)
         pin.updateFramePlacements(self.model, self._data)
         poses = {name: world_base @ self._data.oMf[index].homogeneous

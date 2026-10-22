@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`c84b34a`（连续初始化 A/B 实际实现提交；本次仅文档更新引用该代码基线，文档提交与实现提交分别记录）。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
@@ -49,11 +49,27 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `generate_reference` 接收以上表示及当前功能坐标 `T_world_function`、当前到示教的物体坐标对应 `J`、声明附着 `A`、当前工具/物体位姿，以及可选机构模型与坐标。该接口以 `body` 命名被操作物体的表示坐标。`A=T_eef_body` 是物体坐标在工具坐标中的位姿，满足 `T_world_body=T_world_eef A`；`J=T_demo_body_current_body` 将当前物体坐标中的点映到示教物体坐标。将该表示绑定到 `program` 接口的同一 `carrier` 坐标后，`A=inv(scene.holding.T_carrier_eef)`。
 
-抓取路径由源抓取关系和当前功能坐标生成，再满足当前工具入口与原交互时刻的名义目标。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数在 `M` 中适配当前入口与交互目标，再右乘 `L_body_material⁻¹` 恢复物体参考。给定声明附着 `A` 后，工具路径由该物体路径右乘 `A⁻¹` 唯一确定，两者共享同一参考计算。
+抓取名义路径由源抓取关系和当前功能坐标组合生成。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数依次组合当前功能路径、`Q(t)`、`Q(t_c)⁻¹` 和 `L_body_material⁻¹`，得到完整名义物体路径。给定声明附着 `A` 后，名义工具路径由该物体路径右乘 `A⁻¹` 唯一确定。父路径与固定右乘在每次求值时组合，旋转引起的 TCP 杆臂运动由同一函数保留。
 
 对于转动或移动机构，输入提供源标量坐标与当前坐标。参考在标量坐标中保留源运动增量与累计转角，再通过当前机构模型的正运动学生成位姿。`contact_motion=True` 与固定附着 `A` 是互斥输入分支，分别对应时变接触关系与刚性附着关系；同时给定时产生 `ValueError`。
 
-输出包括 `object_path/eef_path`、对应时间和位姿数组、`boundary_checks`、`summaries`、`missing` 与 `status`。`object_path/eef_path` 保存后续任务编译使用的参考路径，终点为源释放时间与显式持物终点中的较早者；`bound_*` 保存适配前的诊断路径。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
+输出包括 `object_path/eef_path`、对应时间和名义位姿数组、`object_boundaries/eef_boundaries`、`boundary_checks`、`summaries`、`missing` 与 `status`。受控路径的终点为源释放时间与显式持物终点中的较早者；`bound_*` 另保存原名义绑定诊断。每份边界声明包含 `initial_pose`、带局部进度/位姿/来源的 `goals` 以及声明来源；`boundary_checks` 记录 `declared_for_physical_time_binding`。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
+
+`reference_phase` 复用完整 `eef_path`，将 `eef_boundaries` 复制到 `MotionPhase.metadata["reference_boundaries"]`；源帧、源时间和原事件分别保存。`reference_visualization.write_reference_html` 在真实源/目标图像上叠加原功能区域、采样点和名义路径，直接从该边界声明投影工具入口与每个事件目标。这个页面的时间是源示教时间；物理时间连接在规划器绑定后产生。
+
+## 2.1 实际物理时钟上的工具参考
+
+`timed_reference.BoundToolReference` 的输入为名义阶段、归一化物理时间到技能进度的 `progress_u/progress_s`、实际时长 `duration`，以及当前机器人 TCP 位姿和世界速度。`planning._reference_entrance` 使用同一官方机器人模型和具名关节 `q/dq` 运行 Pinocchio FK，读取工具连杆原点的 `LOCAL_WORLD_ALIGNED` 速度，经基座标定旋转到 W，并将 `ω_W × r_W` 加到线速度；`r_W` 为连杆原点到标定 TCP 的世界杆臂。输出 `initial_twist=[v_W,ω_W]` 的单位分别为 m/s 与 rad/s。
+
+设名义 TCP 位姿为 `(p_n(t),R_n(t))`，其中 `p_n` 是 E 原点在 W 中的位置，`R_n` 将 E 坐标映到 W。接口使用世界加性平移 `b(t)` 与左旋转 `E(t)=Exp([φ(t)]×)`，计算 `p=p_n+b`、`R=E R_n`。名义物体、机构坐标及父路径组合在实际 `s(t)` 上直接求值。名义线速度和世界角速度由 Torch 对完整组合函数的单侧时间导数获得，保留进度停留段、斜率变化和旋转杆臂。
+
+入口的目标速度是测得机器人速度；每个声明事件选择右侧名义物理速度作为左右输出的共同速度。对每个边界，修正位置为目标位置减名义位置，修正旋转为 `R_target R_nᵀ`；其导数满足 `ḃ=v_target−v_n`、`φ̇=J_l(φ)⁻¹(ω_target−Eω_n)`。这里 `J_l` 是 SO(3) 指数映射的左雅可比，代码以 `pin.Jexp3(-φ)` 求值。各相邻边界之间使用 SciPy `CubicHermiteSpline` 构造修正的三次多项式，Torch 负责按物理秒求值。
+
+事件时间取其声明进度的首次到达时刻。恢复名义后缀的拼接以右侧名义速度为共同边界，左段修正补偿原名义左右导数差；拼接处及其后直接返回原名义函数。位于整个请求终点的声明目标可以采用不同于名义终点的位姿，此时修正函数在终点仍生效；位于请求内部的最后一个拼接则须恢复名义位姿，以连接其后的名义路径。多个边界使用同一规则，修正旋转坐标在相邻边界间选择连续分支；原机构累计转角保留在名义坐标中。当前边界阶次为一阶，连续性结论覆盖实际声明的拼接处，其他源内部断点保留其原导数。`source_boundaries` 保留原完整声明，`boundaries/diagnostics` 保存实际使用的物理边界、左右速度和来源。
+
+`sample(times_s)` 返回 W 中的位置 `[...,3]` 与单位 wxyz 四元数 `[...,4]`；`sample_numpy` 返回同一函数的 `[...,4,4]` 齐次变换。`_CuroboPlanner._goal`、`NativeReferenceCost.bind` 和规划结果记录均消费该物理时间接口。保存候选使用自身的时长和进度映射构造同规则参考；没有显式边界声明的普通阶段继续提供其名义值。
+
+续接区间位于最后一个声明拼接之后，或本区间唯一拼接位于零时刻时，返回原名义后缀，并以 `entrance_twist_bound=false` 记录当前区间的入口连接范围。存在未来声明拼接时，实际机器人入口连接到该拼接，并在已声明边界提供一阶连续性。原零时刻事件继续保留其技能表示和任务接口职责；参考对象只承担软跟踪目标的构造，当前 FK 与名义目标之差用于事后解释。
 
 ## 3. 当前 program 的几何绑定
 
@@ -102,7 +118,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 ## 5. PlanningProblem 的运行接口
 
-`sample_reference(s)` 返回当前进度的名义工具参考；参考 IK、`NativeReferenceCost.bind` 和最终固定评分均读取这一连续路径。`NativeReferenceCost` 同时供工具曲线初始化与完整主优化使用，按各候选的物理时刻、时长和进度映射取得 `s`，保留组合路径与机构坐标插值的原计算。`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
+`sample_reference(s)` 返回当前进度的完整名义工具路径；物理时间适配由第 2.1 节的 `BoundToolReference` 读取同一阶段及显式边界后完成。`NativeReferenceCost` 同时供工具曲线初始化与完整主优化使用，预采样各候选实际物理时钟对应的绑定参考。`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
 
 `residuals(position, quaternion, progress, ...)` 接收相互对齐的批量候选状态，返回名字到非负硬残差张量的字典。姿态数组分别为 `[...,3]` 和 `[...,4]`；进度数组是相同的批量/时间维度。具名关节、速度、物理时间和工具速度在对应要求需要时使用。事件约束在其精确进度的首次物理到达样本上计算，`point_goal_ids` 将当前查询样本绑定到相应原目标身份。`direction_mode="point"` 用于独立候选状态，`"trajectory"` 用于具有物理顺序的完整路径；依赖路径历史的方向要求由后者评价。所有调用读取同一 `hard_components` 和同一任务容差。
 

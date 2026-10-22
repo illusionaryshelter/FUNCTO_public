@@ -280,6 +280,9 @@ def test_native_metric_failure_clears_explicit_candidate_context():
             goal_js=kwargs["goal_state"], use_implicit_goal=kwargs["use_implicit_goal"])
     # END only geometry execution below is replaced by the failing test sentry.
     manager = SimpleNamespace(_process_mode="trajectory_metrics", _candidate_query=None)
+    # BEGIN this fixture stops at native metrics, before reference-cost use.
+    native._reference_for_candidate = Mock(return_value=object())
+    # END physical reference sampling is covered by the timed-reference tests.
     # BEGIN the real augmented-state adapter verifies native scalar/state layouts.
     transition = RobotStateTransition.__new__(RobotStateTransition)
     transition.robot_dynamics = None

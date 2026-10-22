@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`c84b34a`（连续初始化 A/B 实际实现提交；本次仅文档更新引用该代码基线，文档提交与实现提交分别记录）。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -14,16 +14,18 @@
 |---|---|---|
 | `representation.build_representation` | 建立源示教的相对功能运动；各位姿须共用源世界坐标 | 帧/时间、源物体/工具位姿、功能局部变换、事件 → 相对关系与来源记录；`generate_reference` |
 | `sample_poses` | 在源时间轴上插值位姿 | 有序时刻及位姿、查询时刻 → 刚体变换序列；参考适配 |
-| `generate_reference` | 将源功能运动绑定到当前功能坐标与入口 | 表示、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 物体/工具连续路径、数组、边界检查与缺失状态；任务适配器 |
-| `program.ground_program` | 按技能种类绑定当前几何；持物声明与入口须代数一致 | `program,scene` → 工具参考、事件及几何诊断；`build_planning_problem` |
+| `generate_reference` | 将源功能运动组合到当前功能坐标，并声明工具/物体入口和名义事件 | 表示、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 完整名义组合路径、采样数组、显式 `*_boundaries` 及缺失状态；任务适配器与 reference_phase |
+| `program.ground_program` | 按程序声明绑定当前几何；持物声明与入口须代数一致 | `program,scene` → 工具参考、事件及几何诊断；`build_planning_problem` |
 | `ground_object_program` | 生成当前物体参考 | 物体程序、当前关系与功能绑定 → 物体路径；持物参考调用者 |
 | `function_motion.optimize_trajectory/transfer_function_motion` | 对已有参考施加明确的入口和功能关键帧 | 位姿序列、静态/当前入口、功能目标 → 适配位姿；`program` |
 | `motion.MotionModel.poses` | 计算给定机构坐标对应的刚体位姿 | 已绑定轴/原点/类型、标量或向量坐标 → 位姿；机构参考与要求 |
 | `MotionModel.coordinates_of` | 计算位姿对应坐标及模型相容性 | 机构模型、位姿 → 机构坐标；参考与机构诊断 |
 | `build_planning_problem` | 编译一个技能、原事件、目标与过程要求 | `skills`、具名 `start_q/start_dq`、工具/基座标定、数值容差 → `PlanningProblem`；`plan_trajectory` |
-| `PosePath.sample/sample_numpy` | 在给定进度读取已绑定路径 | 进度 → 位置与四元数；任务、物体运动 |
-| `TransferredPosePath.sample` | 对参考施加固定入口与目标适配 | 已绑定适配数据、进度 → 位置与四元数；任务参考 |
-| `reference_phase` | 将具名参考组织为阶段 | 参考、技能身份、来源 → `MotionPhase`；问题构造 |
+| `PosePath.sample/sample_numpy` | 在给定进度读取完整组合路径及指定单侧导数 | 进度与 `side=left/right` → 位置/四元数或齐次变换；任务、物体运动与名义边界求导 |
+| `reference_phase` | 将具名名义参考及其显式边界组织为阶段 | generate_reference 的 eef_path/eef_boundaries、技能身份、来源 → 保留组合路径与 reference_boundaries 元数据的 MotionPhase；问题构造 |
+| `BoundToolReference.__init__` | 把实际物理时钟及机器人入口连接到已声明参考边界 | PlanningProblem、progress_u/s、duration、入口 T_W_E 与 `[v_W,omega_W]` → 名义阶段、物理边界、一阶修正多项式及诊断；规划器绑定、重绑与候选自身时钟 |
+| `BoundToolReference.sample/sample_numpy` | 在物理秒上求同一完整工具参考 | 任意形状时刻 Tensor/NumPy → 同形状前缀的 W 系位置和 wxyz 四元数，或 4×4 齐次变换；参考 IK、NativeReferenceCost、保存与网页 |
+| `write_reference_html` | 在真实源/目标图像中展示 grounding 几何输出 | 技能、RGB 视图、区域记录、名义路径及 eef_boundaries → 可缩放本地 HTML 与区域图，标记声明入口、名义首点与全部事件目标；config.ground_skill |
 | `event_occurrence_key` | 获取一次命令/事件的完整身份 | 事件记录 → `(skill_id,event_id,occurrence)`；规划、手指与执行 |
 | `resolve_event_window` | 解析绝对或相对物理时间窗 | `EventTimeConstraint`、实际历史、可用预测原点 → 上下时间界；时钟绑定与执行 |
 | `PoseProcessRequirement.error` | 计算过程关系偏差 | 候选位置/姿态/进度 → 指定过程残差；问题残差 |
@@ -39,7 +41,7 @@
 | `MechanismRequirement.project_residual/history_complete` | 提供过程投影及转角历史完整性 | 位姿/进度 → 投影残差或历史完整状态；OMPL、任务验证 |
 | `MechanismRequirement.coordinate_rates/direction_residuals` | 计算坐标变化率及方向要求 | 姿态、工具线/角速度、时间、原坐标起点 → 坐标速率/方向残差；优化与验收 |
 | `CoordinateEventRequirement.absolute_target/error/evaluate` | 解析绝对/增量机构目标并检查候选 | 机构、入口坐标、目标与候选 → 绝对目标、误差或超容差量；事件验收 |
-| `PlanningProblem.sample_reference/terminal_pose_target` | 提供进度参考或终端目标 | 已编译阶段、进度 → 工具参考或目标记录；IK 种子 |
+| `PlanningProblem.sample_reference/terminal_pose_target` | 提供完整名义进度路径或终端目标 | 已编译阶段、进度 → 名义工具参考或目标记录；任务表示与边界数据消费者，物理参考由 BoundToolReference 单独绑定 |
 | `source_time_map/source_time_to_progress/progress_to_source_time` | 在源时间和技能进度之间换算 | 阶段时间、查询值 → 映射数组或转换值；时钟与报告 |
 | `transform_tool_pose/reference_to_link_pose` | 连接原生 FK 连杆与任务工具坐标 | 固定基座/工具标定、位姿 → 对应坐标中的位姿；FK 与 IK |
 | `transform_tool_velocity` | 转换工具速度 | 线/角速度及连杆姿态 → 任务坐标中的工具速度；方向要求 |
@@ -82,7 +84,8 @@
 | `native_pair_lower_bound` | 两个官方机器人原实体、当前变换及候选分离轴 | 完整实体支持投影的分离下界；区间几何证据，原生容差不作为误差界 |
 | `RobotGeometryChecker.model_record` | 已消费的原模型 | URDF和原顶点/解析尺寸/局部变换的独立副本；输入绑定 |
 | `DifferentiableRobotKinematics.poses` | 纯运动学配置和完整具名关节 | 可微世界连杆位姿；场景再合成原实体局部变换 |
-| `RobotGeometryChecker.query` | 具名关节、基座标定、成对策略和所需帧 | 限位、独立FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` |
+| `RobotGeometryChecker.query` | 完整具名关节值、基座标定、冻结 PairQuery 和所需帧；同一模型中复用最近一次已验证的关节列、官方限位、frame IDs 与完整配对规则 | 每次状态的限位、独立 FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` 与场景共享机器人检查 |
+| `RobotGeometryChecker._native_pair_distances` | 原有序配对与当前各实体刚体位姿；最近一组配对按每块最多 128 对保存原生模型及工作数据 | 每次先恢复原始求解器、写入当前变换并调用 pin.computeDistances，按原顺序返回全部距离结果；query 构造逐对证据 |
 | `OnlinePlanningScene.bind_online_robot` | 同一原生检查器、纯运动学配置、验证器、请求检查 | 完整FK和对策略绑定；后端初始化 |
 | `OnlinePlanningScene._robot_self_components` | 已准备的完整具名关节、可微机器人位姿及同值矩阵、手部状态、原 required_pairs | 官方机器人自身穿透与数值边界硬分项、原见证导数及查询报告；robot/full 两种 components 范围共用 |
 | `OnlinePlanningScene.components/evaluate` | 同时刻关节、工具位姿、进度、时间、query_role 与 geometry_scope；full optimization 另需 local_models | robot 范围计算共享机器人自身与手部，full 范围继续计算任务场；components 返回硬分项并另输出连续目标，evaluate 按角色汇总，原证据独立保留 |
@@ -138,7 +141,7 @@
 | `ProcessCostManager.compute_costs` | 按配置分别计算普通参考成本或当前范围的任务/场景约束 | reference_objective 返回同一时间权重下的关节项与 continuous_reference；trajectory_optimizer 消费有序有效样本/确切锚点并按 scope 计算场景，trajectory_metrics 始终计算完整原硬证据 |
 | `ProcessCostManager.optimizer_evidence` | 核对同次 AL/几何张量并合并原 cspace 及其他硬约束 | trajectories → `(feasible,signed,fixed_objective)`；几何证据采用本次 robot/full 范围，固定目标仅汇总普通成本；候选槽与初始化快照 |
 | `physical_time_mean_weights` | 实际物理时间 [A,H] 与各行有效前缀长度 [A] | 归一化梯形积分权重，padding 为零；参考与原生普通成本共用 |
-| `NativeReferenceCost.bind/row_indices/time_weights/forward` | 完整问题、原配置位姿权重、候选时长/进度映射、普通网格与已有原生工具 FK | 预采样目标、显式行映射、积分权重及 [B,H] 连续参考成本；普通优化与固定候选评分 |
+| `NativeReferenceCost.bind/row_indices/time_weights/forward` | 完整问题、原配置位姿权重、普通物理网格/有效数、该候选的 BoundToolReference 与已有原生工具 FK | 预采样 TCP 目标、显式行映射、积分权重及 [B,H] 连续参考成本；普通优化与固定候选评分 |
 | `NativeRigidToolTransform.apply` | 原生连杆位姿与固定 TCP 平移/旋转标定 | TCP 位姿及符合原生 FK 反向协议的导数；NativeReferenceCost |
 | `freeze_cspace_time_weights` | 原普通 STATE 成本配置的副本、本请求 native_dt | 一次固化时间系数并启用外部梯度权重的配置；请求绑定时构造关节成本 |
 | `FixedTimeStateCSpaceCost.setup_batch_tensors/forward` | 上述配置、固定系数时间尺度与真实物理关节状态 | 原生 STATE 成本；仅成本用固定 dt 视图，轨迹与积分时钟保持各自物理含义 |
@@ -151,6 +154,8 @@
 | `select_ik_tracking_candidate` | 为下一参考查询选择至多一个数值跟踪状态 | 候选、合法索引、位姿能量、前态和必填同次 reports → 原索引或 None；共享前缀后成功状态距离优先、失败状态原能量优先，原生 SeedManager 补足剩余槽位 |
 | `select_ik_chains` | 按完整图选择固定数量的粗参考链 | 原池/报告/能量、入口、物理时刻及原位置/速度界 → 逐项累计共同资格前缀，再比较失败能量、速度能量和成功能量；保留原索引、三种查询身份、SOLVED observation_mask 及 selection_cost |
 | `_CuroboPlanner._solve_ik` | 将原生 IK 提交计入当前请求共享账本 | 原生目标、[batch,supplied_seed,joint] 种子与 optional 标志 → 原生结果；提交前按 batch×ik_seeds 计量，额度不足时可选查询返回 None，必需查询产生原累计工作耗尽状态 |
+| `_reference_entrance` | 从同一官方机器人与具名反馈建立物理参考入口 | problem.start_q/start_dq、名义手部入口、原验证器标定 → W 系 TCP 位姿与 `[v_W,omega_W]`；Pinocchio LWA 连杆速度经基座旋转并加入 TCP 杆臂项 |
+| `_CuroboPlanner._reference_for_candidate` | 为保存曲线自身时钟构造相同边界规则的参考 | 原问题、原测得 TCP 入口及曲线 duration/progress_u/progress_s → BoundToolReference；候选普通评分与完整指标上下文 |
 | `_CuroboPlanner.reference_seeds` | 构造并细化同一完整工具参考的固定基初值 | 原参考或可选关节曲线、测得入口、已绑定模型/时钟和请求预算 → `[B,K,M,D]` 实际返回系数与原查询成功数；普通参考路径先使用成功观测拟合和有限补查询，再进行一次完整曲线细化 |
 | `_CuroboPlanner._reference_ik_query` | 执行一个带明确物理时刻与热启动来源的参考查询 | u、[1,1,D] 前态、warm_start_source、kind、optional → 原候选/报告/能量/跟踪状态；追加实际执行顺序的查询记录，原生调用通过共享 _solve_ik 记账 |
 | `_CuroboPlanner._select_reference_chains` | 从按时间组织的原候选池构造完整粗链 | 归一化物理时间到候选层的映射 → 原选择器的链、query_parameters 和生产者 query/candidate 索引；首次拟合与补查询重拟合 |

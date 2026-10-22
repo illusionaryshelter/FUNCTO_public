@@ -7,8 +7,9 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from manipulation.planning_problem import PosePath, TransferredPosePath
+from manipulation.planning_problem import MotionPhase, PosePath
 from manipulation.planning_scene import CollisionOwner
+from manipulation.timed_reference import BoundToolReference
 
 
 def pose(position, rotation):
@@ -29,22 +30,25 @@ def test_transferred_path_cannot_lose_its_continuous_rule_in_owner_serialization
         pose([s, .1*s, .2], [.4*s, -.7*s, 1.4*s]) for s in keys]),
         source="nonuniform measured material motion",
         attachment=pose([.31, -.17, .08], [.4, -.2, .7]))
-    path = TransferredPosePath(source, pose([-.4, .2, .6], [.3, -.5, .1]), [
-        {"progress": .29, "pose": pose([.4, -.3, .1], [.8, .2, -1.])},
-        {"progress": .73, "pose": pose([-.2, .7, .4], [-.4, 1.1, .9])},
-    ], source="independent entry and functional events")
+    initial = pose([-.4, .2, .6], [.3, -.5, .1])
+    phase = MotionPhase("declared interval", source, {"reference_boundaries": {
+        "initial_pose": initial, "goals": [
+            {"progress": .29, "pose": pose([.4, -.3, .1], [.8, .2, -1.]), "source": "declared event"},
+            {"progress": .73, "pose": source.sample_numpy(.73), "source": "nominal return"}],
+        "source": "independent entry and functional events"}})
+    path = BoundToolReference(SimpleNamespace(phases=(phase,)), [0., 1.], [0., 1.], 1., initial,
+                              [.1, -.2, .1, .2, -.1, .3])
 
     # These are precisely the path fields the collision-owner snapshot saves.
     # A round trip through that representation changes the physical curve,
     # even though every saved knot still matches and there is no parent path.
-    restored = PosePath(path.progress, path.poses, source=path.source,
-                        attachment=path.attachment)
+    restored = PosePath(source.progress, path.sample_numpy(source.progress), source="sampled reference output")
     query = np.array([.04, .24, .51, .9])
     discrepancy = np.linalg.norm(path.sample_numpy(query)[:, :3, 3]
                                  - restored.sample_numpy(query)[:, :3, 3], axis=1)
     assert discrepancy.max() > .02
-    assert path.parent is None
-    with pytest.raises(ValueError, match="native PosePath serialization"):
+    assert not isinstance(path, PosePath)
+    with pytest.raises(ValueError, match="serializable world-frame PosePath"):
         owner(path)
 
 

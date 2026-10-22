@@ -1,11 +1,11 @@
 # `manipulation/reference_tracking.py` 实现契约
 
-代码基线：`c84b34a`。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `physical_time_mean_weights`
 
-[定义位置](../../../manipulation/reference_tracking.py#L27)。
+[定义位置](../../../manipulation/reference_tracking.py#L26)。
 
 输入签名：
 
@@ -74,7 +74,7 @@ weight.sum
 
 ## `freeze_cspace_time_weights`
 
-[定义位置](../../../manipulation/reference_tracking.py#L52)。
+[定义位置](../../../manipulation/reference_tracking.py#L51)。
 
 输入签名：
 
@@ -140,7 +140,7 @@ values.new_tensor
 
 ## `FixedTimeStateCSpaceCost`
 
-[定义位置](../../../manipulation/reference_tracking.py#L85)。
+[定义位置](../../../manipulation/reference_tracking.py#L84)。
 
 ```python
 class FixedTimeStateCSpaceCost(StateCSpaceCost):
@@ -163,7 +163,7 @@ class FixedTimeStateCSpaceCost(StateCSpaceCost):
 
 ## `FixedTimeStateCSpaceCost.__init__`
 
-[定义位置](../../../manipulation/reference_tracking.py#L96)。
+[定义位置](../../../manipulation/reference_tracking.py#L95)。
 
 输入签名：
 
@@ -196,7 +196,7 @@ super
 
 ## `FixedTimeStateCSpaceCost.setup_batch_tensors`
 
-[定义位置](../../../manipulation/reference_tracking.py#L100)。
+[定义位置](../../../manipulation/reference_tracking.py#L99)。
 
 输入签名：
 
@@ -236,7 +236,7 @@ super
 
 ## `FixedTimeStateCSpaceCost.forward`
 
-[定义位置](../../../manipulation/reference_tracking.py#L106)。
+[定义位置](../../../manipulation/reference_tracking.py#L105)。
 
 输入签名：
 
@@ -271,7 +271,7 @@ replace
 
 ## `NativeRigidToolTransform`
 
-[定义位置](../../../manipulation/reference_tracking.py#L110)。
+[定义位置](../../../manipulation/reference_tracking.py#L109)。
 
 ```python
 class NativeRigidToolTransform(torch.autograd.Function):
@@ -300,7 +300,7 @@ class NativeRigidToolTransform(torch.autograd.Function):
 
 ## `NativeRigidToolTransform.forward`
 
-[定义位置](../../../manipulation/reference_tracking.py#L128)。
+[定义位置](../../../manipulation/reference_tracking.py#L127)。
 
 输入签名：
 
@@ -337,7 +337,7 @@ ctx.save_for_backward
 
 ## `NativeRigidToolTransform.backward`
 
-[定义位置](../../../manipulation/reference_tracking.py#L136)。
+[定义位置](../../../manipulation/reference_tracking.py#L135)。
 
 输入签名：
 
@@ -394,7 +394,7 @@ native_quaternion_gradient.contiguous
 
 ## `NativeReferenceCost`
 
-[定义位置](../../../manipulation/reference_tracking.py#L147)。
+[定义位置](../../../manipulation/reference_tracking.py#L146)。
 
 ```python
 class NativeReferenceCost():
@@ -423,7 +423,7 @@ class NativeReferenceCost():
 
 ## `NativeReferenceCost.__init__`
 
-[定义位置](../../../manipulation/reference_tracking.py#L164)。
+[定义位置](../../../manipulation/reference_tracking.py#L163)。
 
 输入签名：
 
@@ -479,19 +479,17 @@ ToolPoseCost
 输入签名：
 
 ```python
-def bind(self, sample_times, valid_count, progress_map, duration):
+def bind(self, sample_times, valid_count, bound_reference):
 ```
 
 实现说明：
 
 > Sample the supplied skill reference at this grid's physical times.
 >
-> Seconds are relative to the bound trajectory start. The reference
-> coordinate is progress_map(sample_times/duration), including holds
-> and a continuation request's cropped progress interval. Sampling
-> uses PlanningProblem.sample_reference, preserving composed PosePath
-> and mechanism-coordinate behavior. No joint-reference time map is
-> applied to this already bound pose-reference clock.
+> Seconds are relative to this reference's trajectory start. Its
+> nominal composition, actual progress map and physical boundary
+> correction are already bound. Candidate curves with another clock
+> explicitly supply a reference constructed on that candidate clock.
 >
 > Call again when the request, mapping, duration or ordinary grid
 > changes. The resulting device goals and quadrature weights are
@@ -515,10 +513,7 @@ times.device
 torch.long
 times.shape
 torch.no_grad
-progress_map.u
-progress_map.s
-self.problem.sample_reference
-self.problem
+bound_reference.sample
 self._base_translation
 self._base_rotation
 self.tool_frames
@@ -539,7 +534,6 @@ counts
 self.weights
 self.reference_rows
 self.horizon
-progress
 position
 quaternion
 self.goal
@@ -555,8 +549,7 @@ self.device_cfg.as_torch_dict
 torch.as_tensor(valid_count, device=times.device, dtype=torch.long).reshape
 physical_time_mean_weights
 torch.no_grad
-_interpolate
-self.problem.sample_reference
+bound_reference.sample
 quaternion_rotate
 quaternion_multiply
 GoalToolPose
@@ -569,7 +562,7 @@ torch.arange
 
 ## `NativeReferenceCost.row_indices`
 
-[定义位置](../../../manipulation/reference_tracking.py#L223)。
+[定义位置](../../../manipulation/reference_tracking.py#L221)。
 
 输入签名：
 
@@ -615,7 +608,7 @@ reference_rows.reshape
 
 ## `NativeReferenceCost.time_weights`
 
-[定义位置](../../../manipulation/reference_tracking.py#L231)。
+[定义位置](../../../manipulation/reference_tracking.py#L229)。
 
 输入签名：
 
@@ -658,7 +651,7 @@ rows.long
 
 ## `NativeReferenceCost.forward`
 
-[定义位置](../../../manipulation/reference_tracking.py#L236)。
+[定义位置](../../../manipulation/reference_tracking.py#L234)。
 
 输入签名：
 

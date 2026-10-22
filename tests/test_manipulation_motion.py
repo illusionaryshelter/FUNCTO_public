@@ -13,7 +13,8 @@ from scipy.spatial.transform import Rotation
 
 # BEGIN non-constraining motion analysis and shared boundary regressions.
 from manipulation.motion import analyze_motion, fit_motion, transfer_motion
-from manipulation.planning_problem import PosePath, TransferredPosePath, quaternion_rotate, _slerp
+from manipulation.planning_problem import MotionPhase, PosePath, quaternion_rotate, _slerp
+from manipulation.timed_reference import BoundToolReference
 # END motion analysis and continuous boundary imports.
 
 
@@ -310,25 +311,31 @@ class MotionTransferTest(unittest.TestCase):
 
 # BEGIN independent continuous-boundary, event-suffix and phase-density checks.
 class ContinuousMotionTransferTest(unittest.TestCase):
+    def bound(self, source, initial, goals, twist=(.1, -.05, .02, .02, .03, -.04)):
+        from types import SimpleNamespace
+        phase = MotionPhase("declared motion", source, {"reference_boundaries": {
+            "initial_pose": initial, "goals": [{"progress": s, "pose": goal, "source": "explicit test boundary"}
+                for s, goal in goals], "source": "explicit physical boundary inputs"}})
+        return BoundToolReference(SimpleNamespace(phases=(phase,)), [0., 1.], [0., 1.], 4., initial, twist)
+
     def source(self):
         keys = np.array([0., .18, .63, 1.])
         rotations = Rotation.from_euler("z", [.1, .35, .9, 1.2]).as_matrix()
         poses = np.stack([transform(r, [s, .2*s*s, .1]) for s, r in zip(keys, rotations)])
         return PosePath(keys, poses, source="explicit nonuniform source times")
 
-    def test_array_and_continuous_share_boundaries_under_nonuniform_sampling(self):
+    def test_physical_correction_keeps_boundaries_under_nonuniform_nominal_sampling(self):
         source = self.source()
         initial = transform(Rotation.from_euler("xyz", [.2, -.3, .1]).as_matrix(), [.4, -.2, .5])
         goal = transform(Rotation.from_euler("xyz", [-.3, .1, 1.7]).as_matrix(), [1.1, .4, .2])
-        path = TransferredPosePath(source, initial, [{"progress": 1., "pose": goal}], "two observed boundaries")
+        path = self.bound(source, initial, [(1., goal)])
         query = np.unique(np.r_[source.progress, .07, .29, .81])
-        dense = transfer_motion(source.sample_numpy(query), initial, goal_pose=goal, progress=query)
-        sparse = transfer_motion(source.poses, initial, goal_pose=goal, progress=source.progress)
-        np.testing.assert_allclose(path.sample_numpy(query), dense["poses"], atol=2e-12)
-        np.testing.assert_allclose(path.sample_numpy(source.progress), sparse["poses"], atol=2e-12)
+        dense_source = PosePath(query, source.sample_numpy(query), "same nominal with redundant samples")
+        dense = self.bound(dense_source, initial, [(1., goal)])
+        np.testing.assert_allclose(path.sample_numpy(4*query), dense.sample_numpy(4*query), atol=2e-12)
         np.testing.assert_allclose(path.sample_numpy(0.), initial, atol=2e-12)
-        np.testing.assert_allclose(path.sample_numpy(1.), goal, atol=2e-12)
-        self.assertGreater(np.linalg.norm(path.sample_numpy(.29)-source.sample_numpy(.29)), .1)
+        np.testing.assert_allclose(path.sample_numpy(4.), goal, atol=2e-12)
+        self.assertGreater(np.linalg.norm(path.sample_numpy(4*.29)-source.sample_numpy(.29)), .1)
 
     def test_event_rebind_preserves_suffix_and_continuous_attachment(self):
         raw = self.source()
@@ -337,27 +344,21 @@ class ContinuousMotionTransferTest(unittest.TestCase):
         event = .41
         goal = raw.sample_numpy(event)
         initial = transform(Rotation.from_euler("y", .5).as_matrix(), [-.3, .2, .4])
-        path = TransferredPosePath(raw, initial, [{"progress": event, "pose": goal}], "internal functional event")
-        self.assertIn(event, path.progress)
-        np.testing.assert_allclose(path.sample_numpy(event), goal, atol=2e-12)
-        np.testing.assert_allclose(path.sample_numpy([.57, .83, 1.]), raw.sample_numpy([.57, .83, 1.]), atol=2e-12)
-        A = transform(Rotation.from_euler("x", .3).as_matrix(), [.13, -.07, .12])
-        eef = PosePath(path.progress, np.repeat(np.eye(4)[None], len(path.progress), axis=0),
-                       source="same fixed attachment for all progress", parent=path, attachment=np.linalg.inv(A))
-        query = np.array([.11, .29, .48, .91])
-        np.testing.assert_allclose(eef.sample_numpy(query) @ A, path.sample_numpy(query), atol=2e-12)
-        # A source ending at a functional event cannot acquire a constant
-        # post-event correction from the earlier displaced entrance.
-        np.testing.assert_allclose(eef.sample_numpy(.83) @ A, raw.sample_numpy(.83), atol=2e-12)
+        path = self.bound(raw, initial, [(event, goal)])
+        self.assertEqual(path.boundaries[-1]["progress"], event)
+        np.testing.assert_allclose(path.sample_numpy(4*event), goal, atol=2e-12)
+        np.testing.assert_array_equal(path.sample_numpy(4*np.array([.57, .83, 1.])), raw.sample_numpy([.57, .83, 1.]))
+        self.assertIs(path.nominal_phases[0], raw)
+        np.testing.assert_array_equal(path.nominal_phases[0].attachment, raw.attachment)
 
     def test_continuous_derivatives_match_pose_finite_differences(self):
         import torch
 
         raw = self.source()
         goal = transform(Rotation.from_euler("xyz", [.2, .4, -.2]).as_matrix(), [.2, -.3, .6])
-        path = TransferredPosePath(raw, transform(translation=[-.2, .1, .3]),
-                                   [{"progress": .76, "pose": goal}], "gradient regression")
-        query = torch.tensor([.12, .42, .87], dtype=torch.float64, requires_grad=True)
+        path = self.bound(raw, transform(translation=[-.2, .1, .3]),
+                          [(.76, goal), (1., raw.sample_numpy(1.))])
+        query = torch.tensor([.48, 1.68, 3.48], dtype=torch.float64, requires_grad=True)
         position, quaternion = path.sample(query)
         axis = torch.tensor([1., 0., 0.], dtype=torch.float64).expand(3, 3)
         value = (position+quaternion_rotate(quaternion, axis)).sum()
@@ -395,11 +396,11 @@ class ContinuousMotionTransferTest(unittest.TestCase):
                 # Exercise the same small-angle correction inside the actual
                 # transferred path, not only its unadapted input interpolator.
                 goal = transform(Rotation.from_euler("z", angle+.02).as_matrix())
-                adapted = [TransferredPosePath(candidate, np.eye(4),
-                    [{"progress": 1., "pose": goal}], "explicit small-angle target") for candidate in paths]
-                exact = Rotation.from_euler("z", (angle+.02)*query).as_matrix()
+                adapted = [self.bound(candidate, np.eye(4), [(1., goal)],
+                    twist=(0., 0., 0., 0., 0., angle/4)) for candidate in paths]
+                exact = Rotation.from_euler("z", angle*query+.02*(3*query**2-2*query**3)).as_matrix()
                 for candidate in adapted:
-                    np.testing.assert_allclose(candidate.sample_numpy(query)[:, :3, :3], exact, atol=2e-14, rtol=0)
+                    np.testing.assert_allclose(candidate.sample_numpy(4*query)[:, :3, :3], exact, atol=2e-14, rtol=0)
 
     def test_identity_slerp_has_finite_input_and_progress_gradients(self):
         import torch
@@ -418,17 +419,17 @@ class ContinuousMotionTransferTest(unittest.TestCase):
     def test_missing_conflicting_and_invalid_boundaries_do_not_complete_transfer(self):
         raw = self.source()
         initial = raw.sample_numpy(0.)
-        with self.assertRaisesRegex(ValueError, "explicit event goals"):
-            TransferredPosePath(raw, initial, [], "missing terminal")
-        with self.assertRaisesRegex(ValueError, "conflicts"):
-            TransferredPosePath(raw, initial, [{"progress": 0., "pose": transform(translation=[1., 0., 0.])}], "conflict")
+        for goals in ([], [(0., transform(translation=[1., 0., 0.]))]):
+            unchanged = self.bound(raw, initial, goals)
+            np.testing.assert_array_equal(unchanged.sample_numpy([0., 2., 4.]), raw.sample_numpy([0., .5, 1.]))
+            self.assertFalse(unchanged.diagnostics["entrance_twist_bound"])
         # An explicitly satisfied entrance event is evidence, so preserving
         # its remaining suffix must not require inventing another endpoint.
-        entered = TransferredPosePath(raw, initial, [{"progress": 0., "pose": initial}], "event at actual entrance")
-        np.testing.assert_allclose(entered.sample_numpy([0., .31, .79, 1.]), raw.sample_numpy([0., .31, .79, 1.]), atol=2e-12)
-        with self.assertRaisesRegex(ValueError, "conflicts"):
-            TransferredPosePath(raw, initial, [{"progress": 0., "pose": initial},
-                {"progress": 0., "pose": transform(translation=[1., 0., 0.])}], "conflicting duplicate entrance")
+        linear = (raw.poses[1, :3, 3]-raw.poses[0, :3, 3])/(4*.18)
+        entered = self.bound(raw, initial, [(0., initial)], twist=np.r_[linear, 0., 0., .25/(4*.18)])
+        np.testing.assert_allclose(entered.sample_numpy(4*np.array([0., .31, .79, 1.])), raw.sample_numpy([0., .31, .79, 1.]), atol=2e-12)
+        entered = self.bound(raw, initial, [(0., initial), (0., transform(translation=[1., 0., 0.]))])
+        self.assertEqual(len(entered.source_boundaries[0]["declaration"]["goals"]), 2)
         for phase in ([0., .2, .2, 1.], [0., .2, .8, .9], [0., .3, np.nan, 1.], [0., 1.]):
             with self.subTest(phase=phase), self.assertRaisesRegex(ValueError, "progress"):
                 transfer_motion(raw.poses, initial, progress=phase)

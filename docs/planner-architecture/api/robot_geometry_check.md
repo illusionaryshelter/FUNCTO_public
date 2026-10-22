@@ -1,6 +1,6 @@
 # `manipulation/robot_geometry_check.py` 实现契约
 
-代码基线：`c84b34a`。
+代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_name`
@@ -363,6 +363,7 @@ self._request
 self._request.enable_signed_distance
 self.numerics
 self._native_distance_batches
+self._query_schema
 pair_count
 block_geometries
 name_bytes
@@ -420,7 +421,7 @@ name.encode
 
 ## `RobotGeometryChecker._frame_id`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L215)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L222)。
 
 输入签名：
 
@@ -459,7 +460,7 @@ ValueError
 
 ## `RobotGeometryChecker.geometry_names`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L223)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L230)。
 
 输入签名：
 
@@ -495,7 +496,7 @@ tuple
 
 ## `RobotGeometryChecker.geometry_sources`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L228)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L235)。
 
 输入签名：
 
@@ -531,7 +532,7 @@ self._geometries.items
 
 ## `RobotGeometryChecker.model_record`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L231)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L238)。
 
 输入签名：
 
@@ -568,7 +569,7 @@ deepcopy
 
 ## `RobotGeometryChecker.geometry_depending_on`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L235)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L242)。
 
 输入签名：
 
@@ -623,7 +624,7 @@ tuple
 
 ## `RobotGeometryChecker.query`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L249)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L256)。
 
 输入签名：
 
@@ -649,7 +650,10 @@ def query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames
 读取的对象属性：
 
 ```python
+self._query_schema
 self.joint_names
+self._q_columns
+self.joint_limits
 np.asarray
 values.shape
 values.dtype.kind
@@ -658,8 +662,6 @@ np.isfinite(values).all
 np.isfinite
 pin.neutral
 self.model
-self._q_columns
-self.joint_limits
 dict.fromkeys
 self.base_frame
 self._geometries.values
@@ -670,7 +672,6 @@ pair.second
 pair.policy
 pair.source
 identities.add
-pair_list.append
 pin.forwardKinematics
 self._data
 pin.updateFramePlacements
@@ -703,22 +704,29 @@ geometry_poses.items
 
 ```python
 names
+schema
+same_names
+columns
+limits
 name
 values
 world_base
 q
 violations
 value
-q[self._q_columns[name]]
+column
 lower
 upper
+q[column]
 violations[name]
+requested_frames
+pair_list
 selected_frames
 frame_ids
-pair_list
 identities
 pair
 identity
+self._query_schema
 poses
 index
 geometry_poses
@@ -760,7 +768,6 @@ self._frame_id
 frozenset
 _name
 identities.add
-pair_list.append
 pin.forwardKinematics
 pin.updateFramePlacements
 frame_ids.items
@@ -788,7 +795,7 @@ dict
 
 ## `RobotGeometryChecker._native_pair_distances`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L334)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L358)。
 
 输入签名：
 

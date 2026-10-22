@@ -17,7 +17,6 @@ from curobo._src.cost.cost_cspace_state import StateCSpaceCost
 
 from .motion import _inverse
 from .planning_problem import (
-    _interpolate,
     _quaternion,
     quaternion_multiply,
     quaternion_rotate,
@@ -185,15 +184,14 @@ class NativeReferenceCost:
         )
         self.native_cost = ToolPoseCost(config)
 
-    def bind(self, sample_times, valid_count, progress_map, duration):
+    # BEGIN one explicitly bound physical reference supplies all tool goals.
+    def bind(self, sample_times, valid_count, bound_reference):
         """Sample the supplied skill reference at this grid's physical times.
 
-        Seconds are relative to the bound trajectory start. The reference
-        coordinate is progress_map(sample_times/duration), including holds
-        and a continuation request's cropped progress interval. Sampling
-        uses PlanningProblem.sample_reference, preserving composed PosePath
-        and mechanism-coordinate behavior. No joint-reference time map is
-        applied to this already bound pose-reference clock.
+        Seconds are relative to this reference's trajectory start. Its
+        nominal composition, actual progress map and physical boundary
+        correction are already bound. Candidate curves with another clock
+        explicitly supply a reference constructed on that candidate clock.
 
         Call again when the request, mapping, duration or ordinary grid
         changes. The resulting device goals and quadrature weights are
@@ -206,8 +204,7 @@ class NativeReferenceCost:
         self.weights = physical_time_mean_weights(times, counts)
         self.reference_rows, self.horizon = times.shape
         with torch.no_grad():
-            progress = _interpolate(progress_map.u, progress_map.s, times / duration)
-            position, quaternion = self.problem.sample_reference(progress)
+            position, quaternion = bound_reference.sample(times)
             # The goal is a TCP pose in the robot base frame. Composing the
             # live link-to-TCP transform below preserves that same origin.
             position = self._base_translation + quaternion_rotate(self._base_rotation, position)
@@ -219,6 +216,7 @@ class NativeReferenceCost:
             )
         self._time_indices = torch.arange(self.horizon, device=times.device, dtype=torch.int32)
         return self
+    # END grid rebinding cannot silently change the reference's physical clock.
 
     def row_indices(self, batch_size, reference_rows=None):
         """Map each current state row to a bound reference/time-grid row."""
