@@ -1,6 +1,6 @@
 # `manipulation/contact_binding.py` 实现契约
 
-代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
+代码基线：`e0262a5`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `bind_grasp_contact_rules`
