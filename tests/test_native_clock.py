@@ -61,7 +61,9 @@ class NativeClockAdapterTests(unittest.TestCase):
         joint_state = SimpleNamespace(zeros=lambda shape, device, joint_names:
             SimpleNamespace(shape=shape, position=torch.zeros(shape), joint_names=joint_names))
         method = interpolation_method(torch, joint_state, _formal_native_clock)
-        managers = [SimpleNamespace(set_dense_counts=Mock()) for _ in range(2)]
+        # BEGIN match the actual native rollout's process-manager collection.
+        managers = [SimpleNamespace(_process_mode="trajectory_metrics", set_dense_counts=Mock()) for _ in range(2)]
+        # END dense valid lengths belong to every configured process manager.
         goal = SimpleNamespace(current_js=SimpleNamespace(position=torch.zeros(2, 7),
             velocity=torch.full((2, 7), 1e-5)), seed_goal_js=object(),
             idxs_current_js=torch.arange(2, dtype=torch.int32), idxs_seed_goal_js=object(),
@@ -76,7 +78,7 @@ class NativeClockAdapterTests(unittest.TestCase):
             _interpolated_traj_buffer=None, _interpolation_dt_buffer=None,
             core=SimpleNamespace(_goal_buffer=goal),
             additional_metrics_rollouts={"interpolated_rollout": SimpleNamespace(
-                constraint_manager=managers[0], metrics_constraint_manager=managers[1])})
+                _cost_manager_list=managers, constraint_manager=managers[0], metrics_constraint_manager=managers[1])})
         state = SimpleNamespace(position=torch.zeros((2, 81, 7)), knot=torch.arange(252).reshape(2, 18, 7).float(),
                                 dt=torch.full((2,), .2), knot_dt=torch.full((2,), .8))
         original_controls = state.knot.clone()

@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`e0262a5`（实际实现提交；后续仅文档提交更新引用，代码内容与此提交一致）。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
+代码基线：本次 A–D 实现工作树，实际实现提交引用待提交后补入；实施前保存提交为 `e1d2b32`。正文描述已落地接口，随后仅文档提交将补准确代码基线。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
 
 ## 1. 请求生命周期与资源分配
 
@@ -24,21 +24,29 @@
 
 ## 3. 共享三次曲线与物理关节域
 
-`CubicBasis(controls, knot_dt)` 使用 SciPy 三次 B 样条建立动作系数到位置、速度、加速度和加速度变化率 `jerk` 的线性映射；`jerk` 是关节位置对物理时间的三阶导数。令自由控制系数数量为 `M`、结点间隔为 `h`，完整系数含 `M+5` 行、有效曲线含 `M+2` 个区间。当前规划器把 `M=budget.knots+2` 交给该基，因而物理区间数为 `budget.knots+4`。
+`CubicBasis(controls, knot_dt)` 使用 SciPy 三次 B 样条建立自由系数到关节位置及一至三阶时间导数的线性映射。关节坐标为 `q`，物理时间为秒制 `t`，`jerk` 指 `d³q/dt³`。转动关节这四类量的单位依次为 rad、rad/s、rad/s²、rad/s³。令自由位置系数数量为 `M`、原段间隔为 `h`，完整系数含 `M+5` 行、有效曲线含 `M+2` 个区间；规划器采用 `M=budget.knots+2`，所以区间数为 `budget.knots+4`。
 
-入口位置 `q0` 和速度 `dq0` 作为实测边界消去两个系数。若第一个自由位置系数为 `x0`，则前两个系数为 `c0=x0−2h·dq0`、`c1=1.5q0+0.5h·dq0−0.5x0`；末端重复最后一个自由系数形成停止区间。实现以 `x−q0` 做相对运算，位置查询为 `q=q0+W(x−q0)+Vdq0`。`weights` 和 `weights_at_knot_times` 返回相应阶数的 `W,V`，导数按物理秒缩放。
+入口位置 `q0` 和速度 `dq0` 是测得边界。若第一个自由系数为 `x0`，前两个完整系数由 `c0=x0−2h·dq0`、`c1=1.5q0+0.5h·dq0−0.5x0` 消元；末端重复最后一个自由系数，形成整个末区间的停止状态。实际计算使用相对系数 `x−q0`，位置为 `q=q0+W(x−q0)+Vdq0`。`weights` 和 `weights_at_knot_times` 返回指定阶数的 `W,V`，导数按同一物理秒缩放。
 
-`CubicTrajectoryStep.sample` 消费 `[batch,M,dof]` 的动作、每个候选的入口索引、原生状态缓冲和有效样本数量，返回同一曲线的 `q,dq,ddq,jerk,dt`；其中 `batch` 是候选数，`dof` 是活动关节数。本文中的 rollout 指在给定时刻计算候选状态、运动学和代价的前向计算。普通 rollout 与密集导出共用此函数，Torch 对实际前向算术求导。`forward` 实现 cuRobo 的状态转移签名，核对固定时钟及自由终端声明。`cubic_transition_config_type` 通过实例配置工厂把该状态转移装配到 cuRobo 的 FK、状态缓冲和代价计算中。
+`CubicTrajectoryStep.sample` 消费 `[batch,M,dof]` 动作、入口索引和原生状态缓冲，生成普通或密集原生指标需要的 `q,dq,ddq,jerk,dt`；`batch` 是候选数，`dof` 是活动关节数。基权重和相对运算使用 float64，结果转为原生 dtype；Torch 对实际前向算术求导。`forward` 实现 cuRobo 状态转移签名，核对固定时钟及自由终端声明；`cubic_transition_config_type` 把该计算装配到原生 FK、状态和成本管理中。
 
-`JointPositionDomain` 表示单个 IK 状态的具名关节闭区间。`feasible/validate` 检查有限数及位置边界，`limit_step_tensor` 为一组线搜索倍率限制步长，保证被评估的关节状态处于此域。`CubicJointDomain` 则对完整三次曲线建立位置域：`coefficients` 形成实际多项式系数，`extrema` 求各段内部驻点与端点，`feasible` 判断整条曲线的位置范围；`initialize` 构造域内初值，`fit_reference` 把离散关节目标拟合到相同基，`recovery_step` 求停滞时仍处在域内的候选方向。
+保存曲线由 `CubicBasis.hermite_nodes(actions,start_q,start_dq)` 生成。它在整数原断点 `0…M+2` 上以 binary64 计算位置、速度，物理时刻为整数乘 `h`。每段三次多项式由两端位置与一阶导数确定，因而这些原节点可直接构造现有 `JointTrajectory` 的 Hermite 表示。保存定义与密集原生指标网格各自保留职责；正式评价读取实际保存曲线。
 
-`physical_joint_qp.py` 的 `CubicAffineMap` 为上述计算提供 CPU 仿射表达 `q(u)=B(u)c+b(u)`；`c` 是自由系数，`b` 由入口与固定时钟确定。生产初始化调用 `fit_reference`，以粗关节样本为最小二乘目标，联合原位置与速度边界求解。`fit_cubic_reference` 使用已有 quadprog，解析极值交换向 QP 增加实际违反的连续约束。工具事件通过后续任务允许集合计算。
+`JointPositionDomain` 管理单次 IK 状态的具名关节位置闭区间。`CubicJointDomain(bounds,start_q,start_dq,knot_dt,knots)` 管理完整曲线；`bounds[r,side,j]` 按 `r=0,1,2,3`、下界/上界、具名关节顺序提供同一份位置至 jerk 原界。`_bind_physical_domains` 从原 `JointLimits` 按活动关节名收集这些边界。入口 `q0/dq0` 固定、时钟固定后，`q(t;c)=B(t)c+d(t)` 对自由系数 `c` 仿射。每个时刻的位置及一至三阶导数边界均为系数线性不等式，所有时刻的交集构成同一凸域。
 
-输出转换为原生浮点 dtype 后再次检查完整位置和速度域。若舍入产生越界，`_fit_anchor` 在同一连续位置和速度边界内构造可行锚点，再沿系数线段恢复原生 dtype 可行性。QP 的速度条件属于这次粗拟合；随后 `CubicJointDomain` 的迭代域保持测得入口与连续关节位置约束，速度和加速度由原生约束及保存曲线的连续导数报告另行评价。`recover_position_step` 在当前动作、梯度、步长范围及固定基上构造优化恢复方向。
+`all_extrema(action)` 返回尾维为 `[4,dof]` 的连续最小值和最大值，`extrema(action,derivative)` 选择其中一阶。位置检查速度二次式的根及端点；速度检查加速度线性式的根及端点；加速度检查每段两端；jerk 检查每段常量，包含断点两侧。`feasible/validate` 对实际系数的位置及一至三阶导数的全部极值及入口条件判断。入口位置、速度须在原界内；位置正处边界而速度向外时，有限加速度曲线会立即越界，该代数必要条件单独保留。
+
+`CubicAffineMap` 在 CPU 上为同一基提供仿射行。`query` 使用归一化物理时间，`query_knot_times` 使用原段坐标；两者输出导数量的物理单位相同。`solve_joint` 将待求量表示为相对 `origin` 的系数增量，每个关节串行调用已有 quadprog；四类边界共同形成上下不等式，`step_limit` 约束增量幅度。解析极值交换最多进行 24 轮，把实际越界时刻追加到同一 QP。
+
+`initialize`、`fit_reference`、OMPL 路径拟合及 `recovery_step` 共用上述完整域。软关节参考拟合使用 `fit_cubic_reference` 的最小二乘目标，任务事件由候选曲线上的原任务接口计算。`_construct_anchor` 首先检查入口常值自由系数提议，否则调用 `construct_cubic_anchor`；该锚点构造直接使用同一 QP，独立于拟合和初始化调用。入口速度非零时，常值自由系数仍表示具有该入口速度的物理曲线。
+
+QP 答案转为实际动作 dtype 后，连续极值重新按原界检查。构造锚点时的内部余量由系数舍入通过约束行传播得到；资格边界保持原值。拟合舍入越界时，沿同域可行锚点到拟合系数的线段缩回。`fit_contraction_scale`、按导数阶数分列的 `maximum_bound_excess_before_contraction` 及 `continuous_max_abs_derivatives` 描述实际结果。`finite_constraints_inconsistent`、`rounded_boundary_repeated` 和 `extrema_exchange_limit` 记录相应数值步骤；最终在原界内得到的近似拟合可继续供任务优化使用，未构造结果保留原因。
+
+`recover_position_step` 同时服务单状态位置域和完整曲线域：前者使用位置盒，后者使用同一位置及一至三阶导数仿射 QP。它投影缩放负梯度，分别校正各关节完整系数增量，再由共用 limiter 检查实际原生乘法、加法和全部线搜索倍率。返回方向还须通过优化器原目标的实际下降检查。域构造与有限数值求解的结果说明本次固定入口、时钟和表示下完成的计算。
 
 ## 4. cuRobo 装配、参考 IK 与工具曲线初始化
 
-`_CuroboPlanner._initialize` 先核对机器人模型身份、工具、活动关节及场景要求，然后建立时钟、绑定手指曲线、检查工作区并创建 IK 与轨迹求解器。原生配置来自 `ik/lbfgs_ik.yml` 和 `trajopt/lbfgs_bspline_trajopt.yml`。轨迹优化采用 L-BFGS，关节状态由本章三次基产生；主生产请求使用 eager 执行，即按当前程序调用计算张量运算。`bind_solver_components` 将本项目的物理域线搜索、优化核心与目标缓冲管理装配到对应求解器实例。
+`_CuroboPlanner._initialize` 核对机器人身份、工具、活动关节和场景，建立时钟、手指曲线及工作区，再创建 IK 与轨迹求解器。配置来自 `ik/lbfgs_ik.yml`、`trajopt/lbfgs_bspline_trajopt.yml` 和 `metrics_base.yml`。`_bind_optimizer_constraint_config` 将原独立指标的 `cspace_cfg` 深拷贝到轨迹优化 `constraint_cfg`，使用相同原界、权重和零激活距离，并将普通优化成本配置副本装入指标配置供统一评分。该约束项同时参与数值罚项和同次硬证据。原生初始及普通 rollout 从这一配置构建，`bind_solver_components` 为求解器实例绑定物理域线搜索、优化核心和目标缓冲。生产请求使用 eager 张量计算。
 
 `_native_request` 统一构造 `constrained` 轨迹请求：`PlanningProblem` 中的类型化目标负责名义硬要求，`reference_objective` 负责完整路径的软跟踪。原生任务目标缓冲保留求解器所需的批次和种子布局，轨迹请求的原生末端目标位姿跟踪与关节目标位置跟踪均处于关闭状态。
 
@@ -46,15 +54,17 @@
 
 `reference_seeds` 在三次基参考参数处查询完整工具参考，调用原生完整姿态 IK，再经 `_rank_ik_candidates` 记录静态证据。`native_pose_ik_success`、`task_satisfied` 和 `model_valid` 分别说明原生收敛、任务点检查和模型检查；`static_model_query` 记录静态检查是否实际运行。有限且位于原关节位置域内、具有有限位姿能量的状态可作为数值提议。其原生失败标记与真实残差随原始候选保留。
 
-`select_ik_tracking_candidate` 在这些提议中按未截断的位姿能量、相对前一跟踪状态的欧氏关节距离及原索引选择至多一个状态。能量为 `(w_p/2)·e_p²+w_R·e_R²`，其中 `e_p,e_R` 来自上述原生位置和真实转角指标，`w_p,w_R` 为补偿前的原成本权重。原生 `SeedManager` 保留这一热启动，并生成固定总槽位内的其余种子；没有本次合法提议时，既有跟踪状态保持其来源。查询记录保存实际热启动数量、原生补充数量、跟踪来源以及所选索引。
+`select_ik_tracking_candidate(...,native_success=...)` 接收同一次 IK 的显式成功标志。它先选择已收敛集合，再按相对前一跟踪状态的欧氏关节距离、成功位姿能量和原索引排序；未收敛集合仍按原位姿能量、关节距离和索引排序。位姿能量为 `(w_p/2)·e_p²+w_R·e_R²`，`e_p,e_R` 为原生位置误差和真实转角，`w_p,w_R` 为补偿前原权重。原生 `SeedManager` 保留至多一个热启动，再生成固定槽位内的其余种子。缺少本次合法提议时，跟踪状态保留其原来源；查询记录保存实际选择及种子数量。
 
-`select_ik_chains` 消费具名关节状态、原生报告、相同顺序的位姿能量、实测入口、查询物理时刻和原位置/速度界。节点首先通过有限性和位置域条件；动态规划依次按未收敛节点数、位姿能量和归一化关节速度能量选择固定数量的粗链，静态证据用于后续并列排序。速度界在此给出连续性成本的单位尺度。原生收敛节点记为 `SOLVED`，合法但原生未收敛的节点记为 `APPROXIMATE_PROPOSAL`。缺少数值节点的时刻在入口与已有节点间插值，末段保持最后节点，这类补充点记为 `INTERPOLATED_PROPOSAL`。关节链和 QP 共同提供粗系数；不足的分支或未构造成功的粗拟合使用实测入口建立的位置域内提议，并保存对应构造结果。
+`select_ik_chains` 消费候选、原报告、同序位姿能量、实测入口、查询秒数及原位置/速度界。有限性和位置域限定数值节点；完整动态规划的累计键为 `(N_f,E_f,J_v,E_s,N_task,N_model)`。`N_f` 为未收敛节点数，`E_f/E_s` 分别为失败/成功节点的原位姿能量，`J_v` 是按真实时间和原速度尺度归一化的节点连线速度平方积分，最后两项是原静态检查不合格数。每个末节点保留所需数量的历史，稳定索引处理并列。输出 `selection_cost` 分别保存 `failed_pose_energy`、`normalized_velocity_energy`、`successful_pose_energy` 及原计数。
 
-`_refine_reference_seeds` 负责最终初始化输出。它先对原生优化阶段调用 `reset_cuda_graph`，再通过 `_prepare_goal_buffer/_update_rollout_params` 绑定同一请求、入口、显式时钟、自由终端声明和候选布局。该顺序对应原生 reset 同时清空常规 rollout 目标注册表的行为。随后关闭本阶段的场景约束计算，先记录粗系数，再使用第 1 节分得的更新额度调用 `reinitialize` 与 `optimize`。该阶段直接评价完整工具参考、原关节成本、过程关系和完整有序轨迹上的功能事件允许集合。`_initialization_snapshot` 在优化前后对实际系数计算同一任务/关节证据，导出原生多项式并评价连续位置、速度及加速度。保存后的最终系数直接作为返回值；完整场景评价从该值开始。
+已收敛节点为 `SOLVED`，合法未收敛节点为 `APPROXIMATE_PROPOSAL`；缺少数值提议的时刻由实测入口和已有节点插值，末段保持最后节点，记录为 `INTERPOLATED_PROPOSAL`。这些节点是软拟合参考；实际导数界由连续曲线域承担。粗链进入统一 QP 拟合；全层缺少提议或参考拟合未构造时，入口自由系数提议仍经同一完整物理域初始化，并保留实际构造原因。
+
+`_refine_reference_seeds` 负责最终初始化输出。它先对原生优化阶段调用 `reset_cuda_graph`，再通过 `_prepare_goal_buffer/_update_rollout_params` 绑定同一请求、入口、显式时钟、自由终端声明和候选布局。该顺序对应原生 reset 同时清空常规 rollout 目标注册表的行为。随后关闭本阶段的场景约束计算，先记录粗系数，再使用第 1 节分得的更新额度调用 `reinitialize` 与 `optimize`。该阶段直接评价完整工具参考、原关节成本、过程关系和完整有序轨迹上的功能事件允许集合。`_initialization_snapshot` 在优化前后对实际系数计算同一任务/关节证据，从实际系数导出原断点多项式，并评价连续位置至 jerk 边界。保存后的最终系数直接作为返回值；完整场景评价从该值开始。
 
 快照调用该 optimizer rollout 的 `compute_metrics_from_action`，输入为每个种子一行的 `[S,M,D]` 动作，并由其 `metrics_constraint_manager.optimizer_evidence` 读取同次任务/关节证据；`S` 是种子数，`M` 是自由系数数，`D` 是关节数。该 metrics 入口与优化入口使用相同成本及约束配置，但入口状态索引按种子组织。线搜索入口 `evaluate_action` 的索引则按种子与粒子展开。完整验收另由 `trajopt.metrics_rollout` 的 `trajectory_metrics` 模式完成。
 
-每次切换目标范围都使旧场景证据失效。初始化结束时恢复场景配置与总迭代配置，再清理原生图记录；后续完整主求解由原生 `_solve_impl` 重新绑定目标，并建立新目标的历史、功能乘子和候选保存状态。初始化有限更新完成时可仍有任务或导数残差，报告保留这些实际数值，返回位置域内数值候选。`status="completed"` 表示该计算完成，完整可执行资格由第 8 节的候选验收产生。调用者提供的 `JointTrajectory` 先按原曲线完整验收，转换为固定基粗系数后也进入相同细化接口。
+每次切换目标范围都使旧场景证据失效。初始化结束时恢复场景配置与总迭代配置，再清理原生图记录；后续完整主求解由原生 `_solve_impl` 重新绑定目标，并建立新目标的历史、功能乘子和候选保存状态。初始化有限更新完成后，实际返回动作保持在统一连续物理域内；同次原生采样证据、任务残差及保存多项式报告分别记录其实际结果。`status="completed"` 表示该计算完成，完整可执行资格由第 8 节的候选验收产生。调用者提供的 `JointTrajectory` 先按原曲线完整验收，转换为固定基粗系数后也进入相同细化接口。
 
 `_build_goal_ik_candidates` 由 `ompl_seed` 调用，为搜索构造事件边界的数值提议。它将当前窗口内相同精确进度的 `pose_events`、`coordinate_events` 和 `supports` 合为一次事件查询。`bind_ik_goals` 绑定其原目标身份，调用 cuRobo 的 `disable_tool_pose_tracking`，令该次 IK 使用 `PlanningProblem.goal_residual(normalized=True)` 的连续允许集合。`ProcessCostManager` 同时加入点上可评价的过程条件，排除需要实际速度的停止项；优化模式计算归一化超差平方，指标模式保留原硬超差。原生 `GoalToolPose` 缓冲仍接收名义位姿，实际目标由已绑定要求计算。每次事件求解结束后，`finally` 清除事件身份并恢复参考 IK 的完整姿态跟踪。
 
@@ -66,7 +76,7 @@
 
 ## 5. 同一任务声明下的分阶段约束证据
 
-`_process_manager_type` 为请求创建 `ProcessCostManager` 及对应配置类型。`bind_request_data` 绑定任务、场景、进度映射和功能约束；`set_dense_counts` 区分普通与密集样本的有效数量；`bind_scene_evidence` 连接同一次前向的场景证据。原生 `cost_cfg` 使用 `reference_objective` 模式，计算连续参考与原生关节正则项；`constraint_cfg` 中的 `trajectory_optimizer` 模式计算任务和功能增广项，并根据当前阶段计算场景项。`set_scene_constraints(False)` 使初始化的初始/普通梯度入口共同省略场景查询及局部几何模型，证据中相应缺少 `process_scene`。重新启用场景约束后，完整主优化恢复原场景计算。`trajectory_metrics` 始终计算完整原硬要求，并配置相同普通成本供固定评分调用。
+`_process_manager_type` 为请求创建 `ProcessCostManager` 及对应配置类型。`bind_request_data` 绑定任务、场景、进度映射和功能约束；`set_dense_counts` 区分普通与密集样本的有效数量；`bind_scene_evidence` 连接同一次前向的场景证据。原生 `cost_cfg` 使用 `reference_objective` 模式，计算连续参考与原生关节正则项；`constraint_cfg` 中的原生 `cspace` 检查实际状态的关节界，`trajectory_optimizer` 模式计算任务和功能增广项，并按当前阶段计算场景项。`set_scene_constraints(False)` 使初始化的初始/普通梯度入口共同省略场景查询及局部几何模型，证据中相应缺少 `process_scene`。重新启用场景约束后，完整主优化恢复原场景计算。`trajectory_metrics` 始终计算完整原硬要求，并配置相同普通成本供固定评分调用。
 
 ### 5.1 连续参考与固定时间平均
 
@@ -94,7 +104,7 @@ J_reference = Σ_i α_i [ (w_p/2) ‖p_E(q(t_i)) − p_E*(P(t_i/T))‖² + w_R �
 
 `PlanningProblem.optimizer_preferences` 在 `feasibility/quality` 两种目标配置中均汇总过程等式坐标和机构方向偏好；`quality` 阶段另加入支持声明中非硬分量的归一化超差平方，以及功能位姿、机构坐标目标中心偏好。当前主求解使用 `feasibility` 阶段，其支持计算由声明的硬分量进入功能增广拉格朗日；连续示教参考在相同阶段由普通成本持续优化，`measurements` 提供其解释性误差。场景优化项由本块冻结的 `LocalPairModel/LocalContactModel`、原生机器人距离、初始支撑高度和已有连续控制项组成；原始分类与未决状态另存为硬证据和查询报告。
 
-任务计算按要求自身的声明确定硬条件。`trajectory_optimizer` 与 `trajectory_metrics` 均读取同一 `PlanningProblem.residuals`。硬功能条件由增广拉格朗日管理，其余过程项进入原过程代价；支持默认硬项为 body/footprint，gap/normal 按原阈值提供 `quality` 阶段偏好。原生指标的 `metrics.costs_and_constraints.constraints` 保存硬条件张量。`select_candidate` 首次按普通与密集结果判断时，要求该种子的 `result.success` 成立，且两套 constraints 的各项最大值均为有限数、不大于零。`convergence` 中的离散标识作为原生诊断保存。
+任务计算按原声明确定硬条件。`trajectory_optimizer` 与 `trajectory_metrics` 读取同一 `PlanningProblem.residuals`；硬功能条件由增广拉格朗日管理，其余过程项进入原过程代价。原生 `cspace` 约束包含位置、速度、加速度、jerk 及状态中已提供的力矩值。`diagnostics.joint_state_computation.effort` 根据实际 transition 的 `compute_inverse_dynamics` 分别记录 `inverse_dynamics` 或 `not_computed`。当前机器人配置关闭动力学计算，零力矩缓冲对应未计算通道。原生成功标志和普通/密集约束描述其各次实际采样，保存在 `optimization_diagnostics`；保存曲线的正式资格由第 8 节统一入口形成。
 
 `optimization_constraints` 返回功能条件管理器，`query_anchor_parameters` 返回当前确切查询参数，`add_collision_witnesses` 将密集查询发现的有限冲突时刻加入同一锚点容量。`query_diagnostics` 保存本次实际输入布局和场景查询信息。同一次计算的张量身份将候选保存依据与其产生的代价连接。
 
@@ -116,7 +126,7 @@ J_reference = Σ_i α_i [ (w_p/2) ‖p_E(q(t_i)) − p_E*(P(t_i/T))‖² + w_R �
 
 `plan_trajectory` 完整验收调用者提供的原关节曲线；`reference_seeds` 完成任务空间细化后，`evaluate_reference` 再完整评价其实际返回系数。合格初值完成执行绑定后进入独立的最佳候选记录；随后在首次求解额度的剩余更新数内执行完整主求解，持续改善普通参考目标。显式未知空间策略要求补充观察时保留相应结论。新候选只有完成全部验收、执行绑定且固定评分更低时，才替换已有合格记录。
 
-主求解后仍无合格候选时，密集样本发现的碰撞见证可由 `promote_collision_witnesses` 加入下一次求解；否则在存在适用的碰撞或禁止未知条件且仍有预算时，`ompl_seed` 提供一次搜索种子。这两个恢复来源互斥，整个请求最多使用预算允许的两次完整轨迹求解。改善过程中累计工作预算耗尽时，交付此前已在预算内完成资格的最佳记录。取消、外部截止时间和其他计算异常继续产生对应失败；实际工作消耗统一在请求结束时保存。
+主求解后仍无合格候选时，恢复类型由所选保存曲线的正式碰撞或观测覆盖残差决定。对应原生候选的密集碰撞见证可由 `promote_collision_witnesses` 增加下一次求解的查询；这些见证保留原生采样身份。没有可提升见证且存在适用条件及剩余搜索预算时，`ompl_seed` 提供一次搜索种子。两个恢复来源互斥，求解次数、验证次数、查询数和时间各受原额度限制。改善工作耗尽预算时，已有在预算内完成资格的最佳记录仍可交付；取消、外部截止时间及其他异常保持各自类型。
 
 `ompl_seed` 按功能目标、过程边界、接触切换及停止边界组织阶段。`_ompl_stage` 的状态为 `(q,u)`；`u` 单调前进并给出固定物理时间。过程等式通过 `_independent_projection` 选择局部独立行，在需要时交给 OMPL `ProjectedStateSpace`；允许区域中的不等式继续作为有效性条件。投影改变关节坐标，保留时间坐标。
 
@@ -124,18 +134,20 @@ J_reference = Σ_i α_i [ (w_p/2) ‖p_E(q(t_i)) − p_E*(P(t_i/T))‖² + w_R �
 
 ## 8. 从求解结果到候选曲线
 
-`_observed_native_result` 对给定动作执行普通与密集原生 metrics；`evaluate_reference` 验收初始动作；`optimize` 返回原生优化结果与计算诊断。`_candidate_objective` 以请求固定的 `(knots+4)×interpolation_steps+1` 个归一化节点计算普通成本。每条曲线按自身 `T` 转为物理时刻，使用自身 `P` 采样同一工具参考，并保留自身物理关节导数。该有限积分定义统一候选比较的网格与系数，`objective_components` 保存各项值。
+`_observed_native_result` 对实际动作执行普通与密集原生 metrics，`evaluate_reference` 形成初始化返回动作的原生结果，`optimize` 形成完整场景优化结果。`native_diagnostics` 从这些原结果读取成功标志、约束、普通成本及碰撞/观测分类。它们描述原生网格上的实际计算；正式资格的对象是随后保存的 `JointTrajectory`。
 
-`native_diagnostics` 分别在 `rollout/interpolated` 中记录本次实际网格的 `ordinary_costs`，对已有成本张量按项求和。两种网格的积分值描述各自已完成的前向计算；候选排序使用上述统一网格的 `fixed_objective`。
+`_trajectory_candidate` 通过原生 gather 取得指定 seed 的动作、状态、时钟及有限恢复见证，单 seed 与多 seed 均拥有独立必要张量。完整状态可含锁定关节，动作系数仅含活动关节，二者分别按自身具名布局保存。`select_candidate` 在任何保存曲线评分或指标调用之前，先取得全部原生候选与诊断，使后续复用常驻缓冲时这些输入保持完整。
 
-`reference_initialization` 独立保存初始化的 `status`、实际 `iteration_allocation` 和场景 `not_evaluated` 范围。`coarse/refined.seeds` 中每项记录实际 `seed_index`、自由系数、标准 `curve_snapshot`、普通成本分项、固定普通目标、功能有符号残差、原生约束和连续关节域报告。`sampled_task_joint_feasible` 来自同次优化前向；连续导数检查与完整场景资格分别由相应报告表达。`refined` 保存的是实际返回动作，包含原生候选保留后的选择。
+`_native_curve` 读取所选结果的实际 `solution`，交给 `_controls_curve`；后者调用 `CubicBasis.hermite_nodes`，以原断点 binary64 节点构造 `JointTrajectory`，复制进度、事件、条件、手指曲线和已满足依赖。`_initialization_snapshot` 从每个种子的实际 `actions` 进入同一导出函数。`reference_initialization` 记录粗系数与实际返回系数、标准轨迹快照、同次普通目标、原生约束、功能残差及连续位置至 jerk 边界，场景状态为 `not_evaluated`。中断时保留已经完成的阶段记录；完整候选尚未产生时，最后完成初始化阶段的第一条曲线可作为诊断轨迹。
 
-`_joint_state_curve` 将同一原生密集位置、速度和原步长复制成具名 `JointTrajectory`，并保留进度映射、原事件、手指曲线和已满足依赖；它同时供初始化记录和完整结果导出使用。中断时，已完成的阶段记录在 `plan_trajectory.finally` 复制到 diagnostics。完整候选尚未产生时，最后完成的初始化阶段第一条曲线可作为诊断轨迹保存；它的执行资格仍由完整验收定义。
+`_candidate_objective` 在请求固定的 `(knots+4)×interpolation_steps+1` 个归一化节点上计算普通成本。每条曲线使用自身时长、进度映射、工具标定及物理导数，`fixed_objective/objective_components` 因而具有共同排名定义。有限原生曲线按该评分和稳定索引排列，已完成的评分直接传入正式评价。
 
-`select_candidate` 先按普通和密集硬指标区分资格，再按 `fixed_objective` 和稳定索引排序可验收候选，依次进行完整关节与区间几何检查，返回其中固定评分最小的完整合格候选。已拒绝候选按验收残差和稳定索引提供诊断。当代码重新计算已有候选时，仍使用相同任务验收定义、原始观测模型和非穿透规则。
+`evaluate_candidate(trajectory,record_work=...,objective=...)` 对每条保存曲线统一调用 `_candidate_metrics`，再检查 `_candidate_domain_validation` 和 `_candidate_geometry`。实际样本由 `_candidate_sample_times` 在每个原多项式区间内按最大间隔生成，确切任务锚点从本候选物理时钟计算；位置、速度、加速度及 jerk 均来自保存多项式。临时 `_candidate_query` 向常驻指标管理器提供实际时间、场景、进度及锚点位置/速度，`finally` 清空该上下文和参考网格缓存。后续原生求解通过原 `_solve_impl` 重新绑定自身目标。
 
-`_native_curve` 从原生位置、速度和原始时钟导出 `JointTrajectory`。`select_candidate` 对原生任务指标合格候选调用 `evaluate_candidate`，先检查连续关节域，再以原曲线 FK、原场景距离下界和实体运动界完成区间几何计算。新增实际场景违反进入原恢复决策，未决区间保留其范围和原因。已完成的指标继续复用同一曲线和时钟身份。`export` 返回已经验收的 `delivery_candidate`，新增查询数为零。
+正式报告中的 `native_success/native_metrics` 表示原生指标 API 对该保存曲线的采样结果；`optimization_diagnostics` 单独保存提议产生时的原普通/密集结果。正式残差由实际保存曲线采样、连续关节界及区间场景查询组成。`select_candidate` 逐条评价，返回固定评分最小的完整合格曲线；全部已评价曲线未通过时，按正式残差严重度和稳定索引选取诊断结果。报告分别保存 `validation_query_points` 和 `evaluated_candidate_count`。
 
-`qualify_native` 在后续原生查询改写暂存结果前调用 `export`，再由 `qualify_candidate` 调用 `execution_binding.bind_candidate`，完成曲线、问题、候选场景与验收的正式绑定。完整记录包含曲线副本、评分及分项、验收、事件时间检查、场景描述、时钟与资格完成时间。构造记录后的预算检查通过，记录才成为新的最佳候选。`deliver_incumbent` 恢复选中候选的这些字段，最终账本另保存整次请求的实际消耗。完整契约见[下一章](05-acceptance-and-execution.md)。
+`record_validation_work` 是 `plan_trajectory` 中现有请求账本的回调。每次正式评价开始前检查剩余验证次数，再登记本次尝试；每批原生样本和锚点、每批区间几何查询完成后立即累计实际点数，再检查请求期限。后续候选中断时此前完成的工作已在账本中。验证次数上限为 `maximum_trajectory_solves × trajectory_seeds`，总查询额度来自同一预算；每条曲线的区间查询只使用其 `max_validation_points` 中扣除实际采样后的余额。
 
-`reinitialize` 完成模型捕获、初始前向、功能参数初始化和候选保存后，`optimize` 消费同一个未消耗的原生迭代状态。块结束时以 `torch.no_grad()` 对实际探索点同时捕获下一块模型与原硬证据；候选排名读取不含局部模型的固定目标。局部模型或乘子改变后，再计算新目标梯度及重建相应种子的历史。
+`export` 返回已验收的 `delivery_candidate`，新增查询数为零。`qualify_native` 随后通过 `qualify_candidate → execution_binding.bind_candidate` 完成曲线、问题、场景与正式验收的绑定。独立最佳记录包含曲线副本、评分、验收、事件时间检查及资格完成时间；记录完成后的预算检查通过，它才可替换已有记录。`deliver_incumbent` 恢复选中记录，最终账本另保存整次请求消耗。完整交接见[验收组件](05-acceptance-and-execution.md)。
+
+`reinitialize` 完成当前目标的模型捕获、初始前向、功能参数初始化和候选保存后，`optimize` 消费同一个原生迭代状态。块结束时在实际探索点同时捕获下一块模型与原硬证据，候选排名读取固定普通目标；模型或乘子改变后重新计算梯度并建立对应历史。

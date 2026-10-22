@@ -1,9 +1,9 @@
 """Small CPU quadratic programs on the existing fixed-clock cubic curves.
 
 The cubic action is an affine curve with an immutable entrance and clock.
-Position rows propose recovery steps; seed fits can additionally constrain
-velocity. Analytic extrema and the exact tensor position domain remain the
-acceptance oracle. These routines run only outside CUDA capture.
+Position, velocity, acceleration and jerk rows constrain both seed fits and
+recovery steps. Analytic extrema and the same tensor domain determine
+physical feasibility. These routines run only outside CUDA capture.
 """
 
 # BEGIN fixed-clock affine sampling and bounded continuous-domain QP recovery.
@@ -24,7 +24,7 @@ def _numpy(value):
             else np.asarray(value, dtype=float))
 
 
-# BEGIN continuous position and velocity rows share one two-sided QP.
+# BEGIN all four physical derivatives share one two-sided QP.
 def _solve_qp(hessian, linear, rows, lower, upper):
     """Solve two-sided linear bounds in the free-coefficient space."""
     nonzero = np.any(rows != 0., axis=1)
@@ -32,7 +32,7 @@ def _solve_qp(hessian, linear, rows, lower, upper):
         return None
     rows, lower, upper = rows[nonzero], lower[nonzero], upper[nonzero]
     try:
-        # quadprog minimizes .5*x'G*x-a'x with C'x >= b. Position
+        # quadprog minimizes .5*x'G*x-a'x with C'x >= b. Physical
         # constraints have two sides; unconstrained free coefficients do not
         # receive the robot's joint-position box.
         return quadprog.solve_qp(np.asarray(hessian, dtype=float), -linear,
@@ -63,6 +63,14 @@ class CubicAffineMap(CubicBasis):
 
     def query(self, progress, derivative=0):
         weights, velocity = self.weights(_numpy(progress), derivative)
+        return self._affine_query(weights, velocity, derivative)
+
+    def query_knot_times(self, times, derivative=0):
+        """Build rows at original segment coordinates, including jerk sides."""
+        weights, velocity = self.weights_at_knot_times(_numpy(times), derivative)
+        return self._affine_query(weights, velocity, derivative)
+
+    def _affine_query(self, weights, velocity, derivative):
         offset = velocity[:, None]*self.start_dq-weights.sum(-1, keepdims=True)*self.start_q
         if derivative == 0:
             offset = offset+self.start_q
@@ -79,10 +87,11 @@ class CubicAffineMap(CubicBasis):
     # END all derivatives act on relative controls; public actions stay positions.
 
     def extrema_times(self, controls, joint, derivative=0):
-        """Return boundaries and extrema of q or dq, in fixed-clock units.
+        """Return exact bounds witnesses for derivative 0..3, in knot units.
 
         Query times use knot units. Values use the model's joint coordinates
-        and seconds; velocity extrema are roots of the actual acceleration.
+        and seconds. Jerk is constant on each segment, so its midpoint
+        supplies every segment value without losing a side of a knot jump.
         """
         # BEGIN form derivatives before adding the absolute entrance angle.
         coefficients = (self.matrix@(controls-self.start_q[joint])
@@ -98,9 +107,12 @@ class CubicAffineMap(CubicBasis):
         polynomial.c[-1, terminal] = controls[-1]-self.start_q[joint]
         if derivative:
             polynomial = polynomial.derivative(derivative)
-        roots = polynomial.derivative().roots(extrapolate=False)
-        roots = roots[np.isfinite(roots) & (roots >= 0.) & (roots <= self.intervals)]
-        times = np.unique(np.r_[np.arange(self.intervals+1), roots])
+        if derivative == 3:
+            times = np.arange(self.intervals, dtype=float)+.5
+        else:
+            roots = polynomial.derivative().roots(extrapolate=False)
+            roots = roots[np.isfinite(roots) & (roots >= 0.) & (roots <= self.intervals)]
+            times = np.unique(np.r_[np.arange(self.intervals+1), roots])
         values = polynomial(times)/(self.knot_dt**derivative)
         if derivative == 0:
             values = values+self.start_q[joint]
@@ -110,18 +122,8 @@ class CubicAffineMap(CubicBasis):
         return times, values
         # END exact boundary states are preserved without a numerical tolerance.
 
-    def velocity_extrema(self, controls):
-        """Analytic all-time velocity bounds for one [control,joint] action."""
-        controls = _numpy(controls)
-        limits = []
-        for joint in range(controls.shape[-1]):
-            _, values = self.extrema_times(controls[:, joint], joint, 1)
-            limits.append((float(values.min()), float(values.max())))
-        return np.asarray(limits).T
-
-    def solve_joint(self, hessian, linear, lower, upper, joint, *, origin,
-                    initial, native_dtype, step_limit=None, velocity_bounds=None,
-                    interior=False):
+    def solve_joint(self, hessian, linear, bounds, joint, *, origin,
+                    initial, native_dtype, step_limit=None, interior=False):
         """Exchange violated analytic extrema for linear QP rows, at most 24 times.
 
         The optimization variable is a coefficient increment from ``origin``.
@@ -129,22 +131,19 @@ class CubicAffineMap(CubicBasis):
         action. Checking the rounded candidate, rather than the double QP
         answer, also exposes violations introduced by the actual action dtype.
         """
-        bounds = {0: (lower, upper)}
-        if velocity_bounds is not None:
-            bounds[1] = tuple(velocity_bounds)
         times = {derivative: self.extrema_times(initial, joint, derivative)[0]
-                 for derivative in bounds}
+                 for derivative in range(4)}
         # This small inward margin belongs only to construction of a
         # representable fit anchor. Physical acceptance keeps the exact model
         # limits, and optimizer recovery never activates this margin.
-        coordinate_scale = max(1., abs(lower), abs(upper), float(np.max(np.abs(initial))))
+        coordinate_scale = max(1., float(np.max(np.abs(bounds[0]))), float(np.max(np.abs(initial))))
         roundoff = 32*np.finfo(native_dtype).eps*coordinate_scale if interior else 0.
         report = {"rounds": 0, "constraint_count": 0}
         for iteration in range(24):
             row_parts, lower_parts, upper_parts = [], [], []
-            for derivative, (lo_bound, hi_bound) in bounds.items():
+            for derivative, (lo_bound, hi_bound) in enumerate(bounds):
                 # BEGIN use the same exact entrance rows as tensor sampling.
-                weights, fixed = self.query(times[derivative]/self.intervals, derivative)
+                weights, fixed = self.query_knot_times(times[derivative], derivative)
                 offset = fixed[:, joint]+weights@origin
                 # END numerical cancellation cannot fabricate an entrance QP row.
                 # BEGIN inward construction margins act only on free directions.
@@ -160,12 +159,12 @@ class CubicAffineMap(CubicBasis):
             report.update(rounds=iteration+1, constraint_count=int(2*len(rows)))
             increment = _solve_qp(hessian, linear, rows, lo, hi)
             if increment is None:
-                return None, {**report, "reason": "sampled_curve_qp_infeasible"}
+                return None, {**report, "reason": "finite_constraints_inconsistent"}
             # Match base + direction in the actual float dtype. In particular,
             # float32 addition is not the cast of a float64 coefficient sum.
             rounded = (origin.astype(native_dtype)+increment.astype(native_dtype)).astype(float)
             violation, added = False, False
-            for derivative, (lo_bound, hi_bound) in bounds.items():
+            for derivative, (lo_bound, hi_bound) in enumerate(bounds):
                 query, values = self.extrema_times(rounded, joint, derivative)
                 bad = (values < lo_bound) | (values > hi_bound)
                 violation = violation or bool(np.any(bad))
@@ -186,7 +185,7 @@ class CubicAffineMap(CubicBasis):
 def recover_position_step(domain, base, gradient, step_limits, scales, curve=None):
     """Project a scaled negative gradient, retaining independent joint motion.
 
-    Position constraints are separable by joint, so the small diagonal QPs
+    Physical constraints are separable by joint, so the small diagonal QPs
     are solved serially. The original native step limits bound *increments*,
     not cubic coefficients. The optimizer must separately demand actual cost
     decrease before accepting any returned direction.
@@ -196,9 +195,9 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
               "constraint_count": 0, "gradient_dot_step": 0., "limiter_scale": 0.,
               "per_joint_limiter_scale": []}
     if base.ndim != 3 or base.shape[0] != 1 or gradient.shape != base.shape:
-        raise ValueError("Position recovery requires one matching action/gradient batch")
+        raise ValueError("Physical-domain recovery requires one matching action/gradient batch")
     if not bool(domain.feasible(base).all()):
-        raise ValueError("Position recovery requires a legal current curve")
+        raise ValueError("Physical-domain recovery requires a legal current action")
     domain.validate_scales(scales)
     x, g, limits = _numpy(base)[0], _numpy(gradient)[0], _numpy(step_limits)
     limits = np.broadcast_to(limits, x.shape)
@@ -212,7 +211,10 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
     target = -g/normalization
     increments = np.empty_like(x)
     native_dtype = base.detach().cpu().numpy().dtype
-    lower, upper = _numpy(domain.lower), _numpy(domain.upper)
+    if curve is None:
+        lower, upper = _numpy(domain.lower), _numpy(domain.upper)
+    else:
+        bounds = _numpy(domain.bounds)
     hessian = np.eye(x.shape[0])
     for joint in range(x.shape[1]):
         if curve is None:
@@ -220,12 +222,13 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
             lo = np.r_[(lower[joint]-x[:, joint])/maximum, -limits[:, joint]/maximum]
             hi = np.r_[(upper[joint]-x[:, joint])/maximum, limits[:, joint]/maximum]
             increment = _solve_qp(hessian, -target[:, joint], rows, lo, hi)
-            detail = {"rounds": 1, "constraint_count": int(2*len(rows))}
+            detail = {"rounds": 1, "constraint_count": int(2*len(rows)),
+                      "reason": "finite_constraints_inconsistent" if increment is None else "position_qp_solved"}
         else:
             # Solve the furthest native trial as a displacement; convert back
             # to a direction only after the continuous-curve checks.
             increment, detail = curve.solve_joint(hessian, -maximum*target[:, joint],
-                lower[joint], upper[joint], joint, origin=x[:, joint],
+                bounds[:, :, joint], joint, origin=x[:, joint],
                 initial=x[:, joint], native_dtype=native_dtype,
                 step_limit=limits[:, joint])
             if increment is not None:
@@ -233,10 +236,11 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
         report["rounds"] = max(report["rounds"], detail["rounds"])
         report["constraint_count"] += detail["constraint_count"]
         if increment is None:
-            return zero, {**report, "reason": "position_qp_infeasible"}
+            return zero, {**report, "reason": "recovery_qp_not_constructed",
+                          "joint_column": joint, "joint_qp_reason": detail["reason"]}
         increments[:, joint] = increment
     proposed = torch.as_tensor(increments, dtype=base.dtype, device=base.device)[None]
-    # Position domains and these diagonal QPs are separable by joint. Correct
+    # Physical domains and these diagonal QPs are separable by joint. Correct
     # float-dtype rounding for each joint's *complete curve increment* before
     # combining them; a roundoff-sized outward component in one joint must
     # not shrink valid motion in every other joint. This preserves all ratios
@@ -265,68 +269,54 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
     return direction, {**report, "success": True, "reason": "physical_descent_direction"}
 
 
-def _fit_feasible(domain, curve, action, velocity_bounds):
-    """Seed-only feasibility: the optimizer's position domain stays unchanged."""
-    if not bool(domain.feasible(action[None]).all()):
-        return False
-    if velocity_bounds is None:
-        return True
-    extrema = curve.velocity_extrema(action)
-    return (bool(np.isfinite(extrema).all()) and bool(np.all(extrema[0] >= velocity_bounds[0]))
-            and bool(np.all(extrema[1] <= velocity_bounds[1])))
+# BEGIN one algebraic QP anchor serves every complete-domain entry point.
+def construct_cubic_anchor(domain, curve, dtype, device):
+    """Construct a native-dtype feasible curve using the shared four-order QP.
 
-
-# BEGIN rounded seed recovery uses a continuous position-and-velocity anchor.
-def _fit_anchor(domain, curve, dtype, device, velocity_bounds):
-    """Construct an anchor for the fit's position and velocity bounds.
-
-    A position initializer can be reused only after the velocity check.
-    Otherwise a small strictly convex QP constructs a numerical interior
-    anchor satisfying both sets of bounds.
+    This construction has no fit/initialize dependency. The position-valued
+    constant proposal supplies a finite objective centre; the measured q0,
+    dq0, stopped terminal interval and fixed clock remain in the affine map.
+    A construction margin accounts for coefficient rounding only. Every
+    returned action is checked against the original model bounds.
     """
-    from .physical_joint_domain import JointDomainInitializationError
-    try:
-        anchor = (domain._anchor if domain._anchor is not None
-                  else domain._construct_anchor(dtype, device))[0].to(dtype=dtype, device=device)
-    except JointDomainInitializationError as error:
-        return None, {"fit_anchor_source": "not_constructed", "detail": str(error)}
-    if _fit_feasible(domain, curve, anchor, velocity_bounds):
-        return anchor, {"fit_anchor_source": "validated_position_initializer"}
-    initial = _numpy(anchor)
-    lower, upper = _numpy(domain.lower), _numpy(domain.upper)
+    initial = np.broadcast_to(_numpy(domain._start_q), (domain.knots, len(domain.lower)))
     controls = np.empty_like(initial)
-    native_dtype = anchor.detach().cpu().numpy().dtype
+    native_dtype = torch.empty((), dtype=dtype).numpy().dtype
+    bounds = _numpy(domain.bounds)
+    report = {"reason": "anchor_not_constructed", "joint_qp_status": [], "rounds": 0,
+              "constraint_count": 0}
     for joint in range(initial.shape[-1]):
         candidate, detail = curve.solve_joint(np.eye(domain.knots), -initial[:, joint],
-            lower[joint], upper[joint], joint, origin=np.zeros(domain.knots),
-            initial=initial[:, joint], native_dtype=native_dtype,
-            velocity_bounds=velocity_bounds[:, joint], interior=True)
+            bounds[:, :, joint], joint, origin=np.zeros(domain.knots),
+            initial=initial[:, joint], native_dtype=native_dtype, interior=True)
+        report["rounds"] = max(report["rounds"], detail["rounds"])
+        report["constraint_count"] += detail["constraint_count"]
+        report["joint_qp_status"].append(detail["reason"])
         if candidate is None:
-            return None, {"fit_anchor_source": "not_constructed", "detail": detail["reason"]}
+            return None, {**report, "reason": detail["reason"], "joint_column": joint}
         controls[:, joint] = candidate
-    anchor = torch.as_tensor(controls, dtype=dtype, device=device)
-    if not _fit_feasible(domain, curve, anchor, velocity_bounds):
-        return None, {"fit_anchor_source": "not_constructed", "detail": "rounded_anchor_outside_domain"}
-    return anchor, {"fit_anchor_source": "position_velocity_qp"}
-# END the returned anchor satisfies the same bounds as the fitted curve.
+    anchor = torch.as_tensor(controls, dtype=dtype, device=device)[None]
+    if not bool(domain.feasible(anchor).all()):
+        reason = ("extrema_exchange_limit" if "extrema_exchange_limit" in report["joint_qp_status"]
+                  else "rounded_anchor_outside_domain")
+        return None, {**report, "reason": reason}
+    return anchor, {**report, "reason": "physical_anchor_constructed"}
+# END anchor feasibility is the same predicate used by native optimization.
 
 
-# BEGIN reference samples remain soft under continuous physical bounds.
-def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, velocity_bounds=None):
-    """Fit soft references with the measured entrance and fixed cubic clock.
+# BEGIN reference samples remain soft under the single continuous physical domain.
+def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None):
+    """Fit soft references while preserving the measured entrance and clock.
 
-    Every production caller passes the model's [lower,upper] velocity bounds.
-    Position-only numerical users may omit them. The returned curve satisfies
-    every supplied physical bound, including after native-dtype rounding.
+    The complete bound declaration belongs to ``domain``. Native-dtype
+    contraction uses its ordinary line limiter, so fitting, initialization
+    and recovery cannot accept different derivative domains.
     """
+    from .physical_joint_domain import JointDomainInitializationError
+
     values = _numpy(targets)
     weights, offset = curve.query(progress)
     count, dof = domain.knots, len(domain.lower)
-    if velocity_bounds is not None:
-        velocity_bounds = _numpy(velocity_bounds)
-        if (velocity_bounds.shape != (2, dof) or not np.isfinite(velocity_bounds).all()
-                or np.any(velocity_bounds[0] >= velocity_bounds[1])):
-            raise ValueError("Cubic fit velocity bounds must be finite ordered [2,joint] values")
     if values.shape != offset.shape or not len(values) or not np.isfinite(values).all():
         raise ValueError("Cubic reference targets must be finite [query, joint] values")
     prior = (np.zeros((count, dof)) if prior_controls is None else _numpy(prior_controls))
@@ -338,79 +328,60 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
     native_dtype = torch.empty((), dtype=dtype).numpy().dtype
     gram = weights.T@weights
     # A machine-precision-scaled ridge makes underdetermined observations
-    # strictly convex. It is only a numerical tie-break, not another task cost.
+    # strictly convex. It is only a numerical tiebreaker, not another task cost.
     ridge = np.finfo(float).eps*max(1., float(np.trace(gram)))*64
     hessian = gram+ridge*np.eye(count)
     linear = weights.T@(offset-values)-ridge*prior
     controls = np.empty((count, dof))
     report = {"success": False, "reason": "fit_initializer_not_constructed", "rounds": 0,
-              "constraint_count": 0, "joint_qp_status": [],
-              "velocity_bounds_enforced": velocity_bounds is not None}
-    lower, upper = _numpy(domain.lower), _numpy(domain.upper)
+              "constraint_count": 0, "joint_qp_status": [], "physical_derivative_orders": [0, 1, 2, 3]}
+    if not bool(domain._entrance_valid):
+        return None, {**report, "reason": "algebraic_entrance_invalid"}
+    bounds = _numpy(domain.bounds)
     for joint in range(dof):
         candidate, detail = curve.solve_joint(hessian, linear[:, joint],
-            lower[joint], upper[joint], joint, origin=np.zeros(count),
-            initial=prior[:, joint], native_dtype=native_dtype,
-            velocity_bounds=None if velocity_bounds is None else velocity_bounds[:, joint])
+            bounds[:, :, joint], joint, origin=np.zeros(count),
+            initial=prior[:, joint], native_dtype=native_dtype)
         report["rounds"] = max(report["rounds"], detail["rounds"])
         report["constraint_count"] += detail["constraint_count"]
         report["joint_qp_status"].append(detail["reason"])
         if candidate is None:
-            return None, {**report, "reason": "fit_initializer_not_constructed"}
+            return None, {**report, "reason": detail["reason"], "joint_column": joint}
         controls[:, joint] = candidate
     action = torch.as_tensor(controls, dtype=dtype, device=device)
-    report.update(fit_contraction_scale=1., maximum_bound_excess_before_contraction=0.,
-        maximum_velocity_bound_excess_before_contraction=0., fit_anchor_source="unneeded")
-    if not _fit_feasible(domain, curve, action, velocity_bounds):
-        # At an active extremum the rounded float32 optimum can lie a few
-        # ulps outside the exact domain. Contract the entire curve toward an
-        # anchor validated against every domain requested by this fit.
-        # This is a feasible approximate fit, not a claim of QP optimality;
-        # record both the pre-contraction violation and the actual contraction.
-        low, high = domain.extrema(action[None])
-        excess = torch.maximum(domain.lower-low, high-domain.upper).max()
-        if velocity_bounds is None:
-            from .physical_joint_domain import JointDomainInitializationError
-            try:
-                initialized = domain.initialize(action[None])[0]
-            except JointDomainInitializationError as error:
-                return None, {**report, "reason": "fit_initializer_not_constructed", "detail": str(error)}
-            anchor = domain._anchor[0]
-            report["fit_anchor_source"] = "position_initializer"
-        else:
-            velocity_extrema = curve.velocity_extrema(action)
-            report["maximum_velocity_bound_excess_before_contraction"] = max(0.,
-                float(np.max(velocity_bounds[0]-velocity_extrema[0])),
-                float(np.max(velocity_extrema[1]-velocity_bounds[1])))
-            anchor, anchor_report = _fit_anchor(domain, curve, dtype, device, velocity_bounds)
-            report.update(anchor_report)
-            if anchor is None:
-                return None, {**report, "reason": "fit_initializer_not_constructed"}
-            # Both domains are convex in the free coefficients. Contract
-            # toward the validated anchor and recheck the actual native-dtype
-            # sum at each trial because rounding can cross either boundary.
-            delta, low_scale, high_scale = action-anchor, 0., 1.
-            for _ in range(24):
-                middle = .5*(low_scale+high_scale)
-                trial = anchor+middle*delta
-                if _fit_feasible(domain, curve, trial, velocity_bounds):
-                    low_scale = middle
-                else:
-                    high_scale = middle
-            initialized = anchor+low_scale*delta
-            if not _fit_feasible(domain, curve, initialized, velocity_bounds):
-                return None, {**report, "reason": "rounded_fit_outside_position_velocity_domain"}
-        proposed_norm = float((action-anchor).to(torch.float64).norm())
-        accepted_norm = float((initialized-anchor).to(torch.float64).norm())
-        report.update(maximum_bound_excess_before_contraction=max(0., float(excess)),
-            fit_contraction_scale=accepted_norm/proposed_norm if proposed_norm else 0.)
-        action = initialized
+    report.update(fit_contraction_scale=1., maximum_bound_excess_before_contraction=[0.]*4,
+                  fit_anchor_source="unneeded")
+    if not bool(domain.feasible(action[None]).all()):
+        # A rounded optimum can cross an active bound. The common limiter
+        # contracts the whole coefficient increment toward a feasible anchor
+        # in the original arithmetic: anchor + scale * (action - anchor).
+        # This produces an approximate fit and reports the actual change.
+        low, high = domain.all_extrema(action[None])
+        excess = torch.maximum(domain.bounds[:, 0]-low, high-domain.bounds[:, 1])
+        try:
+            if domain._anchor is None:
+                domain._anchor = domain._construct_anchor(dtype, device)
+            anchor = domain._anchor.to(dtype=dtype, device=device)
+            domain.validate(anchor)
+            delta = action[None]-anchor
+            limited = domain.limit_step(anchor, delta, action.new_ones((1, 1, 1, 1)))
+            initialized = anchor+limited
+            domain.validate(initialized)
+        except JointDomainInitializationError as error:
+            return None, {**report, "reason": "fit_initializer_not_constructed", "detail": str(error)}
+        proposed_norm = float(delta.to(torch.float64).norm())
+        accepted_norm = float(limited.to(torch.float64).norm())
+        report.update(maximum_bound_excess_before_contraction=excess.clamp_min(0).amax(dim=(0, 2)).cpu().tolist(),
+            fit_contraction_scale=accepted_norm/proposed_norm if proposed_norm else 0.,
+            fit_anchor_source="physical_domain_anchor")
+        action = initialized[0]
     residual = curve.evaluate(action, progress)-values
-    velocity_extrema = curve.velocity_extrema(action)
+    low, high = domain.all_extrema(action[None])
     return action, {**report, "success": True, "reason": "physical_reference_fit",
         "reference_rms_joint_units": float(np.sqrt(np.mean(residual**2))),
         "reference_max_error_joint_units": float(np.max(np.abs(residual))),
+        "continuous_max_abs_derivatives": torch.maximum(low.abs(), high.abs())[0].cpu().tolist(),
         "query_max_abs_velocity_joint_units_per_s": np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist(),
-        "continuous_max_abs_velocity_joint_units_per_s": np.max(np.abs(velocity_extrema), axis=0).tolist()}
+        "continuous_max_abs_velocity_joint_units_per_s": torch.maximum(low.abs(), high.abs())[0, 1].cpu().tolist()}
 # END reference residuals describe the fitted curve in the model's joint units.
-# END the complete curve validator and rollout own final feasibility/acceptance.
+# END the complete curve validator and rollout own final task/geometry acceptance.

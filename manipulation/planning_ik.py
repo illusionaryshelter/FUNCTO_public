@@ -11,27 +11,35 @@ import numpy as np
 
 
 # BEGIN one numerical tracking state leaves the remaining native seed slots free.
-def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous):
-    """Select one supplied numerical proposal by pose energy, then continuity.
+def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous,
+                                 *, native_success):
+    """Select one warm start with native success and continuity kept distinct.
 
     ``candidates`` contains named-order joint positions with shape ``[N,D]``;
     ``candidate_indices`` identifies the caller's finite, position-domain
     proposals. ``pose_costs[N]`` contains their finite native pose energies
     for the same reference query. ``previous[1,D]`` is the preceding tracking
-    state, initially the measured entrance. The caller retains native pose
-    success and residuals separately, including for an un-converged proposal.
+    state, initially the measured entrance. ``native_success[N]`` is the
+    same native query's success flag for every candidate.
 
-    Energy ranks candidates before Euclidean displacement in the supplied
-    joint-coordinate units; the original candidate index breaks exact ties. The returned index names
+    Successful proposals precede failed proposals and minimize Euclidean
+    joint displacement before using their pose energy as a tiebreaker.
+    Failed proposals minimize pose energy before joint displacement. This
+    preserves the failed solver's numerical progress without allowing tiny
+    differences between solved poses to select a distant posture. The
+    original candidate index breaks exact ties. The returned index names
     at most one warm start. The native SeedManager fills the remaining fixed
     seed budget. An empty input index set has no tracking proposal.
     """
     values = np.asarray(candidates, dtype=float)
     costs = np.asarray(pose_costs, dtype=float)
+    solved = np.asarray(native_success, dtype=bool)
     prior = np.asarray(previous, dtype=float)[0]
     selected = min(candidate_indices, default=None,
-        key=lambda index: (float(costs[index]),
-                           float(np.linalg.norm(values[index]-prior)), int(index)))
+        key=lambda index: (not solved[index],
+                           0. if solved[index] else float(costs[index]),
+                           float(np.linalg.norm(values[index]-prior)),
+                           float(costs[index]) if solved[index] else 0., int(index)))
     return None if selected is None else int(selected)
 # END task/scene qualification and native success are not changed by warm-start ranking.
 
@@ -126,7 +134,8 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     nor their connecting edges certify the later continuous trajectory.
 
     Dynamic programming first minimizes the number of nonconverged nodes,
-    then their total pose energy, then normalized joint velocity energy.
+    then failed-node pose energy, then normalized joint velocity energy,
+    then successful-node pose energy.
     Existing static evidence breaks only these ties. Unqualified counts
     include rows whose static query was not performed. Each last node keeps
     'count' histories. Samples with no finite legal proposal are filled
@@ -179,7 +188,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     # BEGIN fixed node evidence and physical-time continuity define one ranking.
     # Pose energy and continuity remain separate lexicographic quantities; no
     # task-specific conversion weight or extra rejection threshold is added.
-    states = {None: [((0, 0., 0., 0, 0), ())]}
+    states = {None: [((0, 0., 0., 0., 0, 0), ())]}
     previous_time = 0.
     normalizer = times[-1]*start.shape[1]
     for layer, (query, indices) in enumerate(layers):
@@ -196,10 +205,13 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 if not np.isfinite(edge):
                     continue
                 for cost, path in paths:
-                    combined = (cost[0]+int(not report["native_pose_ik_success"]),
-                                cost[1]+float(costs[query][index]), cost[2]+edge,
-                                cost[3]+int(not report["task_satisfied"]),
-                                cost[4]+int(not report["model_valid"]))
+                    solved = report["native_pose_ik_success"]
+                    energy = float(costs[query][index])
+                    combined = (cost[0]+int(not solved),
+                                cost[1]+(0. if solved else energy), cost[2]+edge,
+                                cost[3]+(energy if solved else 0.),
+                                cost[4]+int(not report["task_satisfied"]),
+                                cost[5]+int(not report["model_valid"]))
                     options.append((combined, (*path, index)))
             next_states[index] = sorted(options)[:count]
         states = next_states
@@ -227,8 +239,9 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
         result.append({"candidate_indices": indices, "joint_positions": positions.tolist(),
             "anchor_query_indices": anchor_queries, "query_statuses": statuses,
             "selection_cost": {"nonconverged_candidate_count": int(cost[0]),
-                "quadratic_pose_energy": float(cost[1]), "normalized_velocity_energy": float(cost[2]),
-                "static_task_unqualified_count": int(cost[3]), "static_model_unqualified_count": int(cost[4])},
+                "failed_pose_energy": float(cost[1]), "normalized_velocity_energy": float(cost[2]),
+                "successful_pose_energy": float(cost[3]),
+                "static_task_unqualified_count": int(cost[4]), "static_model_unqualified_count": int(cost[5])},
             "interpolated_queries": [query for query, index in enumerate(indices) if index is None],
             "reference_success": all(status == "SOLVED" for status in statuses)})
         if len(result) == count:

@@ -1,6 +1,6 @@
 # `manipulation/cubic_trajectory.py` 实现契约
 
-代码基线：`e0262a5`。
+代码基线：`本次 A–D 实现工作树，实际提交引用待补`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `CubicBasis`
@@ -237,9 +237,82 @@ self.velocity_basis
 float
 ```
 
-## `CubicTrajectoryStep`
+## `CubicBasis.hermite_nodes`
 
 [定义位置](../../../manipulation/cubic_trajectory.py#L90)。
+
+输入签名：
+
+```python
+def hermite_nodes(self, actions, start_q, start_dq):
+```
+
+实现说明：
+
+> Return binary64 time, position and velocity at every original break.
+>
+> ``actions`` is one [free controls, named joints] array; the two entry
+> vectors use the same joint order. A cubic segment is uniquely fixed
+> by its endpoint positions and velocities. Using its original breaks
+> therefore preserves that segment without rebuilding many short
+> polynomials from independently rounded native state samples.
+
+显式输出分支：
+
+```python
+(knots * self.knot_dt, position, velocity)
+```
+
+读取的对象属性：
+
+```python
+np.asarray
+np.float64
+actions.ndim
+actions.shape
+self.knots
+start_q.shape
+start_dq.shape
+np.isfinite(value).all
+np.isfinite
+np.arange
+self.intervals
+self.weights_at_knot_times
+self.knot_dt
+```
+
+写入目标：
+
+```python
+actions
+start_q
+start_dq
+value
+knots
+delta
+position_weights
+position_entry
+velocity_weights
+velocity_entry
+position
+velocity
+```
+
+直接调用符号：
+
+```python
+np.asarray
+all
+np.isfinite(value).all
+np.isfinite
+ValueError
+np.arange
+self.weights_at_knot_times
+```
+
+## `CubicTrajectoryStep`
+
+[定义位置](../../../manipulation/cubic_trajectory.py#L116)。
 
 ```python
 class CubicTrajectoryStep():
@@ -253,14 +326,14 @@ class CubicTrajectoryStep():
 
 > Small differentiable action-to-JointState component for cuRobo.
 >
-> Both regular rollout and dense export use ``sample``. Basis tensors are
+> Both regular rollout and dense metrics use ``sample``. Basis tensors are
 > float64 so measured sub-float32 increments are combined relative to q0
 > before the final native float32 state cast. Torch owns the complete VJP;
 > there is no detached entrance acceleration or handwritten backward.
 
 ## `CubicTrajectoryStep.__init__`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L99)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L125)。
 
 输入签名：
 
@@ -302,7 +375,7 @@ self.bind_clock
 
 ## `CubicTrajectoryStep.bind_clock`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L109)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L135)。
 
 输入签名：
 
@@ -351,7 +424,7 @@ CubicBasis
 
 ## `CubicTrajectoryStep.update_dt`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L123)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L149)。
 
 输入签名：
 
@@ -403,7 +476,7 @@ float
 
 ## `CubicTrajectoryStep.update_batch_size`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L130)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L156)。
 
 输入签名：
 
@@ -435,7 +508,7 @@ ValueError
 
 ## `CubicTrajectoryStep._weights`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L135)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L161)。
 
 输入签名：
 
@@ -497,7 +570,7 @@ np.stack
 
 ## `CubicTrajectoryStep.sample`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L159)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L185)。
 
 输入签名：
 
@@ -602,7 +675,7 @@ torch.full
 
 ## `CubicTrajectoryStep.forward`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L188)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L214)。
 
 输入签名：
 
@@ -661,7 +734,7 @@ self.sample
 
 ## `cubic_transition_config_type`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L205)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L231)。
 
 输入签名：
 
@@ -695,7 +768,7 @@ lru_cache
 
 ## `cubic_transition_config_type.CubicTransition`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L211)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L237)。
 
 ```python
 class CubicTransition(RobotStateTransition):
@@ -707,7 +780,7 @@ class CubicTransition(RobotStateTransition):
 
 ## `cubic_transition_config_type.CubicTransition.__init__`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L212)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L238)。
 
 输入签名：
 
@@ -749,7 +822,7 @@ CubicTrajectoryStep
 
 ## `cubic_transition_config_type.CubicTransitionCfg`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L222)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L248)。
 
 ```python
 class CubicTransitionCfg(RobotStateTransitionCfg):
@@ -763,7 +836,7 @@ class_type: type = CubicTransition
 
 ## `cubic_transition_config_type.CubicTransitionCfg.__post_init__`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L225)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L251)。
 
 输入签名：
 
@@ -801,7 +874,7 @@ ValueError
 
 ## `cubic_transition_config_type.CubicTransitionCfg.create`
 
-[定义位置](../../../manipulation/cubic_trajectory.py#L232)。
+[定义位置](../../../manipulation/cubic_trajectory.py#L258)。
 
 输入签名：
 

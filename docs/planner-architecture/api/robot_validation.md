@@ -1,6 +1,6 @@
 # `manipulation/robot_validation.py` 实现契约
 
-代码基线：`e0262a5`。
+代码基线：`本次 A–D 实现工作树，实际提交引用待补`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_positive_scalar`

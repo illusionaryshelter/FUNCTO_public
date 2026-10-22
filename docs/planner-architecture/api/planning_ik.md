@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`e0262a5`。
+代码基线：`本次 A–D 实现工作树，实际提交引用待补`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `select_ik_tracking_candidate`
@@ -10,22 +10,26 @@
 输入签名：
 
 ```python
-def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous):
+def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous, *, native_success):
 ```
 
 实现说明：
 
-> Select one supplied numerical proposal by pose energy, then continuity.
+> Select one warm start with native success and continuity kept distinct.
 >
 > ``candidates`` contains named-order joint positions with shape ``[N,D]``;
 > ``candidate_indices`` identifies the caller's finite, position-domain
 > proposals. ``pose_costs[N]`` contains their finite native pose energies
 > for the same reference query. ``previous[1,D]`` is the preceding tracking
-> state, initially the measured entrance. The caller retains native pose
-> success and residuals separately, including for an un-converged proposal.
+> state, initially the measured entrance. ``native_success[N]`` is the
+> same native query's success flag for every candidate.
 >
-> Energy ranks candidates before Euclidean displacement in the supplied
-> joint-coordinate units; the original candidate index breaks exact ties. The returned index names
+> Successful proposals precede failed proposals and minimize Euclidean
+> joint displacement before using their pose energy as a tiebreaker.
+> Failed proposals minimize pose energy before joint displacement. This
+> preserves the failed solver's numerical progress without allowing tiny
+> differences between solved poses to select a distant posture. The
+> original candidate index breaks exact ties. The returned index names
 > at most one warm start. The native SeedManager fills the remaining fixed
 > seed budget. An empty input index set has no tracking proposal.
 
@@ -48,6 +52,7 @@ np.linalg
 ```python
 values
 costs
+solved
 prior
 selected
 ```
@@ -64,7 +69,7 @@ int
 
 ## `_validate_reports`
 
-[定义位置](../../../manipulation/planning_ik.py#L39)。
+[定义位置](../../../manipulation/planning_ik.py#L47)。
 
 输入签名：
 
@@ -106,7 +111,7 @@ report.get
 
 ## `_measurement`
 
-[定义位置](../../../manipulation/planning_ik.py#L49)。
+[定义位置](../../../manipulation/planning_ik.py#L57)。
 
 输入签名：
 
@@ -149,7 +154,7 @@ np.isfinite
 
 ## `_quality`
 
-[定义位置](../../../manipulation/planning_ik.py#L58)。
+[定义位置](../../../manipulation/planning_ik.py#L66)。
 
 输入签名：
 
@@ -192,7 +197,7 @@ tuple
 
 ## `_tier`
 
-[定义位置](../../../manipulation/planning_ik.py#L67)。
+[定义位置](../../../manipulation/planning_ik.py#L75)。
 
 输入签名：
 
@@ -224,7 +229,7 @@ def _tier(report, query_kind):
 
 ## `rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning_ik.py#L73)。
+[定义位置](../../../manipulation/planning_ik.py#L81)。
 
 输入签名：
 
@@ -305,7 +310,7 @@ int
 
 ## `rank_ik_candidates.key`
 
-[定义位置](../../../manipulation/planning_ik.py#L100)。
+[定义位置](../../../manipulation/planning_ik.py#L108)。
 
 输入签名：
 
@@ -346,7 +351,7 @@ int
 
 ## `select_ik_chains`
 
-[定义位置](../../../manipulation/planning_ik.py#L116)。
+[定义位置](../../../manipulation/planning_ik.py#L124)。
 
 输入签名：
 
@@ -366,7 +371,8 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 > nor their connecting edges certify the later continuous trajectory.
 >
 > Dynamic programming first minimizes the number of nonconverged nodes,
-> then their total pose energy, then normalized joint velocity energy.
+> then failed-node pose energy, then normalized joint velocity energy,
+> then successful-node pose energy.
 > Existing static evidence breaks only these ties. Unqualified counts
 > include rows whose static query was not performed. Each last node keeps
 > 'count' histories. Samples with no finite legal proposal are filled
@@ -460,6 +466,7 @@ scaled_velocity
 edge
 cost
 path
+solved
 combined
 next_states[index]
 result

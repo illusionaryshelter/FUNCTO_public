@@ -97,7 +97,7 @@ def cartesian_planner(problem, world=None, *, fixed_self_sphere=None):
     planner.trajopt = SimpleNamespace(action_horizon=8, transition_model=SimpleNamespace(
         action_bound_lows=torch.full((dof,), -2.), action_bound_highs=torch.full((dof,), 2.)))
     planner.formal_clock, planner.finger_trajectory = {"duration": 1.}, None
-    def fit_test_initializer(parameters,positions,*,prior_controls,velocity_bounds):
+    def fit_test_initializer(parameters,positions,*,prior_controls):
         # The fixture has Cartesian sample controls, not a native GPU spline.
         # This resampling only packages the geometrically checked OMPL path;
         # physical native spline fitting has its own representation tests.

@@ -110,12 +110,17 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
         "conditional_unknown_residuals": {},
         # This integration fixture isolates interval evidence from scoring.
         "fixed_objective": 0., "objective_components": {"fixture_objective": 0.}}
+    # BEGIN isolate interval queries behind explicit completed sampled evidence.
+    instance._candidate_metrics = Mock(side_effect=lambda curve, scene, *, record_work:
+        (deepcopy(report), np.array([0., 1.]), 0))
+    instance._candidate_objective = Mock(return_value={"fixed_objective": 0.})
+    # END native sampled-metric numerics have their separate factory regression.
     return instance, curve, report, queries
 
 
 def test_interval_collision_rejects_sampled_candidate_and_keeps_exact_failure(monkeypatch):
     instance, curve, report, queries = planner(monkeypatch)
-    returned, result, points = instance.evaluate_candidate(curve, native_report=report)
+    returned, result, points = instance.evaluate_candidate(curve, record_work=Mock())
     assert returned is curve and not result["accepted"]
     assert result["residuals"]["interval:process_scene"] == 1.
     assert result["collision_residuals"]["interval:scene_collision"] == 1.
@@ -126,7 +131,7 @@ def test_interval_collision_rejects_sampled_candidate_and_keeps_exact_failure(mo
 
 def test_unresolved_finite_permission_preserves_warning_and_original_hard_result(monkeypatch):
     instance, curve, report, _ = planner(monkeypatch, permission="finite_region")
-    _, result, _ = instance.evaluate_candidate(curve, native_report=report)
+    _, result, _ = instance.evaluate_candidate(curve, record_work=Mock())
     assert result["accepted"]
     geometry = result["continuous_geometry"]
     assert geometry["unresolved_intervals"] and not geometry["proved_intervals"]
@@ -136,7 +141,7 @@ def test_unresolved_finite_permission_preserves_warning_and_original_hard_result
 
 def test_interval_sampling_keeps_controller_residual_separate_from_intersection(monkeypatch):
     instance, curve, report, _ = planner(monkeypatch, permission="finite_region", residual=.2)
-    _, result, _ = instance.evaluate_candidate(curve, native_report=report)
+    _, result, _ = instance.evaluate_candidate(curve, record_work=Mock())
     assert not result["accepted"] and result["residuals"]["interval:process_scene"] == .2
     assert result["collision_residuals"]["interval:scene_collision"] == 0.
     assert result["continuous_geometry"]["scene_components"]["gripper/controller"]["maximum"] == .2
@@ -144,7 +149,7 @@ def test_interval_sampling_keeps_controller_residual_separate_from_intersection(
 
 def test_release_query_keeps_original_anchor_and_physical_sides_in_one_call(monkeypatch):
     instance, curve, report, queries = planner(monkeypatch, release=True)
-    _, result, _ = instance.evaluate_candidate(curve, native_report=report)
+    _, result, _ = instance.evaluate_candidate(curve, record_work=Mock())
     assert len(queries) == 1 and np.count_nonzero(queries[0] == .0125) == 3
     rows = result["continuous_geometry"]["confirmed_intersections"]
     assert {row["side"] for row in rows if row["time_s"] == .0125} == {-1, 0, 1}
@@ -153,7 +158,7 @@ def test_release_query_keeps_original_anchor_and_physical_sides_in_one_call(monk
 # BEGIN one immutable candidate reuses its first complete release evidence.
 def test_release_cache_charges_each_new_time_once_and_preserves_full_scene_result(monkeypatch):
     instance, curve, report, queries = planner(monkeypatch, permission="finite_region", release=True)
-    _, result, points = instance.evaluate_candidate(curve, native_report=report)
+    _, result, points = instance.evaluate_candidate(curve, record_work=Mock())
     saved = deepcopy(instance.scene_queries)
     assert result["accepted"] and points == 5
     assert len(queries) == 4 and np.count_nonzero(queries[0] == .0125) == 3
@@ -200,7 +205,7 @@ def test_release_cache_charges_each_new_time_once_and_preserves_full_scene_resul
 def test_rejected_task_or_joint_domain_does_not_spend_interval_geometry_work(monkeypatch):
     instance, curve, report, queries = planner(monkeypatch)
     instance._candidate_domain_validation = lambda value: value.residuals.update(continuous_position=.1) or {}
-    _, result, points = instance.evaluate_candidate(curve, native_report=report)
+    _, result, points = instance.evaluate_candidate(curve, record_work=Mock())
     assert not result["accepted"] and points == 0 and not queries
     assert "continuous_geometry" not in result
 # END only actual scene violations reject; interval proof gaps retain their own meaning.

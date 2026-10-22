@@ -7,13 +7,15 @@ import numpy as np
 from scipy.interpolate import BSpline, PPoly
 import torch
 
-from manipulation.physical_joint_domain import CubicJointDomain, JointPositionDomain
+from manipulation.physical_joint_domain import (CubicJointDomain, JointPositionDomain,
+                                                JointDomainInitializationError)
 
 
 class PhysicalJointQPTest(unittest.TestCase):
     @staticmethod
-    def domain(q=0., dq=0.):
-        return CubicJointDomain(torch.tensor([-1.]), torch.tensor([1.]),
+    def domain(q=0., dq=0., limits=(1., 100., 1000., 10000.)):
+        bounds = torch.tensor([[-value, value] for value in limits])[:, :, None]
+        return CubicJointDomain(bounds,
             torch.tensor([q]), torch.tensor([dq]), .2, 8)
 
     @staticmethod
@@ -101,7 +103,8 @@ class PhysicalJointQPTest(unittest.TestCase):
         self.assertLessEqual(float((2*direction).abs().max()), 1.)
 
     def test_cubic_rounding_on_one_joint_does_not_shrink_an_independent_joint(self):
-        domain = CubicJointDomain(torch.full((2,), -1.), torch.ones(2),
+        bounds = torch.tensor([[-1., 1.], [-100., 100.], [-1000., 1000.], [-10000., 10000.]])
+        domain = CubicJointDomain(bounds[:, :, None].expand(-1, -1, 2),
             torch.zeros(2), torch.zeros(2), .2, 16)
         base = torch.zeros((1, 16, 2))
         base[..., 0] = 1.
@@ -110,12 +113,13 @@ class PhysicalJointQPTest(unittest.TestCase):
         # The second joint is in the interior and has an ordinary descent step.
         gradient = torch.full_like(base, -1.)
         gradient[..., 0] = -6.
-        scales = torch.tensor([0., .1, .5, 1.]).reshape(1, 4, 1, 1)
+        scales = self.scales(1.5)
         direction, report = domain.recovery_step(base, gradient, torch.full((16, 2), 1.96), scales)
         self.assertTrue(report["success"], report)
         self.assertGreater(float(direction[..., 1].abs().min()), .1)
         self.assertEqual(report["per_joint_limiter_scale"][1], 1.)
         self.assertTrue(bool(domain.feasible(base[:, None]+scales*direction[:, None]).all()))
+        self.assertLessEqual(float((scales.max()*direction).abs().max()), 1.96)
 
     def test_constrained_stationary_state_has_no_fabricated_recovery(self):
         domain = JointPositionDomain(torch.tensor([-1.]), torch.tensor([1.]))
@@ -126,14 +130,13 @@ class PhysicalJointQPTest(unittest.TestCase):
         torch.testing.assert_close(direction, torch.zeros_like(base))
 
     def test_seed_fit_enforces_continuous_velocity_at_moving_acceleration_roots(self):
-        domain = self.domain(.2, .1)
+        domain = self.domain(.2, .1, limits=(1., .5, 1000., 10000.))
         original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
         progress = np.linspace(0., 1., 41)
         targets = np.sin(6*np.pi*progress)[:, None]
-        velocity_bounds = torch.tensor([[-.5], [.5]])
-        fitted, report = domain.fit_reference(progress, targets, velocity_bounds=velocity_bounds)
+        fitted, report = domain.fit_reference(progress, targets)
         self.assertTrue(report["success"], report)
-        self.assertTrue(report["velocity_bounds_enforced"])
+        self.assertEqual(report["physical_derivative_orders"], [0, 1, 2, 3])
         self.assertGreater(report["rounds"], 1)
         low, high = self.velocity_oracle(domain, fitted)
         self.assertGreaterEqual(low, -.5)
@@ -145,37 +148,24 @@ class PhysicalJointQPTest(unittest.TestCase):
         torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
         np.testing.assert_allclose(domain.evaluate(fitted, [0.], 1), [[.1]], atol=1e-8)
 
-    def test_rounding_contraction_constructs_anchor_for_both_position_and_velocity(self):
-        domain = self.domain(0., .1)
-        # BEGIN a cached position-only anchor is not velocity certification.
-        # The revised entrance can brake a constant proposal immediately.
-        # Use a legal position curve with an independently proved fast hump
-        # to exercise the still-required position+velocity anchor construction.
-        velocity_bounds = torch.tensor([[-.11], [.11]])
-        domain._anchor = torch.zeros(1, 8, 1)
-        domain._anchor[0, 3, 0] = .1
-        position_anchor = domain._anchor[0]
-        self.assertTrue(bool(domain.feasible(domain._anchor).all()))
-        self.assertGreater(max(abs(v) for v in self.velocity_oracle(domain, position_anchor)), .11)
-        # END fitting must not silently weaken its requested velocity bounds.
-        fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.full((16, 1), .5),
-                                              velocity_bounds=velocity_bounds)
+    def test_rounding_contraction_uses_one_anchor_for_all_four_model_bounds(self):
+        domain = self.domain(0., .1, limits=(1., .11, .4, 2.))
+        fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.full((16, 1), .5))
         self.assertTrue(report["success"], report)
-        self.assertEqual(report["fit_anchor_source"], "position_velocity_qp")
+        self.assertEqual(report["fit_anchor_source"], "physical_domain_anchor")
         low, high = self.velocity_oracle(domain, fitted)
-        self.assertGreaterEqual(low, float(velocity_bounds[0, 0]))
-        self.assertLessEqual(high, float(velocity_bounds[1, 0]))
+        self.assertGreaterEqual(low, float(domain.bounds[1, 0, 0]))
+        self.assertLessEqual(high, float(domain.bounds[1, 1, 0]))
         self.assertTrue(bool(domain.feasible(fitted[None]).all()))
 
     def test_incompatible_fixed_velocity_reports_failure_without_dropping_bound(self):
-        domain = self.domain(.2, .1)
+        domain = self.domain(.2, .1, limits=(1., .05, 2., 20.))
         original_q, original_dq = domain._start_q.clone(), domain._start_dq.clone()
-        fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.zeros((16, 1)),
-                                              velocity_bounds=np.array([[-.05], [.05]]))
+        fitted, report = domain.fit_reference(np.linspace(0., 1., 16), np.zeros((16, 1)))
         self.assertIsNone(fitted)
         self.assertFalse(report["success"])
-        self.assertTrue(report["velocity_bounds_enforced"])
-        self.assertEqual(report["reason"], "fit_initializer_not_constructed")
+        self.assertEqual(report["physical_derivative_orders"], [0, 1, 2, 3])
+        self.assertEqual(report["reason"], "algebraic_entrance_invalid")
         torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
         torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
 
@@ -187,6 +177,77 @@ class PhysicalJointQPTest(unittest.TestCase):
         self.assertFalse(report["success"])
         torch.testing.assert_close(domain._start_q, original_q, rtol=0, atol=0)
         torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
+
+    # BEGIN nonzero measured velocity is feasible only with sufficient braking room.
+    def test_qp_anchor_brakes_with_the_full_model_acceleration_and_jerk_limits(self):
+        domain = self.domain(.8, .6, limits=(1., .8, 2., 20.))
+        proposal = torch.full((1, 8, 1), .8)
+        self.assertFalse(bool(domain.feasible(proposal).all()))
+        initialized = domain.initialize(proposal)
+        self.assertTrue(bool(domain.feasible(initialized).all()))
+        np.testing.assert_array_equal(domain.evaluate(initialized, [0.])[0, 0],
+                                      domain._start_q.numpy())
+        np.testing.assert_array_equal(domain.evaluate(initialized, [0.], 1)[0, 0],
+                                      domain._start_dq.numpy())
+        for derivative in range(4):
+            _, values = domain._curve_map.extrema_times(initialized[0, :, 0].numpy(), 0, derivative)
+            self.assertGreaterEqual(float(values.min()), float(domain.bounds[derivative, 0, 0]))
+            self.assertLessEqual(float(values.max()), float(domain.bounds[derivative, 1, 0]))
+
+    def test_inside_q_and_velocity_intervals_can_still_fail_the_braking_qp(self):
+        domain = self.domain(.99, .6, limits=(1., .8, .5, 20.))
+        self.assertTrue(bool(domain._entrance_valid))
+        # Even maximum braking requires v^2/(2*a)=.36 joint units while
+        # only .01 remains. The finite constrained construction must fail.
+        fitted, report = domain.fit_reference(np.linspace(0., 1., 41), np.zeros((41, 1)))
+        self.assertIsNone(fitted)
+        self.assertEqual(report["reason"], "finite_constraints_inconsistent")
+        with self.assertRaisesRegex(JointDomainInitializationError, "finite_constraints_inconsistent"):
+            domain.initialize(torch.full((1, 8, 1), .99))
+
+    def test_fixed_terminal_stop_needs_more_time_than_the_bound_clock_allows(self):
+        domain = self.domain(0., 1., limits=(100., 2., .1, 2.))
+        self.assertTrue(bool(domain._entrance_valid))
+        self.assertTrue(bool(((domain._start_q >= domain.bounds[0, 0])
+                              & (domain._start_q <= domain.bounds[0, 1])).all()))
+        self.assertTrue(bool(((domain._start_dq >= domain.bounds[1, 0])
+                              & (domain._start_dq <= domain.bounds[1, 1])).all()))
+        duration = domain.intervals*domain._curve_map.knot_dt
+        # The wide position interval leaves room, while |a| <= .1 requires
+        # at least ten seconds to stop the measured unit velocity. The
+        # immutable two-second cubic includes its original stopped end.
+        self.assertEqual(duration, 2.)
+        self.assertLess(duration, float(domain._start_dq/domain.bounds[2, 1]))
+        fitted, report = domain.fit_reference(np.linspace(0., 1., 41), np.zeros((41, 1)))
+        self.assertIsNone(fitted)
+        self.assertFalse(report["success"])
+        self.assertEqual(report["reason"], "finite_constraints_inconsistent")
+        self.assertEqual(float(domain._start_q), 0.)
+        self.assertEqual(float(domain._start_dq), 1.)
+
+    def test_tight_acceleration_and_jerk_fit_and_recovery_share_all_trial_bounds(self):
+        domain = self.domain(0., .1, limits=(1., .5, .2, 1.))
+        progress = np.linspace(0., 1., 41)
+        fitted, report = domain.fit_reference(progress, np.linspace(0., .2, 41)[:, None])
+        self.assertTrue(report["success"], report)
+        self.assertTrue(bool(domain.feasible(fitted[None]).all()))
+        self.assertGreater(report["maximum_bound_excess_before_contraction"][2], 0.)
+        self.assertGreater(report["maximum_bound_excess_before_contraction"][3], 0.)
+        self.assertLess(report["fit_contraction_scale"], 1.)
+        # The actual float32 action is independently checked by piecewise
+        # polynomial extrema; no model bound is widened by these assertions.
+        for derivative in range(4):
+            _, values = domain._curve_map.extrema_times(fitted[:, 0].numpy(), 0, derivative)
+            self.assertGreaterEqual(float(values.min()), float(domain.bounds[derivative, 0, 0]))
+            self.assertLessEqual(float(values.max()), float(domain.bounds[derivative, 1, 0]))
+        base = domain.initialize(torch.zeros((1, 8, 1)))
+        direction, recovery = domain.recovery_step(base, -torch.ones_like(base),
+                                                   torch.full((8, 1), .1), self.scales(1.5))
+        self.assertTrue(recovery["success"], recovery)
+        trials = base[:, None]+self.scales(1.5)*direction[:, None]
+        self.assertTrue(bool(domain.feasible(trials).all()))
+        self.assertLessEqual(float((1.5*direction).abs().max()), float(torch.tensor(.1)))
+    # END algebraic entrance checks and bounded continuous construction stay distinct.
 
 
 

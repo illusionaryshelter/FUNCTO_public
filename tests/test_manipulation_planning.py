@@ -110,8 +110,9 @@ def bind_analytic_ik_screening(planner, report_for=None):
     planner.formal_clock = {"knot_dt": .2, "duration": .2*(planner.trajopt.action_horizon+2)}
     if not hasattr(planner.start, "velocity"):
         planner.start.velocity = torch.zeros_like(planner.start.position)
-    planner.physical_domain = CubicJointDomain(torch.full((dimensions,), -200.),
-        torch.full((dimensions,), 200.), planner.start.position, planner.start.velocity,
+    # BEGIN declare all derivative bounds for the analytic proposal fixture.
+    bounds = torch.tensor([[-200., 200.], [-2., 2.], [-20., 20.], [-100., 100.]])[:, :, None].expand(-1, -1, dimensions)
+    planner.physical_domain = CubicJointDomain(bounds, planner.start.position, planner.start.velocity,
         planner.formal_clock["knot_dt"], planner.trajopt.action_horizon)
     # BEGIN coarse fitting fixtures expose the production proposal contract.
     from manipulation.physical_joint_domain import JointPositionDomain
@@ -188,8 +189,12 @@ def export_fixture(problem, progress_map, position, velocity, dt):
                                            position=q[:, :, None], quaternion=quaternion),
                 robot_spheres=spheres)
 
-    native = SimpleNamespace(position=position, velocity=velocity,
-                             dt=torch.tensor([dt], dtype=torch.float64))
+    # BEGIN constant control fixtures use the actual native basis exporter.
+    controls = max(2, position.shape[1]-3)
+    duration = (position.shape[1]-1)*dt
+    knot_dt = duration/(controls+2)
+    actions = position[:, -1:, :].expand(1, controls, -1).clone()
+    # END analytic nonconstant polynomials are supplied directly to qualification.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.check_request = Mock()
     planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
@@ -208,9 +213,8 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner.device_cfg = SimpleNamespace(to_device=lambda x: torch.as_tensor(x, dtype=torch.float64))
     planner.JointState = SimpleNamespace
     planner._RobotState = lambda **kwargs: SimpleNamespace(**kwargs, robot_spheres=kwargs["cuda_robot_model_state"].robot_spheres)
-    planner.trajopt = SimpleNamespace(get_active_js=lambda state: state)
-    planner.formal_clock = {"valid_count": position.shape[1], "interpolation_dt": dt,
-                            "duration": (position.shape[1]-1)*dt}
+    planner.trajopt = SimpleNamespace(action_horizon=controls)
+    planner.formal_clock = {"knot_dt": knot_dt, "duration": duration}
     planner.finger_trajectory = None
     planner.start = SimpleNamespace(position=position[:, 0], velocity=velocity[:, 0])
     planner._verification_fk = CartesianKinematics()
@@ -236,7 +240,8 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     limits = SimpleNamespace(joint_names=list(problem.joint_names),
         position=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
         velocity=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
-        acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
+        acceleration=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64),
+        jerk=torch.tensor([[-1e6]*3, [1e6]*3], dtype=torch.float64))
     cspace = SimpleNamespace(enabled=True, config=SimpleNamespace(joint_limits=limits))
     planner._verification_native = SimpleNamespace(
         get_cost={"cspace": cspace}.get,
@@ -250,7 +255,9 @@ def export_fixture(problem, progress_map, position, velocity, dt):
         "hard_scene_residual": 0., "scene_categories": {}, "scene_components": {},
         "confirmed_intersections": [], "proved_intervals": [], "unresolved_intervals": []})
     # END the original polynomial owns all continuous joint-domain checks.
-    return planner, SimpleNamespace(batch_size=1, num_seeds=1, get_interpolated_plan=lambda: native)
+    planner._candidate_metrics = Mock(return_value=(
+        {"accepted": True, "residuals": {}}, np.array([0., 1.]), 0))
+    return planner, SimpleNamespace(batch_size=1, num_seeds=1, solution=actions[:, None])
 
 
 class PlannerCalculusTests(unittest.TestCase):
@@ -747,7 +754,8 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.trajopt = SimpleNamespace(action_horizon=15, transition_model=SimpleNamespace(
             action_bound_lows=torch.full((3,), -2.), action_bound_highs=torch.full((3,), 2.)))
         planner.formal_clock, planner.finger_trajectory = {"duration": 2.}, None
-        planner.physical_domain = CubicJointDomain(torch.full((3,), -2.), torch.full((3,), 2.),
+        bounds = torch.tensor([[-2., 2.], [-10., 10.], [-100., 100.], [-1000., 1000.]])[:, :, None].expand(-1, -1, 3)
+        planner.physical_domain = CubicJointDomain(bounds,
             planner.start.position, planner.start.velocity, 2./19., 15)
         limits = SimpleNamespace(joint_names=list(planner.joint_names),
                                 velocity=torch.tensor([[-10.]*3, [10.]*3]))
@@ -956,7 +964,8 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         # BEGIN coarse-proposal tests stop at the tool-space refinement boundary.
         lower, upper = torch.full((3,), -2., dtype=torch.float64), torch.full((3,), 2., dtype=torch.float64)
         planner.position_domain = JointPositionDomain(lower, upper)
-        planner.physical_domain = CubicJointDomain(lower, upper, planner.start.position,
+        bounds = torch.tensor([[-2., 2.], [-2., 2.], [-20., 20.], [-100., 100.]], dtype=torch.float64)[:, :, None].expand(-1, -1, 3)
+        planner.physical_domain = CubicJointDomain(bounds, planner.start.position,
             planner.start.velocity, planner.formal_clock["knot_dt"], horizon)
         planner.reference_ik_pose_weights = (10000., 500.)
         planner._refine_reference_seeds = Mock(side_effect=lambda seeds: seeds.contiguous())
@@ -2426,6 +2435,28 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _trajectory_candidate(result, 2)
 
+    # BEGIN a resident single-seed result must survive subsequent metric buffer reuse.
+    def test_single_seed_extraction_owns_actions_states_and_constraint_witnesses(self):
+        from manipulation.planning import _trajectory_candidate
+
+        original = _trajectory_candidate(self.native_candidates(), 0)
+        original.interpolated_metrics = original.metrics.clone()
+        original.interpolated_metrics.debug = torch.ones((1, 9, 4))
+        selected = _trajectory_candidate(original, 0)
+        actions = selected.solution.clone()
+        positions = selected.interpolated_trajectory.position.clone()
+        constraints = selected.interpolated_metrics.costs_and_constraints.constraints.values[0].clone()
+        original.solution.fill_(31.)
+        original.interpolated_trajectory.position.fill_(47.)
+        original.interpolated_metrics.costs_and_constraints.constraints.values[0].zero_()
+        original.interpolated_metrics.debug.zero_()
+        torch.testing.assert_close(selected.solution, actions, rtol=0, atol=0)
+        torch.testing.assert_close(selected.interpolated_trajectory.position, positions, rtol=0, atol=0)
+        torch.testing.assert_close(selected.interpolated_metrics.costs_and_constraints.constraints.values[0],
+                                   constraints, rtol=0, atol=0)
+        torch.testing.assert_close(selected.interpolated_metrics.debug, torch.ones((1, 9, 4)), rtol=0, atol=0)
+    # END completed native evidence remains tied to its selected sampled states.
+
     # BEGIN native top-k must preserve selected collision evidence explicitly.
     def test_native_multi_seed_selection_retains_only_its_own_dense_collision_values(self):
         from manipulation.planning import _trajectory_candidate, _dense_collision_witnesses
@@ -2530,34 +2561,28 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
 
 # BEGIN exact knot-side, barrier and named-bound acceleration regressions.
 # BEGIN native-feasible selection invokes continuous qualification before delivery.
-def test_native_selection_uses_shared_residuals_and_exports_no_rejected_seed():
+def test_native_failure_flag_cannot_skip_saved_curve_qualification():
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
-    planner.check_request = Mock()
     planner.seed_strategies = ["reference", "alternate"]
     planner.last_optimizer_diagnostics = []
-    planner._native_curve = Mock(return_value=object())
-    # BEGIN this selection fixture isolates the separately tested interval checker.
-    planner._candidate_objective = Mock(return_value={
-        "fixed_objective": 2.5, "objective_components": {"continuous_reference": 2.5}})
-    planner.evaluate_candidate = Mock(side_effect=lambda curve, *, native_report:
-        (curve, native_report, 3))
-    # END rejected native seeds do not start continuous geometry queries.
-    planner.export = Mock(side_effect=AssertionError("Selection must not run output delivery"))
+    planner._native_curve = Mock(side_effect=lambda result: float(result.solution[0, 0, 0, 0]))
+    planner._candidate_objective = Mock(side_effect=lambda curve: {"fixed_objective": curve})
+    def qualify(curve, *, record_work, objective):
+        record_work(passes=1)
+        record_work(points=3)
+        return curve, {"accepted": True, "residuals": {}, **objective}, 3
+    planner.evaluate_candidate = Mock(side_effect=qualify)
+    planner.export = Mock(side_effect=AssertionError("Selection must not deliver output"))
     candidates = PlannerCandidateSelectionTests.native_candidates()
-    _, curve, report = planner.select_candidate(candidates)
-    assert report["accepted"] and report["selected_seed_index"] == 1
-    # BEGIN candidates are visited in qualified-score order until one passes.
-    assert [(row["seed_index"], row["accepted"]) for row in report["candidates"]] == [(1, True)]
-    assert report["fixed_objective"] == 2.5
-    planner._candidate_objective.assert_called_once_with(curve)
-    # END the rejected native seed never enters score or interval evaluation.
-    planner._native_curve.assert_called_once()
+    work = Mock()
+    _, curve, report = planner.select_candidate(candidates, record_work=work)
+    assert curve == 1. and report["accepted"] and report["selected_seed_index"] == 0
+    assert not report["optimization_diagnostics"]["success"]
+    assert planner._native_curve.call_count == planner._candidate_objective.call_count == 2
     planner.evaluate_candidate.assert_called_once()
-    assert planner.evaluate_candidate.call_args.args[0] is curve
-    assert planner.evaluate_candidate.call_args.kwargs["native_report"]["seed_index"] == 1
-    assert report["interval_query_points"] == 3
-    planner.export.assert_not_called()
-# END only the selected native candidate reaches the later delivery boundary.
+    assert report["validation_query_points"] == 3 and report["evaluated_candidate_count"] == 1
+    assert work.call_args_list == [unittest.mock.call(passes=1), unittest.mock.call(points=3)]
+# END native success remains provenance while the saved curve determines acceptance.
 
 
 class ContinuousCubicDerivativeTests(unittest.TestCase):
@@ -2636,13 +2661,14 @@ class ExportedCurveContractTests(unittest.TestCase):
     """Curve construction, continuous qualification and delivery have separate roles."""
 
     # BEGIN every delivered curve has completed the real candidate domain check.
-    def qualify(self, planner, result):
-        trajectory = planner._native_curve(result)
+    def qualify(self, planner, result, trajectory=None):
+        if trajectory is None:
+            trajectory = planner._native_curve(result)
         # BEGIN this fixture supplies the independent ordinary score explicitly.
         # These cases exercise exact polynomial bounds, event timing and
         # delivery reuse. Reference-cost numerics have their own native tests.
         returned, report, points = planner.evaluate_candidate(trajectory,
-            native_report={"accepted": True, "residuals": {}, "fixed_objective": 0.})
+            record_work=Mock(), objective={"fixed_objective": 0.})
         self.assertEqual(report["fixed_objective"], 0.)
         # END polynomial qualification retains its separate hard residuals.
         self.assertIs(returned, trajectory)
@@ -2657,7 +2683,11 @@ class ExportedCurveContractTests(unittest.TestCase):
             [[0., 0., 0.], [3., 0., 0.], [3., 0., 0.]], 1.)
         limits = planner._verification_native.get_cost("cspace").config.joint_limits
         limits.acceleration[:, 0] = torch.tensor([-2., 5.], dtype=torch.float64)
-        trajectory, report = self.qualify(planner, result)
+        analytic = JointTrajectory(problem.joint_names, np.array([0., 1., 2.]),
+            np.array([[0., 0., 0.], [1., 0., 0.], [4., 0., 0.]]),
+            np.array([[0., 0., 0.], [3., 0., 0.], [3., 0., 0.]]),
+            np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+        trajectory, report = self.qualify(planner, result, analytic)
         self.assertFalse(report["accepted"])
         self.assertAlmostEqual(trajectory.residuals["continuous_acceleration"], 1.)
         self.assertAlmostEqual(report["residuals"]["continuous_acceleration"], 1.)

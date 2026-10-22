@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 
 import numpy as np
-from scipy.interpolate import BSpline
+from scipy.interpolate import BSpline, CubicHermiteSpline
 import torch
 
 from manipulation.cubic_trajectory import CubicBasis, CubicTrajectoryStep, cubic_transition_config_type
@@ -24,6 +24,44 @@ def independent_curve(q, dq, h, action):
 
 
 class CubicTrajectoryTests(unittest.TestCase):
+    # BEGIN original-break export must retain derivatives as metric density changes.
+    def test_hermite_export_preserves_original_curve_and_avoids_dense_roundoff(self):
+        q = torch.tensor([[1.5, -.75, .2]])
+        dq = torch.tensor([[1e-5, -.02, .01]])
+        actions = q[:, None] + .025 * torch.sin(
+            torch.arange(54, dtype=torch.float32).reshape(1, 18, 3) * .37)
+        start = SimpleNamespace(position=q, velocity=dq)
+        for native_dt in (.125, .13005000352859497):
+            with self.subTest(native_dt=native_dt):
+                step = CubicTrajectoryStep(18, 4, native_dt, device="cpu")
+                times, positions, velocities = step.curve.hermite_nodes(
+                    actions[0].numpy(), q[0].numpy(), dq[0].numpy())
+                exported = CubicHermiteSpline(times, positions, velocities)
+                original = independent_curve(q[0].double().numpy(), dq[0].double().numpy(),
+                    step.knot_dt, actions[0].double().numpy())
+                query = (np.arange(1280) + .375) * (times[-1] / 1280)
+                for derivative in range(4):
+                    np.testing.assert_allclose(exported(query, derivative),
+                        original(query / step.knot_dt, derivative) / step.knot_dt**derivative,
+                        rtol=0, atol=2e-12)
+                self.assertEqual(len(times), 21)
+                np.testing.assert_array_equal(positions[0], q[0].numpy())
+                np.testing.assert_array_equal(velocities[0], dq[0].numpy())
+                np.testing.assert_array_equal(exported(query[query >= times[-2]], 1),
+                                               np.zeros((64, 3)))
+                for count in (641, 1281):
+                    output = step.sample(actions, start, torch.zeros(1, dtype=torch.int32),
+                        output_state(1, count, 3), valid_count=count, dense=True,
+                        output_dt=times[-1]/(count-1))
+                    dense_times = np.linspace(0., times[-1], count)
+                    rounded = CubicHermiteSpline(dense_times, output.position[0].numpy(),
+                                                output.velocity[0].numpy())
+                    self.assertGreater(np.max(np.abs(rounded(query, 3)-exported(query, 3))), .01)
+                    repeated = step.curve.hermite_nodes(actions[0].numpy(), q[0].numpy(), dq[0].numpy())
+                    for actual, expected in zip(repeated, (times, positions, velocities)):
+                        np.testing.assert_array_equal(actual, expected)
+    # END independent complete-coefficient B-spline supplies the comparison polynomial.
+
     def test_regular_dense_and_scipy_match_with_two_measured_entrances(self):
         step = CubicTrajectoryStep(10, 4, .125, device="cpu")
         q = torch.tensor([[1.4, -.7], [.2, 1.1]])

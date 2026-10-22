@@ -21,7 +21,7 @@ from curobo.types import DeviceCfg, JointState
 
 from manipulation.cubic_trajectory import CubicTrajectoryStep
 from manipulation.curobo_solver_components import bind_solver_components
-from manipulation.physical_joint_domain import CubicJointDomain
+from manipulation.physical_joint_domain import CubicJointDomain, JointDomainInitializationError
 from manipulation.planning import _CuroboPlanner, _ProgressMap, PlanningBudget
 from test_event_allowed_set_ik import event_problem
 from test_scene_query_performance import manager_fixture
@@ -74,8 +74,12 @@ def make_planner(fixture, count=2, iterations=8):
     step = CubicTrajectoryStep(controls, 1, .125, device=device.device)
     start = JointState.from_position(torch.zeros(1, 2), joint_names=list(fixture.problem.joint_names))
     start.velocity = torch.tensor([[.02, -.03]])
-    domain = CubicJointDomain(torch.full((2,), -2.), torch.full((2,), 2.),
+    # BEGIN the analytic fixture declares one physical bound tensor for all consumers.
+    physical_bounds = torch.tensor([[-2., 2.], [-2., 2.], [-100., 100.], [-1000., 1000.]])
+    physical_bounds = physical_bounds[:, :, None].expand(-1, -1, 2).clone()
+    domain = CubicJointDomain(physical_bounds,
                               start.position[0], start.velocity[0], .125, controls)
+    # END continuous checks and native sampled checks read the same model declaration.
     rollout = CurveRollout(fixture, domain, step, start)
     stage = LBFGSOpt(LBFGSOptCfg(device_cfg=device, num_iters=iterations, inner_iters=2,
         history=3, line_search_scale=[0., .1, .5, 1.], initial_step_scale=.001,
@@ -96,27 +100,21 @@ def make_planner(fixture, count=2, iterations=8):
     planner.functional_constraints = fixture.manager.optimization_constraints
     planner.budget = PlanningBudget(knots=12, trajectory_seeds=count, trajectory_iterations=iterations,
         interpolation_steps=1, maximum_trajectory_dt=.125, interpolation_dt=.125)
-    planner.formal_clock = {"duration": 2., "valid_count": 17, "interpolation_dt": .125, "native_dt": .125}
+    planner.formal_clock = {"duration": 2., "valid_count": 17, "interpolation_dt": .125,
+                            "native_dt": .125, "knot_dt": .125}
     planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.finger_trajectory = None
     planner.reference_initialization = {"status": "collecting_proposals", "scene_constraints": "not_evaluated"}
     planner.initial_seed_strategies = ["declared_numeric_proposal"]*count
     planner.initialization_candidate = None
-    bounds = torch.tensor([[-2., -2.], [2., 2.]])
-    limits = SimpleNamespace(joint_names=list(planner.joint_names), position=bounds,
-        velocity=bounds, acceleration=torch.tensor([[-100., -100.], [100., 100.]]))
+    limits = SimpleNamespace(joint_names=list(planner.joint_names),
+        **dict(zip(("position", "velocity", "acceleration", "jerk"), physical_bounds)))
     planner._verification_native = SimpleNamespace(get_cost=lambda _: SimpleNamespace(config=SimpleNamespace(joint_limits=limits)))
-
-    def interpolate(joint):
-        output = JointState.zeros((count, 17, 2), device, joint_names=list(planner.joint_names))
-        step.sample(joint.knot, start, torch.zeros(count, dtype=torch.int32), output, valid_count=17)
-        return output, torch.full((count,), 17), False
 
     planner.trajopt = SimpleNamespace(optimizer=optimizer, optimizer_rollouts=[rollout],
         core=SimpleNamespace(optimizers=[stage]), action_horizon=controls, action_dim=2,
         interpolation_steps=1, disable_tool_pose_tracking=Mock(), disable_joint_position_tracking=Mock(),
-        _prepare_goal_buffer=Mock(return_value=(object(), True)), _update_rollout_params=Mock(),
-        get_interpolated_trajectory=interpolate)
+        _prepare_goal_buffer=Mock(return_value=(object(), True)), _update_rollout_params=Mock())
     seeds = torch.zeros((1, count, controls, 2))
     seeds[0, :, :, 0] = torch.arange(count)[:, None]*.05
     return planner, seeds, rollout, stage
@@ -177,14 +175,16 @@ def test_interruption_preserves_completed_coarse_curve_and_restores_original_sco
         assert stage.config.num_iters == 8 and fixture.manager.local_geometry_models is not None
 
 
-def test_continuous_derivative_violation_remains_evidence_and_does_not_block_handoff(manager_fixture):
+def test_curve_with_illegal_derivatives_cannot_enter_reference_refinement(manager_fixture):
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
         planner, seed, _, _ = make_planner(fixture, count=1, iterations=2)
-        planner._verification_native.get_cost("cspace").config.joint_limits.acceleration.fill_(0.)
-        refined = planner._refine_reference_seeds(seed)
-        final = planner.reference_initialization["refined"]["seeds"][0]
-        assert final["continuous_residuals"]["continuous_acceleration"] > 0
-        torch.testing.assert_close(refined, seed, rtol=0, atol=0)
+        seed[0, 0, 3, 0] = 1.5
+        assert bool((seed >= planner.physical_domain.lower).all()
+                    & (seed <= planner.physical_domain.upper).all())
+        assert not bool(planner.physical_domain.feasible(seed).all())
+        with pytest.raises(JointDomainInitializationError):
+            planner._refine_reference_seeds(seed)
+        assert planner.initialization_candidate is None
 # END initialization evidence describes the actual curve without execution authority.
 
 

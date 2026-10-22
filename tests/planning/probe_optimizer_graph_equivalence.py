@@ -5,6 +5,10 @@ probe exercises native L-BFGS with four coordinates and eight cubic controls,
 not a robot planner. It retains each native iteration's action, cost, gradient,
 best/exploration fields and quasi-Newton buffers so an unchanged final success
 flag cannot hide a numerical difference earlier in the solve.
+
+Both source snapshots must expose the same four-derivative physical domain.
+The explicit reference directory names that arithmetic baseline; historical
+position-only snapshots describe a different optimization problem.
 """
 
 # BEGIN finite optimizer-only differential probe; no simulation or model loading.
@@ -145,8 +149,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cuda:0")
-    parser.add_argument("--reference-dir", type=Path, default=PROJECT.parent / "sim-version-plans" /
-                        "2026-10-04-exact-gpu-ompl-native-validation")
+    parser.add_argument("--reference-dir", type=Path, required=True)
     arguments = parser.parse_args()
     import torch
     from curobo import runtime
@@ -172,6 +175,11 @@ def main():
     upper = torch.tensor([1., .9, 1., 3.], device=device.device)
     q0 = torch.tensor([.2, .1, .4, .0], device=device.device)
     dq0 = torch.tensor([.03, -.02, .01, 0.], device=device.device)
+    # BEGIN both implementations receive the same explicit physical derivatives.
+    derivative_bounds = torch.tensor([[-10., 10.], [-100., 100.], [-1000., 1000.]], device=device.device)
+    physical_bounds = torch.cat((torch.stack((lower, upper))[None],
+        derivative_bounds[:, :, None].expand(-1, -1, 4)))
+    # END the probe compares execution mode under one unchanged model domain.
 
     class Objective:
         def __init__(self, domain, horizon):
@@ -196,7 +204,7 @@ def main():
 
     def construct(module, components, horizon):
         domain = (module.JointPositionDomain(lower, upper) if horizon == 1 else
-            module.CubicJointDomain(lower, upper, q0, dq0, .2, horizon))
+            module.CubicJointDomain(physical_bounds, q0, dq0, .2, horizon))
         rollouts = [Objective(domain, horizon) for _ in range(2)]
         optimizer = LBFGSOpt(LBFGSOptCfg(device_cfg=device, num_iters=4, inner_iters=2,
             history=4, line_search_scale=[0., .2, 1.], step_scale=.98,
@@ -253,8 +261,10 @@ def main():
                                                (updated, updated_domain, updated_components)):
                 solver, optimizer, _, rollouts = record
                 changed_upper = upper-.1
+                changed_bounds = physical_bounds.clone()
+                changed_bounds[0, 1] = changed_upper
                 domain = (module.JointPositionDomain(lower, changed_upper) if horizon == 1 else
-                    module.CubicJointDomain(lower, changed_upper, q0, dq0, .2, horizon))
+                    module.CubicJointDomain(changed_bounds, q0, dq0, .2, horizon))
                 kwargs = {"use_optimizer_graph": use_graph} if components is updated_components else {}
                 components.bind_solver_components(solver, domain, **kwargs)
                 for rollout in rollouts:

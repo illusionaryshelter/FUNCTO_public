@@ -144,39 +144,44 @@ class PlanningRequestBudgetTest(unittest.TestCase):
             for row in rejected.request_ledger["binding_records"]))
     # END an explicit physical quota never replenishes samples, solves or time.
 
-    # BEGIN interval queries consume the existing request budget before delivery.
-    def test_interval_checked_last_solve_delivers_without_recharging_geometry(self):
-        for solves in (1, 2):
-            with self.subTest(solves=solves):
-                native = Native([False] * solves + [True], collision=True)
+    # BEGIN started validations and completed queries consume the original ledger.
+    def test_last_admitted_validation_delivers_without_recharging_geometry(self):
+        for solves, seeds in ((1, 2), (2, 1)):
+            with self.subTest(solves=solves, seeds=seeds):
+                native = Native([False, True])
                 select = native.select_candidate
-                query_counts = iter([0] + [11] * solves)
+                query_counts = iter((3, 11))
 
-                def interval_checked(accepted):
-                    candidate, curve, report = select(accepted)
-                    report['interval_query_points'] = next(query_counts)
+                def interval_checked(accepted, *, record_work):
+                    candidate, curve, report = select(accepted, record_work=record_work)
+                    points = next(query_counts)
+                    record_work(points=points)
+                    report['interval_query_points'] = points
                     return candidate, curve, report
 
                 native.select_candidate = interval_checked
                 result, backend = run_native(native,
-                    budget=replace(self.budget, maximum_trajectory_solves=solves, trajectory_seeds=1))
+                    budget=replace(self.budget, maximum_trajectory_solves=solves, trajectory_seeds=seeds))
                 try:
                     self.assertTrue(result.success, result.diagnostics.get('reason'))
                     self.assertIsNotNone(result.execution_binding)
-                    self.assertEqual(native.calls.count('solve'), solves)
+                    self.assertEqual(native.calls.count('solve'), 1)
                     self.assertEqual(native.calls.count('export'), 1)
                     work = result.request_ledger['consumed_planning']
-                    self.assertEqual(work['validation_passes'], solves)
-                    self.assertEqual(work['validation_queries'], 1 + 11 * solves)
+                    self.assertEqual(work['validation_passes'], 2)
+                    self.assertEqual(work['validation_queries'], 1 + 3 + 11)
                 finally:
                     backend.close()
 
-    def test_excess_interval_queries_exhaust_the_original_validation_budget(self):
+    def test_recovery_validation_cannot_start_after_reference_and_main_use_two_passes(self):
         native = Native([False, False, True], collision=True)
         select = native.select_candidate
+        completed = []
 
-        def interval_checked(accepted):
-            candidate, curve, report = select(accepted)
+        def interval_checked(accepted, *, record_work):
+            candidate, curve, report = select(accepted, record_work=record_work)
+            record_work(points=11)
+            completed.append(accepted)
             report['interval_query_points'] = 11
             return candidate, curve, report
 
@@ -185,29 +190,82 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         try:
             self.assertFalse(result.success)
             self.assertEqual(result.diagnostics['failure'], 'cumulative_planning_budget_exhausted')
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 3)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 2)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 1 + 22)
+            self.assertEqual(completed, [False, False])
             self.assertNotIn('export', native.calls)
             self.assertIsNone(result.execution_binding)
         finally:
             backend.close()
 
-    def test_delivery_that_reports_new_queries_still_consumes_a_pass(self):
+    def test_export_reuses_qualification_without_charging_another_validation(self):
         native = Native([True, True])
-        export = native.export
+        select = native.select_candidate
+        completed = []
 
-        def queried_delivery(*args):
-            curve, _ = export(*args)
-            return curve, 7
+        def qualified(accepted, *, record_work):
+            candidate, curve, report = select(accepted, record_work=record_work)
+            record_work(points=7)
+            completed.append(accepted)
+            report['interval_query_points'] = 7
+            return candidate, curve, report
 
-        native.export = queried_delivery
+        native.select_candidate = qualified
+        native.export = Mock(wraps=native.export)
         result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
         try:
             self.assertTrue(result.success)
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 1)
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 8)
+            self.assertEqual(completed, [True, True])
+            self.assertEqual(native.export.call_count, 1)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 2)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 1 + 14)
         finally:
             backend.close()
-    # END delivery reuse retains the existing cumulative work limits.
+
+    def test_partial_second_validation_retains_queries_and_only_a_qualified_incumbent(self):
+        for reference_passed in (False, True):
+            with self.subTest(reference_passed=reference_passed):
+                native = Native([reference_passed, False])
+                select = native.select_candidate
+                clock, attempts = [0.], []
+
+                def timed_query(accepted, *, record_work):
+                    candidate, curve, report = select(accepted, record_work=record_work)
+                    attempts.append(accepted)
+                    if len(attempts) == 1:
+                        record_work(points=7)
+                        report['interval_query_points'] = 7
+                        return candidate, curve, report
+                    # The first batch of the second validation completed as
+                    # its original wall-time allowance expired. Committing
+                    # those five points invokes the real budget check before
+                    # another batch or qualification result can be produced.
+                    clock[0] = self.budget.planning_seconds + 1.
+                    record_work(points=5)
+                    self.fail('An exhausted validation started another query')
+
+                native.select_candidate = timed_query
+                with patch('manipulation.planning.time.monotonic', side_effect=lambda: clock[0]):
+                    result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
+                try:
+                    self.assertEqual(result.success, reference_passed)
+                    self.assertEqual(attempts, [reference_passed, False])
+                    work = result.request_ledger['consumed_planning']
+                    self.assertEqual(work['validation_passes'], 2)
+                    self.assertEqual(work['validation_queries'], 1 + 7 + 5)
+                    if reference_passed:
+                        self.assertIsNotNone(result.execution_binding)
+                        self.assertEqual(result.diagnostics['improvement_end']['reason'],
+                                         'cumulative_planning_budget_exhausted')
+                        self.assertEqual(native.calls.count('export'), 1)
+                    else:
+                        self.assertIsNone(result.execution_binding)
+                        self.assertEqual(result.diagnostics['failure'], 'cumulative_planning_budget_exhausted')
+                        self.assertNotIn('export', native.calls)
+                finally:
+                    backend.close()
+    # END export consumes completed evidence; partial work survives an interrupted query.
+
 
 
 if __name__ == "__main__":

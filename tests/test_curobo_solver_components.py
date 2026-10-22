@@ -626,9 +626,15 @@ class NativeComponentTest(unittest.TestCase):
 
     def test_both_rollouts_obey_domains_through_native_resize_and_reinitialize(self):
         lower, upper = torch.tensor([.1, -.8]), torch.tensor([1., .9])
+        # BEGIN explicit derivative limits accompany the named position intervals.
+        bounds = torch.stack((torch.stack((lower, upper)),
+            torch.tensor([[-10., -10.], [10., 10.]]),
+            torch.tensor([[-100., -100.], [100., 100.]]),
+            torch.tensor([[-1000., -1000.], [1000., 1000.]])))
         domains = [(JointPositionDomain(lower, upper), 1),
-            (CubicJointDomain(lower, upper, torch.tensor([.4, .2]),
+            (CubicJointDomain(bounds, torch.tensor([.4, .2]),
                              torch.tensor([.05, -.05]), .2, 8), 8)]
+        # END both rollout copies consume the same continuous physical domain.
         for domain, horizon in domains:
             with self.subTest(horizon=horizon):
                 solver, optimizer, rollouts = self.make_solver(domain, horizon)

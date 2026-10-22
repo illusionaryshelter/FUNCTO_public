@@ -79,8 +79,12 @@ def main():
                 get_sum_cost_and_constraint=lambda sum_horizon: costs))
 
     def construct(graph):
-        domain = CubicJointDomain(-torch.ones(7, device=device.device), torch.ones(7, device=device.device),
+        # BEGIN numerical recovery declares the same four model derivatives as the domain.
+        bounds = torch.tensor([[-1., 1.], [-10., 10.], [-100., 100.], [-1000., 1000.]],
+                              device=device.device)[:, :, None].expand(-1, -1, 7)
+        domain = CubicJointDomain(bounds,
             torch.zeros(7, device=device.device), torch.zeros(7, device=device.device), .2, 16)
+        # END one declared domain serves both eager and captured native updates.
         optimizer = LBFGSOpt(LBFGSOptCfg(device_cfg=device, num_iters=8, inner_iters=2,
             history=27, line_search_scale=[0., .1, .5, 1.], step_scale=.98,
             use_cuda_kernel_step_direction=True, use_cuda_kernel_line_search=True,

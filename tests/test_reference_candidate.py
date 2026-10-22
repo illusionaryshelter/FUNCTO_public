@@ -56,8 +56,9 @@ def candidate_fixture(*, accepted=True, components=None, native_outcomes=(), int
     for name in ("bind_reference_candidate", "evaluate_candidate", "_candidate_domain_validation"):
         setattr(native, name, MethodType(getattr(_CuroboPlanner, name), native))
 
-    def completed_metrics(curve, scene):
+    def completed_metrics(curve, scene, *, record_work):
         native.calls.append("candidate")
+        record_work(points=4)
         return {"accepted": accepted, "native_success": accepted,
             "residuals": {"interpolated:process_scene": 0. if accepted else 1.},
             "scene_components": components or {}}, np.array([0., 1.]), 4
@@ -69,10 +70,12 @@ def candidate_fixture(*, accepted=True, components=None, native_outcomes=(), int
     # Interval geometry is a separate required consumer. These two completed
     # endpoint queries are fixture evidence; production joint-domain checks,
     # residual combination and remaining query-budget arithmetic stay real.
-    native._candidate_geometry = Mock(return_value={
-        "query_points": 2, "hard_scene_residual": interval_residual,
-        "scene_categories": {"collision": interval_residual}, "scene_components": {},
-        "scope": "CPU fixture of completed interval geometry evidence"})
+    def completed_geometry(curve, scene, *, remaining_points, record_work):
+        record_work(points=2)
+        return {"query_points": 2, "hard_scene_residual": interval_residual,
+            "scene_categories": {"collision": interval_residual}, "scene_components": {},
+            "scope": "CPU fixture of completed interval geometry evidence"}
+    native._candidate_geometry = Mock(side_effect=completed_geometry)
     return native
 # END geometry accuracy is covered by the native scene and interval test modules.
 
@@ -122,8 +125,8 @@ def test_supplied_curve_keeps_its_own_clock_when_native_improvements_score_worse
         np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
     select = native.select_candidate
 
-    def worse_native_candidate(value):
-        result, curve, report = select(value)
+    def worse_native_candidate(value, *, record_work):
+        result, curve, report = select(value, record_work=record_work)
         report.update(fixed_objective=2., objective_components={"fixture_reference": 2.})
         return result, curve, report
 
@@ -230,22 +233,20 @@ def test_nonuniform_query_grid_retains_every_original_piece_and_bounds_spacing()
     np.testing.assert_allclose(ddq[:, 0], .2, atol=1e-14)
 
 
-# BEGIN reuse sampled metrics while independently checking continuous intervals.
+# BEGIN exact saved-curve metrics and interval queries share one qualification.
 @pytest.mark.parametrize("interval_residual", [0., .01])
-def test_completed_native_metrics_reuse_samples_and_consume_interval_evidence(interval_residual):
+def test_saved_curve_queries_sampled_and_interval_evidence(interval_residual):
     native = candidate_fixture(interval_residual=interval_residual)
-    native._candidate_metrics.side_effect = AssertionError("Completed metrics must not be recomputed")
     reference = supplied_curve()
-    curve, attempt, points = native.evaluate_candidate(reference,
-        native_report={"accepted": True, "residuals": {"interpolated:process_scene": 0.}})
+    record_work = Mock()
+    curve, attempt, points = native.evaluate_candidate(reference, record_work=record_work)
     assert attempt["accepted"] is (interval_residual == 0.)
-    assert points == 2
+    assert points == 6
     assert attempt["residuals"]["interval:process_scene"] == interval_residual
-    native._candidate_metrics.assert_not_called()
-    prior_points = len(reference.times)+len(
-        _ProgressMap(reference.progress_u, reference.progress_s).anchor_parameters(native.anchors))
+    native._candidate_metrics.assert_called_once_with(reference, native.scene, record_work=record_work)
     native._candidate_geometry.assert_called_once_with(reference, native.scene,
-        remaining_points=native.budget.max_validation_points-prior_points)
+        remaining_points=native.budget.max_validation_points-4, record_work=record_work)
+    assert record_work.call_count == 3
     if interval_residual == 0.:
         assert native.last_validation["cubic_derivatives"]["acceleration"]["maximum_bound_excess"] == 0
         assert native.last_validation["continuous_geometry"] == attempt["continuous_geometry"]
@@ -313,7 +314,7 @@ def test_native_metric_failure_clears_explicit_candidate_context():
     # END candidate code itself no longer patches the returned native registry.
     for _ in range(2):
         with pytest.raises(RuntimeError, match="metric sentry"):
-            _CuroboPlanner._candidate_metrics(native, reference, Scene())
+            _CuroboPlanner._candidate_metrics(native, reference, Scene(), record_work=Mock())
         assert manager._candidate_query is None
         assert goals._goal_buffer.batch_size == 1
         assert goals._goal_buffer.seed_goal_js.position.shape == (1, 1, 2)
@@ -470,4 +471,4 @@ def test_regular_samples_and_exact_anchors_share_one_metric_buffer_capacity():
         np.array([0., 1.]), np.array([0., 1.]), (), (), {})
     assert len(_candidate_sample_times(reference, native.budget)) == 481
     with pytest.raises(Exception, match="samples and exact anchors"):
-        _CuroboPlanner._candidate_metrics(native, reference, Scene())
+        _CuroboPlanner._candidate_metrics(native, reference, Scene(), record_work=Mock())

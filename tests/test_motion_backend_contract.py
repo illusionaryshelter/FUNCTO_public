@@ -53,7 +53,8 @@ class Native:
         self.budget = PlanningBudget()
         core = lambda: SimpleNamespace(optimizers=[])
         self.ik = SimpleNamespace(config=SimpleNamespace(exit_early=False), core=core())
-        self.trajopt = SimpleNamespace(core=core())
+        self.trajopt = SimpleNamespace(core=core(),
+            transition_model=SimpleNamespace(compute_inverse_dynamics=False))
         self.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         self.scene_workspace_bytes = self.scene_cpu_workspace_bytes = self.scene_gpu_workspace_bytes = 0
         self.anchor_fk_workspace_bytes = 0
@@ -70,7 +71,8 @@ class Native:
         self.initial_seed_strategies = self.seed_strategies = ["test", "test"]
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
         limits = SimpleNamespace(joint_names=["q"], position=torch.tensor([[-1.], [1.]]),
-            velocity=torch.tensor([[-1.], [1.]]), acceleration=torch.tensor([[-1.], [1.]]))
+            velocity=torch.tensor([[-1.], [1.]]), acceleration=torch.tensor([[-1.], [1.]]),
+            jerk=torch.tensor([[-10.], [10.]]))
         self._verification_native = SimpleNamespace(get_cost=lambda _: SimpleNamespace(config=SimpleNamespace(joint_limits=limits)))
         self.curve = JointTrajectory(("q",), np.array([0., 1.]), np.zeros((2, 1)), np.zeros((2, 1)),
                                     np.array([0., 1.]), np.array([0., 1.]), (), (), {})
@@ -85,7 +87,10 @@ class Native:
     def optimize(self, seed, *, iterations=None):
         self.calls.append("solve")
         return next(self.outcomes)
-    def select_candidate(self, accepted):
+    def select_candidate(self, accepted, *, record_work):
+        # BEGIN even a zero-query fixture starts one formal validation attempt.
+        record_work(passes=1)
+        # END query counts are charged only by actual completed fixture queries.
         report = {"accepted": accepted, "native_success": accepted, "seed_provenance": "test",
                   "fixed_objective": 1., "objective_components": {"continuous_reference": 1.},
                   "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.},
@@ -131,6 +136,8 @@ def test_feasible_reference_is_retained_through_one_main_improvement():
     assert result.success and native.calls == ["seed", "reference", "export", "solve"]
     assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
     assert result.execution_binding["verification_joint_limits"]["joint_names"] == ["q"]
+    assert result.diagnostics["joint_state_computation"] == {
+        "kinematic_derivative_orders": [0, 1, 2, 3], "effort": "not_computed"}
     assert backend._planner is native
     backend.close()
     assert native.calls[-1] == "close"
@@ -204,8 +211,8 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
     native = Native([False, False, False])
     native.functional_constraints.keys = ("event",) if functional else ()
     select = native.select_candidate
-    def missing_support(accepted):
-        candidate, curve, report = select(accepted)
+    def missing_support(accepted, *, record_work):
+        candidate, curve, report = select(accepted, record_work=record_work)
         report["residuals"] = {"rollout:process_scene": 400000., "interpolated:process_scene": 500000.}
         report["collision_residuals"] = {"rollout:scene_collision": 0., "interpolated:scene_collision": 0.}
         report["scene_update_residuals"] = {"rollout:scene_update": 400000., "interpolated:scene_update": 500000.}
@@ -230,8 +237,8 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
 def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(search_succeeds):
     native = Native([False, False, True], ompl=search_succeeds)
     select = native.select_candidate
-    def covered(accepted):
-        candidate, curve, report = select(accepted)
+    def covered(accepted, *, record_work):
+        candidate, curve, report = select(accepted, record_work=record_work)
         report["residuals"] = {"interpolated:process_scene": 0. if accepted else 4000.}
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": 0. if accepted else 4000.}
         # BEGIN final policy classification consumes named same-candidate evidence.
@@ -262,8 +269,8 @@ def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(
 def test_forbidden_coverage_cannot_replenish_a_zero_search_budget():
     native = Native([False, False])
     select = native.select_candidate
-    def forbidden(accepted):
-        candidate, curve, report = select(accepted)
+    def forbidden(accepted, *, record_work):
+        candidate, curve, report = select(accepted, record_work=record_work)
         report["residuals"] = {"interpolated:process_scene": 1.}
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": 1.}
         return candidate, curve, report
@@ -284,8 +291,8 @@ def test_forbidden_coverage_cannot_replenish_a_zero_search_budget():
 def test_other_scene_terms_cannot_masquerade_as_forbidden_coverage(component):
     native = Native([False, False])
     select = native.select_candidate
-    def other_scene_failure(accepted):
-        candidate, curve, report = select(accepted)
+    def other_scene_failure(accepted, *, record_work):
+        candidate, curve, report = select(accepted, record_work=record_work)
         report["residuals"] = {"interpolated:process_scene": 1.}
         report["scene_components"] = {component: {"maximum": 1.}}
         return candidate, curve, report
@@ -317,8 +324,8 @@ def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(st
         select = native.select_candidate
         selections = []
 
-        def confirmed(accepted):
-            candidate, curve, report = select(accepted)
+        def confirmed(accepted, *, record_work):
+            candidate, curve, report = select(accepted, record_work=record_work)
             selections.append(1)
             if stage == "reference" or len(selections) == 2:
                 report.update(residuals={"interpolated:process_scene": .04},
@@ -346,8 +353,8 @@ def test_require_observation_does_not_relabel_a_mixed_collision_failure():
     world.unknown_policy = {"outside_regions": "require_observation", "conditional_regions": []}
     select = native.select_candidate
 
-    def mixed(accepted):
-        candidate, curve, report = select(accepted)
+    def mixed(accepted, *, record_work):
+        candidate, curve, report = select(accepted, record_work=record_work)
         report.update(residuals={"interpolated:process_scene": .05},
             coverage_residuals={"interpolated:unknown_forbidden": .04},
             collision_residuals={"interpolated:scene_collision": .01},
@@ -419,8 +426,8 @@ def test_new_dense_witnesses_continue_current_controls_without_search_or_third_s
     optimized_controls = torch.full((1, 1, 8, 1), .37)
     recovery_seeds = []
 
-    def select(outcome):
-        selected, curve, report = original_select(outcome)
+    def select(outcome, *, record_work):
+        selected, curve, report = original_select(outcome, record_work=record_work)
         selected.solution = optimized_controls.clone()
         return selected, curve, report
 
@@ -467,8 +474,8 @@ def test_sampled_collision_evidence_selects_search_or_missing_time_recovery(alre
                 names=["process_scene"], values=[collision])))
         # END coverage never acquires a collision sample through fixture defaults.
 
-    def select(accepted):
-        candidate, curve, report = original_select(accepted)
+    def select(accepted, *, record_work):
+        candidate, curve, report = original_select(accepted, record_work=record_work)
         # Constant positive evidence has no sampling gap. The alternative
         # has one collision strictly between ordinary zero-valued samples.
         candidate.batch_size = candidate.num_seeds = 1
@@ -576,8 +583,8 @@ def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, col
     select = native.select_candidate
     source = problem()
     source_positions = source.phases[0].reference.poses.copy()
-    def with_support(accepted):
-        candidate, curve, report = select(accepted)
+    def with_support(accepted, *, record_work):
+        candidate, curve, report = select(accepted, record_work=record_work)
         gap = 0. if accepted else 100000.
         report["scene_update_residuals"] = {"rollout:scene_update": gap}
         report["residuals"]["rollout:process_scene"] = gap
@@ -606,11 +613,11 @@ def test_complete_candidates_compare_one_fixed_objective(improved_score, expecte
     native = Native([(True, 1., .1), (True, improved_score, .2)])
     select = native.select_candidate
 
-    def scored(outcome):
+    def scored(outcome, *, record_work):
         accepted, score, end = outcome
         native.curve = JointTrajectory(("q",), np.array([0., 1.]), np.array([[0.], [end]]),
             np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
-        result, curve, report = select(accepted)
+        result, curve, report = select(accepted, record_work=record_work)
         report.update(fixed_objective=score, objective_components={"continuous_reference": score})
         return result, curve, report
 

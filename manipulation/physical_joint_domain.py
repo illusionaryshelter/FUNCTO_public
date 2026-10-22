@@ -2,7 +2,7 @@
 
 The domains restrict numerical iterates, not the demonstration or task goal.
 No position is clipped after optimization. Cubic checks include the measured
-instantaneous entrance and every analytic interior position extremum.
+instantaneous entrance and the analytic extrema of q, dq, ddq and jerk.
 """
 
 # BEGIN physical-domain step restriction shared by initialization and L-BFGS.
@@ -11,19 +11,19 @@ from __future__ import annotations
 import numpy as np
 import torch
 from scipy.interpolate import CubicHermiteSpline, PPoly
-from scipy.optimize import linprog
 
 # BEGIN a graph scope records errors without changing any domain arithmetic.
 from .optimizer_device_checks import has_active_device_checks, require_tensor
 # END public calls outside an optimizer graph still raise synchronously.
 
 # BEGIN CPU QPs share the exact cubic representation used by the tensor domain.
-from .physical_joint_qp import CubicAffineMap, fit_cubic_reference, recover_position_step
+from .physical_joint_qp import (CubicAffineMap, construct_cubic_anchor,
+                               fit_cubic_reference, recover_position_step)
 # END no CPU solver is called by a captured tensor limiter.
 
 
 class JointDomainInitializationError(ValueError):
-    """A bounded initializer construction failed for the unchanged actual."""
+    """A bounded initializer construction failed for the bound physical domain."""
 
 
 def cubic_position_report(curve: CubicHermiteSpline, lower: np.ndarray, upper: np.ndarray) -> dict:
@@ -88,7 +88,7 @@ class JointPositionDomain:
         """Shorten one direction before constructing any native trial action.
 
         Every nonnegative line-search scale retains its ratio on the same
-        direction. Convexity of the physical position domain justifies the
+        direction. Convexity of the bound physical domain justifies the
         scalar bisection. Rechecking the actual native-dtype trial arithmetic
         handles rounding at a physical boundary without widening that domain.
         """
@@ -150,20 +150,29 @@ class JointPositionDomain:
 
 
 class CubicJointDomain(JointPositionDomain):
-    """Exact position domain of the shared instantaneous-boundary cubic.
+    """Continuous q/dq/ddq/jerk domain of the measured-entrance cubic.
 
     Only measured q0/dq0 are fixed. Acceleration and jerk remain optimizable
     immediately; the original three terminal copies retain a stopped end.
     Free controls themselves have no invented box: only the represented
-    physical q(t) determines this domain.
+    physical curve and its three time derivatives determine this domain.
     """
 
-    def __init__(self, lower: torch.Tensor, upper: torch.Tensor, start_q: torch.Tensor,
+    def __init__(self, bounds: torch.Tensor, start_q: torch.Tensor,
                  start_dq: torch.Tensor, knot_dt: float, knots: int):
-        super().__init__(lower, upper)
+        # BEGIN one model declaration binds every derivative to named joints.
+        self.bounds = bounds.detach().to(torch.float64)
+        if (self.bounds.ndim != 3 or self.bounds.shape[:2] != (4, 2)
+                or not bool(torch.isfinite(self.bounds).all())
+                or not bool((self.bounds[:, 0] < self.bounds[:, 1]).all())):
+            raise ValueError("Cubic physical bounds require finite ordered [4,2,joint] values")
+        super().__init__(self.bounds[0, 0], self.bounds[0, 1])
+        # END position attributes also serve the shared single-state interface.
         self.knots = knots
         q = start_q.detach().reshape(-1).to(torch.float64)
         dq = start_dq.detach().reshape(-1).to(torch.float64)
+        if q.shape != self.lower.shape or dq.shape != q.shape:
+            raise ValueError("Cubic model bounds and measured entrance must share the named joint axis")
         self._anchor = None
         # BEGIN eliminate only the two measured instantaneous equalities.
         self._start_q, self._start_dq = q, dq
@@ -178,6 +187,7 @@ class CubicJointDomain(JointPositionDomain):
         # necessary tangent condition is algebraic, not a widened q tolerance.
         self._entrance_valid = (torch.isfinite(q).all() & torch.isfinite(dq).all()
             & (q >= self.lower).all() & (q <= self.upper).all()
+            & (dq >= self.bounds[1, 0]).all() & (dq <= self.bounds[1, 1]).all()
             & ((q > self.lower) | (dq >= 0)).all()
             & ((q < self.upper) | (dq <= 0)).all())
         # END domain, CPU QP and native tensor states share these coefficients.
@@ -192,17 +202,14 @@ class CubicJointDomain(JointPositionDomain):
         return self._curve_map.evaluate(actions, progress, derivative)
 
     # BEGIN reference fitting uses the same measured entrance and cubic clock.
-    def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
-        """Fit soft joint references under continuous position and supplied velocity bounds.
+    def fit_reference(self, progress, joint_targets, prior_controls=None):
+        """Fit soft joint references in this complete continuous physical domain.
 
-        Returns [controls,joints] or None with a construction report. Velocity
-        bounds apply only to this initializer, not to the optimizer domain or
-        its recovery directions for trajectories with existing violations.
+        Returns [controls,joints] or None with a construction report.
         Progress uses the normalized physical clock; targets use this domain's
         joint column order. The report includes actual joint-reference errors.
         """
-        return fit_cubic_reference(self, self._curve_map, progress, joint_targets,
-            prior_controls, velocity_bounds)
+        return fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls)
     # END task-space constraints are evaluated by the planner on the fitted curve.
 
     def recovery_step(self, base, gradient, step_limits, scales):
@@ -221,8 +228,14 @@ class CubicJointDomain(JointPositionDomain):
         return (torch.matmul(self._coefficient_matrix, action.to(torch.float64)-self._start_q)
                 +self._velocity_coefficients[:, None]*self._start_dq)
 
-    def extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate endpoints and every real derivative root of each cubic."""
+    def all_extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return lower/upper values with trailing [derivative, named joint] axes.
+
+        Position checks its velocity roots, velocity checks acceleration
+        roots, acceleration checks both segment endpoints, and jerk checks
+        each constant segment. Both sides of every jerk jump are included.
+        All derivatives use physical seconds on the unchanged knot clock.
+        """
         # BEGIN evaluate polynomial differences before restoring absolute q0.
         if action.shape[-2:] != (self.knots, len(self.lower)):
             raise ValueError("Physical cubic domain requires the bound free-control layout")
@@ -256,61 +269,45 @@ class CubicJointDomain(JointPositionDomain):
         second = torch.where(second_valid & (second > 0) & (second < 1), second, torch.zeros_like(second))
         values = torch.stack((e, a+b+d+e, ((a*first+b)*first+d)*first+e,
                               ((a*second+b)*second+d)*second+e), dim=-2)+self._start_q
+        safe_a = torch.where(a != 0, a, torch.ones_like(a))
+        velocity_root = -b/(3*safe_a)
+        velocity_root = torch.where((a != 0) & (velocity_root > 0) & (velocity_root < 1),
+                                    velocity_root, torch.zeros_like(velocity_root))
+        h = self._curve_map.knot_dt
+        velocities = torch.stack((d, 3*a+2*b+d,
+            (3*a*velocity_root+2*b)*velocity_root+d), dim=-2)/h
+        accelerations = torch.stack((2*b, 6*a+2*b), dim=-2)/(h*h)
+        jerks = (6*a/(h*h*h)).unsqueeze(-2)
         # END no roundoff-sized outward entrance is fabricated or tolerated.
-        return values.amin(dim=(-2, -3)), values.amax(dim=(-2, -3))
+        ranges = (values, velocities, accelerations, jerks)
+        return (torch.stack([value.amin(dim=(-2, -3)) for value in ranges], dim=-2),
+                torch.stack([value.amax(dim=(-2, -3)) for value in ranges], dim=-2))
+
+    def extrema(self, action: torch.Tensor, derivative=0) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return continuous extrema of the requested physical derivative."""
+        low, high = self.all_extrema(action)
+        return low[..., derivative, :], high[..., derivative, :]
 
     def feasible(self, action: torch.Tensor) -> torch.Tensor:
-        low, high = self.extrema(action)
-        return (self._entrance_valid & torch.isfinite(action).all(dim=(-1, -2)) & torch.isfinite(low).all(-1)
-                & torch.isfinite(high).all(-1) & (low >= self.lower).all(-1)
-                & (high <= self.upper).all(-1))
+        low, high = self.all_extrema(action)
+        return (self._entrance_valid & torch.isfinite(action).all(dim=(-1, -2))
+                & torch.isfinite(low).all(dim=(-1, -2)) & torch.isfinite(high).all(dim=(-1, -2))
+                & (low >= self.bounds[:, 0]).all(dim=(-1, -2))
+                & (high <= self.bounds[:, 1]).all(dim=(-1, -2)))
 
     def _construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Use the existing SciPy LP and analytic extrema in a finite cutting loop.
-
-        Failure means this bounded initializer was not constructed. It does
-        not rewrite dq0 or prove that every representation is infeasible.
-        Only this initializer uses a small inward numerical margin, to obtain
-        representable free controls. The optimizer's domain remains the full
-        physical interval above.
-        """
+        """Construct a same-domain QP anchor independently of fit/initialization."""
         constant = self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone()
         if not bool(self._entrance_valid):
             raise JointDomainInitializationError(
-                "Measured entrance lies outside physical bounds or has an outward boundary velocity")
+                "algebraic_entrance_invalid: measured q0/dq0 violate model bounds or the position tangent")
         if bool(self.feasible(constant).all()):
             return constant
-        lower, upper = self.lower.cpu().numpy(), self.upper.cpu().numpy()
-        controls = np.empty((self.knots, len(lower)))
-        for joint in range(len(lower)):
-            samples = np.linspace(0., self.intervals, 4*self.intervals+1)
-            solved = False
-            for _ in range(24):
-                weights, fixed = self._curve_map.query(samples/self.intervals)
-                offset = fixed[:, joint]
-                influence = np.minimum(1., np.abs(weights).sum(-1))
-                margin = 32*np.finfo(np.float32).eps*(1+abs(lower[joint])+abs(upper[joint]))*influence
-                result = linprog(np.zeros(self.knots),
-                    A_ub=np.r_[weights, -weights],
-                    b_ub=np.r_[upper[joint]-offset-margin, offset-lower[joint]-margin],
-                    bounds=[(None, None)]*self.knots, method="highs")
-                if not result.success:
-                    break
-                candidate = result.x.astype(np.float32).astype(float)
-                # BEGIN reuse the exact relative entrance/extrema identities.
-                query, positions = self._curve_map.extrema_times(candidate, joint)
-                # END the LP and tensor limiter describe the same actual curve.
-                bad = (positions < lower[joint]) | (positions > upper[joint])
-                if not np.any(bad):
-                    controls[:, joint], solved = candidate, True
-                    break
-                samples = np.unique(np.r_[samples, query[bad]])
-            if not solved:
-                raise JointDomainInitializationError(
-                    f"No physical-domain cubic initializer was constructed for joint column {joint}; "
-                    "measured q0/dq0 and the frozen knot clock were retained")
-        anchor = torch.as_tensor(controls, dtype=dtype, device=device)[None]
-        self.validate(anchor)
+        anchor, report = construct_cubic_anchor(self, self._curve_map, dtype, device)
+        if anchor is None:
+            raise JointDomainInitializationError(
+                f"No physical-domain cubic initializer was constructed: {report}; "
+                "measured q0/dq0 and the frozen knot clock were retained")
         return anchor
 
     def initialize(self, proposals: torch.Tensor) -> torch.Tensor:

@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_domain.py` 实现契约
 
-代码基线：`e0262a5`。
+代码基线：`本次 A–D 实现工作树，实际提交引用待补`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `JointDomainInitializationError`
@@ -17,7 +17,7 @@ class JointDomainInitializationError(ValueError):
 
 实现说明：
 
-> A bounded initializer construction failed for the unchanged actual.
+> A bounded initializer construction failed for the bound physical domain.
 
 ## `cubic_position_report`
 
@@ -336,7 +336,7 @@ def limit_step(self, base: torch.Tensor, step: torch.Tensor, scales: torch.Tenso
 > Shorten one direction before constructing any native trial action.
 >
 > Every nonnegative line-search scale retains its ratio on the same
-> direction. Convexity of the physical position domain justifies the
+> direction. Convexity of the bound physical domain justifies the
 > scalar bisection. Rechecking the actual native-dtype trial arithmetic
 > handles rounding at a physical boundary without widening that domain.
 
@@ -464,12 +464,12 @@ class CubicJointDomain(JointPositionDomain):
 
 实现说明：
 
-> Exact position domain of the shared instantaneous-boundary cubic.
+> Continuous q/dq/ddq/jerk domain of the measured-entrance cubic.
 >
 > Only measured q0/dq0 are fixed. Acceleration and jerk remain optimizable
 > immediately; the original three terminal copies retain a stopped end.
 > Free controls themselves have no invented box: only the represented
-> physical q(t) determines this domain.
+> physical curve and its three time derivatives determine this domain.
 
 ## `CubicJointDomain.__init__`
 
@@ -478,7 +478,7 @@ class CubicJointDomain(JointPositionDomain):
 输入签名：
 
 ```python
-def __init__(self, lower: torch.Tensor, upper: torch.Tensor, start_q: torch.Tensor, start_dq: torch.Tensor, knot_dt: float, knots: int):
+def __init__(self, bounds: torch.Tensor, start_q: torch.Tensor, start_dq: torch.Tensor, knot_dt: float, knots: int):
 ```
 
 显式输出分支：
@@ -489,14 +489,26 @@ def __init__(self, lower: torch.Tensor, upper: torch.Tensor, start_q: torch.Tens
 
 ```python
 torch.Tensor
+bounds.detach().to
+bounds.detach
+torch.float64
+self.bounds.ndim
+self.bounds
+self.bounds.shape
+torch.isfinite(self.bounds).all
+torch.isfinite
+(self.bounds[:, 0] < self.bounds[:, 1]).all
 super().__init__
 start_q.detach().reshape(-1).to
 start_q.detach().reshape
 start_q.detach
-torch.float64
 start_dq.detach().reshape(-1).to
 start_dq.detach().reshape
 start_dq.detach
+q.shape
+self.lower.shape
+self.lower
+dq.shape
 self._curve_map.intervals
 self._curve_map
 torch.as_tensor
@@ -504,12 +516,12 @@ self._curve_map.matrix
 q.device
 self._curve_map.velocity_coefficients
 torch.isfinite(q).all
-torch.isfinite
 torch.isfinite(dq).all
 (q >= self.lower).all
-self.lower
 (q <= self.upper).all
 self.upper
+(dq >= self.bounds[1, 0]).all
+(dq <= self.bounds[1, 1]).all
 ((q > self.lower) | (dq >= 0)).all
 ((q < self.upper) | (dq <= 0)).all
 ```
@@ -517,6 +529,7 @@ self.upper
 写入目标：
 
 ```python
+self.bounds
 self.knots
 q
 dq
@@ -533,6 +546,13 @@ self._entrance_valid
 直接调用符号：
 
 ```python
+bounds.detach().to
+bounds.detach
+bool
+torch.isfinite(self.bounds).all
+torch.isfinite
+(self.bounds[:, 0] < self.bounds[:, 1]).all
+ValueError
 super().__init__
 super
 start_q.detach().reshape(-1).to
@@ -544,17 +564,18 @@ start_dq.detach
 CubicAffineMap
 torch.as_tensor
 torch.isfinite(q).all
-torch.isfinite
 torch.isfinite(dq).all
 (q >= self.lower).all
 (q <= self.upper).all
+(dq >= self.bounds[1, 0]).all
+(dq <= self.bounds[1, 1]).all
 ((q > self.lower) | (dq >= 0)).all
 ((q < self.upper) | (dq <= 0)).all
 ```
 
 ## `CubicJointDomain.evaluate`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L186)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L196)。
 
 输入签名：
 
@@ -594,28 +615,26 @@ self._curve_map.evaluate
 
 ## `CubicJointDomain.fit_reference`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L195)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L205)。
 
 输入签名：
 
 ```python
-def fit_reference(self, progress, joint_targets, prior_controls=None, velocity_bounds=None):
+def fit_reference(self, progress, joint_targets, prior_controls=None):
 ```
 
 实现说明：
 
-> Fit soft joint references under continuous position and supplied velocity bounds.
+> Fit soft joint references in this complete continuous physical domain.
 >
-> Returns [controls,joints] or None with a construction report. Velocity
-> bounds apply only to this initializer, not to the optimizer domain or
-> its recovery directions for trajectories with existing violations.
+> Returns [controls,joints] or None with a construction report.
 > Progress uses the normalized physical clock; targets use this domain's
 > joint column order. The report includes actual joint-reference errors.
 
 显式输出分支：
 
 ```python
-fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls, velocity_bounds)
+fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls)
 ```
 
 读取的对象属性：
@@ -636,7 +655,7 @@ fit_cubic_reference
 
 ## `CubicJointDomain.recovery_step`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L208)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L215)。
 
 输入签名：
 
@@ -672,7 +691,7 @@ recover_position_step
 
 ## `CubicJointDomain.coefficients`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L213)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L220)。
 
 输入签名：
 
@@ -711,7 +730,7 @@ self._relative_coefficients
 
 ## `CubicJointDomain._relative_coefficients`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L220)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L227)。
 
 输入签名：
 
@@ -748,24 +767,29 @@ torch.matmul
 action.to
 ```
 
-## `CubicJointDomain.extrema`
+## `CubicJointDomain.all_extrema`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L224)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L231)。
 
 输入签名：
 
 ```python
-def extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def all_extrema(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 ```
 
 实现说明：
 
-> Evaluate endpoints and every real derivative root of each cubic.
+> Return lower/upper values with trailing [derivative, named joint] axes.
+>
+> Position checks its velocity roots, velocity checks acceleration
+> roots, acceleration checks both segment endpoints, and jerk checks
+> each constant segment. Both sides of every jerk jump are included.
+> All derivatives use physical seconds on the unchanged knot clock.
 
 显式输出分支：
 
 ```python
-(values.amin(dim=(-2, -3)), values.amax(dim=(-2, -3)))
+(torch.stack([value.amin(dim=(-2, -3)) for value in ranges], dim=-2), torch.stack([value.amax(dim=(-2, -3)) for value in ranges], dim=-2))
 ```
 
 读取的对象属性：
@@ -790,8 +814,9 @@ torch.where
 torch.ones_like
 torch.stack
 self._start_q
-values.amin
-values.amax
+(6 * a / (h * h * h)).unsqueeze
+value.amin
+value.amax
 ```
 
 写入目标：
@@ -823,6 +848,14 @@ linear_root
 first_valid
 second_valid
 values
+safe_a
+velocity_root
+h
+velocities
+accelerations
+jerks
+ranges
+value
 ```
 
 直接调用符号：
@@ -841,40 +874,36 @@ torch.clamp_min
 torch.where
 torch.ones_like
 torch.stack
-values.amin
-values.amax
+(6 * a / (h * h * h)).unsqueeze
+value.amin
+value.amax
 ```
 
-## `CubicJointDomain.feasible`
+## `CubicJointDomain.extrema`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L262)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L286)。
 
 输入签名：
 
 ```python
-def feasible(self, action: torch.Tensor) -> torch.Tensor:
+def extrema(self, action: torch.Tensor, derivative=0) -> tuple[torch.Tensor, torch.Tensor]:
 ```
+
+实现说明：
+
+> Return continuous extrema of the requested physical derivative.
 
 显式输出分支：
 
 ```python
-self._entrance_valid & torch.isfinite(action).all(dim=(-1, -2)) & torch.isfinite(low).all(-1) & torch.isfinite(high).all(-1) & (low >= self.lower).all(-1) & (high <= self.upper).all(-1)
+(low[..., derivative, :], high[..., derivative, :])
 ```
 
 读取的对象属性：
 
 ```python
 torch.Tensor
-self.extrema
-self._entrance_valid
-torch.isfinite(action).all
-torch.isfinite
-torch.isfinite(low).all
-torch.isfinite(high).all
-(low >= self.lower).all
-self.lower
-(high <= self.upper).all
-self.upper
+self.all_extrema
 ```
 
 写入目标：
@@ -887,18 +916,62 @@ high
 直接调用符号：
 
 ```python
-self.extrema
+self.all_extrema
+```
+
+## `CubicJointDomain.feasible`
+
+[定义位置](../../../manipulation/physical_joint_domain.py#L291)。
+
+输入签名：
+
+```python
+def feasible(self, action: torch.Tensor) -> torch.Tensor:
+```
+
+显式输出分支：
+
+```python
+self._entrance_valid & torch.isfinite(action).all(dim=(-1, -2)) & torch.isfinite(low).all(dim=(-1, -2)) & torch.isfinite(high).all(dim=(-1, -2)) & (low >= self.bounds[:, 0]).all(dim=(-1, -2)) & (high <= self.bounds[:, 1]).all(dim=(-1, -2))
+```
+
+读取的对象属性：
+
+```python
+torch.Tensor
+self.all_extrema
+self._entrance_valid
 torch.isfinite(action).all
 torch.isfinite
 torch.isfinite(low).all
 torch.isfinite(high).all
-(low >= self.lower).all
-(high <= self.upper).all
+(low >= self.bounds[:, 0]).all
+self.bounds
+(high <= self.bounds[:, 1]).all
+```
+
+写入目标：
+
+```python
+low
+high
+```
+
+直接调用符号：
+
+```python
+self.all_extrema
+torch.isfinite(action).all
+torch.isfinite
+torch.isfinite(low).all
+torch.isfinite(high).all
+(low >= self.bounds[:, 0]).all
+(high <= self.bounds[:, 1]).all
 ```
 
 ## `CubicJointDomain._construct_anchor`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L268)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L298)。
 
 输入签名：
 
@@ -908,13 +981,7 @@ def _construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.T
 
 实现说明：
 
-> Use the existing SciPy LP and analytic extrema in a finite cutting loop.
->
-> Failure means this bounded initializer was not constructed. It does
-> not rewrite dq0 or prove that every representation is infeasible.
-> Only this initializer uses a small inward numerical margin, to obtain
-> representable free controls. The optimizer's domain remains the full
-> physical interval above.
+> Construct a same-domain QP anchor independently of fit/initialization.
 
 显式输出分支：
 
@@ -936,34 +1003,7 @@ self.knots
 self._entrance_valid
 self.feasible(constant).all
 self.feasible
-self.lower.cpu().numpy
-self.lower.cpu
-self.lower
-self.upper.cpu().numpy
-self.upper.cpu
-self.upper
-np.empty
-np.linspace
-self.intervals
-self._curve_map.query
 self._curve_map
-np.minimum
-np.abs(weights).sum
-np.abs
-np.finfo(np.float32).eps
-np.finfo
-np.float32
-np.zeros
-np.r_
-result.success
-result.x.astype(np.float32).astype
-result.x.astype
-result.x
-self._curve_map.extrema_times
-np.any
-np.unique
-torch.as_tensor
-self.validate
 torch.Tensor
 ```
 
@@ -971,25 +1011,8 @@ torch.Tensor
 
 ```python
 constant
-lower
-upper
-controls
-joint
-samples
-solved
-_
-weights
-fixed
-offset
-influence
-margin
-result
-candidate
-query
-positions
-bad
-controls[:, joint]
 anchor
+report
 ```
 
 直接调用符号：
@@ -1002,34 +1025,12 @@ bool
 JointDomainInitializationError
 self.feasible(constant).all
 self.feasible
-self.lower.cpu().numpy
-self.lower.cpu
-self.upper.cpu().numpy
-self.upper.cpu
-np.empty
-len
-range
-np.linspace
-self._curve_map.query
-np.minimum
-np.abs(weights).sum
-np.abs
-np.finfo
-abs
-linprog
-np.zeros
-result.x.astype(np.float32).astype
-result.x.astype
-self._curve_map.extrema_times
-np.any
-np.unique
-torch.as_tensor
-self.validate
+construct_cubic_anchor
 ```
 
 ## `CubicJointDomain.initialize`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L316)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L313)。
 
 输入签名：
 

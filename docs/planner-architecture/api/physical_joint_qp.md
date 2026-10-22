@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_qp.py` 实现契约
 
-代码基线：`e0262a5`。
+代码基线：`本次 A–D 实现工作树，实际提交引用待补`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_numpy`
@@ -220,13 +220,92 @@ def query(self, progress, derivative=0):
 显式输出分支：
 
 ```python
-(weights, offset)
+self._affine_query(weights, velocity, derivative)
 ```
 
 读取的对象属性：
 
 ```python
 self.weights
+self._affine_query
+```
+
+写入目标：
+
+```python
+weights
+velocity
+```
+
+直接调用符号：
+
+```python
+self.weights
+_numpy
+self._affine_query
+```
+
+## `CubicAffineMap.query_knot_times`
+
+[定义位置](../../../manipulation/physical_joint_qp.py#L68)。
+
+输入签名：
+
+```python
+def query_knot_times(self, times, derivative=0):
+```
+
+实现说明：
+
+> Build rows at original segment coordinates, including jerk sides.
+
+显式输出分支：
+
+```python
+self._affine_query(weights, velocity, derivative)
+```
+
+读取的对象属性：
+
+```python
+self.weights_at_knot_times
+self._affine_query
+```
+
+写入目标：
+
+```python
+weights
+velocity
+```
+
+直接调用符号：
+
+```python
+self.weights_at_knot_times
+_numpy
+self._affine_query
+```
+
+## `CubicAffineMap._affine_query`
+
+[定义位置](../../../manipulation/physical_joint_qp.py#L73)。
+
+输入签名：
+
+```python
+def _affine_query(self, weights, velocity, derivative):
+```
+
+显式输出分支：
+
+```python
+(weights, offset)
+```
+
+读取的对象属性：
+
+```python
 self.start_dq
 weights.sum
 self.start_q
@@ -235,22 +314,18 @@ self.start_q
 写入目标：
 
 ```python
-weights
-velocity
 offset
 ```
 
 直接调用符号：
 
 ```python
-self.weights
-_numpy
 weights.sum
 ```
 
 ## `CubicAffineMap.evaluate`
 
-[定义位置](../../../manipulation/physical_joint_qp.py#L71)。
+[定义位置](../../../manipulation/physical_joint_qp.py#L79)。
 
 输入签名：
 
@@ -296,7 +371,7 @@ np.einsum
 
 ## `CubicAffineMap.extrema_times`
 
-[定义位置](../../../manipulation/physical_joint_qp.py#L81)。
+[定义位置](../../../manipulation/physical_joint_qp.py#L89)。
 
 输入签名：
 
@@ -306,10 +381,11 @@ def extrema_times(self, controls, joint, derivative=0):
 
 实现说明：
 
-> Return boundaries and extrema of q or dq, in fixed-clock units.
+> Return exact bounds witnesses for derivative 0..3, in knot units.
 >
 > Query times use knot units. Values use the model's joint coordinates
-> and seconds; velocity extrema are roots of the actual acceleration.
+> and seconds. Jerk is constant on each segment, so its midpoint
+> supplies every segment value without losing a side of a knot jump.
 
 显式输出分支：
 
@@ -332,11 +408,11 @@ polynomial.x
 polynomial.c
 self.intervals
 polynomial.derivative
+np.arange
 polynomial.derivative().roots
 np.isfinite
 np.unique
 np.r_
-np.arange
 ```
 
 写入目标：
@@ -350,8 +426,8 @@ polynomial.c[-2, entrance]
 terminal
 polynomial.c[:-1, terminal]
 polynomial.c[-1, terminal]
-roots
 times
+roots
 values
 values[times == 0.0]
 ```
@@ -363,76 +439,21 @@ PPoly.from_spline
 BSpline
 np.flatnonzero
 polynomial.derivative
+np.arange
 polynomial.derivative().roots
 np.isfinite
 np.unique
-np.arange
 polynomial
-```
-
-## `CubicAffineMap.velocity_extrema`
-
-[定义位置](../../../manipulation/physical_joint_qp.py#L113)。
-
-输入签名：
-
-```python
-def velocity_extrema(self, controls):
-```
-
-实现说明：
-
-> Analytic all-time velocity bounds for one [control,joint] action.
-
-显式输出分支：
-
-```python
-np.asarray(limits).T
-```
-
-读取的对象属性：
-
-```python
-controls.shape
-self.extrema_times
-limits.append
-values.min
-values.max
-np.asarray(limits).T
-np.asarray
-```
-
-写入目标：
-
-```python
-controls
-limits
-joint
-_
-values
-```
-
-直接调用符号：
-
-```python
-_numpy
-range
-self.extrema_times
-limits.append
-float
-values.min
-values.max
-np.asarray
 ```
 
 ## `CubicAffineMap.solve_joint`
 
-[定义位置](../../../manipulation/physical_joint_qp.py#L122)。
+[定义位置](../../../manipulation/physical_joint_qp.py#L125)。
 
 输入签名：
 
 ```python
-def solve_joint(self, hessian, linear, lower, upper, joint, *, origin, initial, native_dtype, step_limit=None, velocity_bounds=None, interior=False):
+def solve_joint(self, hessian, linear, bounds, joint, *, origin, initial, native_dtype, step_limit=None, interior=False):
 ```
 
 实现说明：
@@ -447,7 +468,7 @@ def solve_joint(self, hessian, linear, lower, upper, joint, *, origin, initial, 
 显式输出分支：
 
 ```python
-(None, {**report, 'reason': 'sampled_curve_qp_infeasible'})
+(None, {**report, 'reason': 'finite_constraints_inconsistent'})
 (increment, {**report, 'reason': 'analytic_extrema_passed'})
 (increment, {**report, 'reason': 'rounded_boundary_repeated'})
 (increment, {**report, 'reason': 'extrema_exchange_limit'})
@@ -461,9 +482,7 @@ np.max
 np.abs
 np.finfo(native_dtype).eps
 np.finfo
-bounds.items
-self.query
-self.intervals
+self.query_knot_times
 np.abs(weights).sum
 row_parts.append
 lower_parts.append
@@ -483,8 +502,6 @@ np.unique
 写入目标：
 
 ```python
-bounds
-bounds[1]
 times
 derivative
 coordinate_scale
@@ -517,17 +534,15 @@ times[derivative]
 直接调用符号：
 
 ```python
-tuple
 self.extrema_times
+range
 max
-abs
 float
 np.max
 np.abs
 np.finfo
-range
-bounds.items
-self.query
+enumerate
+self.query_knot_times
 np.abs(weights).sum
 row_parts.append
 lower_parts.append
@@ -548,7 +563,7 @@ np.unique
 
 ## `recover_position_step`
 
-[定义位置](../../../manipulation/physical_joint_qp.py#L186)。
+[定义位置](../../../manipulation/physical_joint_qp.py#L185)。
 
 输入签名：
 
@@ -560,7 +575,7 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
 
 > Project a scaled negative gradient, retaining independent joint motion.
 >
-> Position constraints are separable by joint, so the small diagonal QPs
+> Physical constraints are separable by joint, so the small diagonal QPs
 > are solved serially. The original native step limits bound *increments*,
 > not cubic coefficients. The optimizer must separately demand actual cost
 > decrease before accepting any returned direction.
@@ -569,7 +584,7 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
 
 ```python
 (zero, report)
-(zero, {**report, 'reason': 'position_qp_infeasible'})
+(zero, {**report, 'reason': 'recovery_qp_not_constructed', 'joint_column': joint, 'joint_qp_reason': detail['reason']})
 (zero, {**report, 'reason': 'no_representable_descent_direction'})
 (direction, {**report, 'success': True, 'reason': 'physical_descent_direction'})
 ```
@@ -600,6 +615,7 @@ base.detach().cpu
 base.detach
 domain.lower
 domain.upper
+domain.bounds
 np.eye
 np.r_
 curve.solve_joint
@@ -649,6 +665,7 @@ increments
 native_dtype
 lower
 upper
+bounds
 hessian
 joint
 rows
@@ -731,166 +748,120 @@ joint_scales.cpu().tolist
 joint_scales.cpu
 ```
 
-## `_fit_feasible`
+## `construct_cubic_anchor`
 
-[定义位置](../../../manipulation/physical_joint_qp.py#L268)。
-
-输入签名：
-
-```python
-def _fit_feasible(domain, curve, action, velocity_bounds):
-```
-
-实现说明：
-
-> Seed-only feasibility: the optimizer's position domain stays unchanged.
-
-显式输出分支：
-
-```python
-False
-True
-bool(np.isfinite(extrema).all()) and bool(np.all(extrema[0] >= velocity_bounds[0])) and bool(np.all(extrema[1] <= velocity_bounds[1]))
-```
-
-读取的对象属性：
-
-```python
-domain.feasible(action[None]).all
-domain.feasible
-curve.velocity_extrema
-np.isfinite(extrema).all
-np.isfinite
-np.all
-```
-
-写入目标：
-
-```python
-extrema
-```
-
-直接调用符号：
-
-```python
-bool
-domain.feasible(action[None]).all
-domain.feasible
-curve.velocity_extrema
-np.isfinite(extrema).all
-np.isfinite
-np.all
-```
-
-## `_fit_anchor`
-
-[定义位置](../../../manipulation/physical_joint_qp.py#L280)。
+[定义位置](../../../manipulation/physical_joint_qp.py#L273)。
 
 输入签名：
 
 ```python
-def _fit_anchor(domain, curve, dtype, device, velocity_bounds):
+def construct_cubic_anchor(domain, curve, dtype, device):
 ```
 
 实现说明：
 
-> Construct an anchor for the fit's position and velocity bounds.
+> Construct a native-dtype feasible curve using the shared four-order QP.
 >
-> A position initializer can be reused only after the velocity check.
-> Otherwise a small strictly convex QP constructs a numerical interior
-> anchor satisfying both sets of bounds.
+> This construction has no fit/initialize dependency. The position-valued
+> constant proposal supplies a finite objective centre; the measured q0,
+> dq0, stopped terminal interval and fixed clock remain in the affine map.
+> A construction margin accounts for coefficient rounding only. Every
+> returned action is checked against the original model bounds.
 
 显式输出分支：
 
 ```python
-(None, {'fit_anchor_source': 'not_constructed', 'detail': str(error)})
-(anchor, {'fit_anchor_source': 'validated_position_initializer'})
-(None, {'fit_anchor_source': 'not_constructed', 'detail': detail['reason']})
-(None, {'fit_anchor_source': 'not_constructed', 'detail': 'rounded_anchor_outside_domain'})
-(anchor, {'fit_anchor_source': 'position_velocity_qp'})
+(None, {**report, 'reason': detail['reason'], 'joint_column': joint})
+(None, {**report, 'reason': reason})
+(anchor, {**report, 'reason': 'physical_anchor_constructed'})
 ```
 
 读取的对象属性：
 
 ```python
-(domain._anchor if domain._anchor is not None else domain._construct_anchor(dtype, device))[0].to
-domain._anchor
-domain._construct_anchor
+np.broadcast_to
+domain._start_q
+domain.knots
 domain.lower
-domain.upper
 np.empty_like
-anchor.detach().cpu().numpy().dtype
-anchor.detach().cpu().numpy
-anchor.detach().cpu
-anchor.detach
+torch.empty((), dtype=dtype).numpy().dtype
+torch.empty((), dtype=dtype).numpy
+torch.empty
+domain.bounds
 initial.shape
 curve.solve_joint
 np.eye
-domain.knots
 np.zeros
+report['joint_qp_status'].append
 torch.as_tensor
+domain.feasible(anchor).all
+domain.feasible
 ```
 
 写入目标：
 
 ```python
-anchor
 initial
-lower
-upper
 controls
 native_dtype
+bounds
+report
 joint
 candidate
 detail
+report['rounds']
+report['constraint_count']
 controls[:, joint]
+anchor
+reason
 ```
 
 直接调用符号：
 
 ```python
-(domain._anchor if domain._anchor is not None else domain._construct_anchor(dtype, device))[0].to
-domain._construct_anchor
-str
-_fit_feasible
+np.broadcast_to
 _numpy
+len
 np.empty_like
-anchor.detach().cpu().numpy
-anchor.detach().cpu
-anchor.detach
+torch.empty((), dtype=dtype).numpy
+torch.empty
 range
 curve.solve_joint
 np.eye
 np.zeros
+max
+report['joint_qp_status'].append
 torch.as_tensor
+bool
+domain.feasible(anchor).all
+domain.feasible
 ```
 
 ## `fit_cubic_reference`
 
-[定义位置](../../../manipulation/physical_joint_qp.py#L315)。
+[定义位置](../../../manipulation/physical_joint_qp.py#L308)。
 
 输入签名：
 
 ```python
-def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, velocity_bounds=None):
+def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None):
 ```
 
 实现说明：
 
-> Fit soft references with the measured entrance and fixed cubic clock.
+> Fit soft references while preserving the measured entrance and clock.
 >
-> Every production caller passes the model's [lower,upper] velocity bounds.
-> Position-only numerical users may omit them. The returned curve satisfies
-> every supplied physical bound, including after native-dtype rounding.
+> The complete bound declaration belongs to ``domain``. Native-dtype
+> contraction uses its ordinary line limiter, so fitting, initialization
+> and recovery cannot accept different derivative domains.
 
 显式输出分支：
 
 ```python
-(None, {**report, 'reason': 'fit_initializer_not_constructed'})
+(None, {**report, 'reason': 'algebraic_entrance_invalid'})
+(None, {**report, 'reason': detail['reason'], 'joint_column': joint})
 (None, {**report, 'reason': 'fit_initializer_not_constructed', 'detail': str(error)})
-(None, {**report, 'reason': 'fit_initializer_not_constructed'})
-(None, {**report, 'reason': 'rounded_fit_outside_position_velocity_domain'})
-(action, {**report, 'success': True, 'reason': 'physical_reference_fit', 'reference_rms_joint_units': float(np.sqrt(np.mean(residual ** 2))), 'reference_max_error_joint_units': float(np.max(np.abs(residual))), 'query_max_abs_velocity_joint_units_per_s': np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist(), 'continuous_max_abs_velocity_joint_units_per_s': np.max(np.abs(velocity_extrema), axis=0).tolist()})
+(action, {**report, 'success': True, 'reason': 'physical_reference_fit', 'reference_rms_joint_units': float(np.sqrt(np.mean(residual ** 2))), 'reference_max_error_joint_units': float(np.max(np.abs(residual))), 'continuous_max_abs_derivatives': torch.maximum(low.abs(), high.abs())[0].cpu().tolist(), 'query_max_abs_velocity_joint_units_per_s': np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist(), 'continuous_max_abs_velocity_joint_units_per_s': torch.maximum(low.abs(), high.abs())[0, 1].cpu().tolist()})
 ```
 
 读取的对象属性：
@@ -899,13 +870,10 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
 curve.query
 domain.knots
 domain.lower
-velocity_bounds.shape
-np.isfinite(velocity_bounds).all
-np.isfinite
-np.any
 values.shape
 offset.shape
 np.isfinite(values).all
+np.isfinite
 np.zeros
 prior.shape
 np.isfinite(prior).all
@@ -923,29 +891,43 @@ np.finfo
 np.trace
 np.eye
 np.empty
-domain.upper
+domain._entrance_valid
+domain.bounds
 curve.solve_joint
 report['joint_qp_status'].append
 torch.as_tensor
 report.update
-domain.extrema
-torch.maximum(domain.lower - low, high - domain.upper).max
+domain.feasible(action[None]).all
+domain.feasible
+domain.all_extrema
 torch.maximum
-domain.initialize
 domain._anchor
-curve.velocity_extrema
-np.max
-(action - anchor).to(torch.float64).norm
-(action - anchor).to
+domain._construct_anchor
+domain._anchor.to
+domain.validate
+domain.limit_step
+action.new_ones
+delta.to(torch.float64).norm
+delta.to
 torch.float64
-(initialized - anchor).to(torch.float64).norm
-(initialized - anchor).to
+limited.to(torch.float64).norm
+limited.to
+excess.clamp_min(0).amax(dim=(0, 2)).cpu().tolist
+excess.clamp_min(0).amax(dim=(0, 2)).cpu
+excess.clamp_min(0).amax
+excess.clamp_min
 curve.evaluate
 np.sqrt
 np.mean
+np.max
 np.abs
+torch.maximum(low.abs(), high.abs())[0].cpu().tolist
+torch.maximum(low.abs(), high.abs())[0].cpu
+low.abs
+high.abs
 np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist
-np.max(np.abs(velocity_extrema), axis=0).tolist
+torch.maximum(low.abs(), high.abs())[0, 1].cpu().tolist
+torch.maximum(low.abs(), high.abs())[0, 1].cpu
 ```
 
 写入目标：
@@ -956,7 +938,6 @@ weights
 offset
 count
 dof
-velocity_bounds
 prior
 source
 dtype
@@ -968,8 +949,7 @@ hessian
 linear
 controls
 report
-lower
-upper
+bounds
 joint
 candidate
 detail
@@ -980,18 +960,11 @@ action
 low
 high
 excess
-initialized
+domain._anchor
 anchor
-report['fit_anchor_source']
-velocity_extrema
-report['maximum_velocity_bound_excess_before_contraction']
-anchor_report
 delta
-low_scale
-high_scale
-_
-middle
-trial
+limited
+initialized
 proposed_norm
 accepted_norm
 residual
@@ -1003,11 +976,9 @@ residual
 _numpy
 curve.query
 len
-np.isfinite(velocity_bounds).all
-np.isfinite
-np.any
-ValueError
 np.isfinite(values).all
+np.isfinite
+ValueError
 np.zeros
 np.isfinite(prior).all
 isinstance
@@ -1019,28 +990,40 @@ float
 np.trace
 np.eye
 np.empty
+bool
 range
 curve.solve_joint
 report['joint_qp_status'].append
 torch.as_tensor
 report.update
-_fit_feasible
-domain.extrema
-torch.maximum(domain.lower - low, high - domain.upper).max
+domain.feasible(action[None]).all
+domain.feasible
+domain.all_extrema
 torch.maximum
-domain.initialize
+domain._construct_anchor
+domain._anchor.to
+domain.validate
+domain.limit_step
+action.new_ones
 str
-curve.velocity_extrema
-np.max
-_fit_anchor
-(action - anchor).to(torch.float64).norm
-(action - anchor).to
-(initialized - anchor).to(torch.float64).norm
-(initialized - anchor).to
+delta.to(torch.float64).norm
+delta.to
+limited.to(torch.float64).norm
+limited.to
+excess.clamp_min(0).amax(dim=(0, 2)).cpu().tolist
+excess.clamp_min(0).amax(dim=(0, 2)).cpu
+excess.clamp_min(0).amax
+excess.clamp_min
 curve.evaluate
 np.sqrt
 np.mean
+np.max
 np.abs
+torch.maximum(low.abs(), high.abs())[0].cpu().tolist
+torch.maximum(low.abs(), high.abs())[0].cpu
+low.abs
+high.abs
 np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist
-np.max(np.abs(velocity_extrema), axis=0).tolist
+torch.maximum(low.abs(), high.abs())[0, 1].cpu().tolist
+torch.maximum(low.abs(), high.abs())[0, 1].cpu
 ```

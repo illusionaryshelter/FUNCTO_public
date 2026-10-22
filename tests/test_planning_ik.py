@@ -146,7 +146,8 @@ def test_legal_failed_states_are_coarse_nodes_with_original_success_evidence():
             [report(native_pose_ik_success=False)]]
     selected = chains([[[.1], [.9]], [[.2]]], rows, pose_costs=[[.2, .1], [.3]])
     assert selected[0]["candidate_indices"] == [1, 0]
-    assert selected[0]["selection_cost"]["quadratic_pose_energy"] == pytest.approx(.4)
+    assert selected[0]["selection_cost"]["failed_pose_energy"] == pytest.approx(.4)
+    assert selected[0]["selection_cost"]["successful_pose_energy"] == 0.
     assert selected[0]["query_statuses"] == ["APPROXIMATE_PROPOSAL"]*2
     assert selected[0]["interpolated_queries"] == []
     assert not selected[0]["reference_success"]
@@ -163,15 +164,16 @@ def test_position_domain_and_finite_energy_define_nodes_without_a_soft_pose_thre
     assert all(item["query_statuses"] == ["APPROXIMATE_PROPOSAL"]*2 for item in selected)
     # These are coarse numerical proposals. Their large pose/velocity
     # errors remain for the tool-space optimizer and continuous validation.
-    assert all(item["selection_cost"]["quadratic_pose_energy"] == 2e8 for item in selected)
+    assert all(item["selection_cost"]["failed_pose_energy"] == 2e8 for item in selected)
 
 
-def test_pose_energy_ranks_before_continuity_and_static_screening():
+def test_successful_continuity_ranks_before_pose_refinement_and_static_screening():
     selected = chains([[[.1], [2.]]], [[report(), report(model_valid=False)]],
                       pose_costs=[[1., .1]])
-    assert selected[0]["candidate_indices"] == [1]
-    assert selected[0]["selection_cost"]["static_model_unqualified_count"] == 1
-    assert selected[1]["candidate_indices"] == [0]
+    assert selected[0]["candidate_indices"] == [0]
+    assert selected[0]["selection_cost"]["successful_pose_energy"] == 1.
+    assert selected[1]["candidate_indices"] == [1]
+    assert selected[1]["selection_cost"]["static_model_unqualified_count"] == 1
 
 
 def test_velocity_bounds_scale_named_joints_before_comparing_postures():
@@ -215,15 +217,21 @@ def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
         intervals = np.diff(np.r_[0., times])
         energy = np.sum(changes**2/scale**2/intervals[:, None])/(times[-1]*2)
         failures = sum(not solved[query, index] for query, index in enumerate(path))
-        pose_energy = sum(costs[query, index] for query, index in enumerate(path))
-        expected.append(((failures, float(pose_energy), float(energy)), path))
+        failed_energy = sum(costs[query, index] for query, index in enumerate(path)
+                            if not solved[query, index])
+        successful_energy = sum(costs[query, index] for query, index in enumerate(path)
+                                if solved[query, index])
+        expected.append(((failures, float(failed_energy), float(energy),
+                          float(successful_energy)), path))
     expected.sort()
     actual = chains(pools, rows, times=times, velocity=bounds, pose_costs=costs, count=3)
     assert [tuple(row["candidate_indices"]) for row in actual] == [path for _, path in expected[:3]]
     np.testing.assert_allclose([row["selection_cost"]["normalized_velocity_energy"] for row in actual],
                                [score[2] for score, _ in expected[:3]], rtol=1e-14)
-    np.testing.assert_allclose([row["selection_cost"]["quadratic_pose_energy"] for row in actual],
+    np.testing.assert_allclose([row["selection_cost"]["failed_pose_energy"] for row in actual],
                                [score[1] for score, _ in expected[:3]], rtol=1e-14)
+    np.testing.assert_allclose([row["selection_cost"]["successful_pose_energy"] for row in actual],
+                               [score[3] for score, _ in expected[:3]], rtol=1e-14)
 
 
 @pytest.mark.parametrize("times", [[0., 1.], [1., 1.], [2., 1.], [1., float("nan")]])
@@ -394,7 +402,8 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
     planner.start = SimpleNamespace(position=torch.zeros((1, 3), dtype=torch.float64))
     from manipulation.physical_joint_domain import CubicJointDomain
-    planner.physical_domain = CubicJointDomain(torch.full((3,), -2.), torch.full((3,), 2.),
+    physical_bounds = torch.tensor([[-2., 2.], [-2., 2.], [-20., 20.], [-200., 200.]])
+    planner.physical_domain = CubicJointDomain(physical_bounds[:, :, None].expand(-1, -1, 3),
         planner.start.position, torch.zeros((1, 3)), 3./10., 6)
     planner._functional_goal = lambda target: target
     planner._manager_type = SimpleNamespace(bind_ik_goals=Mock())

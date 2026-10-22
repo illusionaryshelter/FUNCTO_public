@@ -15,8 +15,9 @@ from manipulation.optimizer_device_checks import DeviceChecks
 
 
 class PhysicalJointDomainTest(unittest.TestCase):
-    def domain(self, q=0., dq=0., knots=8):
-        return CubicJointDomain(torch.tensor([-1.]), torch.tensor([1.]),
+    def domain(self, q=0., dq=0., knots=8, limits=(1., 100., 1000., 10000.)):
+        bounds = torch.tensor([[-value, value] for value in limits])[:, :, None]
+        return CubicJointDomain(bounds,
             torch.tensor([q]), torch.tensor([dq]), .2, knots)
 
     def oracle(self, domain, controls):
@@ -36,6 +37,64 @@ class PhysicalJointDomainTest(unittest.TestCase):
             low, high = domain.extrema(controls)
             expected = self.oracle(domain, controls)
             np.testing.assert_allclose([low.item(), high.item()], expected, atol=1e-12, rtol=0.)
+
+    # BEGIN one continuous domain checks every physical derivative.
+    def test_all_four_extrema_match_independent_segment_polynomials(self):
+        domain = self.domain(q=.2, dq=.1)
+        rng = np.random.default_rng(29)
+        for _ in range(20):
+            controls = torch.tensor(rng.uniform(-1., 1., (1, 8, 1)), dtype=torch.float32)
+            coefficients = domain.coefficients(controls).numpy()[0, :, 0]
+            polynomial = PPoly.from_spline(BSpline(np.arange(-3., 14.), coefficients, 3))
+            low, high = domain.all_extrema(controls)
+            for derivative in range(4):
+                differentiated = polynomial.derivative(derivative)
+                if derivative == 3:
+                    times = np.arange(domain.intervals)+.5
+                else:
+                    roots = differentiated.derivative().roots(extrapolate=False)
+                    times = np.r_[np.arange(domain.intervals+1), roots[np.isfinite(roots)
+                        & (roots >= 0.) & (roots <= domain.intervals)]]
+                expected = differentiated(times)/(.2**derivative)
+                np.testing.assert_allclose([low[0, derivative, 0], high[0, derivative, 0]],
+                    [expected.min(), expected.max()], atol=4e-12, rtol=1e-13)
+                query, cpu_values = domain._curve_map.extrema_times(controls[0, :, 0].numpy(), 0, derivative)
+                np.testing.assert_allclose([cpu_values.min(), cpu_values.max()],
+                    [expected.min(), expected.max()], atol=4e-12, rtol=1e-13)
+                self.assertTrue(bool(np.isfinite(query).all()))
+
+    def test_velocity_acceleration_and_jerk_each_can_exclude_a_position_legal_curve(self):
+        controls = torch.zeros((1, 8, 1))
+        controls[0, 3, 0] = .2
+        wide = self.domain()
+        low, high = wide.all_extrema(controls)
+        self.assertTrue(bool(wide.feasible(controls).all()))
+        for derivative in (1, 2, 3):
+            limits = [1., 100., 1000., 10000.]
+            limits[derivative] = float(torch.maximum(low.abs(), high.abs())[0, derivative, 0])*.8
+            constrained = self.domain(limits=limits)
+            self.assertFalse(bool(constrained.feasible(controls).all()))
+            initialized = constrained.initialize(controls)
+            self.assertTrue(bool(constrained.feasible(initialized).all()))
+            scales = torch.tensor([0., .2, 1.5]).reshape(1, 3, 1, 1)
+            step = constrained.limit_step(initialized, controls, scales)
+            self.assertTrue(bool(constrained.feasible(initialized[:, None]+scales*step[:, None]).all()))
+
+    def test_initial_velocity_outside_model_bounds_is_an_algebraic_failure(self):
+        domain = self.domain(dq=.6, limits=(1., .5, 2., 20.))
+        with self.assertRaisesRegex(JointDomainInitializationError, "algebraic_entrance_invalid"):
+            domain.initialize(torch.zeros((1, 8, 1)))
+
+    def test_stopped_terminal_interval_has_zero_derivatives_on_both_interfaces(self):
+        domain = self.domain(dq=.1)
+        controls = torch.linspace(-.2, .3, 8).reshape(1, 8, 1)
+        for derivative in (1, 2, 3):
+            actual = domain.evaluate(controls, [.9, .95, 1.], derivative)
+            np.testing.assert_array_equal(actual, np.zeros_like(actual))
+            weights, offset = domain._curve_map.query_knot_times([9., 9.5, 10.], derivative)
+            np.testing.assert_array_equal(weights, np.zeros_like(weights))
+            np.testing.assert_array_equal(offset, np.zeros_like(offset))
+    # END finite initial q/dq does not substitute for continuous derivative bounds.
 
     # BEGIN instantaneous entrance regressions replace fixed-prefix assertions.
     def test_control_box_does_not_hide_nonzero_velocity_curve_violation(self):

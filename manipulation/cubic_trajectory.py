@@ -86,11 +86,37 @@ class CubicBasis:
             weights[terminal, -1] = 1.
         return weights, velocity
 
+    # BEGIN preserve the original polynomial through the public Hermite interface.
+    def hermite_nodes(self, actions, start_q, start_dq):
+        """Return binary64 time, position and velocity at every original break.
+
+        ``actions`` is one [free controls, named joints] array; the two entry
+        vectors use the same joint order. A cubic segment is uniquely fixed
+        by its endpoint positions and velocities. Using its original breaks
+        therefore preserves that segment without rebuilding many short
+        polynomials from independently rounded native state samples.
+        """
+        actions = np.asarray(actions, dtype=np.float64)
+        start_q = np.asarray(start_q, dtype=np.float64)
+        start_dq = np.asarray(start_dq, dtype=np.float64)
+        if (actions.ndim != 2 or actions.shape[0] != self.knots
+                or start_q.shape != (actions.shape[1],) or start_dq.shape != start_q.shape
+                or not all(np.isfinite(value).all() for value in (actions, start_q, start_dq))):
+            raise ValueError("Cubic export requires one finite named control array and its measured entrance")
+        knots = np.arange(self.intervals + 1, dtype=np.float64)
+        delta = actions - start_q
+        position_weights, position_entry = self.weights_at_knot_times(knots)
+        velocity_weights, velocity_entry = self.weights_at_knot_times(knots, 1)
+        position = start_q + position_weights @ delta + position_entry[:, None] * start_dq
+        velocity = velocity_weights @ delta + velocity_entry[:, None] * start_dq
+        return knots * self.knot_dt, position, velocity
+    # END output density is independent of the native metric sampling grid.
+
 
 class CubicTrajectoryStep:
     """Small differentiable action-to-JointState component for cuRobo.
 
-    Both regular rollout and dense export use ``sample``. Basis tensors are
+    Both regular rollout and dense metrics use ``sample``. Basis tensors are
     float64 so measured sub-float32 increments are combined relative to q0
     before the final native float32 state cast. Torch owns the complete VJP;
     there is no detached entrance acceleration or handwritten backward.
@@ -239,4 +265,4 @@ def cubic_transition_config_type():
             return CubicTransitionCfg(**values)
 
     return CubicTransitionCfg
-# END CPU domains, differentiable rollouts and dense export share one cubic.
+# END CPU domains, differentiable rollouts and dense metrics share one cubic.

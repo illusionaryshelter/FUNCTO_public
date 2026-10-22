@@ -18,29 +18,47 @@ from curobo._src.types.device_cfg import DeviceCfg
 from manipulation.planning_ik import select_ik_tracking_candidate
 
 
-def test_pose_energy_precedes_distance_and_only_supplied_proposals_are_ranked():
+def test_failed_pose_energy_precedes_distance_and_only_supplied_proposals_are_ranked():
     values = np.array([[0., 0.], [1.5, 1.], [.01, .01]])
     costs = np.array([0., .02, .8])
     # Row zero is outside the caller's supplied proposal set. The best
     # eligible pose is farther away than row two, but its energy is smaller.
-    assert select_ik_tracking_candidate(values, [2, 1], costs, [[0., 0.]]) == 1
+    assert select_ik_tracking_candidate(values, [2, 1], costs, [[0., 0.]],
+                                         native_success=[True, False, False]) == 1
 
 
 def test_equal_pose_energy_uses_joint_continuity_then_original_index():
     values = np.array([[.4, .3], [2., 0.], [-.4, -.3]])
     costs = np.ones(3)
-    assert select_ik_tracking_candidate(values, [1, 2, 0], costs, [[0., 0.]]) == 0
-    assert select_ik_tracking_candidate(values, [0, 1, 2], costs, [[-.1, -.1]]) == 2
+    assert select_ik_tracking_candidate(values, [1, 2, 0], costs, [[0., 0.]],
+                                         native_success=[True]*3) == 0
+    assert select_ik_tracking_candidate(values, [0, 1, 2], costs, [[-.1, -.1]],
+                                         native_success=[True]*3) == 2
+
+
+# BEGIN successful native poses use continuity before residual refinement.
+def test_successful_pose_micro_residual_cannot_select_a_distant_posture():
+    values = np.array([[.01], [2.], [0.]])
+    assert select_ik_tracking_candidate(values, [0, 1, 2], [1e-7, 1e-12, 0.], [[0.]],
+                                         native_success=[True, True, False]) == 0
+
+
+def test_successful_pose_energy_only_breaks_equal_distance_ties():
+    assert select_ik_tracking_candidate([[-1.], [1.]], [0, 1], [.2, .1], [[0.]],
+                                         native_success=[True, True]) == 1
+# END native success remains an explicit input from the same query.
 
 
 def test_empty_proposal_set_has_no_tracking_index():
-    assert select_ik_tracking_candidate(np.empty((0, 2)), [], np.empty(0), [[0., 0.]]) is None
+    assert select_ik_tracking_candidate(np.empty((0, 2)), [], np.empty(0), [[0., 0.]],
+                                         native_success=[]) is None
 
 
 @pytest.mark.parametrize("total_slots", [1, 2, 4])
 def test_native_seed_manager_preserves_one_tracking_row_and_fills_only_remaining_slots(total_slots):
     values = np.array([[-.7, .1], [.4, -.2], [.2, .8]])
-    selected = select_ik_tracking_candidate(values, [0, 1, 2], [.4, .1, .3], [[0., 0.]])
+    selected = select_ik_tracking_candidate(values, [0, 1, 2], [.4, .1, .3], [[0., 0.]],
+                                           native_success=[True]*3)
     warm = torch.as_tensor(values[[selected]][None], dtype=torch.float32)
     manager = SeedManager(DeviceCfg("cpu"), 2, torch.full((2,), -1.),
                           torch.full((2,), 1.), random_seed=123)
