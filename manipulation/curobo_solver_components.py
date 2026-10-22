@@ -475,15 +475,20 @@ class PhysicalGradientCore(GradientOptCore):
         # END final ordinary/dense acceptance remains a separate planner report.
 
     def _recover_stalled(self, state):
-        """Try one physically legal Armijo recovery per stalled block/seed.
+        """Try one physically legal Armijo recovery at each stalled block tail.
 
         QP construction is host work. Its trials use the normal main rollout
         layout, including a fresh zero-scale cost/gradient, and never enter
-        approximate-Wolfe's non-descending exploration fallback.
+        approximate-Wolfe's non-descending exploration fallback. A partial
+        block's failed attempt continues from that same main gradient; the
+        original full-block stall still controls retirement after failure.
         """
         # BEGIN recovery uses the same bounded request as ordinary steps.
         self._check_request()
-        stalled = ((self._stalled_steps >= self.config.inner_iters) & ~self._exhausted)
+        # BEGIN an attempted recovery and a retired seed have different evidence.
+        stalled = ((self._stalled_steps > 0) & ~self._exhausted)
+        retire_on_failure = self._stalled_steps >= self.config.inner_iters
+        # END snapshot retirement before an accepted step clears its stall count.
         indices = stalled.nonzero().flatten().tolist()
         if not indices:
             return state
@@ -520,7 +525,10 @@ class PhysicalGradientCore(GradientOptCore):
                 context.line_search_scale)
             self._check_request()
             direction[index:index+1].copy_(proposed)
-            reports[index] = {**report, "accepted": False, "line_search_evaluations": 0}
+            # BEGIN the report retains the actual pre-attempt stopping evidence.
+            reports[index] = {**report, "accepted": False, "line_search_evaluations": 0,
+                "stalled_steps_before": int(self._stalled_steps[index]), "retired": False}
+            # END sampled candidate retention remains owned by each completed forward.
         pending = [index for index in indices if reports[index]["success"]]
         # A descent direction can overshoot every native trial scale. Keep
         # their ratios and halve the complete direction at most eight times;
@@ -572,8 +580,16 @@ class PhysicalGradientCore(GradientOptCore):
             self._check_request()
         for index in indices:
             if not reports[index]["accepted"]:
-                self._exhausted[index] = True
-                state.step_direction[index].zero_()
+                # BEGIN partial-block failure refreshes the same exploration point.
+                retire = bool(retire_on_failure[index])
+                self._exhausted[index] = retire
+                if retire:
+                    state.step_direction[index].zero_()
+                else:
+                    state.step_direction[index].copy_(
+                        -self.config.initial_step_scale*state.exploration_gradient[index])
+                reports[index]["retired"] = retire
+                # END actual sampled-feasible trials survive an unaccepted work step.
                 reports[index]["acceptance_reason"] = "no_finite_strict_armijo_decrease"
             # Recovery creates a fresh local metric. Clear only this row and
             # bind its exact accepted (or retained) exploration state/gradient.

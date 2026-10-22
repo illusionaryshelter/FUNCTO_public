@@ -1,6 +1,6 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`a56c3e4`。
+代码基线：`A/B 工作区（实施起点 d97977c）`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -950,14 +950,146 @@ self._release_pose
 owner.pose
 ```
 
-## `OnlinePlanningScene.components`
+## `OnlinePlanningScene._robot_self_components`
 
-[定义位置](../../../manipulation/online_geometry.py#L398)。
+[定义位置](../../../manipulation/online_geometry.py#L399)。
 
 输入签名：
 
 ```python
-def components(self, robot_spheres, position, quaternion, progress, joint_position=None, joint_names=None, *, trajectory_time, active_contact_rule_ids=None, contact_permission_progress=None, owner_poses=None, query_role='acceptance', local_models=None, objectives_out=None, geometry_evidence_out=None):
+def _robot_self_components(self, complete_q, complete_names, robot_poses, robot_matrices, hand_state, zero, *, query, record_pair, include_bounds, query_role):
+```
+
+实现说明：
+
+> Query the fixed robot's required entity pairs at prepared states.
+>
+> Entity shapes and fixed link transforms are the official model of
+> this unchanged robot/end-effector configuration, reusable across
+> tasks. Named feedback/nominal hand coordinates and calibrated FK
+> determine poses; task fields and camera coverage do not enter here.
+> The caller supplies differentiable poses and their same-state matrix
+> snapshots. Coal distances own the classification. Penetrating-pair
+> witnesses supply the existing local derivative; numerical boundaries
+> remain separately reported hard evidence.
+> ``query`` only shares evidence for explicitly repeated base particles.
+
+显式输出分支：
+
+```python
+({'collision/robot/self': torch.stack(self_costs).reshape(shape), 'unresolved/robot/self': torch.stack(self_unresolved).reshape(shape)}, report)
+```
+
+读取的对象属性：
+
+```python
+complete_q.shape
+np.zeros
+hand_state.uncertain.detach().cpu().numpy
+hand_state.uncertain.detach().cpu
+hand_state.uncertain.detach
+hand_state.uncertain
+self.robot_model.geometry_depending_on
+self.robot_model
+self.gripper.joint_names
+self.gripper
+self.tool_geometry_names
+complete_q.detach().cpu().numpy
+complete_q.detach().cpu
+complete_q.detach
+np.ndindex
+self.robot_model.query
+self.robot_validator.T_reference_base
+self.robot_validator
+self.robot_validator.required_pairs
+self.check_request
+self.robot_model._geometries
+np.asarray
+report['status_counts'].get
+((_world(b, pb) - _world(a, pa)) * normal).sum
+signed.detach
+report['nonclear_pairs'].append
+self_costs.append
+self_unresolved.append
+torch.stack(self_costs).reshape
+torch.stack
+torch.stack(self_unresolved).reshape
+```
+
+写入目标：
+
+```python
+shape
+uncertain
+unmodelled
+report
+q_cpu
+self_costs
+self_unresolved
+index
+evidence
+value
+undecided
+row
+first_id
+second_id
+entity_key
+status
+lower
+report['pair_queries']
+report['status_counts'][status]
+a
+b
+pa
+item
+pb
+normal
+signed
+```
+
+直接调用符号：
+
+```python
+tuple
+np.zeros
+hand_state.uncertain.detach().cpu().numpy
+hand_state.uncertain.detach().cpu
+hand_state.uncertain.detach
+set
+self.robot_model.geometry_depending_on
+list
+complete_q.detach().cpu().numpy
+complete_q.detach().cpu
+complete_q.detach
+np.ndindex
+query
+self.robot_model.query
+record_pair
+native_pair_lower_bound
+np.asarray
+report['status_counts'].get
+inverse_points
+_tensor
+((_world(b, pb) - _world(a, pa)) * normal).sum
+_world
+signed.detach
+len
+report['nonclear_pairs'].append
+self_costs.append
+self_unresolved.append
+torch.stack(self_costs).reshape
+torch.stack
+torch.stack(self_unresolved).reshape
+```
+
+## `OnlinePlanningScene.components`
+
+[定义位置](../../../manipulation/online_geometry.py#L478)。
+
+输入签名：
+
+```python
+def components(self, robot_spheres, position, quaternion, progress, joint_position=None, joint_names=None, *, trajectory_time, active_contact_rule_ids=None, contact_permission_progress=None, owner_poses=None, query_role='acceptance', local_models=None, objectives_out=None, geometry_evidence_out=None, geometry_scope='full'):
 ```
 
 实现说明：
@@ -968,10 +1100,13 @@ def components(self, robot_spheres, position, quaternion, progress, joint_positi
 > native entities carry all robot geometry. Both query roles return the
 > same hard components. Optimization additionally fills independent
 > continuous objectives using an explicitly captured block model.
+> ``geometry_scope='robot'`` computes the same official self pairs and
+> hand state without constructing task-owner poses or querying fields.
 
 显式输出分支：
 
 ```python
+costs
 costs or {'observed_geometry': torch.zeros_like(progress)}
 ```
 
@@ -1005,6 +1140,14 @@ self.robot_model._geometries
 self.robot_model
 Rotation.from_matrix(local[:3, :3]).as_quat
 Rotation.from_matrix
+robot_poses.items
+complete_q.sum
+position.sum
+robot_poses.values
+pose[0].sum
+self._robot_self_components
+costs.update
+objectives_out.update
 self._owner_poses
 torch.zeros_like
 owner.owner_id
@@ -1012,11 +1155,7 @@ owner.query
 self.owners
 self.background
 poses.items
-robot_poses.items
-complete_q.sum
 poses.values
-robot_poses.values
-pose[0].sum
 self.contacts
 rule.actor
 self._permission
@@ -1064,22 +1203,6 @@ hand_state.uncertain.detach
 self.robot_validator.checker.geometry_depending_on
 self.robot_validator.checker
 self.robot_validator
-self.tool_geometry_names
-complete_q.detach().cpu().numpy
-complete_q.detach().cpu
-complete_q.detach
-self.robot_model.query
-self.robot_validator.T_reference_base
-self.robot_validator.required_pairs
-np.asarray
-report['status_counts'].get
-((_world(b, pb) - _world(a, pa)) * normal).sum
-signed.detach
-report['nonclear_pairs'].append
-self_costs.append
-self_unresolved.append
-torch.stack(self_costs).reshape
-torch.stack(self_unresolved).reshape
 owner.moving
 fields.items
 self.fixed_geometry_names
@@ -1107,12 +1230,15 @@ model.relation.target_owner
 unmodelled_entity_keys.intersection
 entity_key.values
 residuals.append
+self.tool_geometry_names
 regions.append
 model.relation.interval
 model.permission
 second.root
 self._native_local_bounds
 states[index].pairs
+report['status_counts'].get
+report['nonclear_pairs'].append
 torch.stack(residuals).reshape
 costs.get
 states[index].pairs.get
@@ -1120,7 +1246,6 @@ local_values.append
 objectives.get
 torch.stack(local_values).reshape
 model.components
-costs.update
 model.relation.relation_id
 self.coverage
 self.unknown_policy
@@ -1129,7 +1254,6 @@ unresolved.append
 rows.append
 progress.new_tensor(unknown).reshape
 progress.new_tensor(unresolved).reshape
-objectives_out.update
 ```
 
 写入目标：
@@ -1172,6 +1296,15 @@ link_quaternion
 local_position
 local_quaternion
 robot_poses[name]
+robot_matrices
+pose
+zero
+robot_costs
+report
+objectives['collision/robot/self']
+report['geometry_scope']
+self.last_query_report
+report['coverage_scope']
 poses
 identity
 identity[1][..., 0]
@@ -1180,10 +1313,7 @@ fields
 owner
 fields['background']
 matrices
-pose
-robot_matrices
 contact_actor_matrices
-zero
 policies
 rule
 actor_pose
@@ -1224,27 +1354,6 @@ progress_cpu
 uncertain_cpu
 unmodelled
 unmodelled_entity_keys
-report
-q_cpu
-self_costs
-self_unresolved
-row
-first_id
-second_id
-entity_key
-status
-lower
-report['pair_queries']
-report['status_counts'][status]
-a
-b
-pa
-item
-pb
-signed
-costs['collision/robot/self']
-objectives['collision/robot/self']
-costs['unresolved/robot/self']
 pairs
 moving_owners
 geometry
@@ -1257,12 +1366,15 @@ attached
 relation
 native_world_bounds
 component
+first_id
+second_id
 first_pose
 second_pose
 fm
 sm
 actor
 residuals
+entity_key
 rules
 support
 model
@@ -1277,6 +1389,9 @@ permission
 native_bounds
 native_world_bounds[key]
 states[index].pairs[component, first_id, second_id]
+report['pair_queries']
+status
+report['status_counts'][status]
 costs[component]
 local_values
 objectives[component]
@@ -1292,7 +1407,6 @@ prefix
 costs[f'{prefix}unknown/forbidden/{owner.owner_id}']
 costs[f'{prefix}unresolved/coverage/{owner.owner_id}']
 report['owner_coverage'][owner.owner_id]
-self.last_query_report
 ```
 
 直接调用符号：
@@ -1317,16 +1431,20 @@ Rotation.from_matrix(local[:3, :3]).as_quat
 Rotation.from_matrix
 quaternion_rotate
 quaternion_multiply
-self._owner_poses
-torch.zeros_like
 _matrices
-poses.items
 robot_poses.items
-dict
 complete_q.sum
-poses.values
+position.sum
 robot_poses.values
 pose[0].sum
+self._robot_self_components
+costs.update
+objectives_out.update
+self._owner_poses
+torch.zeros_like
+poses.items
+dict
+poses.values
 self._permission
 policy['normals'].detach().cpu().numpy
 policy['normals'].detach().cpu
@@ -1369,25 +1487,6 @@ hand_state.uncertain.detach().cpu
 hand_state.uncertain.detach
 set
 self.robot_validator.checker.geometry_depending_on
-list
-complete_q.detach().cpu().numpy
-complete_q.detach().cpu
-complete_q.detach
-self.robot_model.query
-record_pair
-native_pair_lower_bound
-np.asarray
-report['status_counts'].get
-inverse_points
-((_world(b, pb) - _world(a, pa)) * normal).sum
-_world
-signed.detach
-len
-report['nonclear_pairs'].append
-self_costs.append
-self_unresolved.append
-torch.stack(self_costs).reshape
-torch.stack(self_unresolved).reshape
 fields.items
 pairs.append
 combinations
@@ -1401,6 +1500,7 @@ self.check_request
 unmodelled_entity_keys.intersection
 entity_key.values
 residuals.append
+record_pair
 regions.append
 PairPermission
 model.permission
@@ -1408,6 +1508,10 @@ _native_bounds
 _transform
 pair_residual
 pair_local_model
+report['status_counts'].get
+len
+report['nonclear_pairs'].append
+list
 torch.stack(residuals).reshape
 costs.get
 states[index].pairs.get
@@ -1415,19 +1519,17 @@ local_values.append
 objectives.get
 torch.stack(local_values).reshape
 model.components
-costs.update
 query_coverage
 unknown.append
 unresolved.append
 rows.append
 progress.new_tensor(unknown).reshape
 progress.new_tensor(unresolved).reshape
-objectives_out.update
 ```
 
 ## `OnlinePlanningScene.components.record_pair`
 
-[定义位置](../../../manipulation/online_geometry.py#L427)。
+[定义位置](../../../manipulation/online_geometry.py#L511)。
 
 输入签名：
 
@@ -1459,7 +1561,7 @@ float
 
 ## `OnlinePlanningScene.components.original_query`
 
-[定义位置](../../../manipulation/online_geometry.py#L460)。
+[定义位置](../../../manipulation/online_geometry.py#L544)。
 
 输入签名：
 
@@ -1494,7 +1596,7 @@ dict
 
 ## `OnlinePlanningScene.evaluate`
 
-[定义位置](../../../manipulation/online_geometry.py#L823)。
+[定义位置](../../../manipulation/online_geometry.py#L859)。
 
 输入签名：
 
@@ -1547,7 +1649,7 @@ name.startswith
 
 ## `OnlinePlanningScene.estimated_workspace_allocation`
 
-[定义位置](../../../manipulation/online_geometry.py#L835)。
+[定义位置](../../../manipulation/online_geometry.py#L871)。
 
 输入签名：
 
@@ -1600,7 +1702,7 @@ dict
 
 ## `OnlinePlanningScene.describe`
 
-[定义位置](../../../manipulation/online_geometry.py#L847)。
+[定义位置](../../../manipulation/online_geometry.py#L883)。
 
 输入签名：
 
@@ -1644,7 +1746,7 @@ deepcopy
 
 ## `OnlinePlanningScene.to_execution_binding`
 
-[定义位置](../../../manipulation/online_geometry.py#L859)。
+[定义位置](../../../manipulation/online_geometry.py#L895)。
 
 输入签名：
 

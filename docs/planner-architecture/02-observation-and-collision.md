@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`a56c3e4`（A–D 实际实现提交；本次仅文档更新提交引用，所述代码与该实现提交一致）。
+代码基线：`d97977c`（本轮实施起点）；当前正文对应待提交的 A/B 工作区实现。
 
 ## 1. 两种实体来源
 
@@ -64,9 +64,11 @@
 
 `query` 返回原生有符号距离、最近点、法向、FK 和关节域。`required`、`excluded`、`mechanical_contact` 是调用者明确提供的原模型配对语义。自碰撞使用 `separated`、`penetrating`、`numerical_boundary` 区分原生查询结果，保留 Coal 默认数值边界；该数值尺度不等于严格误差界，数值边界单列未决。
 
-`RobotStateValidator.required_pairs` 是原配对策略中所有 `required` 记录组成的元组。`OnlinePlanningScene.components` 将该元组直接传给 `RobotGeometryChecker.query`，取得当前自碰撞条件需要的实体对证据；完整 `robot_pairs` 继续用于模型描述与快照保存。实体身份、几何形状和必检配对集合由原机器人配置确定。
+`RobotStateValidator.required_pairs` 是原配对策略中所有 `required` 记录组成的元组。`OnlinePlanningScene._robot_self_components` 将该元组直接传给 `RobotGeometryChecker.query`，取得当前自碰撞条件需要的实体对证据；完整 `robot_pairs` 继续用于模型描述与快照保存。实体身份、几何形状和必检配对集合由原机器人配置确定。
 
 `DifferentiableRobotKinematics` 用 cuRobo 完整关节树求连杆位姿，包括本时刻名义手指坐标。场景对解析实体乘固定局部变换；凸顶点已在连杆坐标中，局部变换为单位阵。机器人模型与状态验证器共享同一个检查器。
+
+`components(..., geometry_scope="robot")` 和 `geometry_scope="full"` 先运行同一手指状态、完整具名关节 FK、机器人实体放置和 `_robot_self_components`。共享函数输出 `collision/robot/self` 与 `unresolved/robot/self`；确定穿透使用原生有符号距离及其见证导数，数值边界保留独立未决分项。缺少名义手指几何时，对依赖相应关节的原配对记录 `unmodelled_motion`。手指控制残差与 conditional 手部状态也由同次手部计算保留。`robot` 范围完成这些项后返回；`full` 范围继续构造任务实体位姿并查询接触、观测场、支撑和覆盖。初始化与完整场景由此共享同一官方机器人实体、配对和数值分类。
 
 `native_field_distance.query_native_field` 直接查询原生实体与原任务场。原实体的支持投影及任务空间框产生距离下界；原实体内可行点及原场占据点产生上界。凸体内点由原面顶点和原顶点均值的非负组合构造，区间计算保留该实际点的局部与世界范围。原生实体保持其有体积的凸体或解析形状；若其实际可行点完整区间严格位于原支持单元的开内部，且该范围上三线性值可靠为负，或该原单元八角点全部非正，即有原场占据开邻域与原生实体发生体积交叠。未许可的这类见证产生 `intersection`。`witness_*_bounds` 保存点的数值区间，中点仅用于显示和局部导数。结论针对已知机器人模型与已表示任务场，不输出真实物理穿透深度。
 
@@ -74,7 +76,7 @@
 
 `query_native_field(..., native_bounds=(local,world))` 可直接消费同一原生实体的局部与世界投影范围。场景构造时保存不可变形状的局部范围；`components` 在本次调用内按实体和状态计算一次世界范围，供不同场配对复用。空场无需构造对应世界范围。required contact 使用的作用实体矩阵也在整批转换一次，然后按状态读取。这些范围和矩阵只复用相同几何计算，实体查询仍使用原形状和原任务场。
 
-`OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。优化调用另外提供 `local_models`，由 `objectives_out` 返回固定局部模型和其他连续场景项。`evaluate` 在 acceptance 模式汇总硬分项，在 optimization 模式汇总优化项；两者均保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留分类计数和有限见证；场配对的未决只进入该报告。原生自身的 `numerical_boundary`、required contact、初始支撑高度与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
+完整范围的 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。完整场景优化另外提供 `local_models`，由 `objectives_out` 返回固定局部模型和其他连续场景项；机器人范围使用同次原生距离见证计算连续项。`evaluate` 在 acceptance 模式汇总硬分项，在 optimization 模式汇总优化项；两者均保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留 `geometry_scope`、分类计数和有限见证；场配对的未决只进入该报告。原生自身的 `numerical_boundary`、required contact、初始支撑高度与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
 
 区间几何调用显式提供 `geometry_evidence_out`，接收每个状态的完整实体对记录，包含原实体 ID、硬状态、距离范围、许可种类、内部组合体和未建模运动；该记录不受显示报告的有限条数限制。`first/second` 保存显示名称，`geometry_entity_key` 的两个同名字段分别保存 `robot/<geometry ID>`、`owner/<owner ID>` 或 `background`。带类别的实体键连接距离证据、运动界、配对缓存和交叠去重，也用于筛选依赖未建模手指运动的机器人实体；同名机器人组件与任务实体保留独立身份。
 

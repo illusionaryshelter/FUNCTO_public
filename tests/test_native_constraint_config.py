@@ -71,7 +71,9 @@ def test_bound_configuration_drives_native_constraints_and_sampled_retention(
     assert optimizer_bound["activation_distance"] == [0.] * 5
 
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4) as fixture:
-        fixture.configuration.set_scene_constraints(False)
+        # BEGIN initialization retains native bounds beside robot-scope geometry.
+        fixture.configuration.set_geometry_scope("robot")
+        # END the analytic fixture declares an empty, explicitly queried self set.
         rollout = RobotRolloutCfg.create_with_component_types(
             deepcopy(optimizer["rollout"]), robot_cfg=None, device_cfg=device,
             cost_manager_config_instance_type=fixture.configuration)
@@ -102,6 +104,8 @@ def test_bound_configuration_drives_native_constraints_and_sampled_retention(
         state = RobotState(joint_state=joints,
             cuda_robot_model_state=fixture.kinematics(joints), joint_torque=effort)
         constraints = manager.compute_costs(state)
+        assert fixture.scene.queries == ["robot"]
+        assert "process_scene" in constraints.names
         native_bound = constraints.values[constraints.names.index("cspace")]
         assert (native_bound.flatten(1).sum(-1) > 0).tolist() == [False] + [True] * 5
         assert manager.get_cost("cspace").config.activation_distance.eq(0).all()

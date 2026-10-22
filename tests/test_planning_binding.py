@@ -453,13 +453,15 @@ class PlanningBindingTest(unittest.TestCase):
         clock = torch.tensor([[.25, .5, .75]], dtype=torch.float32)
         q = torch.tensor([[[0.], [.1], [.1]]], dtype=torch.float32)
         observations = []
-        # BEGIN the unchanged material-mode fixture declares no arrival pair permission.
+        # BEGIN the material-mode fixture consumes the explicit geometry scope.
         def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                     contact_permission_progress, query_role, local_models, geometry_evidence_out):
+                     contact_permission_progress, query_role, local_models, geometry_evidence_out,
+                     geometry_scope):
+            self.assertEqual(geometry_scope, "full")
             observations.append((s.clone(), joints.clone(), trajectory_time.clone()))
             return ((s < .5) & (joints[..., 0] > 0)).to(s.dtype)
         scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)
-        # END the existing test still proves both original material-mode sides.
+        # END the test proves both original material-mode sides in full geometry.
         def check(joints):
             return _scene_boundary_evaluate(scene, self.problem(), mapping,
                 torch.zeros((1, 3, 1, 4)), torch.zeros((1, 3, 3)),

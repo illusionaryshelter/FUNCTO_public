@@ -84,10 +84,15 @@ def bind_analytic_ik_screening(planner, report_for=None):
     def rank(candidates, success, previous, parameter, goal_ids=()):
         reports = []
         for row, flag in zip(candidates, success):
-            evidence = {"task_satisfied": True, "model_valid": bool(np.isfinite(row).all()),
+            # BEGIN mirror the production producer's evaluated versus skipped query.
+            evaluated = bool(np.isfinite(row).all() and (flag or goal_ids))
+            evidence = {"task_satisfied": evaluated, "model_valid": evaluated,
                 "native_pose_ik_success": bool(flag), "candidate_source": "native_ik",
+                "static_model_query": "evaluated" if evaluated else "not_run_native_reference_ik_failed",
+                "task_violations": {}, "native_violations": {}, "scene_components": {},
                 "environment_clearance_m": 1., "self_clearance_m": 1.,
                 "joint_limit_margin_fraction": .5}
+            # END synthetic evidence uses the same explicit raw report fields.
             if report_for is not None:
                 evidence.update(report_for(row, bool(flag), parameter))
             reports.append(evidence)
@@ -98,6 +103,10 @@ def bind_analytic_ik_screening(planner, report_for=None):
 
     planner._rank_ik_candidates = Mock(side_effect=rank)
     planner.check_request = Mock()
+    # BEGIN independent fixtures own the actual cumulative submission ledger.
+    planner.request_work = {"ik_queries": 0}
+    planner.remaining_request_seconds = lambda: planner.budget.planning_seconds
+    # END reference calls retain this same dictionary across repeated invocations.
     planner._build_goal_ik_candidates = Mock(return_value={})
     planner.device_cfg = SimpleNamespace(to_device=lambda values: torch.as_tensor(
         values, dtype=planner.start.position.dtype))
@@ -118,7 +127,7 @@ def bind_analytic_ik_screening(planner, report_for=None):
     from manipulation.physical_joint_domain import JointPositionDomain
     planner.position_domain = JointPositionDomain(planner.physical_domain.lower, planner.physical_domain.upper)
     planner.reference_ik_pose_weights = (10000., 500.)
-    planner._refine_reference_seeds = Mock(side_effect=lambda seeds: seeds.contiguous())
+    planner._refine_reference_seeds = Mock(side_effect=lambda seeds, *, enrichment=None: seeds.contiguous())
     # END complete refinement uses the independent native-optimizer fixture.
 # END declared static evidence cannot substitute for source checking or complete trajectory acceptance.
 
@@ -839,17 +848,12 @@ class NativeCubicClockTests(unittest.TestCase):
         self.assertTrue(torch.all(seeds[:, :, 0] != planner.start.position).item())
         self.assertTrue(np.all(np.diff(requested) >= 0))
 
-    # BEGIN native constant-seed initialization contract after failed pose IK.
+    # BEGIN measured proposals enter the continuous domain after failed pose IK.
     def test_two_seeds_keep_nonfinite_ik_diagnostic_and_measured_state_initializer(self):
-        from curobo.types import DeviceCfg
-        from curobo._src.util.trajectory_seed_generator import TrajectorySeedGenerator
-
         horizon = 8
         measured_q = torch.tensor([[.1, -.2, .3]], dtype=torch.float64)
         measured_dq = torch.tensor([[.4, -.5, .6]], dtype=torch.float64)
         position_before, velocity_before = measured_q.clone(), measured_dq.clone()
-        native_generator = TrajectorySeedGenerator(horizon, 3, DeviceCfg("cpu"))
-        helper = Mock(wraps=native_generator.generate_constant_seeds)
         goals, supplied_seed_shapes, requested_parameters = [], [], []
 
         def failed_pose_ik(goal, **kwargs):
@@ -872,17 +876,18 @@ class NativeCubicClockTests(unittest.TestCase):
         planner.seed_parameter = torch.zeros((1, 1))
         # END diagnostic failure does not remove the independent time input.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        planner.trajopt = SimpleNamespace(action_horizon=horizon,
-                                         _trajectory_seed_generator=SimpleNamespace(generate_constant_seeds=helper))
+        planner.trajopt = SimpleNamespace(action_horizon=horizon)
         planner.ik = SimpleNamespace(solve_pose=failed_pose_ik, get_active_js=lambda state: state)
         planner._goal = lambda progress: progress
         bind_analytic_ik_screening(planner)
+        initialize = Mock(wraps=planner.physical_domain.initialize)
+        planner.physical_domain.initialize = initialize
         seeds, success_counts = planner.reference_seeds()
         np.testing.assert_array_equal(requested_parameters,
             ((np.arange(horizon)+1.)/(horizon+2.)).astype(np.float32).astype(float))
-        self.assertEqual(helper.call_count, 2)
-        self.assertIs(helper.call_args.args[0], measured_q)
-        self.assertEqual(helper.call_args.args[1], 1)
+        initialize.assert_called_once()
+        torch.testing.assert_close(initialize.call_args.args[0],
+            measured_q[:, None, None].expand(1, 2, horizon, -1), rtol=0, atol=0)
         self.assertEqual(tuple(seeds.shape), (1, 2, horizon, 3))
         self.assertTrue(seeds.is_contiguous())
         self.assertEqual(success_counts, [0]*horizon)
@@ -891,7 +896,7 @@ class NativeCubicClockTests(unittest.TestCase):
         self.assertEqual(planner.reference_ik_chains, [])
         self.assertTrue(all(row["reference_status"] == "FAILED_REFERENCE"
                             for row in planner.reference_ik_queries))
-        self.assertEqual(planner.initial_seed_strategies, ["measured_state_constant"]*2)
+        self.assertEqual(planner.initial_seed_strategies, ["physical_entry_curve"]*2)
         np.testing.assert_array_equal(seeds[0, 0].numpy(), np.broadcast_to(measured_q.numpy(), (horizon, 3)))
         # END the independent measured-state initializer retains the original entrance.
         np.testing.assert_array_equal(seeds[0, 1].numpy(), np.broadcast_to(measured_q.numpy(), (horizon, 3)))
@@ -914,7 +919,8 @@ class NativeCubicClockTests(unittest.TestCase):
         # Each raw query is screened once. Reused warm starts only initialize
         # IK and never masquerade as successful states at a different time.
         self.assertEqual(planner._rank_ik_candidates.call_count, 2*horizon)
-    # END native constant-seed initialization contract after failed pose IK.
+        self.assertEqual(planner.request_work["ik_queries"], 2*horizon*planner.budget.ik_seeds)
+    # END original query evidence and measured derivative constraints remain distinct.
 
 
 # BEGIN native-result diversity and whole-window initializer selection contracts.
@@ -923,8 +929,6 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
 
     @staticmethod
     def planner_for(pools, flags, *, seed_count=2, joint_tolerance=1e-5, report_for=None):
-        from curobo.types import DeviceCfg
-        from curobo._src.util.trajectory_seed_generator import TrajectorySeedGenerator
         from manipulation.physical_joint_domain import CubicJointDomain, JointPositionDomain
 
         horizon, candidates = len(pools), len(pools[0])
@@ -939,10 +943,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner.seed_parameter = torch.zeros((1, 1), dtype=torch.float64)
         # END no implicit default clock is added to the production planner.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        generator = TrajectorySeedGenerator(horizon, 3, DeviceCfg("cpu"))
-        constant = Mock(wraps=generator.generate_constant_seeds)
-        planner.trajopt = SimpleNamespace(action_horizon=horizon,
-                                         _trajectory_seed_generator=SimpleNamespace(generate_constant_seeds=constant))
+        planner.trajopt = SimpleNamespace(action_horizon=horizon)
         warm_starts = []
 
         def solve(goal, **kwargs):
@@ -967,10 +968,14 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         bounds = torch.tensor([[-2., 2.], [-2., 2.], [-20., 20.], [-100., 100.]], dtype=torch.float64)[:, :, None].expand(-1, -1, 3)
         planner.physical_domain = CubicJointDomain(bounds, planner.start.position,
             planner.start.velocity, planner.formal_clock["knot_dt"], horizon)
+        # BEGIN the real domain receives measured q0 repeated as free proposals.
+        initialize = Mock(wraps=planner.physical_domain.initialize)
+        planner.physical_domain.initialize = initialize
+        # END the fixed domain supplies dq0 and all continuous derivative bounds.
         planner.reference_ik_pose_weights = (10000., 500.)
-        planner._refine_reference_seeds = Mock(side_effect=lambda seeds: seeds.contiguous())
+        planner._refine_reference_seeds = Mock(side_effect=lambda seeds, *, enrichment=None: seeds.contiguous())
         # END the real continuous refinement has independent objective/constraint tests.
-        return planner, constant, warm_starts
+        return planner, initialize, warm_starts
 
     @staticmethod
     def two_tracks():
@@ -989,7 +994,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
 
     def test_whole_chain_continuity_retains_successes_despite_result_order_changes(self):
         primary, alternative, pools, flags = self.two_tracks()
-        planner, constant, warm_starts = self.planner_for(pools, flags)
+        planner, initialize, warm_starts = self.planner_for(pools, flags)
         measured_q, measured_dq = planner.start.position.clone(), planner.start.velocity.clone()
         seeds, success = planner.reference_seeds()
         chains = planner.reference_ik_chains
@@ -1005,8 +1010,8 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                 np.testing.assert_array_equal(chain["joint_positions"][query], pools[query][index])
         self.assertEqual(success, [3]*6)
         self.assertEqual(planner.reference_ik_distinct_counts, [3]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "reference_ik_alternative"])
-        constant.assert_not_called()
+        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"]*2)
+        initialize.assert_called_once()
         self.assertEqual(tuple(warm_starts[0].shape), (1, 1, 3))
         for index in range(1, 6):
             self.assertEqual(tuple(warm_starts[index].shape), (1, 1, 3))
@@ -1029,7 +1034,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
             order = np.arange(4) if index % 2 == 0 else np.arange(3, -1, -1)
             pools.append(values[order])
             flags.append(success[order])
-        planner, constant, _ = self.planner_for(pools, flags)
+        planner, initialize, _ = self.planner_for(pools, flags)
         seeds, success = planner.reference_seeds()
         chains = planner.reference_ik_chains
         self.assertEqual(len(chains), 2)
@@ -1040,18 +1045,18 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertFalse(np.array_equal(chains[0]["joint_positions"], chains[1]["joint_positions"]))
         self.assertEqual(success, [2, 1, 2, 2, 1, 2])
         self.assertEqual(planner.reference_ik_distinct_counts, success)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "reference_ik_alternative"])
-        constant.assert_not_called()
+        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"]*2)
+        initialize.assert_called_once()
 
     def test_failed_control_pose_keeps_finite_approximate_nodes_and_original_flag(self):
         _, _, pools, flags = self.two_tracks()
         flags[2] = np.zeros(4, dtype=bool)
-        planner, constant, _ = self.planner_for(pools, flags)
+        planner, initialize, _ = self.planner_for(pools, flags)
         seeds, success = planner.reference_seeds()
         self.assertEqual(success, [3, 3, 0, 3, 3, 3])
         self.assertEqual(planner.reference_ik_distinct_counts, [3, 3, 0, 3, 3, 3])
         self.assertEqual(planner.initial_seed_strategies,
-                         ["reference_ik_approximate_proposals", "reference_ik_approximate_proposals_alternative"])
+                         ["successful_reference_ik_fit"]*2)
         self.assertEqual(planner.reference_ik_chains[0]["interpolated_queries"], [])
         self.assertTrue(bool(torch.isfinite(seeds).all()))
         self.assertGreater(float(seeds[0, 0].abs().max()), 0.)
@@ -1061,49 +1066,49 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                             and not chain["reference_success"] for chain in planner.reference_ik_chains))
         self.assertTrue(all(not candidate["report"]["native_pose_ik_success"]
                             for candidate in planner.reference_ik_queries[2]["candidates"]))
-        constant.assert_not_called()
+        initialize.assert_called_once()
 
     def test_numerically_duplicate_native_results_do_not_claim_a_second_reference_trace(self):
         tolerance = 1e-5
         pools = [np.array([[.3+.01*index, 0., 0.], [.3+.01*index+.25*tolerance, 0., 0.]])
                  for index in range(6)]
-        planner, constant, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
+        planner, initialize, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
         seeds, success = planner.reference_seeds()
         self.assertEqual(success, [2]*6)
         self.assertEqual(planner.reference_ik_distinct_counts, [1]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "measured_state_constant"])
+        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit", "physical_entry_curve"])
         np.testing.assert_array_equal(seeds.numpy()[0, 1], np.zeros((6, 3)))
-        constant.assert_called_once()
+        initialize.assert_called_once()
 
     def test_distinction_uses_declared_joint_numerics_without_an_extra_branch_threshold(self):
         tolerance = 1e-5
         pools = [np.array([[.3+.01*index, 0., 0.], [.3+.01*index+4*tolerance, 0., 0.]])
                  for index in range(6)]
-        planner, constant, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
+        planner, initialize, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
         seeds, _ = planner.reference_seeds()
         self.assertEqual(planner.reference_ik_distinct_counts, [2]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik", "reference_ik_alternative"])
+        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"]*2)
         selected = np.asarray([row["joint_positions"] for row in planner.reference_ik_chains])
         self.assertGreater(float(np.max(np.abs(selected[1]-selected[0]))), tolerance)
         self.assertLessEqual(float(np.max(np.abs(selected[1]-selected[0]))), 4*tolerance+1e-14)
-        constant.assert_not_called()
+        initialize.assert_called_once()
 
     def test_single_trajectory_seed_budget_keeps_its_best_complete_coarse_path(self):
         primary, _, pools, flags = self.two_tracks()
-        planner, constant, _ = self.planner_for(pools, flags, seed_count=1)
+        planner, initialize, _ = self.planner_for(pools, flags, seed_count=1)
         seeds, success = planner.reference_seeds()
         self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
         np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
         rebuilt = planner.physical_domain.evaluate(seeds[0, 0], (np.arange(6)+1.)/8.)
         np.testing.assert_allclose(rebuilt, primary, atol=1e-5)
         self.assertEqual(success, [3]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik"])
-        constant.assert_not_called()
+        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"])
+        initialize.assert_called_once()
 
     def test_reference_seed_chooses_a_complete_chain_before_fitting_coefficients(self):
         pools = [np.array([[0., 0., 0.], [.4, 0., 0.]])]
         pools.extend(np.array([[.5, 0., 0.], [.5, 0., 0.]]) for _ in range(5))
-        planner, constant, warm_starts = self.planner_for(pools, [np.ones(2, bool)]*6, seed_count=1)
+        planner, initialize, warm_starts = self.planner_for(pools, [np.ones(2, bool)]*6, seed_count=1)
         seeds, _ = planner.reference_seeds()
         selected = np.asarray(planner.reference_ik_chains[0]["joint_positions"])
         self.assertEqual(selected[0, 0], .4)
@@ -1114,23 +1119,23 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         np.testing.assert_array_equal(warm_starts[1].numpy()[0, 0], [0., 0., 0.])
         self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
         self.assertTrue(planner.reference_seed_fits[0]["success"])
-        constant.assert_not_called()
+        initialize.assert_called_once()
 
     def test_failed_optional_reference_fit_retains_evidence_and_measured_initializer(self):
         _, _, pools, flags = self.two_tracks()
-        planner, constant, _ = self.planner_for(pools, flags, seed_count=1)
+        planner, initialize, _ = self.planner_for(pools, flags, seed_count=1)
         with patch.object(planner.physical_domain, "fit_reference",
                           return_value=(None, {"success": False, "reason": "declared_fit_failure"})):
             seeds, success = planner.reference_seeds()
         self.assertEqual(success, [3]*6)
         self.assertTrue(planner.reference_ik_chains[0]["reference_success"])
         np.testing.assert_array_equal(seeds.numpy()[0, 0], np.zeros((6, 3)))
-        self.assertEqual(planner.initial_seed_strategies, ["measured_state_after_reference_fit_failure"])
+        self.assertEqual(planner.initial_seed_strategies, ["entry_curve_after_fit_failure"])
         fit = planner.reference_seed_fits[0]
         self.assertFalse(fit["success"])
         self.assertEqual(fit["reason"], "declared_fit_failure")
-        self.assertEqual(fit["initializer_after_failure"], "measured_state_constant")
-        constant.assert_called_once()
+        self.assertEqual(fit["source"], "entry_curve_after_fit_failure")
+        initialize.assert_called_once()
 
     # BEGIN static evidence and direct refinement retain the original seed budget.
     def test_extra_clearance_does_not_override_qualified_whole_chain_continuity(self):
@@ -1141,19 +1146,19 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                     "environment_clearance_m": .002 if row[0] > 1. else .0001,
                     "self_clearance_m": 1., "joint_limit_margin_fraction": .5}
 
-        planner, constant, warm_starts = self.planner_for(pools, flags, seed_count=1, report_for=report)
+        planner, initialize, warm_starts = self.planner_for(pools, flags, seed_count=1, report_for=report)
         seeds, success = planner.reference_seeds()
         np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
         self.assertEqual(success, [3]*6)
         self.assertEqual(len(warm_starts), 6)
         self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
         self.assertEqual(planner._rank_ik_candidates.call_count, 6)
-        constant.assert_not_called()
+        initialize.assert_called_once()
 
     # BEGIN transfer IK remains an initializer when static observations are incomplete.
     def test_reference_native_success_survives_static_task_and_scene_failures(self):
         primary, _, pools, flags = self.two_tracks()
-        planner, constant, warm_starts = self.planner_for(pools, flags, seed_count=1,
+        planner, initialize, warm_starts = self.planner_for(pools, flags, seed_count=1,
             report_for=lambda row, success, parameter: {"task_satisfied": False, "model_valid": False})
         before_q, before_dq = planner.start.position.clone(), planner.start.velocity.clone()
         seeds, success = planner.reference_seeds()
@@ -1165,12 +1170,12 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                             for query in planner.reference_ik_queries for candidate in query["candidates"]))
         self.assertEqual(tuple(warm_starts[1].shape), (1, 1, 3))
         cost = planner.reference_ik_chains[0]["selection_cost"]
-        self.assertEqual((cost["static_task_unqualified_count"], cost["static_model_unqualified_count"]), (6, 6))
+        self.assertEqual((cost["static_task_not_established_count"], cost["static_model_not_established_count"]), (6, 6))
         self.assertTrue(planner.reference_seed_fits[0]["success"])
         torch.testing.assert_close(planner.start.position, before_q, rtol=0, atol=0)
         torch.testing.assert_close(planner.start.velocity, before_dq, rtol=0, atol=0)
         self.assertTrue(torch.isfinite(seeds).all())
-        constant.assert_not_called()
+        initialize.assert_called_once()
     # END static failure evidence stays separate from the measured entrance.
 
     # BEGIN direct refinement owns the returned curve after coarse joint fitting.
@@ -1179,7 +1184,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner, _, _ = self.planner_for(pools, flags)
         returned = []
 
-        def refine(coarse):
+        def refine(coarse, *, enrichment=None):
             result = coarse.clone()
             result[:, :, 2:] += .01
             returned.append(result)

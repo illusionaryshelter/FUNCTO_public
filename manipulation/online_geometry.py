@@ -395,21 +395,105 @@ class OnlinePlanningScene:
             poses[owner.owner_id] = owner.pose(position, quaternion, progress, releases)
         return poses
 
+    # BEGIN one official-robot self query serves both initialization and full scenes.
+    def _robot_self_components(self, complete_q, complete_names, robot_poses,
+                               robot_matrices, hand_state, zero, *, query,
+                               record_pair, include_bounds, query_role):
+        """Query the fixed robot's required entity pairs at prepared states.
+
+        Entity shapes and fixed link transforms are the official model of
+        this unchanged robot/end-effector configuration, reusable across
+        tasks. Named feedback/nominal hand coordinates and calibrated FK
+        determine poses; task fields and camera coverage do not enter here.
+        The caller supplies differentiable poses and their same-state matrix
+        snapshots. Coal distances own the classification. Penetrating-pair
+        witnesses supply the existing local derivative; numerical boundaries
+        remain separately reported hard evidence.
+        ``query`` only shares evidence for explicitly repeated base particles.
+        """
+        from .implicit_distance import inverse_points
+        from .observed_collision import _world
+
+        shape = tuple(complete_q.shape[:-1])
+        uncertain = (np.zeros(shape, bool) if hand_state is None
+                     else hand_state.uncertain.detach().cpu().numpy())
+        unmodelled = (set() if hand_state is None else
+                     set(self.robot_model.geometry_depending_on(self.gripper.joint_names)))
+        report = {"query_role": query_role, "collision_rule": "nonpenetration", "pair_queries": 0,
+                  "status_counts": {}, "nonclear_pairs": [],
+                  "internal_assembly_pair_count": 0, "tool_geometry_names": list(self.tool_geometry_names),
+                  "robot_geometry_source": "registered_native_model",
+                  "robot_view_coverage_status": "not_queried",
+                  "coverage_scope": "not_queried"}
+        q_cpu = complete_q.detach().cpu().numpy()
+        self_costs, self_unresolved = [], []
+        for index in np.ndindex(shape):
+            evidence = query(index, ("robot", "self"),
+                lambda: self.robot_model.query(joint_names=complete_names,
+                    joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
+                    pairs=self.robot_validator.required_pairs, check_request=self.check_request))
+            value = zero[index]
+            undecided = value
+            for row in evidence["pairs"]:
+                first_id, second_id = row["first"], row["second"]
+                entity_key = {"first": f"robot/{first_id}", "second": f"robot/{second_id}"}
+                if uncertain[index] and ({first_id, second_id} & unmodelled):
+                    record_pair(index, "collision/robot/self", first_id, second_id,
+                        {"status": "unmodelled_motion", "lower_m": None}, geometry_entity_key=entity_key)
+                    continue
+                status = row["relation"]
+                lower = None
+                if include_bounds:
+                    lower = native_pair_lower_bound(
+                        self.robot_model._geometries[first_id][1],
+                        np.asarray(evidence["geometry_poses"][first_id], float),
+                        self.robot_model._geometries[second_id][1],
+                        np.asarray(evidence["geometry_poses"][second_id], float),
+                        row["normal_first_to_second"])
+                record_pair(index, "collision/robot/self", first_id, second_id,
+                    {**row, "status": {"separated": "clear", "penetrating": "intersection",
+                                       "numerical_boundary": "unresolved"}[status],
+                     "lower_m": lower, "distance_scope": "full_entities"}, geometry_entity_key=entity_key)
+                report["pair_queries"] += 1
+                report["status_counts"][status] = report["status_counts"].get(status, 0) + 1
+                if status == "numerical_boundary":
+                    undecided = undecided + 1.
+                elif status == "penetrating":
+                    a = inverse_points(row["witness_first"], robot_matrices[first_id][index])
+                    b = inverse_points(row["witness_second"], robot_matrices[second_id][index])
+                    pa = tuple(item[index] for item in robot_poses[first_id])
+                    pb = tuple(item[index] for item in robot_poses[second_id])
+                    normal = _tensor(row["normal_first_to_second"], complete_q)
+                    signed = ((_world(b, pb) - _world(a, pa)) * normal).sum()
+                    value = value - row["signed_distance_m"] - (signed - signed.detach())
+                if status != "separated" and len(report["nonclear_pairs"]) < 32:
+                    report["nonclear_pairs"].append({"component": "collision/robot/self",
+                        "state_index": list(index), **row})
+            self_costs.append(value)
+            self_unresolved.append(undecided)
+        return {"collision/robot/self": torch.stack(self_costs).reshape(shape),
+                "unresolved/robot/self": torch.stack(self_unresolved).reshape(shape)}, report
+    # END all consumers retain the same entity identities and distance semantics.
+
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time,
                    active_contact_rule_ids=None, contact_permission_progress=None,
                    owner_poses=None, query_role="acceptance", local_models=None,
-                   objectives_out=None, geometry_evidence_out=None):
+                   objectives_out=None, geometry_evidence_out=None, geometry_scope="full"):
         """Return same-state residuals and retain distance/coverage diagnostics.
 
         ``robot_spheres`` is an empty native-kinematics output. Registered
         native entities carry all robot geometry. Both query roles return the
         same hard components. Optimization additionally fills independent
         continuous objectives using an explicitly captured block model.
+        ``geometry_scope='robot'`` computes the same official self pairs and
+        hand state without constructing task-owner poses or querying fields.
         """
         if query_role not in {"optimization", "acceptance"}:
             raise ValueError("Observed geometry requires an explicit query role")
-        if query_role == "optimization" and local_models is None:
+        if geometry_scope not in {"robot", "full"}:
+            raise ValueError("Geometry scope must be robot or full")
+        if query_role == "optimization" and geometry_scope == "full" and local_models is None:
             raise ValueError("Optimization requires explicitly captured local geometry models")
         if self.kinematics is None or joint_position is None:
             raise ValueError("Observed robot geometry must be bound to its named joint tree")
@@ -437,7 +521,7 @@ class OnlinePlanningScene:
         # END hard residuals and optional proof evidence have separate consumers.
         # BEGIN bind fixed local records by seed, physical time and relation mode.
         states, state_keys = {}, {}
-        if query_role == "optimization":
+        if query_role == "optimization" and local_models is not None:
             times_cpu, relation_cpu, permission_cpu = (
                 value.detach().cpu().numpy() for value in
                 (trajectory_time, progress, permission_progress))
@@ -454,7 +538,7 @@ class OnlinePlanningScene:
         # and its key retains the query column, seed, physical time and both
         # relation modes. Distinct columns are never merged merely because
         # their physical times round to the same native tensor value.
-        base_evidence = ({} if query_role == "optimization"
+        base_evidence = ({} if query_role == "optimization" and local_models is not None
                          and (local_models.capturing or local_models.repeated_base) else None)
 
         def original_query(index, identity, query):
@@ -493,6 +577,25 @@ class OnlinePlanningScene:
                 link_position + quaternion_rotate(link_quaternion, local_position),
                 quaternion_multiply(link_quaternion, local_quaternion))
         # END geometry IDs remain distinct from their supporting link frames.
+        # BEGIN self geometry precedes every task-field computation.
+        robot_matrices = {name: _matrices(pose) for name, pose in robot_poses.items()}
+        zero = complete_q.sum(-1) * 0 + position.sum(-1) * 0
+        for pose in robot_poses.values():
+            zero = zero + pose[0].sum(-1) * 0
+        robot_costs, report = self._robot_self_components(complete_q, complete_names,
+            robot_poses, robot_matrices, hand_state, zero, query=original_query,
+            record_pair=record_pair, include_bounds=geometry_evidence_out is not None,
+            query_role=query_role)
+        costs.update(robot_costs)
+        objectives["collision/robot/self"] = robot_costs["collision/robot/self"]
+        report["geometry_scope"] = geometry_scope
+        if geometry_scope == "robot":
+            self.last_query_report = report
+            if objectives_out is not None:
+                objectives_out.update(objectives)
+            return costs
+        report["coverage_scope"] = "represented_observed_occupancy"
+        # END full scenes continue from this same completed self query.
         poses = self._owner_poses(position, quaternion, progress, owner_poses, costs)
         identity = (torch.zeros_like(position), torch.zeros_like(quaternion))
         identity[1][..., 0] = 1
@@ -500,7 +603,6 @@ class OnlinePlanningScene:
         fields = {owner.owner_id: owner.query for owner in self.owners}
         fields["background"] = self.background
         matrices = {name: _matrices(pose) for name, pose in poses.items()}
-        robot_matrices = {name: _matrices(pose) for name, pose in robot_poses.items()}
         # BEGIN finite contact queries reuse one full-batch actor conversion.
         contact_actor_matrices = dict(matrices)
         # END owner actors already have the exact required matrix batch.
@@ -508,8 +610,7 @@ class OnlinePlanningScene:
         # Clear or skipped pairs still return a differentiable scalar. Form
         # that zero once over the batch, retaining each entity's connection
         # before independent local objectives transform fixed material points.
-        zero = complete_q.sum(-1) * 0
-        for pose in (*poses.values(), *robot_poses.values()):
+        for pose in poses.values():
             zero = zero + pose[0].sum(-1) * 0
         # END a shared zero changes neither geometry queries nor their verdicts.
         policies = {}
@@ -585,71 +686,6 @@ class OnlinePlanningScene:
         # BEGIN uncertainty belongs to registered robot entities, not display names.
         unmodelled_entity_keys = {f"robot/{name}" for name in unmodelled}
         # END a scene owner may retain the same name as a robot component.
-        # BEGIN native self checks use the same validator pair contract.
-        report = {"query_role": query_role, "collision_rule": "nonpenetration", "pair_queries": 0,
-                  "status_counts": {}, "nonclear_pairs": [],
-                  "internal_assembly_pair_count": 0, "tool_geometry_names": list(self.tool_geometry_names),
-                  "robot_geometry_source": "registered_native_model",
-                  "robot_view_coverage_status": "not_queried",
-                  "coverage_scope": "represented_observed_occupancy"}
-        from .implicit_distance import inverse_points
-        from .observed_collision import _world
-        q_cpu = complete_q.detach().cpu().numpy()
-        self_costs, self_unresolved = [], []
-        for index in np.ndindex(tuple(progress.shape)):
-            evidence = original_query(index, ("robot", "self"),
-                lambda: self.robot_model.query(joint_names=complete_names,
-                    joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
-                    # BEGIN acceptance queries use the validator's existing required tuple.
-                    pairs=self.robot_validator.required_pairs, check_request=self.check_request))
-            # END robot_pairs retains the complete policy for serialization.
-            value = zero[index]
-            undecided = value
-            for row in evidence["pairs"]:
-                first_id, second_id = row["first"], row["second"]
-                entity_key = {"first": f"robot/{first_id}", "second": f"robot/{second_id}"}
-                if uncertain_cpu[index] and ({first_id, second_id} & unmodelled):
-                    record_pair(index, "collision/robot/self", first_id, second_id,
-                        {"status": "unmodelled_motion", "lower_m": None}, geometry_entity_key=entity_key)
-                    continue
-                status = row["relation"]
-                # BEGIN full support projections certify native separation.
-                lower = None
-                if geometry_evidence_out is not None:
-                    lower = native_pair_lower_bound(
-                        self.robot_model._geometries[first_id][1],
-                        np.asarray(evidence["geometry_poses"][first_id], float),
-                        self.robot_model._geometries[second_id][1],
-                        np.asarray(evidence["geometry_poses"][second_id], float),
-                        row["normal_first_to_second"])
-                record_pair(index, "collision/robot/self", first_id, second_id,
-                    {**row, "status": {"separated": "clear", "penetrating": "intersection",
-                                       "numerical_boundary": "unresolved"}[status],
-                     "lower_m": lower, "distance_scope": "full_entities"}, geometry_entity_key=entity_key)
-                # END Coal's raw distance tolerance is never used as an error bound.
-                report["pair_queries"] += 1
-                report["status_counts"][status] = report["status_counts"].get(status, 0) + 1
-                if status == "numerical_boundary":
-                    undecided = undecided + 1.
-                elif status == "penetrating":
-                    # Native witnesses supply a local rigid-motion direction;
-                    # the original signed query alone owns the verdict.
-                    a = inverse_points(row["witness_first"], robot_matrices[first_id][index])
-                    b = inverse_points(row["witness_second"], robot_matrices[second_id][index])
-                    pa = tuple(item[index] for item in robot_poses[first_id])
-                    pb = tuple(item[index] for item in robot_poses[second_id])
-                    normal = _tensor(row["normal_first_to_second"], complete_q)
-                    signed = ((_world(b, pb) - _world(a, pa)) * normal).sum()
-                    value = value - row["signed_distance_m"] - (signed - signed.detach())
-                if status != "separated" and len(report["nonclear_pairs"]) < 32:
-                    report["nonclear_pairs"].append({"component": "collision/robot/self",
-                        "state_index": list(index), **row})
-            self_costs.append(value)
-            self_unresolved.append(undecided)
-        costs["collision/robot/self"] = torch.stack(self_costs).reshape(progress.shape)
-        objectives["collision/robot/self"] = costs["collision/robot/self"]
-        costs["unresolved/robot/self"] = torch.stack(self_unresolved).reshape(progress.shape)
-        # END camera coverage and task margins cannot change self legality.
         pairs = []
         moving_owners = {owner.owner_id for owner in self.owners if owner.moving}
         for name, (_, geometry, _, _) in self.robot_model._geometries.items():

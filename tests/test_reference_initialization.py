@@ -63,7 +63,7 @@ class CurveRollout:
         weights = torch.full_like(error, 1./(self.step.horizon-1))
         weights[:, [0, -1]] *= .5
         ordinary = CostCollection()
-        ordinary.add((error*weights)[..., None], "analytic_tool_reference")
+        ordinary.add((error*weights)[..., None], "continuous_reference")
         terms = self.fixture.manager.compute_costs(state)
         return SimpleNamespace(state=state, actions=action,
             costs_and_constraints=CostsAndConstraints(costs=ordinary, constraints=terms))
@@ -104,7 +104,8 @@ def make_planner(fixture, count=2, iterations=8):
                             "native_dt": .125, "knot_dt": .125}
     planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.finger_trajectory = None
-    planner.reference_initialization = {"status": "collecting_proposals", "scene_constraints": "not_evaluated"}
+    planner.reference_initialization = {"status": "collecting_proposals",
+        "geometry_scope": "robot", "task_scene_constraints": "not_evaluated"}
     planner.initial_seed_strategies = ["declared_numeric_proposal"]*count
     planner.initialization_candidate = None
     limits = SimpleNamespace(joint_names=list(planner.joint_names),
@@ -124,7 +125,6 @@ def make_planner(fixture, count=2, iterations=8):
 def test_actual_native_curve_updates_preserve_clock_entry_and_original_event_evidence(manager_fixture, count):
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
         planner, seed, rollout, stage = make_planner(fixture, count)
-        fixture.scene.evaluate = Mock(side_effect=AssertionError("Initialization queried scene geometry"))
         with patch("curobo._src.runtime.cuda_event_timers", False):
             refined = planner._refine_reference_seeds(seed)
         record = planner.reference_initialization
@@ -133,22 +133,27 @@ def test_actual_native_curve_updates_preserve_clock_entry_and_original_event_evi
         assert stage.config.num_iters == 8
         assert refined.shape == seed.shape and not torch.equal(seed, refined)
         assert fixture.manager.local_geometry_models is not None
+        # BEGIN every actual curve forward includes the shared robot scope.
+        assert fixture.scene.queries and set(fixture.scene.queries) == {"robot"}
+        assert record["refined"]["geometry_scope"] == "robot"
+        assert record["refined"]["task_scene_constraints"] == "not_evaluated"
+        # END full task-entity qualification remains a separately recorded computation.
         for initial, final in zip(record["coarse"]["seeds"], record["refined"]["seeds"]):
             assert final["fixed_objective"] < initial["fixed_objective"]
             assert final["functional_inequalities"].keys() == dict.fromkeys(planner.problem.functional_constraint_keys).keys()
-            assert "process_scene" not in final["optimizer_constraints"]
+            assert final["optimizer_constraints"]["process_scene"] == 0.
             np.testing.assert_allclose(final["trajectory"]["velocity"][0], planner.start.velocity[0].numpy(), atol=1e-8)
             assert final["trajectory"]["times"] == initial["trajectory"]["times"] == list(np.arange(17)*.125)
             np.testing.assert_array_equal(final["controls"], refined[0, final["seed_index"]].numpy())
         # Independent task reevaluation uses the handed-off coefficients. The
         # last line-search sample is not used as the returned curve's evidence.
-        fixture.configuration.set_scene_constraints(False)
+        fixture.configuration.set_geometry_scope("robot")
         actual = rollout.evaluate_action(refined[0])
         _, signed, objective = fixture.manager.optimizer_evidence(actual)
         for index, final in enumerate(record["refined"]["seeds"]):
             assert final["fixed_objective"] == pytest.approx(float(objective[index]))
             assert final["functional_inequalities"] == {key: pytest.approx(float(value[index])) for key, value in signed.items()}
-        fixture.configuration.set_scene_constraints(True)
+        fixture.configuration.set_geometry_scope("full")
 
 
 def test_single_native_block_is_reserved_for_main_solve(manager_fixture):
@@ -193,7 +198,7 @@ def test_snapshot_uses_native_metric_goal_indices_and_same_query_manager(manager
     from curobo._src.rollout.rollout_robot import RobotRollout
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
         planner, seeds, analytic, _ = make_planner(fixture, count=2)
-        fixture.configuration.set_scene_constraints(False)
+        fixture.configuration.set_geometry_scope("robot")
         fixture.manager.optimization_constraints.bind(seeds[0], num_seeds=2)
         native = RobotRollout.__new__(RobotRollout)
         native._batch_size = 2
@@ -224,7 +229,7 @@ def test_snapshot_uses_native_metric_goal_indices_and_same_query_manager(manager
         with patch.object(native, "evaluate_action", side_effect=AssertionError("Wrong particle layout")):
             record, curves = planner._initialization_snapshot(seeds[0])
         assert len(curves) == len(record["seeds"]) == 2
-        assert all("process_scene" not in row["optimizer_constraints"] for row in record["seeds"])
+        assert all(row["optimizer_constraints"]["process_scene"] == 0. for row in record["seeds"])
         assert native._num_particles_goal.idxs_current_js.numel() == 8
         assert native._metrics_goal.idxs_current_js.numel() == 2
 # END the original native goal layouts remain unchanged after snapshot evaluation.

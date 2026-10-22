@@ -7,11 +7,13 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from manipulation.planning_ik import rank_ik_candidates, select_ik_chains
+from manipulation.planning_ik import rank_ik_candidates, select_ik_chains, select_ik_tracking_candidate
 
 
 def report(**changes):
     return {"task_satisfied": True, "model_valid": True, "native_pose_ik_success": True,
+            "static_model_query": "evaluated", "task_violations": {}, "native_violations": {},
+            "scene_components": {},
             "candidate_source": "native_ik", "environment_clearance_m": .001,
             "self_clearance_m": .002, "joint_limit_margin_fraction": .2, **changes}
 
@@ -41,8 +43,10 @@ def test_extra_clearance_cannot_buy_a_large_continuity_loss():
 
 
 @pytest.mark.parametrize("first,second", [
-    (report(task_satisfied=False, environment_clearance_m=100.), report(model_valid=False)),
-    (report(model_valid=False, environment_clearance_m=100.), report()),
+    (report(task_satisfied=False, task_violations={"coordinate:0": .1},
+            environment_clearance_m=100.),
+     report(model_valid=False, native_violations={"cspace": .1})),
+    (report(model_valid=False, native_violations={"cspace": .1}, environment_clearance_m=100.), report()),
     (report(native_pose_ik_success=False, environment_clearance_m=100.), report()),
 ])
 def test_same_query_qualification_precedes_any_continuity_or_clearance_advantage(first, second):
@@ -71,7 +75,8 @@ def test_unknown_distance_never_masquerades_as_infinite_clearance(missing):
 
 def test_duplicate_representative_retains_the_better_evidence_before_deduplication():
     values = [[0.], [.25e-5], [.5], [float("nan")]]
-    reports = [report(model_valid=False), report(), report(), report(environment_clearance_m=100.)]
+    reports = [report(model_valid=False, native_violations={"cspace": .1}),
+               report(), report(), report(environment_clearance_m=100.)]
     assert select(values, reports, count=4) == [1, 2]
     assert select(values, reports, count=1) == [1]
 
@@ -118,26 +123,29 @@ def test_successful_chain_precedes_legal_approximate_alternative_without_deletin
     assert "APPROXIMATE_PROPOSAL" in selected[1]["query_statuses"]
 
 
-# BEGIN missing task/model evidence cannot discard a successful reference proposal.
-def test_task_and_source_screening_are_independent_of_reference_pose_success():
+# BEGIN absent or uncertain evidence is distinct from a measured violation.
+def test_unestablished_model_and_native_reference_success_have_separate_counts():
     selected = chains([[[.1], [.5]]],
         [[report(model_valid=False), report(native_pose_ik_success=False)]])
     assert len(selected) == 2 and selected[0]["candidate_indices"] == [0]
     assert selected[0]["reference_success"]
-    assert selected[0]["selection_cost"]["static_model_unqualified_count"] == 1
+    assert selected[0]["selection_cost"]["static_model_failed_count"] == 0
+    assert selected[0]["selection_cost"]["static_model_not_established_count"] == 1
 
 
 def test_static_failures_rank_chains_without_erasing_the_only_native_solution():
     # Symmetric paths have equal pose energy and equal velocity energy, so
     # the existing static evidence can decide their otherwise exact tie.
     selected = chains([[[-.1], [.1]], [[-.2], [.2]]],
-        [[report(task_satisfied=False, model_valid=False), report()]]*2, count=4)
+        [[report(task_satisfied=False, model_valid=False, task_violations={"coordinate:0": .1},
+                 native_violations={"cspace": .2}), report()]]*2, count=4)
     assert selected[0]["candidate_indices"] == [1, 1]
     assert len(selected) == 4
-    only = chains([[[.1]], [[.2]]], [[report(task_satisfied=False, model_valid=False)]]*2)
+    only = chains([[[.1]], [[.2]]], [[report(task_satisfied=False, model_valid=False,
+        task_violations={"coordinate:0": .1}, native_violations={"cspace": .2})]]*2)
     assert only[0]["candidate_indices"] == [0, 0]
-    assert only[0]["selection_cost"]["static_task_unqualified_count"] == 2
-    assert only[0]["selection_cost"]["static_model_unqualified_count"] == 2
+    assert only[0]["selection_cost"]["static_task_failed_count"] == 2
+    assert only[0]["selection_cost"]["static_model_failed_count"] == 2
 # END whole-curve task and scene acceptance is not asserted by these proposals.
 
 
@@ -167,13 +175,13 @@ def test_position_domain_and_finite_energy_define_nodes_without_a_soft_pose_thre
     assert all(item["selection_cost"]["failed_pose_energy"] == 2e8 for item in selected)
 
 
-def test_successful_continuity_ranks_before_pose_refinement_and_static_screening():
+def test_qualified_successful_continuity_ranks_before_pose_refinement():
     selected = chains([[[.1], [2.]]], [[report(), report(model_valid=False)]],
                       pose_costs=[[1., .1]])
     assert selected[0]["candidate_indices"] == [0]
     assert selected[0]["selection_cost"]["successful_pose_energy"] == 1.
     assert selected[1]["candidate_indices"] == [1]
-    assert selected[1]["selection_cost"]["static_model_unqualified_count"] == 1
+    assert selected[1]["selection_cost"]["static_model_not_established_count"] == 1
 
 
 def test_velocity_bounds_scale_named_joints_before_comparing_postures():
@@ -209,7 +217,18 @@ def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
     scale = np.array([2., 3.])
     costs = rng.uniform(size=(4, 3))
     solved = rng.random(size=(4, 3)) > .4
-    rows = [[report(native_pose_ik_success=bool(flag)) for flag in row] for row in solved]
+    # BEGIN exhaustive enumeration uses independently declared evidence states.
+    # Codes 0/1/2 mean passed, definite violation and unestablished. They are
+    # encoded as the same raw components the production producer supplies.
+    task_states = rng.integers(0, 3, size=(4, 3))
+    model_states = rng.integers(0, 3, size=(4, 3))
+    rows = [[report(native_pose_ik_success=bool(solved[query, index]),
+        task_satisfied=bool(task_states[query, index] == 0),
+        model_valid=bool(model_states[query, index] == 0),
+        task_violations={"coordinate:0": .1} if task_states[query, index] == 1 else {},
+        native_violations={"cspace": .1} if model_states[query, index] == 1 else {})
+        for index in range(3)] for query in range(4)]
+    # END enumeration below never calls the production prefix interpreter.
     expected = []
     for path in product(range(3), repeat=4):
         postures = np.stack([pools[query, index] for query, index in enumerate(path)])
@@ -221,17 +240,21 @@ def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
                             if not solved[query, index])
         successful_energy = sum(costs[query, index] for query, index in enumerate(path)
                                 if solved[query, index])
-        expected.append(((failures, float(failed_energy), float(energy),
+        evidence_counts = (sum(task_states[q, i] == 1 for q, i in enumerate(path)),
+                           sum(model_states[q, i] == 1 for q, i in enumerate(path)), failures,
+                           sum(task_states[q, i] == 2 for q, i in enumerate(path)),
+                           sum(model_states[q, i] == 2 for q, i in enumerate(path)))
+        expected.append(((*evidence_counts, float(failed_energy), float(energy),
                           float(successful_energy)), path))
     expected.sort()
     actual = chains(pools, rows, times=times, velocity=bounds, pose_costs=costs, count=3)
     assert [tuple(row["candidate_indices"]) for row in actual] == [path for _, path in expected[:3]]
     np.testing.assert_allclose([row["selection_cost"]["normalized_velocity_energy"] for row in actual],
-                               [score[2] for score, _ in expected[:3]], rtol=1e-14)
+                               [score[6] for score, _ in expected[:3]], rtol=1e-14)
     np.testing.assert_allclose([row["selection_cost"]["failed_pose_energy"] for row in actual],
-                               [score[1] for score, _ in expected[:3]], rtol=1e-14)
+                               [score[5] for score, _ in expected[:3]], rtol=1e-14)
     np.testing.assert_allclose([row["selection_cost"]["successful_pose_energy"] for row in actual],
-                               [score[3] for score, _ in expected[:3]], rtol=1e-14)
+                               [score[7] for score, _ in expected[:3]], rtol=1e-14)
 
 
 @pytest.mark.parametrize("times", [[0., 1.], [1., 1.], [2., 1.], [1., float("nan")]])
@@ -239,6 +262,101 @@ def test_invalid_clock_is_rejected_instead_of_retimed(times):
     with pytest.raises(ValueError, match="increasing physical times"):
         chains([[[.1]], [[.2]]], times=times)
 # END these candidates are initialization evidence, never a checked continuous trajectory.
+
+
+# BEGIN one qualification prefix governs ranking, tracking and whole chains.
+def policy_first_indices(values, rows, *, pose_costs=None):
+    """Compare the three consumers using identical, explicitly supplied evidence."""
+    values = np.asarray(values, float)
+    energy = np.zeros(len(values)) if pose_costs is None else np.asarray(pose_costs, float)
+    ranked = select(values, rows, count=len(values))
+    tracked = select_ik_tracking_candidate(values, list(reversed(ranked)), energy,
+        np.zeros((1, values.shape[1])), reports=rows)
+    selected = chains([values], [rows], pose_costs=[energy], count=len(values))
+    return ranked[0], tracked, selected[0]["candidate_indices"][0]
+
+
+@pytest.mark.parametrize("component", ["collision/robot/self", "collision/entity/background",
+    "contact/declared_relation", "initial_support/declared_relation", "gripper/controller"])
+def test_same_definite_model_violation_precedes_nearer_joint_state_in_all_consumers(component):
+    rows = [report(model_valid=False, scene_components={component: {"maximum": .01}}), report()]
+    assert policy_first_indices([[.01], [.8]], rows, pose_costs=[1e-12, 1e-6]) == (1, 1, 1)
+
+
+@pytest.mark.parametrize("unknown", [
+    {"static_model_query": "not_run_native_reference_ik_failed", "native_pose_ik_success": False},
+    {"scene_components": {"unresolved/robot/self": {"maximum": 1.}}},
+    {"scene_components": {"unknown/forbidden/entity": {"maximum": 1.}}},
+    {"scene_components": {"conditional/hand_geometry": {"maximum": 1.}}},
+    {"scene_components": {"relationship/missing_release/entity/0": {"maximum": 1.}}},
+    {"scene_components": {"scene_update/background/robot": {"maximum": 1.}}},
+    {"scene_components": {"unclassified_evidence": {"maximum": 1.}}},
+    {"scene_components": {"collision/robot/self": {"maximum": float("nan")}}},
+    {"native_violations": {"cspace": float("inf")}},
+    {},
+])
+def test_unknown_model_never_becomes_a_definite_collision_or_failure(unknown):
+    rows = [report(model_valid=False,
+                   scene_components={"collision/robot/self": {"maximum": .01}}),
+            report(model_valid=False, **unknown)]
+    assert policy_first_indices([[.01], [.8]], rows) == (1, 1, 1)
+    selected = chains([[[.8]]], [[rows[1]]])[0]
+    assert selected["selection_cost"]["static_model_failed_count"] == 0
+    assert selected["selection_cost"]["static_model_not_established_count"] == 1
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_task_value_retains_unestablished_state(value):
+    selected = chains([[[.1]]], [[report(task_satisfied=False,
+        task_violations={"coordinate:0": value})]])[0]
+    assert selected["selection_cost"]["static_task_failed_count"] == 0
+    assert selected["selection_cost"]["static_task_not_established_count"] == 1
+
+
+def test_known_collision_and_unknown_relation_keep_the_same_original_report():
+    row = report(model_valid=False, scene_components={
+        "collision/robot/self": {"maximum": .01},
+        "unresolved/coverage/entity": {"maximum": 1.}})
+    selected = chains([[[.1]]], [[row]])[0]
+    assert selected["selection_cost"]["static_model_failed_count"] == 1
+    assert selected["selection_cost"]["static_model_not_established_count"] == 0
+    assert set(row["scene_components"]) == {"collision/robot/self", "unresolved/coverage/entity"}
+
+
+def test_task_then_model_failure_priority_is_identical_in_all_consumers():
+    rows = [report(task_satisfied=False, task_violations={"coordinate:0": .1}),
+            report(model_valid=False, native_violations={"cspace": .1})]
+    assert policy_first_indices([[.01], [.8]], rows) == (1, 1, 1)
+
+
+def test_unknown_verdict_breaks_equal_native_success_before_continuity():
+    rows = [report(task_satisfied=False, model_valid=False), report()]
+    assert policy_first_indices([[.01], [.8]], rows) == (1, 1, 1)
+
+
+def test_unqueried_reference_counts_neither_static_failure_and_keeps_failed_observation():
+    row = report(task_satisfied=False, model_valid=False, native_pose_ik_success=False,
+        static_model_query="not_run_native_reference_ik_failed")
+    selected = chains([[[.1]]], [[row]])[0]
+    assert selected["selection_cost"] == {
+        "static_task_failed_count": 0, "static_model_failed_count": 0,
+        "nonconverged_candidate_count": 1,
+        "static_task_not_established_count": 1, "static_model_not_established_count": 1,
+        "failed_pose_energy": 0., "normalized_velocity_energy": pytest.approx(.01),
+        "successful_pose_energy": 0.}
+    assert selected["observation_mask"] == [False]
+
+
+def test_observation_mask_retains_original_pool_indices_and_excludes_interpolated_rows():
+    values = [[[float("nan")], [.1]], [[float("nan")]], [[.3]], [[.4]]]
+    rows = [[report(), report()], [report()], [report(native_pose_ik_success=False)], [report()]]
+    selected = chains(values, rows)[0]
+    assert selected["candidate_indices"] == [1, None, 0, 0]
+    assert selected["anchor_query_indices"] == [0, 2, 3]
+    assert selected["observation_mask"] == [True, False, False, True]
+    assert selected["query_statuses"] == ["SOLVED", "INTERPOLATED_PROPOSAL", "APPROXIMATE_PROPOSAL", "SOLVED"]
+    assert not selected["reference_success"]
+# END only successful original nodes become fitting observations.
 
 
 # BEGIN production IK screening uses the same native and online residuals.
@@ -387,7 +505,10 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     from manipulation.planning_problem import PoseEventRequirement
 
     planner = planning._CuroboPlanner.__new__(planning._CuroboPlanner)
-    planner.budget = SimpleNamespace(ik_seeds=2)
+    # BEGIN the functional IK fixture declares the same submitted-work ledger.
+    planner.budget = SimpleNamespace(ik_seeds=2, max_validation_points=32, maximum_trajectory_solves=1)
+    planner.request_work = {"ik_queries": 0}
+    # END both original event calls consume the common candidate-solve count.
     planner.joint_names = ("x", "y", "z")
     # BEGIN the fixture supplies actual typed pose declarations to the proposal API.
     planner.problem = SimpleNamespace(start_progress=0., end_progress=1., supports=(), coordinate_events=(), pose_events=[
@@ -433,5 +554,6 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     assert len(pool[.2]["candidates"]) == 2
     assert planner.ik.disable_tool_pose_tracking.call_count == 2
     assert planner.ik.enable_tool_pose_tracking.call_count == 2
+    assert planner.request_work["ik_queries"] == 4
     check_search.assert_called()
 # END mocked queries test orchestration, not CUDA geometry or actual IK convergence.

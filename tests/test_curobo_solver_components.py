@@ -220,7 +220,8 @@ class NativeComponentTest(unittest.TestCase):
     # END refresh never changes hard evidence, native budgets or peer histories.
 
     # BEGIN block updates exercise the real CPU native optimizer, not a fake loop.
-    def attach_functional_objective(self, rollouts, owner, residual):
+    # BEGIN the same fixture can place its fixed minimizer beyond a joint bound.
+    def attach_functional_objective(self, rollouts, owner, residual, *, target=1.):
         for rollout in rollouts:
             rollout.constraint_manager = rollout
             rollout.optimization_constraints = owner
@@ -228,7 +229,7 @@ class NativeComponentTest(unittest.TestCase):
 
             def evaluate(action, use_cuda_graph=False, rollout=rollout):
                 rollout.domain.validate(action)
-                fixed = ((action-1.)**2).sum((-1, -2))+rollout.objective_offset
+                fixed = ((action-target)**2).sum((-1, -2))+rollout.objective_offset
                 signed = {"event": residual(action, owner.num_seeds)}
                 costs = fixed+owner.terms(signed)["event"]
                 result = SimpleNamespace(costs_and_constraints=SimpleNamespace(
@@ -244,6 +245,7 @@ class NativeComponentTest(unittest.TestCase):
 
             rollout.evaluate_action = evaluate
             rollout.optimizer_evidence = evidence
+    # END all fixture variants retain the real production AL calculation.
 
     def test_original_100_steps_four_blocks_keep_seed_parameters_and_total_work(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
@@ -772,6 +774,136 @@ class NativeComponentTest(unittest.TestCase):
         self.assertEqual(report["iterations"], optimizer.config.inner_iters)
         self.assertEqual(report["recovery_attempts"], 1)
         self.assertTrue(report["exhausted"])
+
+    # BEGIN partial block tails recover without changing AL or retirement cadence.
+    def test_first_update_then_24_stalls_recovers_before_the_first_al_update(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner,
+            lambda action, count: action[:, 0, 0]*0+1., target=4.)
+        bind_solver_components(solver, domain)
+        optimizer.config.num_iters, optimizer.config.inner_iters = 50, 25
+        core = optimizer._core
+        seed = torch.tensor([[[.9, 0.]]])
+        boundaries = []
+        recover, update = core._recover_stalled, owner.update
+
+        def recover_at_boundary(state):
+            boundaries.append(("recovery", core._iterations.tolist(),
+                core._stalled_steps.tolist(), core._effective_updates.tolist()))
+            return recover(state)
+
+        def update_at_boundary(signed):
+            boundaries.append(("AL", core._iterations.tolist(),
+                core._stalled_steps.tolist(), core._effective_updates.tolist()))
+            return update(signed)
+
+        with patch("curobo._src.runtime.cuda_event_timers", False), \
+                patch.object(core, "_recover_stalled", side_effect=recover_at_boundary), \
+                patch.object(owner, "update", side_effect=update_at_boundary):
+            optimizer.reinitialize(seed)
+            result = optimizer.optimize(seed)
+        # These counters come from the actual native 25-step block. Recovery
+        # sees its one effective move and 24 subsequent ineffective steps.
+        self.assertEqual(boundaries[0], ("recovery", [25], [24], [1]))
+        self.assertEqual(boundaries[1], ("AL", [25], [0], [2]))
+        self.assertEqual(sum(row[0] == "AL" for row in boundaries), 1)
+        report = core.solve_diagnostics[0]
+        first = report["recoveries"][0]
+        self.assertEqual(first["stalled_steps_before"], 24)
+        self.assertTrue(first["accepted"])
+        self.assertFalse(first["retired"])
+        self.assertEqual(report["iterations"], 50)
+        self.assertEqual(report["functional_continuation"]["outer_updates"], 1)
+        torch.testing.assert_close(result, torch.ones_like(seed), rtol=0, atol=0)
+
+    def test_partial_failed_recovery_refreshes_main_gradient_and_keeps_peer_state(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer.update_num_problems(2)
+        core, history = optimizer._core, optimizer._qn
+        seed = torch.ones((2, 1, 2))
+
+        def initial_objective(action, use_cuda_graph=False):
+            domain.validate(action)
+            costs = ((action+4.)**2).sum((-1, -2))
+            return SimpleNamespace(costs_and_constraints=SimpleNamespace(
+                get_sum_cost_and_constraint=lambda sum_horizon: costs))
+
+        with patch("curobo._src.runtime.cuda_event_timers", False), \
+                patch.object(rollouts[1], "evaluate_action", side_effect=initial_objective):
+            optimizer.reinitialize(seed)
+        state = core._iteration_state
+        self.assertTrue(bool((state.exploration_gradient > 0).all()))
+        core._stalled_steps[0] = 1
+        for name in ("s", "y", "rho", "alpha"):
+            getattr(history, name).fill_(3.)
+        peer_state = {field.name: getattr(state, field.name)[1].clone() for field in fields(state)
+            if isinstance(getattr(state, field.name), torch.Tensor)}
+        peer_history = {name: getattr(history, name).clone() for name in
+            ("s", "y", "rho", "alpha", "x_0", "grad_0", "step_q_buffer")}
+        # The supplied inward direction is legal but increases the main
+        # objective. Its rejection must not retire a one-step block tail.
+        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed[:1], .1),
+                {"success": True, "reason": "inward_ascending_trial"})):
+            core._recover_stalled(state)
+        torch.testing.assert_close(state.exploration_action, seed, rtol=0, atol=0)
+        torch.testing.assert_close(state.exploration_gradient[0], torch.full_like(seed[0], -6.))
+        torch.testing.assert_close(state.exploration_cost[0], torch.tensor(18.))
+        torch.testing.assert_close(state.step_direction[0],
+            -optimizer.config.initial_step_scale*state.exploration_gradient[0])
+        torch.testing.assert_close(history.x_0[0], state.exploration_action[0].reshape_as(history.x_0[0]))
+        torch.testing.assert_close(history.grad_0[0], state.exploration_gradient[0].reshape_as(history.grad_0[0]))
+        for name in ("s", "y", "rho", "alpha"):
+            self.assertEqual(float(getattr(history, name)[:, 0].abs().sum()), 0.)
+        for name, saved in peer_state.items():
+            torch.testing.assert_close(getattr(state, name)[1], saved, rtol=0, atol=0)
+        for name, saved in peer_history.items():
+            index = (slice(None), 1) if saved.ndim == 4 else 1
+            torch.testing.assert_close(getattr(history, name)[index], saved[index], rtol=0, atol=0)
+        self.assertEqual(core._exhausted.tolist(), [False, False])
+        self.assertEqual(core._stalled_steps.tolist(), [1, 0])
+        self.assertEqual(core._effective_updates.tolist(), [0, 0])
+        self.assertEqual(core._history_resets.tolist(), [1, 0])
+        recovery = core.solve_diagnostics[0]["recoveries"][0]
+        self.assertFalse(recovery["accepted"])
+        self.assertFalse(recovery["retired"])
+        self.assertEqual(recovery["stalled_steps_before"], 1)
+        # Native steps remain available. Once the original complete-stall
+        # condition is reached, its genuine constrained stationary point retires.
+        core._dispatch("_opt_iters", state)
+        self.assertEqual(core._iterations.tolist(), [2, 2])
+        self.assertTrue(core.solve_diagnostics[0]["recoveries"][-1]["retired"])
+
+    def test_partial_failed_recovery_keeps_feasible_trials_outside_armijo_selection(self):
+        domain = JointPositionDomain(-torch.ones(1), torch.ones(1))
+        solver, optimizer, rollouts = self.make_solver(domain, 1)
+        owner = FunctionalAugmentedLagrangian(("event",))
+        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
+        bind_solver_components(solver, domain)
+        seed = torch.full((1, 1, 1), .5)
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(seed)
+        core, state = optimizer._core, optimizer._core._iteration_state
+        self.assertFalse(bool(core._candidate_valid.any()))
+        core._stalled_steps.fill_(1)
+        # At .5 the augmented quadratic is stationary. The negative trial
+        # satisfies the original event but raises that quadratic, so the two
+        # independent production decisions must retain it without moving base.
+        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed, .6),
+                {"success": True, "reason": "feasible_non_armijo_trial"})):
+            core._recover_stalled(state)
+        torch.testing.assert_close(state.exploration_action, seed, rtol=0, atol=0)
+        self.assertFalse(bool(core._exhausted.any()))
+        self.assertEqual(core._effective_updates.tolist(), [0])
+        self.assertEqual(core._candidate_valid.tolist(), [True])
+        self.assertLess(float(core._candidate_action[0, 0, 0]), 0.)
+        torch.testing.assert_close(core._candidate_objective,
+            ((core._candidate_action-1.)**2).sum((-1, -2)))
+        self.assertFalse(core.solve_diagnostics[0]["recoveries"][0]["accepted"])
+    # END actual trial evidence and original stopping thresholds remain independent.
 
     def test_recovery_recomputes_main_gradient_and_backtracks_oversized_descent(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))

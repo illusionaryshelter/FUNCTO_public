@@ -67,6 +67,22 @@ def manager_fixture(monkeypatch):
                 optimizer_preferences=lambda p, *args, **kwargs: p[..., 0] * 0)
         scene = SimpleNamespace(required_progress_anchors=(), contacts=(),
                                 optimizer_preferences=lambda progress, *args: progress * 0)
+        # BEGIN the analytic scene explicitly evaluates its empty self-pair set.
+        # Scope tests use the same manager entry as real robot scenes. This
+        # fixture declares no collision entities, so its differentiable self
+        # components are exactly zero in either requested geometry scope.
+        scene.queries = []
+
+        def clear_scene(spheres, position, quaternion, progress, joints, names,
+                        *, components_out, geometry_scope, **kwargs):
+            scene.queries.append(geometry_scope)
+            zero = joints.sum(-1) * 0
+            components_out.update({"collision/robot/self": zero,
+                                   "unresolved/robot/self": zero})
+            return zero
+
+        scene.evaluate = clear_scene
+        # END individual regressions can replace this explicit declared model.
         scene.clone_for_rollout = lambda: scene
         configuration = _process_manager_type(problem, scene,
             _ProgressMap(np.array([0., 1.]), np.array([0., 1.])), required,

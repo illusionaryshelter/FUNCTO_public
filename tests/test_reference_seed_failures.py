@@ -9,6 +9,7 @@ task/scene qualification.
 # BEGIN finite position-domain proposals remain distinct from native pose success.
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -19,7 +20,9 @@ import test_manipulation_planning as fixtures
 
 
 def _report(solved):
-    return {"task_satisfied": True, "model_valid": True,
+    return {"task_satisfied": solved, "model_valid": solved,
+            "static_model_query": "evaluated" if solved else "not_run_native_reference_ik_failed",
+            "task_violations": {}, "native_violations": {}, "scene_components": {},
             "native_pose_ik_success": solved, "candidate_source": "native_ik"}
 
 
@@ -37,6 +40,7 @@ def test_domain_invalid_gap_uses_available_node_times_and_measured_entrance():
     assert chain["query_statuses"] == ["INTERPOLATED_PROPOSAL", "SOLVED",
         "INTERPOLATED_PROPOSAL", "SOLVED", "INTERPOLATED_PROPOSAL"]
     assert chain["interpolated_queries"] == [0, 2, 4]
+    assert chain["observation_mask"] == [False, True, False, True, False]
     assert chain["selection_cost"]["normalized_velocity_energy"] == pytest.approx((2.+1./1.5)/3.)
 
 
@@ -49,10 +53,10 @@ def test_domain_invalid_native_states_do_not_change_tracking_or_coarse_branches(
         for query in invalid_queries:
             pools[query] = np.full_like(pools[query], invalid_value)
             flags[query] = np.zeros_like(flags[query])
-        planner, constant, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+        planner, initialize, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
         seeds, _ = planner.reference_seeds()
         outcomes.append((seeds, warm_starts))
-        constant.assert_not_called()
+        initialize.assert_called_once()
         assert len(planner.reference_ik_chains) == 2
         for query, last_proposal in enumerate((None, None, 1, 1, 3, 4)):
             warm = warm_starts[query].numpy()
@@ -76,16 +80,24 @@ def test_domain_invalid_native_states_do_not_change_tracking_or_coarse_branches(
         torch.testing.assert_close(first, second, rtol=0., atol=0.)
 
 
-def test_legal_nonconverged_outputs_supply_tracking_and_approximate_coarse_nodes():
-    """An entirely nonconverged sequence can still carry numerical path information."""
+def test_legal_nonconverged_outputs_supply_tracking_but_no_joint_observations():
+    """Finite failed states warm IK while the entry curve initializes refinement."""
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
     flags = [np.zeros_like(row) for row in flags]
-    planner, constant, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
-    seeds, counts = planner.reference_seeds()
+    planner, initialize, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+    with patch.object(planner.physical_domain, "fit_reference",
+                      wraps=planner.physical_domain.fit_reference) as fit:
+        seeds, counts = planner.reference_seeds()
+    fit.assert_not_called()
     assert counts == [0]*6
-    constant.assert_not_called()
+    initialize.assert_called_once()
     assert len(planner.reference_ik_chains) == 2
     assert bool(torch.isfinite(seeds).all())
+    torch.testing.assert_close(initialize.call_args.args[0],
+        planner.start.position[:, None, None].expand_as(seeds), rtol=0, atol=0)
+    assert planner.initial_seed_strategies == ["physical_entry_curve"]*2
+    assert all(row["observation_count"] == 0 for row in planner.reference_seed_fits)
+    planner._refine_reference_seeds.assert_called_once()
     for query, record in enumerate(planner.reference_ik_queries):
         assert record["warm_start_from_query"] == (None if query == 0 else query-1)
         assert all(not row["report"]["native_pose_ik_success"] for row in record["candidates"])
@@ -97,21 +109,22 @@ def test_legal_nonconverged_outputs_supply_tracking_and_approximate_coarse_nodes
         assert chain["query_statuses"] == ["APPROXIMATE_PROPOSAL"]*6
         assert chain["interpolated_queries"] == []
         assert not chain["reference_success"]
+        assert chain["observation_mask"] == [False]*6
         assert chain["selection_cost"]["nonconverged_candidate_count"] == 6
         assert np.abs(chain["joint_positions"]).max() < 2.
 
 
 @pytest.mark.parametrize("failed_check", ["task_satisfied", "model_valid"])
-def test_native_success_and_static_failure_evidence_survive_numerical_initialization(failed_check):
-    """Numerical proposals retain the evidence that whole-curve qualification consumes."""
+def test_native_success_and_unestablished_static_verdicts_remain_separate(failed_check):
+    """Stored False values without a violation do not fabricate measured failures."""
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
-    planner, constant, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(
+    planner, initialize, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(
         pools, flags, report_for=lambda row, success, parameter: {failed_check: False})
     seeds, counts = planner.reference_seeds()
     assert counts == [3]*6
     assert planner.reference_ik_distinct_counts == [3]*6
     assert len(planner.reference_ik_chains) == 2
-    constant.assert_not_called()
+    initialize.assert_called_once()
     assert bool(torch.isfinite(seeds).all())
     for query, record in enumerate(planner.reference_ik_queries):
         assert record["reference_status"] == "SOLVED"
@@ -122,8 +135,11 @@ def test_native_success_and_static_failure_evidence_survive_numerical_initializa
             np.testing.assert_array_equal(warm[0], planner.start.position.numpy())
         else:
             assert any(np.array_equal(warm[0, 0], row) for row in pools[query-1][flags[query-1]])
-    failure_count = "static_task_unqualified_count" if failed_check == "task_satisfied" else "static_model_unqualified_count"
+    failure_count = "static_task_not_established_count" if failed_check == "task_satisfied" else "static_model_not_established_count"
     assert all(chain["selection_cost"][failure_count] == len(pools) for chain in planner.reference_ik_chains)
+    assert all(chain["selection_cost"]["static_task_failed_count"] == 0
+               and chain["selection_cost"]["static_model_failed_count"] == 0
+               for chain in planner.reference_ik_chains)
 
 
 def test_broken_native_values_keep_json_safe_failure_and_convergence_evidence():
@@ -143,3 +159,56 @@ def test_broken_native_values_keep_json_safe_failure_and_convergence_evidence():
     assert candidate["report"]["nominal_position_error_m"] is None
     assert candidate["report"]["nominal_rotation_error_rad"] == pytest.approx(.3)
 # END native success, numerical usability and continuous task acceptance remain distinct.
+
+
+# BEGIN sparse successful observations retain the whole physical curve domain.
+@pytest.mark.parametrize("observed", [(), (2,), (0, 1), (0, 2, 4), tuple(range(6))])
+def test_success_mask_alone_defines_fitting_rows_with_fixed_basis_clock_and_entry(observed):
+    _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
+    for index in range(len(flags)):
+        if index not in observed:
+            flags[index] = np.zeros_like(flags[index])
+    planner, initialize, _ = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+    domain = planner.physical_domain
+    original_map, original_clock = domain._curve_map, dict(planner.formal_clock)
+    q0, dq0 = planner.start.position.clone(), planner.start.velocity.clone()
+    with patch.object(domain, "fit_reference", wraps=domain.fit_reference) as fit:
+        seeds, _ = planner.reference_seeds()
+    assert domain._curve_map is original_map and planner.formal_clock == original_clock
+    assert seeds.shape == (1, 2, 6, 3)
+    assert bool(domain.feasible(seeds).all())
+    np.testing.assert_array_equal(domain.evaluate(seeds[0], [0.])[:, 0], q0.expand(2, -1).numpy())
+    np.testing.assert_allclose(domain.evaluate(seeds[0], [0.], 1)[:, 0],
+                               dq0.expand(2, -1).numpy(), rtol=0, atol=1e-14)
+    initialize.assert_called_once()
+    torch.testing.assert_close(initialize.call_args.args[0], q0[:, None, None].expand_as(seeds), rtol=0, atol=0)
+    assert planner.request_work["ik_queries"] == 6*planner.budget.ik_seeds
+    planner._refine_reference_seeds.assert_called_once()
+    assert fit.call_count == (2 if observed else 0)
+    for branch, call in enumerate(fit.call_args_list):
+        chain = planner.reference_ik_chains[branch]
+        mask = np.asarray(chain["observation_mask"], bool)
+        np.testing.assert_array_equal(np.flatnonzero(mask), observed)
+        np.testing.assert_array_equal(call.args[0], np.asarray(chain["query_parameters"])[mask])
+        np.testing.assert_array_equal(call.args[1].numpy(), np.asarray(chain["joint_positions"])[mask])
+        assert call.kwargs["prior_controls"].shape == (6, 3)
+        assert bool(domain.feasible(call.kwargs["prior_controls"][None]).all())
+        assert planner.reference_seed_fits[branch]["observation_count"] == len(observed)
+
+
+def test_changed_failed_states_cannot_change_fixed_successful_observations_or_their_fit():
+    """One path fixes selected success identities while failed warm starts vary."""
+    outcomes, tracking = [], []
+    for failed_value in (-.8, .8):
+        pools = [np.array([[.1+.01*index, .02*index, 0.]]) for index in range(6)]
+        flags = [np.array([index in (0, 2, 4)]) for index in range(6)]
+        for index in (1, 3, 5):
+            pools[index] = np.full((1, 3), failed_value)
+        planner, _, warm = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags, seed_count=1)
+        seeds, _ = planner.reference_seeds()
+        outcomes.append(seeds)
+        tracking.append(warm)
+        assert planner.reference_ik_chains[0]["observation_mask"] == [True, False, True, False, True, False]
+    torch.testing.assert_close(outcomes[0], outcomes[1], rtol=0, atol=0)
+    assert not torch.equal(tracking[0][2], tracking[1][2])
+# END failed numerical values remain useful seeds without becoming observations.

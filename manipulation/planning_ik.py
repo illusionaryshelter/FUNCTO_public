@@ -10,19 +10,20 @@ from __future__ import annotations
 import numpy as np
 
 
-# BEGIN one numerical tracking state leaves the remaining native seed slots free.
+# BEGIN all proposal consumers use the same completed-query qualification.
 def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous,
-                                 *, native_success):
-    """Select one warm start with native success and continuity kept distinct.
+                                 *, reports):
+    """Select one warm start from the original static and native IK evidence.
 
     ``candidates`` contains named-order joint positions with shape ``[N,D]``;
     ``candidate_indices`` identifies the caller's finite, position-domain
     proposals. ``pose_costs[N]`` contains their finite native pose energies
     for the same reference query. ``previous[1,D]`` is the preceding tracking
-    state, initially the measured entrance. ``native_success[N]`` is the
-    same native query's success flag for every candidate.
+    state, initially the measured entrance. ``reports[N]`` contains the same
+    query's task/model components and original native pose-success flags.
 
-    Successful proposals precede failed proposals and minimize Euclidean
+    The common qualification prefix precedes all numerical preferences.
+    Successful proposals within one prefix minimize Euclidean
     joint displacement before using their pose energy as a tiebreaker.
     Failed proposals minimize pose energy before joint displacement. This
     preserves the failed solver's numerical progress without allowing tiny
@@ -33,15 +34,16 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
     """
     values = np.asarray(candidates, dtype=float)
     costs = np.asarray(pose_costs, dtype=float)
-    solved = np.asarray(native_success, dtype=bool)
+    _validate_reports(reports, len(values))
+    solved = np.asarray([row["native_pose_ik_success"] for row in reports], dtype=bool)
     prior = np.asarray(previous, dtype=float)[0]
     selected = min(candidate_indices, default=None,
-        key=lambda index: (not solved[index],
+        key=lambda index: (*_qualification_prefix(reports[index], "reference"),
                            0. if solved[index] else float(costs[index]),
                            float(np.linalg.norm(values[index]-prior)),
                            float(costs[index]) if solved[index] else 0., int(index)))
     return None if selected is None else int(selected)
-# END task/scene qualification and native success are not changed by warm-start ranking.
+# END one selected numerical state leaves the remaining native seed slots free.
 
 
 def _validate_reports(reports, count):
@@ -72,17 +74,50 @@ def _quality(report):
     return tuple(values)
 
 
-def _tier(report, query_kind):
-    """Keep task/source checks independent of optional nominal pose success."""
-    return (not report["task_satisfied"], not report["model_valid"],
-            not report["native_pose_ik_success"] if query_kind == "reference" else False)
+# BEGIN interpret original component semantics without another geometry query.
+def _qualification_prefix(report, query_kind):
+    """Return known task/model failures, native failure and unknown verdicts.
+
+    ``planning._CuroboPlanner._rank_ik_candidates`` owns these reports. A
+    completed task/native check provides finite positive violation values;
+    NaN and infinities provide no definite violation measurement. The scene
+    component families below are the definite constraints produced by
+    ``OnlinePlanningScene.components``: registered-entity intersections,
+    required contact, declared initial support and gripper control. Unknown
+    coverage, numerical boundaries and missing model relations retain their
+    original components but cannot supply a definite failure here.
+
+    A failure and an unestablished verdict are mutually exclusive ranking
+    states. An explicit violation wins when the same report also contains
+    unknown relations; the report itself retains both pieces of evidence.
+    Functional queries ignore convergence to the nominal pose centre.
+    """
+    evaluated = report.get("static_model_query") == "evaluated"
+
+    def positive(value):
+        return np.isfinite(value) and value > 0
+
+    task_failed = evaluated and any(positive(value)
+        for value in report.get("task_violations", {}).values())
+    model_failed = evaluated and (
+        any(positive(value) for value in report.get("native_violations", {}).values())
+        or any(positive(component["maximum"])
+               for name, component in report.get("scene_components", {}).items()
+               if name.startswith(("collision/", "contact/", "initial_support/"))
+               or name == "gripper/controller"))
+    return (bool(task_failed), bool(model_failed),
+            not report["native_pose_ik_success"] if query_kind == "reference" else False,
+            not task_failed and (not evaluated or not report["task_satisfied"]),
+            not model_failed and (not evaluated or not report["model_valid"]))
+# END a stored False without its definite component remains unestablished.
 
 
 def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance, query_kind):
     """Return bounded distinct proposals, without assembling a trajectory.
 
-    ``query_kind='reference'`` prefers successful nominal-pose IK within the
-    same task/source screening tier. ``query_kind='functional'`` does not use
+    The common prefix compares definite task failure, definite model failure,
+    native reference failure, then unestablished task/model verdicts.
+    ``query_kind='functional'`` does not use
     that flag: the declared allowed set can pass despite failure to reach its
     nominal centre. Both kinds retain finite recovery proposals, explicitly
     leaving their failed checks in the reports; they never reject a skill.
@@ -107,7 +142,7 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
     def key(index):
         report = reports[index]
-        return (*_tier(report, query_kind),
+        return (*_qualification_prefix(report, query_kind),
                 float(np.linalg.norm(prior-values[index], axis=-1).min()),
                 *_quality(report), int(index))
 
@@ -133,11 +168,10 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     bounds only normalize the polyline's continuity cost. Neither the nodes
     nor their connecting edges certify the later continuous trajectory.
 
-    Dynamic programming first minimizes the number of nonconverged nodes,
-    then failed-node pose energy, then normalized joint velocity energy,
-    then successful-node pose energy.
-    Existing static evidence breaks only these ties. Unqualified counts
-    include rows whose static query was not performed. Each last node keeps
+    Dynamic programming sums the common qualification prefix over nodes,
+    then compares failed-node pose energy, normalized joint velocity energy
+    and successful-node pose energy, in that order. Unqueried or unresolved
+    checks contribute only to unestablished-verdict counts. Each last node keeps
     'count' histories. Samples with no finite legal proposal are filled
     between available nodes and measured q0, without inventing pose success.
     The resulting values initialize the common direct tool-space optimizer;
@@ -175,7 +209,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                  & (values <= positions_bounds[1]).all(-1))
         retained = []
         order = sorted(np.flatnonzero(legal), key=lambda index:
-            (not rows[index]["native_pose_ik_success"], energy[index], index))
+            (*_qualification_prefix(rows[index], "reference"), energy[index], index))
         for index in order:
             if retained and np.any(np.max(np.abs(values[retained]-values[index]), axis=-1) <= joint_tolerance):
                 continue
@@ -188,7 +222,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     # BEGIN fixed node evidence and physical-time continuity define one ranking.
     # Pose energy and continuity remain separate lexicographic quantities; no
     # task-specific conversion weight or extra rejection threshold is added.
-    states = {None: [((0, 0., 0., 0., 0, 0), ())]}
+    states = {None: [((0, 0, 0, 0, 0, 0., 0., 0.), ())]}
     previous_time = 0.
     normalizer = times[-1]*start.shape[1]
     for layer, (query, indices) in enumerate(layers):
@@ -196,6 +230,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
         next_states = {}
         for index in indices:
             report = reports[query][index]
+            prefix = _qualification_prefix(report, "reference")
             options = []
             for preceding_index, paths in states.items():
                 preceding = start[0] if layer == 0 else pools[layers[layer-1][0]][preceding_index]
@@ -207,11 +242,9 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 for cost, path in paths:
                     solved = report["native_pose_ik_success"]
                     energy = float(costs[query][index])
-                    combined = (cost[0]+int(not solved),
-                                cost[1]+(0. if solved else energy), cost[2]+edge,
-                                cost[3]+(energy if solved else 0.),
-                                cost[4]+int(not report["task_satisfied"]),
-                                cost[5]+int(not report["model_valid"]))
+                    combined = (*(cost[item]+int(value) for item, value in enumerate(prefix)),
+                                cost[5]+(0. if solved else energy), cost[6]+edge,
+                                cost[7]+(energy if solved else 0.))
                     options.append((combined, (*path, index)))
             next_states[index] = sorted(options)[:count]
         states = next_states
@@ -236,14 +269,23 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                      "SOLVED" if reports[query][index]["native_pose_ik_success"]
                      else "APPROXIMATE_PROPOSAL")
                     for query, index in enumerate(indices)]
+        # BEGIN successful native nodes alone supply joint fitting observations.
+        # The original input-pool index remains intact beside every status.
+        # Interpolation is a numerical path proposal, never a measured IK row.
+        observation_mask = [status == "SOLVED" for status in statuses]
         result.append({"candidate_indices": indices, "joint_positions": positions.tolist(),
             "anchor_query_indices": anchor_queries, "query_statuses": statuses,
-            "selection_cost": {"nonconverged_candidate_count": int(cost[0]),
-                "failed_pose_energy": float(cost[1]), "normalized_velocity_energy": float(cost[2]),
-                "successful_pose_energy": float(cost[3]),
-                "static_task_unqualified_count": int(cost[4]), "static_model_unqualified_count": int(cost[5])},
+            "observation_mask": observation_mask,
+            "selection_cost": {"static_task_failed_count": int(cost[0]),
+                "static_model_failed_count": int(cost[1]),
+                "nonconverged_candidate_count": int(cost[2]),
+                "static_task_not_established_count": int(cost[3]),
+                "static_model_not_established_count": int(cost[4]),
+                "failed_pose_energy": float(cost[5]), "normalized_velocity_energy": float(cost[6]),
+                "successful_pose_energy": float(cost[7])},
             "interpolated_queries": [query for query, index in enumerate(indices) if index is None],
-            "reference_success": all(status == "SOLVED" for status in statuses)})
+            "reference_success": all(observation_mask)})
+        # END evidence selects fitting rows without changing query identities.
         if len(result) == count:
             break
     return result

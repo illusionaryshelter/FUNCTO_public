@@ -27,50 +27,54 @@ def task_forward(fixture, position):
         costs=CostCollection(), constraints=constraints))
 
 
-def test_restored_scene_scope_rechecks_same_curve_and_invalidates_task_only_evidence(manager_fixture):
-    """A task-feasible curve can have a positive, independently queried scene term."""
+def test_restored_full_scope_rechecks_same_curve_and_invalidates_robot_scope_evidence(manager_fixture):
+    """Robot-scope feasibility does not establish task-entity scene feasibility."""
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
         position = torch.tensor([[[.4, 0.], [.4, 0.], [.4, 0.]]])
-        fixture.scene.evaluate = Mock(side_effect=AssertionError("Scene is outside the initializer scope"))
-        fixture.configuration.set_scene_constraints(False)
+        # BEGIN the same query distinguishes official robot and task fields.
+        def scoped_scene(spheres, tool_position, quaternion, progress, joints, names,
+                         *, components_out, geometry_scope, local_models, **kwargs):
+            zero = joints.sum(-1) * 0
+            components_out["collision/robot/self"] = zero
+            components_out["unresolved/robot/self"] = zero
+            if geometry_scope == "robot":
+                assert local_models is None
+                return zero
+            assert local_models is not None
+            violation = torch.full_like(progress, .125)
+            components_out["collision/robot/background"] = violation
+            return violation
+
+        fixture.scene.evaluate = Mock(side_effect=scoped_scene)
+        fixture.configuration.set_geometry_scope("robot")
         task_result = task_forward(fixture, position)
         task_feasible, task_signed, _ = fixture.manager.optimizer_evidence(task_result)
         assert task_feasible.tolist() == [True]
-        assert "process_scene" not in task_result.costs_and_constraints.constraints.names
-        fixture.scene.evaluate.assert_not_called()
-
-        # A reported controller condition belongs to the complete scene query,
-        # even when all functional position and orientation events are legal.
-        def scene_condition(spheres, tool_position, quaternion, progress, joints, names,
-                            *, components_out, **kwargs):
-            violation = torch.full_like(progress, .125)
-            components_out["controller/declared_condition"] = violation
-            return violation
-
-        fixture.scene.evaluate = Mock(side_effect=scene_condition)
-        fixture.configuration.set_scene_constraints(True)
+        assert "process_scene" in task_result.costs_and_constraints.constraints.names
+        assert fixture.scene.evaluate.call_count == 1
+        fixture.configuration.set_geometry_scope("full")
         with pytest.raises(RuntimeError, match="no same-query"):
             fixture.manager.optimizer_evidence(task_result)
         full_result = task_forward(fixture, position)
         full_feasible, full_signed, _ = fixture.manager.optimizer_evidence(full_result)
         assert full_feasible.tolist() == [False]
         assert "process_scene" in full_result.costs_and_constraints.constraints.names
-        assert fixture.scene.evaluate.call_count == 1
+        assert fixture.scene.evaluate.call_count == 2
         for key in task_signed:
             torch.testing.assert_close(full_signed[key], task_signed[key])
         with pytest.raises(RuntimeError, match="different native query"):
             fixture.manager.optimizer_evidence(task_result)
+        # END hard evidence remains tied to its completed scope and forward.
 
 
-def test_task_only_scope_retains_process_coupling_beside_satisfied_event(manager_fixture):
+def test_robot_scope_retains_process_coupling_beside_satisfied_event(manager_fixture):
     """A legal event does not erase a declared actuator relation on the path."""
     task = event_problem()
     coupling = JointCoupling(task.joint_names, np.array([[0., 1.]]), np.array([0.]),
                              "Declared analytic actuator relation")
     task = replace(task, couplings=(coupling,))
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=task) as fixture:
-        fixture.configuration.set_scene_constraints(False)
-        fixture.scene.evaluate = Mock(side_effect=AssertionError("Scene is outside the initializer scope"))
+        fixture.configuration.set_geometry_scope("robot")
         # Both rows reach exactly the same legal event at t=1 s. Row zero
         # violates the independent second-joint relation only at t=0 and 2 s.
         position = torch.tensor([[[.4, .1], [.4, 0.], [.4, .1]],
@@ -82,7 +86,32 @@ def test_task_only_scope_retains_process_coupling_beside_satisfied_event(manager
         collection = result.costs_and_constraints.constraints
         process = collection.values[collection.names.index("skill_process")].flatten(1).amax(-1)
         assert process[0] > 0 and process[1] == 0
-        fixture.scene.evaluate.assert_not_called()
+        assert fixture.scene.queries == ["robot"]
+
+
+# BEGIN each robot component keeps its original hard or conditional role.
+@pytest.mark.parametrize("component,feasible", [
+    ("collision/robot/self", False), ("unresolved/robot/self", False),
+    ("gripper/controller", False), ("conditional/hand_geometry", True)])
+def test_robot_scope_retains_self_controller_and_unresolved_evidence(manager_fixture, component, feasible):
+    with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
+        fixture.configuration.set_geometry_scope("robot")
+
+        def condition(spheres, tool_position, quaternion, progress, joints, names,
+                      *, components_out, geometry_scope, **kwargs):
+            assert geometry_scope == "robot"
+            zero = joints.sum(-1) * 0
+            components_out.update({"collision/robot/self": zero,
+                                   "unresolved/robot/self": zero,
+                                   component: zero + .125})
+            return zero if component.startswith("conditional/") else zero + .125
+
+        fixture.scene.evaluate = condition
+        result = task_forward(fixture, torch.tensor([[[.4, 0.], [.4, 0.], [.4, 0.]]]))
+        actual, signed, _ = fixture.manager.optimizer_evidence(result)
+        assert actual.tolist() == [feasible]
+        assert all(bool((value <= 0).all()) for value in signed.values())
+# END task legality cannot erase a definite robot component or invent one from uncertainty.
 
 
 def test_interrupted_initialization_consumes_first_solve_and_retains_completed_records():
@@ -93,7 +122,7 @@ def test_interrupted_initialization_consumes_first_solve_and_retains_completed_r
     def interrupted_reference(joint_reference=None):
         native.calls.append("seed")
         native.reference_initialization = {"status": "interrupted", "coarse": completed,
-            "scene_constraints": "not_evaluated"}
+            "geometry_scope": "robot", "task_scene_constraints": "not_evaluated"}
         native.initialization_candidate = native.curve
         raise TimeoutError("Declared initializer deadline")
 

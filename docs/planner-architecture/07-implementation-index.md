@@ -1,10 +1,10 @@
 # 实现符号索引
 
-代码基线：`a56c3e4`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：`A/B 工作区（实施起点 d97977c）`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **57 个文件、1027 个定义**。
+覆盖 **57 个文件、1039 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -23,7 +23,7 @@
 | [manipulation/selection.py](api/selection.md) | 7 | [01](01-inputs-and-task-model.md) |
 | [manipulation/planning_observation.py](api/planning_observation.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/robot_self_filter.py](api/robot_self_filter.md) | 6 | [02](02-observation-and-collision.md) |
-| [manipulation/online_geometry.py](api/online_geometry.md) | 20 | [02](02-observation-and-collision.md) |
+| [manipulation/online_geometry.py](api/online_geometry.md) | 21 | [02](02-observation-and-collision.md) |
 | [manipulation/planning_scene.py](api/planning_scene.md) | 26 | [02](02-observation-and-collision.md) |
 | [manipulation/collision_records.py](api/collision_records.md) | 4 | [02](02-observation-and-collision.md) |
 | [manipulation/observations.py](api/observations.md) | 16 | [02](02-observation-and-collision.md) |
@@ -31,8 +31,8 @@
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/planning.py](api/planning.md) | 192 | [04](04-solver-and-search.md) |
-| [manipulation/planning_ik.py](api/planning_ik.md) | 8 | [04](04-solver-and-search.md) |
+| [manipulation/planning.py](api/planning.md) | 202 | [04](04-solver-and-search.md) |
+| [manipulation/planning_ik.py](api/planning_ik.md) | 9 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 20 | [04](04-solver-and-search.md) |
 | [manipulation/physical_joint_domain.py](api/physical_joint_domain.md) | 22 | [04](04-solver-and-search.md) |
 | [manipulation/physical_joint_qp.py](api/physical_joint_qp.md) | 14 | [04](04-solver-and-search.md) |

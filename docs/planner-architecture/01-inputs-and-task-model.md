@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`a56c3e4`（A–D 实际实现提交；本次仅文档更新提交引用，所述代码与该实现提交一致）。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
+代码基线：`d97977c`（本轮实施起点）；当前正文对应待提交的 A/B 工作区实现。本组件将已有示教、当前任务关系及机器人入口状态组织为 `PlanningProblem`，供场景绑定与数值规划调用。第 4.1 节的实验输入适配器以所链接脚本和阶段计划记录其实现。总架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，各函数的完整参数与调用关系见[接口契约目录](06-api-contracts.md)。
 
 ## 1. 输入的来源与相互依赖
 
@@ -108,7 +108,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `PlanningProblem.evaluate` 汇总 `residuals`。`functional_constraint_keys` 枚举当前请求区间的硬功能条件身份；`functional_inequalities` 消费完整有序工具轨迹、进度和物理时间，按这些身份返回有符号归一化条件与事件掩码，供功能约束增广拉格朗日计算。机构绕转历史与确切事件时刻由这一轨迹输入保存。正容差的分量使用 `error/tolerance−1`；零宽 yaw 使用 `error/numerical.rotation_rad`，数值缩放保持原零集合。支持事件只为 `hard_components` 生成约束键。缺少要求的精确事件样本时输出 NaN，表达该条件在当前样本集上的未求值状态。
 
-`ProcessCostManager` 在工具曲线初始化中读取过程残差、全部硬功能不等式和原生关节约束，构造该计算范围内的候选保留资格；完整主优化再加入同次计算的实际场景分项。初始化记录的场景状态为 `not_evaluated`。事件 IK、搜索的目标投影和完整曲线验收都使用相同硬要求；独立点查询的范围由点上可求值的要求确定，曲线检查补齐历史、速度和停止条件。源功能坐标、材料关系及任务几何从首次任务求值开始进入各自计算。
+`ProcessCostManager` 在工具曲线初始化中读取过程残差、全部硬功能不等式、原生关节约束和 `robot` 几何范围，构造同次候选保留资格；该几何范围计算共享官方机器人自身配对与名义手部条件。完整主优化使用 `full` 范围，继续加入任务观测场、接触、支撑和覆盖分项。初始化记录 `geometry_scope="robot"` 与 `task_scene_constraints="not_evaluated"`。事件 IK、搜索的目标投影和完整曲线验收都使用相同任务硬要求；独立点查询的范围由点上可求值的要求确定，曲线检查补齐历史、速度和停止条件。源功能坐标、材料关系及任务几何从首次任务求值开始进入各自计算。
 
 `optimizer_preferences` 在 `feasibility/quality` 两种目标配置中均汇总过程等式和方向偏好；`phase="quality"` 另加入支持硬分量补集的归一化超差正部平方，以及位姿、坐标事件的原目标中心偏好。该方法的默认参数是 `quality`，当前生产求解则显式采用管理器的 `feasibility` 阶段；因此生产中的支持梯度来自声明的硬分量，gap/normal 的质量偏好保留在可选阶段接口中。完整工具参考由独立普通成本持续优化，其位置与完整姿态偏好和事件声明的允许集合分别消费；事件自由 yaw 仍按原容差验收。`measurements` 提供解释性原量；`projection_requirements`、`project_residual`、`goal_requirements_at` 和 `goal_residual` 供事件 IK、边界投影和 OMPL 状态检查。`goal_residual(normalized=True)` 为事件 IK 缩放各声明的超差正部，其允许集合与未缩放形式相同。计算以机器人候选状态为变量，目标与允许范围保持为固定输入。
 

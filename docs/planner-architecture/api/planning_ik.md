@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`a56c3e4`。
+代码基线：`A/B 工作区（实施起点 d97977c）`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `select_ik_tracking_candidate`
@@ -10,21 +10,22 @@
 输入签名：
 
 ```python
-def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous, *, native_success):
+def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous, *, reports):
 ```
 
 实现说明：
 
-> Select one warm start with native success and continuity kept distinct.
+> Select one warm start from the original static and native IK evidence.
 >
 > ``candidates`` contains named-order joint positions with shape ``[N,D]``;
 > ``candidate_indices`` identifies the caller's finite, position-domain
 > proposals. ``pose_costs[N]`` contains their finite native pose energies
 > for the same reference query. ``previous[1,D]`` is the preceding tracking
-> state, initially the measured entrance. ``native_success[N]`` is the
-> same native query's success flag for every candidate.
+> state, initially the measured entrance. ``reports[N]`` contains the same
+> query's task/model components and original native pose-success flags.
 >
-> Successful proposals precede failed proposals and minimize Euclidean
+> The common qualification prefix precedes all numerical preferences.
+> Successful proposals within one prefix minimize Euclidean
 > joint displacement before using their pose energy as a tiebreaker.
 > Failed proposals minimize pose energy before joint displacement. This
 > preserves the failed solver's numerical progress without allowing tiny
@@ -53,6 +54,7 @@ np.linalg
 values
 costs
 solved
+row
 prior
 selected
 ```
@@ -61,7 +63,10 @@ selected
 
 ```python
 np.asarray
+_validate_reports
+len
 min
+_qualification_prefix
 float
 np.linalg.norm
 int
@@ -69,7 +74,7 @@ int
 
 ## `_validate_reports`
 
-[定义位置](../../../manipulation/planning_ik.py#L47)。
+[定义位置](../../../manipulation/planning_ik.py#L49)。
 
 输入签名：
 
@@ -111,7 +116,7 @@ report.get
 
 ## `_measurement`
 
-[定义位置](../../../manipulation/planning_ik.py#L57)。
+[定义位置](../../../manipulation/planning_ik.py#L59)。
 
 输入签名：
 
@@ -154,7 +159,7 @@ np.isfinite
 
 ## `_quality`
 
-[定义位置](../../../manipulation/planning_ik.py#L66)。
+[定义位置](../../../manipulation/planning_ik.py#L68)。
 
 输入签名：
 
@@ -195,29 +200,95 @@ values.extend
 tuple
 ```
 
-## `_tier`
+## `_qualification_prefix`
 
-[定义位置](../../../manipulation/planning_ik.py#L75)。
+[定义位置](../../../manipulation/planning_ik.py#L78)。
 
 输入签名：
 
 ```python
-def _tier(report, query_kind):
+def _qualification_prefix(report, query_kind):
 ```
 
 实现说明：
 
-> Keep task/source checks independent of optional nominal pose success.
+> Return known task/model failures, native failure and unknown verdicts.
+>
+> ``planning._CuroboPlanner._rank_ik_candidates`` owns these reports. A
+> completed task/native check provides finite positive violation values;
+> NaN and infinities provide no definite violation measurement. The scene
+> component families below are the definite constraints produced by
+> ``OnlinePlanningScene.components``: registered-entity intersections,
+> required contact, declared initial support and gripper control. Unknown
+> coverage, numerical boundaries and missing model relations retain their
+> original components but cannot supply a definite failure here.
+>
+> A failure and an unestablished verdict are mutually exclusive ranking
+> states. An explicit violation wins when the same report also contains
+> unknown relations; the report itself retains both pieces of evidence.
+> Functional queries ignore convergence to the nominal pose centre.
 
 显式输出分支：
 
 ```python
-(not report['task_satisfied'], not report['model_valid'], not report['native_pose_ik_success'] if query_kind == 'reference' else False)
+(bool(task_failed), bool(model_failed), not report['native_pose_ik_success'] if query_kind == 'reference' else False, not task_failed and (not evaluated or not report['task_satisfied']), not model_failed and (not evaluated or not report['model_valid']))
 ```
 
 读取的对象属性：
 
-无显式条目。
+```python
+report.get
+report.get('task_violations', {}).values
+report.get('native_violations', {}).values
+report.get('scene_components', {}).items
+name.startswith
+```
+
+写入目标：
+
+```python
+evaluated
+task_failed
+value
+model_failed
+name
+component
+```
+
+直接调用符号：
+
+```python
+report.get
+any
+positive
+report.get('task_violations', {}).values
+report.get('native_violations', {}).values
+report.get('scene_components', {}).items
+name.startswith
+bool
+```
+
+## `_qualification_prefix.positive`
+
+[定义位置](../../../manipulation/planning_ik.py#L97)。
+
+输入签名：
+
+```python
+def positive(value):
+```
+
+显式输出分支：
+
+```python
+np.isfinite(value) and value > 0
+```
+
+读取的对象属性：
+
+```python
+np.isfinite
+```
 
 写入目标：
 
@@ -225,11 +296,13 @@ def _tier(report, query_kind):
 
 直接调用符号：
 
-无显式条目。
+```python
+np.isfinite
+```
 
 ## `rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning_ik.py#L81)。
+[定义位置](../../../manipulation/planning_ik.py#L115)。
 
 输入签名：
 
@@ -241,8 +314,9 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
 > Return bounded distinct proposals, without assembling a trajectory.
 >
-> ``query_kind='reference'`` prefers successful nominal-pose IK within the
-> same task/source screening tier. ``query_kind='functional'`` does not use
+> The common prefix compares definite task failure, definite model failure,
+> native reference failure, then unestablished task/model verdicts.
+> ``query_kind='functional'`` does not use
 > that flag: the declared allowed set can pass despite failure to reach its
 > nominal centre. Both kinds retain finite recovery proposals, explicitly
 > leaving their failed checks in the reports; they never reject a skill.
@@ -310,7 +384,7 @@ int
 
 ## `rank_ik_candidates.key`
 
-[定义位置](../../../manipulation/planning_ik.py#L108)。
+[定义位置](../../../manipulation/planning_ik.py#L143)。
 
 输入签名：
 
@@ -321,7 +395,7 @@ def key(index):
 显式输出分支：
 
 ```python
-(*_tier(report, query_kind), float(np.linalg.norm(prior - values[index], axis=-1).min()), *_quality(report), int(index))
+(*_qualification_prefix(report, query_kind), float(np.linalg.norm(prior - values[index], axis=-1).min()), *_quality(report), int(index))
 ```
 
 读取的对象属性：
@@ -341,7 +415,7 @@ report
 直接调用符号：
 
 ```python
-_tier
+_qualification_prefix
 float
 np.linalg.norm(prior - values[index], axis=-1).min
 np.linalg.norm
@@ -351,7 +425,7 @@ int
 
 ## `select_ik_chains`
 
-[定义位置](../../../manipulation/planning_ik.py#L124)。
+[定义位置](../../../manipulation/planning_ik.py#L159)。
 
 输入签名：
 
@@ -370,11 +444,10 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 > bounds only normalize the polyline's continuity cost. Neither the nodes
 > nor their connecting edges certify the later continuous trajectory.
 >
-> Dynamic programming first minimizes the number of nonconverged nodes,
-> then failed-node pose energy, then normalized joint velocity energy,
-> then successful-node pose energy.
-> Existing static evidence breaks only these ties. Unqualified counts
-> include rows whose static query was not performed. Each last node keeps
+> Dynamic programming sums the common qualification prefix over nodes,
+> then compares failed-node pose energy, normalized joint velocity energy
+> and successful-node pose energy, in that order. Unqueried or unresolved
+> checks contribute only to unestablished-verdict counts. Each last node keeps
 > 'count' histories. Samples with no finite legal proposal are filled
 > between available nodes and measured q0, without inventing pose success.
 > The resulting values initialize the common direct tool-space optimizer;
@@ -458,6 +531,7 @@ indices
 dt
 next_states
 report
+prefix
 options
 preceding_index
 paths
@@ -468,9 +542,10 @@ cost
 path
 solved
 combined
+item
+value
 next_states[index]
 result
-item
 anchor_queries
 _
 anchors
@@ -481,6 +556,7 @@ joint
 prior
 indices[query]
 statuses
+observation_mask
 status
 ```
 
@@ -510,6 +586,7 @@ np.isfinite(values).all
 (values <= positions_bounds[1]).all
 sorted
 np.flatnonzero
+_qualification_prefix
 retained.append
 int
 layers.append

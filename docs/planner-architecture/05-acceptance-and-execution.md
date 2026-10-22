@@ -1,10 +1,10 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`a56c3e4`（A–D 实际实现提交；本次仅文档更新提交引用，所述代码与该实现提交一致）。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`d97977c`（本轮实施起点）；当前正文对应待提交的 A/B 工作区实现。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
-工具曲线初始化产出统一位置至 jerk 连续域内的数值候选及实际任务/关节证据。`reference_initialization.sampled_task_joint_feasible` 表示同次原生前向的任务和关节状态条件，`continuous_domain/continuous_residuals` 表示实际保存多项式的位置、速度、加速度和分段 jerk 范围；初始化场景状态为 `not_evaluated`。`evaluate_reference` 从返回动作建立原生结果，随后导出该实际曲线并进入本章正式评价。计算完成、采样资格和完整可执行资格分别记录。
+工具曲线初始化产出统一位置、速度、加速度和分段 jerk 连续域内的数值候选及实际采样证据。`reference_initialization` 各完整曲线快照中的 `seeds[*].sampled_scope_feasible` 表示同次任务、关节及 `robot` 几何条件；该几何范围包含共享官方机器人自身与名义手部。`continuous_domain/continuous_residuals` 表示实际保存多项式的四类关节范围；任务观测场状态单独为 `task_scene_constraints="not_evaluated"`。`evaluate_reference` 从返回动作建立原生结果，随后导出该实际曲线并进入本章正式评价。计算完成、当前范围采样合格和完整可执行资格分别记录。
 
 `_CuroboPlanner._candidate_metrics` 消费每条实际 `JointTrajectory` 和候选场景，沿保存多项式生成 `q/dq/ddq/jerk`，经原生 FK 计算任务、原关节指标及同一观测场景分项。`_candidate_sample_times` 保留各原多项式区间端点，并按 `interpolation_dt` 分割；确切任务锚点直接按该候选的进度映射和物理时钟求值。原生输出及调用者提供的曲线均经过这一入口，各自保留时长、节点和手指时钟。查询临时上下文在 `finally` 清理。
 
@@ -98,7 +98,7 @@
 | `physical_domain_initializer_not_constructed` | 在固定入口和物理关节域内未构造出本次需要的初值 | 关节域、入口和构造错误 |
 | `planning_stage_failed` | 阶段输入、资源或数值调用产生其他异常 | `failed_stage`、`reason`、`error_type`、原异常栈 |
 
-`reference_initialization.status` 描述计算阶段，包括提议收集、曲线优化、完成、没有可分配初始化块以及中断。它与本表的请求结果、`sampled_task_joint_feasible` 和完整验收结果具有不同职责。主请求在初始化之前或中途退出时，已有查询和完整快照用于定位实际停止位置；最终输出保留原请求的取消、期限或数值失败类别。
+`reference_initialization.status` 描述计算阶段，包括提议收集、曲线优化、完成、没有可分配初始化块以及中断。它与本表的请求结果、快照中的 `sampled_scope_feasible` 和完整验收结果具有不同职责。`enrichment` 单独保存优化前有限补查询、逐槽比较和实际选择。主请求在初始化之前或中途退出时，已有查询和完整快照用于定位实际停止位置；最终输出保留原请求的取消、期限或数值失败类别。
 
 状态说明所完成计算的结论。结果消费者通过具体残差、输入来源及失败阶段决定下一项研究或操作。场景支持范围、未知区域、接触表示范围和实体相交各有独立分项，详见[观测与碰撞](02-observation-and-collision.md)。
 
