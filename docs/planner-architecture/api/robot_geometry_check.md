@@ -1,6 +1,6 @@
 # `manipulation/robot_geometry_check.py` 实现契约
 
-代码基线：`A/B 工作区（实施起点 d97977c）`。
+代码基线：`c84b34a`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_name`
