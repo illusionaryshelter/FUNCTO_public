@@ -1,6 +1,6 @@
 # `manipulation/reference_tracking.py` 实现契约
 
-代码基线：`c84b34a`；本文同时描述本次工作区内已实现、待统一提交的机器人查询结构复用与物理时间参考改动。实现提交后统一更新代码基线引用。
+代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `physical_time_mean_weights`
