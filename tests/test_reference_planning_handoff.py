@@ -207,6 +207,8 @@ class PosePathCompositionTest(unittest.TestCase):
         owner = CollisionOwner("observed_part", query, ordinary, "observed geometry", True)
         self.assertIs(owner.pose_path, ordinary)
         composed = PosePath([0., 1.], np.array([pose(), pose()]), source="relative reference", parent=ordinary)
-        with self.assertRaisesRegex(ValueError, "single world-frame path"):
+        # BEGIN assert the owner's coordinate requirement rather than an old sentence.
+        with self.assertRaisesRegex(ValueError, "world-frame"):
             CollisionOwner("observed_part", query, composed, "observed geometry", True)
+        # END composed skill references remain valid outside owner serialization.
 # END no analytic fixture claims robot planning or physical execution success.

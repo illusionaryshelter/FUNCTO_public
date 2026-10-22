@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 import torch
+from unittest.mock import patch
 
 from manipulation.local_geometry_model import LocalGeometryModels, LocalPairModel
 from manipulation.observed_mapping import FrozenObservedField
@@ -150,3 +151,73 @@ def test_required_contact_uses_the_fixed_zero_point_region_excess(tmp_path):
 def test_optimization_requires_an_explicit_block_model(tmp_path):
     with pytest.raises(ValueError, match="explicitly captured"):
         _query(_moving_scene(tmp_path), torch.tensor([.02], dtype=torch.float64))
+
+
+# BEGIN repeated base queries share records while preserving each gradient row.
+def test_repeated_bases_reuse_hard_queries_but_trials_and_gradients_stay_independent(tmp_path):
+    import manipulation.online_geometry as geometry
+    scene, models = _moving_scene(tmp_path), LocalGeometryModels()
+    base = torch.tensor([-.005, -.005, -.003, -.003], dtype=torch.float64)
+    with patch.object(scene.robot_model, "query", wraps=scene.robot_model.query) as robot, \
+            patch.object(geometry, "pair_residual", wraps=geometry.pair_residual) as pairs:
+        models.begin_capture(2, 2)
+        _query(scene, base, models)
+        models.finish_capture()
+        assert (robot.call_count, pairs.call_count) == (2, 6)
+
+    reference = base.clone().requires_grad_(True)
+    reference_hard = {}
+    reference_value = _query(scene, reference, models, components=reference_hard)
+    reference_gradient = torch.autograd.grad(reference_value.sum(), reference)[0]
+    actual = base.clone().requires_grad_(True)
+    actual_hard = {}
+    with patch.object(scene.robot_model, "query", wraps=scene.robot_model.query) as robot, \
+            patch.object(geometry, "pair_residual", wraps=geometry.pair_residual) as pairs, \
+            models.repeated_base_evaluation():
+        actual_value = _query(scene, actual, models, components=actual_hard)
+        actual_gradient = torch.autograd.grad(actual_value.sum(), actual)[0]
+        assert (robot.call_count, pairs.call_count) == (2, 6)
+    torch.testing.assert_close(actual_value, reference_value, rtol=0, atol=0)
+    torch.testing.assert_close(actual_gradient, reference_gradient, rtol=0, atol=0)
+    assert torch.count_nonzero(actual_gradient) == 4
+    assert actual_hard.keys() == reference_hard.keys()
+    for name in actual_hard:
+        torch.testing.assert_close(actual_hard[name], reference_hard[name], rtol=0, atol=0)
+    assert not models.repeated_base
+
+    trials = torch.tensor([-.004, .04, -.005, .03], dtype=torch.float64, requires_grad=True)
+    trial_hard = {}
+    with patch.object(scene.robot_model, "query", wraps=scene.robot_model.query) as robot, \
+            patch.object(geometry, "pair_residual", wraps=geometry.pair_residual) as pairs:
+        _query(scene, trials, models, components=trial_hard)
+        assert (robot.call_count, pairs.call_count) == (4, 12)
+    assert trial_hard["collision/material/background"][:, 0].tolist() == [1., 0., 1., 0.]
+
+
+def test_repeated_base_scope_does_not_survive_an_interrupted_query():
+    models = LocalGeometryModels()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        with models.repeated_base_evaluation():
+            assert models.repeated_base
+            raise RuntimeError("interrupted")
+    assert not models.repeated_base
+
+
+def test_repeated_base_does_not_merge_distinct_columns_with_rounded_equal_times(tmp_path):
+    scene, models = _moving_scene(tmp_path), LocalGeometryModels()
+    values = torch.tensor([[-.005, .04], [-.005, .04]], dtype=torch.float64)
+    position = torch.stack((values, values * 0 + 1, values * 0), -1)
+    quaternion = torch.zeros((*values.shape, 4), dtype=values.dtype)
+    quaternion[..., 0] = 1
+    joints = torch.stack((values * 0 + .04, values * 0 - .02), -1)
+    # Distinct exact query columns may round to an equal native clock value.
+    # Only their duplicate particle rows are declared to have equal inputs.
+    progress = torch.full_like(values, .5)
+    hard = {}
+    models.begin_capture(1, 2)
+    scene.evaluate(None, position, quaternion, progress, joints,
+        ("left_slide", "right_slide"), trajectory_time=progress,
+        query_role="optimization", local_models=models, components_out=hard)
+    models.finish_capture()
+    assert hard["collision/material/background"].tolist() == [[1., 0.], [1., 0.]]
+# END no candidate-dependent witness is installed during an ordinary trial.

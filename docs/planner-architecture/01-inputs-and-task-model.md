@@ -102,7 +102,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 ## 5. PlanningProblem 的运行接口
 
-`sample_reference(s)` 返回当前进度的名义工具参考；`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
+`sample_reference(s)` 返回当前进度的名义工具参考；参考 IK、`NativeReferenceCost.bind` 和最终固定评分均读取这一连续路径。后两者先将各候选的物理时刻通过其时长和进度映射转为 `s`，因此保留组合路径与机构坐标插值的原计算。`source_time_to_progress` 和 `progress_to_source_time` 在保存的源时钟中转换。`transform_tool_pose`、`reference_to_link_pose` 和 `transform_tool_velocity` 将原生机器人计算转换到任务参考坐标，或将任务目标转换回原生连杆坐标。变换依赖构造时固定的 `base_pose/tool_transform`。
 
 `residuals(position, quaternion, progress, ...)` 接收相互对齐的批量候选状态，返回名字到非负硬残差张量的字典。姿态数组分别为 `[...,3]` 和 `[...,4]`；进度数组是相同的批量/时间维度。具名关节、速度、物理时间和工具速度在对应要求需要时使用。事件约束在其精确进度的首次物理到达样本上计算，`point_goal_ids` 将当前查询样本绑定到相应原目标身份。`direction_mode="point"` 用于独立候选状态，`"trajectory"` 用于具有物理顺序的完整路径；依赖路径历史的方向要求由后者评价。所有调用读取同一 `hard_components` 和同一任务容差。
 
@@ -110,7 +110,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `ProcessCostManager` 在一次优化前向中读取过程残差、全部硬功能不等式和实际场景分项，构造候选保留资格。事件 IK、搜索的目标投影和完整曲线验收都使用相同硬要求；独立点查询的范围由点上可求值的要求确定，曲线检查补齐历史、速度和停止条件。
 
-`optimizer_preferences` 在两阶段均汇总过程等式和方向偏好；`phase="quality"` 另加入支持硬分量补集的归一化超差正部平方，以及位姿、坐标事件的原目标中心偏好。该方法的默认参数是 `quality`，当前生产求解则显式采用管理器的 `feasibility` 阶段；因此生产中的支持梯度来自声明的硬分量，gap/normal 的质量偏好保留在可选阶段接口中。`measurements` 提供解释性原量；`projection_requirements`、`project_residual`、`goal_requirements_at` 和 `goal_residual` 供事件 IK、边界投影和 OMPL 状态检查。`goal_residual(normalized=True)` 为事件 IK 缩放各声明的超差正部，其允许集合与未缩放形式相同。计算以机器人候选状态为变量，目标与允许范围保持为固定输入。
+`optimizer_preferences` 在两阶段均汇总过程等式和方向偏好；`phase="quality"` 另加入支持硬分量补集的归一化超差正部平方，以及位姿、坐标事件的原目标中心偏好。该方法的默认参数是 `quality`，当前生产求解则显式采用管理器的 `feasibility` 阶段；因此生产中的支持梯度来自声明的硬分量，gap/normal 的质量偏好保留在可选阶段接口中。完整工具参考由独立普通成本持续优化，其位置与完整姿态偏好和事件声明的允许集合分别消费；事件自由 yaw 仍按原容差验收。`measurements` 提供解释性原量；`projection_requirements`、`project_residual`、`goal_requirements_at` 和 `goal_residual` 供事件 IK、边界投影和 OMPL 状态检查。`goal_residual(normalized=True)` 为事件 IK 缩放各声明的超差正部，其允许集合与未缩放形式相同。计算以机器人候选状态为变量，目标与允许范围保持为固定输入。
 
 `anchors` 合并源路径节点、目标进度和过程边界；`stop_progress` 收集明确要求停止的事件。`bound_motion_block` 以最早尚未满足的独立效果依赖界定本次可执行区间，返回复制后的问题与区间记录，并保留原目标身份和阶段坐标。参考节点、开闭指令和名义附着按各自字段参与编译。`requirement_consumption`、`verification_issues` 和 `remaining_obligations` 提供这些要求的消费及剩余记录。
 

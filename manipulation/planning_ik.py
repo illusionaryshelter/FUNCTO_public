@@ -88,7 +88,8 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
 
 def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s,
-                     velocity_limits, *, count, joint_tolerance, query_kind="reference"):
+                     velocity_limits, *, count, joint_tolerance, query_kind="reference",
+                     reference_positions=None):
     """Connect qualified reference anchors and interpolate missing seed samples.
 
     Inputs retain the caller's candidate indices. ``previous`` is the measured
@@ -120,12 +121,17 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 
     Dynamic programming retains at most ``count`` paths at each last candidate.
     Failed static task/model check counts rank proposals first, without
-    removing the only available transferred-reference chain. Edges then
+    removing the only available transferred-reference chain. When supplied,
+    ``reference_positions[query,joint]`` contributes squared joint displacement
+    from that reference, normalized by each velocity scale and the final time,
+    then averaged over queries and joints. This additive soft distance precedes
+    velocity energy before any shortlist truncation. Edges then
     integrate squared joint velocity divided by the square of the
     joint's largest absolute native velocity bound. Dividing by the final
     query time and D yields the normalized velocity energy of the selected
-    joint-space polyline. This first-order additive cost makes the bounded
-    dynamic program exact for these supplied candidates. Clearance and joint
+    joint-space polyline. These additive costs make the bounded dynamic program
+    exact for its supplied node/edge ranking. A subsequent whole-curve equality
+    fit has a different objective and compares only this finite shortlist. Clearance and joint
     margin break only equal-energy ties. They never certify the edges.
     """
     pools = [np.asarray(values, dtype=float) for values in candidates_by_query]
@@ -145,6 +151,13 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     scales = np.max(np.abs(bounds), axis=0)
     if np.any(scales <= 0):
         raise ValueError("IK chain velocity scales must be positive")
+
+    # BEGIN explicit reference observations rank functional chains before truncation.
+    reference = None if reference_positions is None else np.asarray(reference_positions, dtype=float)
+    if reference is not None and (reference.shape != (len(pools), start.shape[1])
+                                   or not np.isfinite(reference).all()):
+        raise ValueError("Event-chain reference observations must align with query times and joint columns")
+    # END the reference is soft data, not another event acceptance condition.
 
     # BEGIN only native failure excludes a reference initializer from the graph.
     layers = []
@@ -182,7 +195,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     # sequence. Keeping K predecessors per terminal node suffices for K best
     # complete paths because all future edge costs depend only on that node.
     # BEGIN static failures rank proposals; they cannot erase all native successes.
-    states = {None: [((0, 0, 0., 0, 0., 0, 0., 0, 0.), ())]}
+    states = {None: [((0, 0, 0., 0., 0, 0., 0, 0., 0, 0.), ())]}
     previous_time = 0.
     normalizer = times[-1]*start.shape[1]
     for layer, (query, indices) in enumerate(layers):
@@ -192,6 +205,8 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
             quality = _quality(reports[query][index])
             task_failure = int(not reports[query][index]["task_satisfied"])
             model_failure = int(not reports[query][index]["model_valid"])
+            node_reference = (0. if reference is None else float(np.mean(
+                ((pools[query][index]-reference[query])/(scales*times[-1]))**2))/len(pools))
             options = []
             for preceding_index, paths in states.items():
                 preceding = start[0] if layer == 0 else pools[layers[layer-1][0]][preceding_index]
@@ -209,8 +224,9 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 if not np.isfinite(edge):
                     continue
                 for cost, path in paths:
-                    combined = (cost[0]+task_failure, cost[1]+model_failure, cost[2]+edge,
-                                *(old+new for old, new in zip(cost[3:], quality)))
+                    combined = (cost[0]+task_failure, cost[1]+model_failure,
+                                cost[2]+node_reference, cost[3]+edge,
+                                *(old+new for old, new in zip(cost[4:], quality)))
                     if np.isfinite(combined).all():
                         options.append((combined, (*path, index)))
             next_states[index] = sorted(options)[:count]
@@ -240,13 +256,14 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
             "anchor_query_indices": anchor_queries,
             "query_statuses": ["FALLBACK_SEED" if index is None else "SOLVED" for index in indices],
             "selection_cost": {"static_task_failure_count": int(cost[0]),
-                "static_model_failure_count": int(cost[1]), "normalized_velocity_energy": float(cost[2]),
-                "environment_clearance_missing_count": int(cost[3]),
-                "environment_clearance_sum_m": float(-cost[4]),
-                "self_clearance_missing_count": int(cost[5]),
-                "self_clearance_sum_m": float(-cost[6]),
-                "joint_margin_missing_count": int(cost[7]),
-                "joint_margin_sum": float(-cost[8])},
+                "static_model_failure_count": int(cost[1]),
+                "normalized_reference_distance": float(cost[2]), "normalized_velocity_energy": float(cost[3]),
+                "environment_clearance_missing_count": int(cost[4]),
+                "environment_clearance_sum_m": float(-cost[5]),
+                "self_clearance_missing_count": int(cost[6]),
+                "self_clearance_sum_m": float(-cost[7]),
+                "joint_margin_missing_count": int(cost[8]),
+                "joint_margin_sum": float(-cost[9])},
             "recovery_queries": recovery, "reference_success": not recovery})
         # END interpolated joint samples initialize a curve; they never claim pose convergence.
         if len(result) == count:

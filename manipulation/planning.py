@@ -2441,8 +2441,9 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
 
     Configuration construction must return the derived type and class_type;
     registering a custom name alone is not dispatched by V2's base manager.
-    Only constraint_cfg enables this extension. Built-in joint constraints
-    remain intact; optimizer and metrics share the same frozen online model.
+    The ordinary cost manager evaluates the transferred reference and native
+    joint regularization. Constraint managers retain built-in joint limits,
+    declared task constraints and the same frozen observed scene model.
     """
     import torch
     from curobo.kinematics import Kinematics
@@ -2506,6 +2507,13 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             # END request rebind clears this lightweight diagnostic in place.
             if not self._process_mode:
                 return
+            # BEGIN ordinary reference costs own no scene or event-anchor queries.
+            if self._process_mode == "reference_objective":
+                self._reference_pose_weight = config.tool_pose_cfg.weight.detach().cpu().tolist()
+                self._cspace_template = deepcopy(self.get_cost("cspace").config)
+                self.bind_request_data()
+                return
+            # END task and geometry constraints remain in their own manager.
             transition_model.robot_model.compute_jacobian = True
             self._scene = scene.clone_for_rollout()
             self._joint_names = tuple(transition_model.joint_names)
@@ -2525,8 +2533,19 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
 
         def bind_request_data(self):
             """Replace request values in fixed-capacity native manager buffers."""
-            self._scene = scene.clone_for_rollout()
             self._dense_counts = None
+            # BEGIN rebind ordinary costs from the unscaled native configuration.
+            if self._process_mode == "reference_objective":
+                from .reference_tracking import NativeReferenceCost, FixedTimeStateCSpaceCost, freeze_cspace_time_weights
+                self._reference_cost = NativeReferenceCost(problem, self.device_cfg,
+                    pose_weight=self._reference_pose_weight)
+                config = freeze_cspace_time_weights(deepcopy(self._cspace_template), clock["native_dt"])
+                self.costs["cspace"] = FixedTimeStateCSpaceCost(config, clock["native_dt"])
+                self._batch_size = self._horizon = None
+                self._reference_grid_key = None
+                return
+            # END each request freezes weights once on its admitted physical clock.
+            self._scene = scene.clone_for_rollout()
             # BEGIN a rebind invalidates the previous query's recovery evidence.
             self._scene_evidence = None
             # BEGIN request/clock/anchor rebinding invalidates optimizer evidence.
@@ -2574,6 +2593,10 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
 
         def set_dense_counts(self, counts):
             self._dense_counts = counts.reshape(-1).long()
+            # BEGIN ordinary dense quadrature follows the newly supplied valid prefix.
+            if self._process_mode == "reference_objective":
+                self._reference_grid_key = None
+            # END cached goals are rebuilt at the next ordinary-cost query.
 
         # BEGIN same-forward hard evidence and fixed objective for candidate retention.
         @property
@@ -2617,7 +2640,7 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
                         valid = finite & (detached <= 0).all(-1)
                         feasible = feasible & valid
                     # BEGIN incumbent ranking is independent of changing block models.
-                    if name not in {"functional_augmented_lagrangian", "process_scene"}:
+                    if not hard:
                         fixed_objective = fixed_objective+detached.sum(-1)
                     # END actual geometry determines eligibility, not this score.
             feasible = feasible & torch.isfinite(fixed_objective)
@@ -2649,6 +2672,28 @@ def _process_manager_type(problem, scene, progress_map, anchors, budget,
             if not self._process_mode:
                 return super().compute_costs(state, cost_collection, goal, **kwargs)
             context = getattr(self, "_candidate_query", None)
+            # BEGIN continuous reference and native regularization share time quadrature.
+            if self._process_mode == "reference_objective":
+                joint = state.joint_state
+                batch, horizon = joint.position.shape[:2]
+                counts = (torch.full((batch,), horizon, dtype=torch.long, device=joint.position.device)
+                          if self._dense_counts is None or context is not None else self._dense_counts)
+                mapping = progress_map if context is None else context["mapping"]
+                duration = clock["duration"] if context is None else context["duration"]
+                # All rows of a native request use its one frozen grid; an
+                # explicit candidate context supplies its own physical times.
+                key = (horizon, id(self._dense_counts), id(context))
+                if key != self._reference_grid_key:
+                    times = _joint_state_sample_times(joint, counts) if context is None else context["times"]
+                    self._reference_cost.bind(times[:1], counts[:1], mapping, duration)
+                    self._reference_grid_key = key
+                collection = super().compute_costs(state, cost_collection, None, **kwargs)
+                weights = self._reference_cost.time_weights(batch)
+                collection.values = [value*weights.reshape(*weights.shape, *([1]*(value.ndim-2)))
+                                     for value in collection.values]
+                collection.add(self._reference_cost.forward(state.tool_poses)[..., None], "continuous_reference")
+                return collection
+            # END exact event/witness costs do not change the ordinary time measure.
             active_scene = self._scene if context is None else context["scene"]
             active_map = progress_map if context is None else context["mapping"]
             active_clock = clock if context is None else {"duration": context["duration"]}
@@ -3409,6 +3454,11 @@ class _CuroboPlanner:
 
         ik_optimizer = configuration("ik/lbfgs_ik.yml", "seed_optimizer")
         trajectory_optimizer = configuration("trajopt/lbfgs_bspline_trajopt.yml", "trajectory_optimizer")
+        # BEGIN both optimization and explicit scoring use the same ordinary costs.
+        trajectory_optimizer["rollout"]["cost_cfg"]["process_mode"] = "reference_objective"
+        trajectory_metrics = configuration("metrics_base.yml", "trajectory_metrics")
+        trajectory_metrics["rollout"]["cost_cfg"] = deepcopy(trajectory_optimizer["rollout"]["cost_cfg"])
+        # END native hard metrics keep their separate original configuration.
         for name, config, iterations in (("IK", ik_optimizer, budget.ik_iterations),
                                          ("trajectory", trajectory_optimizer, budget.trajectory_iterations)):
             inner_iterations = config["optimizer"]["inner_iters"]
@@ -3463,7 +3513,7 @@ class _CuroboPlanner:
         self._trajectory_configuration = {
             "robot": deepcopy(robot_dict), "self_collision_check": False,
             "optimizer_configs": [trajectory_optimizer],
-            "metrics_rollout": configuration("metrics_base.yml", "trajectory_metrics"),
+            "metrics_rollout": trajectory_metrics,
             "transition_model": transition, "device_cfg": self.device_cfg,
             "num_seeds": budget.trajectory_seeds, "max_batch_size": 1, "max_goalset": 1,
             "use_cuda_graph": False, "random_seed": budget.random_seed,
@@ -3562,10 +3612,11 @@ class _CuroboPlanner:
                     dense=True, output_dt=grid["interpolation_dt"])
                 # END no second boundary kernel or independent curve is retained.
                 rollout = self.additional_metrics_rollouts["interpolated_rollout"]
-                # Both managers retain valid-prefix masking before the native
-                # caller computes dense metrics and its original success flag.
-                rollout.constraint_manager.set_dense_counts(counts)
-                rollout.metrics_constraint_manager.set_dense_counts(counts)
+                # Ordinary costs and both constraint managers retain the valid
+                # prefix before dense metrics and their original success flag.
+                for manager in rollout._cost_manager_list:
+                    if getattr(manager, "_process_mode", ""):
+                        manager.set_dense_counts(counts)
                 return state, counts, False
                 # END no output resize, retiming, independent interpolation or metric bypass.
 
@@ -3972,31 +4023,42 @@ class _CuroboPlanner:
                       .reshape(-1, len(self.joint_names)) for _, entry in entries]
         reports = [[row["report"] for row in entry["candidates"]] for _, entry in entries]
         velocity_bounds = self._seed_velocity_bounds()
-        self.goal_ik_chains = select_ik_chains(candidates, reports,
-            self.start.position.detach().cpu().numpy(), parameters*self.formal_clock["duration"],
-            velocity_bounds, count=seeds.shape[1], joint_tolerance=self.problem.numerical.joint,
-            query_kind="functional")
-        if not self.goal_ik_chains:
-            self.goal_ik_event_fits.append({"applied": False, "event_u": parameters.tolist(),
-                "reason": "no_complete_time_connectable_event_chain"})
-            return seeds
+        # BEGIN each reference seed owns its event-chain shortlist and actual QP ranking.
         for branch in range(seeds.shape[1]):
-            chain = self.goal_ik_chains[min(branch, len(self.goal_ik_chains)-1)]
-            target = np.asarray(chain["joint_positions"])
-            control, fit = self.physical_domain.fit_reference(reference_progress,
-                self.device_cfg.to_device(np.asarray(reference_positions[branch])),
-                prior_controls=seeds[0, branch], velocity_bounds=velocity_bounds,
-                event_progress=parameters, event_positions=target)
-            self.reference_seed_fits[branch]["event_fit"] = fit
-            self.goal_ik_event_fits.append({"branch": branch, "event_u": parameters.tolist(),
-                "joint_positions": target.tolist(), "applied": control is not None,
-                "candidate_indices": chain["candidate_indices"], "fit": deepcopy(fit),
-                "proposal_reports": [deepcopy(rows[index]) for rows, index in
-                                     zip(reports, chain["candidate_indices"])],
-                "scope": "Initial curve event equalities; main optimization retains task-space allowed sets"})
-            if control is not None:
+            reference = np.asarray(reference_positions[branch])
+            event_reference = np.column_stack([np.interp(parameters, reference_progress, reference[:, joint])
+                                               for joint in range(reference.shape[1])])
+            chains = select_ik_chains(candidates, reports,
+                self.start.position.detach().cpu().numpy(), parameters*self.formal_clock["duration"],
+                velocity_bounds, count=seeds.shape[1], joint_tolerance=self.problem.numerical.joint,
+                query_kind="functional", reference_positions=event_reference)
+            fitted = []
+            for chain_index, chain in enumerate(chains):
+                self.goal_ik_chains.append({**chain, "reference_seed_index": branch,
+                                           "shortlist_index": chain_index})
+                target = np.asarray(chain["joint_positions"])
+                control, fit = self.physical_domain.fit_reference(reference_progress,
+                    self.device_cfg.to_device(reference), prior_controls=seeds[0, branch],
+                    velocity_bounds=velocity_bounds, event_progress=parameters, event_positions=target)
+                record = {"branch": branch, "shortlist_index": chain_index,
+                    "event_u": parameters.tolist(), "joint_positions": target.tolist(), "applied": False,
+                    "candidate_indices": chain["candidate_indices"], "fit": deepcopy(fit),
+                    "proposal_reports": [deepcopy(rows[index]) for rows, index in
+                                         zip(reports, chain["candidate_indices"])],
+                    "scope": "Reference-paired finite shortlist; actual event-equality QP fit ranking"}
+                self.goal_ik_event_fits.append(record)
+                if control is not None:
+                    fitted.append((fit["reference_rms_joint_units"], chain_index, control, fit, record))
+            if fitted:
+                _, _, control, fit, record = min(fitted, key=lambda item: item[:2])
+                record["applied"] = True
                 seeds[0, branch] = control
+                self.reference_seed_fits[branch]["event_fit"] = fit
                 self.initial_seed_strategies[branch] += "+event_equalities"
+            elif not chains:
+                self.goal_ik_event_fits.append({"branch": branch, "applied": False,
+                    "event_u": parameters.tolist(), "reason": "no_complete_time_connectable_event_chain"})
+        # END bounded initializer fitting leaves task-space allowed sets to the main solve.
         self.seed_strategies = list(self.initial_seed_strategies)
         return seeds.contiguous()
     # END every proposed curve retains full trajectory qualification afterward.
@@ -4512,33 +4574,20 @@ class _CuroboPlanner:
     # END functional multipliers are owned by each native solve's inner blocks.
 
     def _native_request(self, seed):
-        """Bind real terminal poses or the task-only native constraint route."""
+        """Bind the typed task constraints and continuous ordinary reference cost."""
         from curobo._src.solver.solve_mode import SolveMode
         from curobo._src.solver.solve_state import SolveState
-        target = next((goal for goal in self.problem.pose_events
-                       if goal.progress == self.problem.end_progress), None)
-        self.route = ("native_pose" if target is not None and target.yaw_axis is None and not any((self.problem.pose_relations,
-            self.problem.mechanisms, self.problem.interiors, self.problem.coordinate_events,
-            self.problem.supports, self.scene.contacts)) and len(self.problem.pose_events) == 1 else "constrained")
-        # Functional frames can be displaced from the TCP; their exact allowed
-        # set remains in ProcessCostManager. Only an identity calibration can
-        # share the native link-pose convergence tolerance without changing it.
-        # BEGIN native convergence to one nominal pose cannot represent a yaw interval.
-        direct = self.route == "native_pose" and np.array_equal(target.tool_from_function, np.eye(4))
-        # END the task cost/metrics retain the complete continuous allowed set.
-        if direct:
-            self.trajopt.enable_tool_pose_tracking()
-        else:
-            self.trajopt.disable_tool_pose_tracking()
+        # BEGIN the transferred path supplies soft tracking; typed events own hard goals.
+        self.route = "constrained"
+        self.trajopt.disable_tool_pose_tracking()
         self.trajopt.disable_joint_position_tracking()
-        goal = None if target is None else self._functional_goal(target)
+        # END no second terminal pose objective changes the reference definition.
         state = SolveState(solve_type=SolveMode.BATCH, num_trajopt_seeds=seed.shape[1],
-                          batch_size=1, num_envs=1, num_goalset=1,
-                          tool_frames=[] if goal is None else goal.tool_frames)
-        return state, goal
+                          batch_size=1, num_envs=1, num_goalset=1, tool_frames=[])
+        return state, None
 
     def evaluate_reference(self, seed):
-        """Accept a feasible complete reference candidate before changing its controls."""
+        """Qualify initial controls before the request's main reference improvement."""
         self.physical_domain.validate(seed)
         state, goal = self._native_request(seed)
         endpoint = self.JointState.from_position(seed[:, :, -1].contiguous())
@@ -4578,6 +4627,44 @@ class _CuroboPlanner:
             deepcopy(self.problem.conditions), {}, None if hand is None else hand.finger_trajectory,
             tuple(getattr(self, "satisfied_dependencies", ())))
         return trajectory, candidate_scene, mapping
+
+    # BEGIN all delivered candidates are ranked on one request-wide quadrature grid.
+    def _candidate_objective(self, trajectory):
+        """Evaluate fixed ordinary costs using this curve's physical derivatives.
+
+        Normalized nodes are fixed by the admitted native rollout, while each
+        curve retains its own duration and progress map. FK is the only model
+        query; scene constraints and event anchors have already defined their
+        independent qualification roles.
+        """
+        mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
+        times = np.linspace(0., trajectory.duration, (self.budget.knots+4)*self.budget.interpolation_steps+1)
+        q, dq, ddq, _ = trajectory.sample(times)
+        columns = [trajectory.joint_names.index(name) for name in self.joint_names]
+        tensor = self.device_cfg.to_device
+        js = self.JointState(position=tensor(q[:, columns])[None].contiguous(),
+            velocity=tensor(dq[:, columns])[None].contiguous(),
+            acceleration=tensor(ddq[:, columns])[None].contiguous(),
+            jerk=tensor(trajectory._curve(times, 3)[:, columns])[None].contiguous(),
+            dt=tensor([self.formal_clock["native_dt"]]), joint_names=list(self.joint_names))
+        rollout = self.trajopt.additional_metrics_rollouts["interpolated_rollout"]
+        manager = next(item for item in rollout._cost_manager_list
+                       if getattr(item, "_process_mode", "") == "reference_objective")
+        manager._candidate_query = {"times": tensor(times)[None], "mapping": mapping,
+                                    "duration": trajectory.duration}
+        manager._reference_grid_key = None
+        try:
+            self.check_request()
+            with self.torch.no_grad():
+                state = rollout.transition_model.compute_augmented_state(js)
+                costs = manager.compute_costs(state)
+                components = {name: float(value.sum().item()) for name, value in zip(costs.names, costs.values)}
+            self.check_request()
+        finally:
+            manager._candidate_query = None
+            manager._reference_grid_key = None
+        return {"fixed_objective": sum(components.values()), "objective_components": components}
+    # END finite quadrature supplies one comparable definition, not exact integration.
 
     def _candidate_metrics(self, trajectory, candidate_scene):
         """Run existing native metrics on exact, possibly nonuniform queries.
@@ -4643,6 +4730,8 @@ class _CuroboPlanner:
         try:
             for manager in managers:
                 manager._candidate_query = context
+                if manager._process_mode == "reference_objective":
+                    manager._reference_grid_key = None
             self.check_request()
             with self.torch.no_grad():
                 native = rollout.transition_model.compute_augmented_state(js)
@@ -4673,6 +4762,8 @@ class _CuroboPlanner:
         finally:
             for manager in managers:
                 manager._candidate_query = None
+                if manager._process_mode == "reference_objective":
+                    manager._reference_grid_key = None
         report = {"native_success": feasible, "accepted": feasible,
             "residuals": residuals, "seed_provenance": "supplied_joint_curve",
             # BEGIN classification is diagnostic-only, outside hard residuals.
@@ -4713,11 +4804,13 @@ class _CuroboPlanner:
         release_times = (mapping.anchor_parameters(release_progress)[:, 0]*trajectory.duration
                          if release_progress else np.empty(0))
         hard, categories, details = [], {}, {}
+        # BEGIN one immutable candidate owns one set of modeled release anchors.
+        released_scene = candidate_scene if not len(release_times) else None
 
         def query(times_s, *, point_budget):
-            # Every call includes the same curve's release FK when a later
-            # owner pose needs it. Repeated anchors consume real query work.
-            times = np.unique(np.r_[np.asarray(times_s, float), release_times])
+            nonlocal released_scene
+            times = np.unique(np.r_[np.asarray(times_s, float),
+                release_times if released_scene is None else np.empty(0)])
             if len(times) > point_budget:
                 return {"states": [], "query_points": 0, "capacity_exhausted": True}
             self.check_request()
@@ -4732,12 +4825,16 @@ class _CuroboPlanner:
                 position, quaternion = self.problem.transform_tool_pose(
                     state.tool_poses.position[:, :, tool], state.tool_poses.quaternion[:, :, tool])
                 evidence, scene_channels, query_details = [], {}, {}
-                values = _scene_boundary_evaluate(candidate_scene, self.problem, mapping,
+                active_scene = candidate_scene if released_scene is None else released_scene
+                values = _scene_boundary_evaluate(active_scene, self.problem, mapping,
                     self.problem.transform_robot_spheres(native.robot_spheres), position, quaternion,
                     tensor(progress)[None], js.position, self.joint_names,
                     trajectory_time=tensor(times)[None], normalized_time=tensor(times/trajectory.duration)[None],
                     component_diagnostics=query_details, scene_evidence_out=scene_channels,
                     geometry_evidence_out=evidence)
+                if released_scene is None:
+                    released_scene = candidate_scene.with_release_history(position, quaternion, tensor(progress)[None])
+                # END subsequent samples reuse anchors from this same exact curve.
                 # Keep the most severe original component and its own time;
                 # a later smaller violation must not replace that witness.
                 for name, entry in query_details.items():
@@ -4804,6 +4901,11 @@ class _CuroboPlanner:
                 attempt.setdefault(target, {})[f"interval:{component}"] = categories.get(category, 0.)
             attempt.setdefault("scene_components", {}).update(geometry["scene_components"])
             accepted = all(np.isfinite(value) and value <= 0 for value in residuals.values())
+        # BEGIN native and supplied curves receive the same finite ordinary score.
+        if "fixed_objective" not in attempt:
+            attempt.update(self._candidate_objective(trajectory))
+        accepted = accepted and bool(np.isfinite(attempt["fixed_objective"]))
+        # END fixed scores rank fully qualified curves without changing hard residuals.
         attempt.update(residuals=residuals, accepted=accepted)
         validation.update(u=parameters, violations=np.full(parameters.shape,
             max(residuals.values(), default=0.)), scope="sampled task metrics, exact joint domain and reported geometry intervals")
@@ -4852,7 +4954,13 @@ class _CuroboPlanner:
                                     torch.full_like(flat, float('inf'))).argmax()
                 return float(flat[index].item())
             constraints = metrics.costs_and_constraints.constraints
-            report[label] = {"constraints": {name: maximum(value) for name, value in
+            # BEGIN report completed ordinary costs without another rollout query.
+            ordinary = metrics.costs_and_constraints.costs
+            ordinary_costs = {name: float((value if seed_index is None else value[seed_index]).detach().sum().item())
+                              for name, value in zip(ordinary.names, ordinary.values)}
+            # END these per-grid integrals are diagnostics; canonical scores rank candidates.
+            report[label] = {"ordinary_costs": ordinary_costs,
+                "constraints": {name: maximum(value) for name, value in
                 zip(constraints.names, constraints.values)}, "convergence": {name: maximum(value)
                 for name, value in zip(metrics.convergence.names, metrics.convergence.values)},
                 # BEGIN typed collision evidence is separate from native constraints.
@@ -4872,9 +4980,8 @@ class _CuroboPlanner:
 
     def select_candidate(self, result):
         """Select a candidate after sampled metrics, joint bounds and interval queries."""
-        reports, selected, selected_key = [], None, None
-        interval_points = 0
-        selected_trajectory = None
+        # BEGIN rank every finite native curve before expensive interval qualification.
+        proposals = []
         for index in range(result.num_seeds):
             metrics = self.native_diagnostics(result, index)
             residuals = {f"{label}:{name}": value for label in ("rollout", "interpolated")
@@ -4899,30 +5006,34 @@ class _CuroboPlanner:
                       # END existing feasible candidates still take precedence.
                       "seed_provenance": self.seed_strategies[index],
                       "optimizer": self.last_optimizer_diagnostics[index] if self.last_optimizer_diagnostics else {}}
-            # BEGIN an interval witness participates in the ordinary recovery decision.
             trajectory = None
             if accepted:
                 trajectory = self._native_curve(_trajectory_candidate(result, index))
+                report.update(self._candidate_objective(trajectory))
+                report["accepted"] = bool(np.isfinite(report["fixed_objective"]))
+            proposals.append((index, trajectory, report, severity))
+        proposals.sort(key=lambda item: (not item[2]["accepted"],
+            item[2]["fixed_objective"] if item[2]["accepted"] else item[3], item[0]))
+        reports, selected_record, selected_key, interval_points = [], None, None, 0
+        for index, trajectory, report, severity in proposals:
+            if report["accepted"]:
                 trajectory, report, points = self.evaluate_candidate(trajectory, native_report=report)
                 interval_points += points
-                accepted = report["accepted"]
                 severity = (sum(max(0., value) for value in report["residuals"].values())
                             if all(np.isfinite(list(report["residuals"].values()))) else float("inf"))
             reports.append(report)
-            key = (not accepted, severity, index)
+            key = (not report["accepted"], report["fixed_objective"] if report["accepted"] else severity, index)
             if selected_key is None or key < selected_key:
-                selected, selected_key, selected_trajectory = index, key, trajectory
-            if accepted:
+                selected_record, selected_key = (index, trajectory, report), key
+            if report["accepted"]:
                 break
-            # END unproven intervals remain explicit evidence, not invented intersections.
-        report = reports[selected]
-        candidate = _trajectory_candidate(result, selected)
-        trajectory = self._native_curve(candidate) if selected_trajectory is None else selected_trajectory
-        # BEGIN select from completed metrics of the same observed model.
-        return candidate, trajectory, {**report, "selected_seed_index": selected,
-                                       "candidates": reports, "interval_query_points": interval_points}
-        # END selection neither changes geometry nor repeats a rejected query.
-
+        selected, trajectory, report = selected_record
+        if trajectory is None:
+            trajectory = self._native_curve(_trajectory_candidate(result, selected))
+        return _trajectory_candidate(result, selected), trajectory, {**report,
+            "selected_seed_index": selected, "candidates": reports,
+            "interval_query_points": interval_points}
+        # END first fully qualified candidate has the best fixed score in this batch.
 
     # END the attempt witness set is independent of the selected continuation.
 
@@ -5111,12 +5222,15 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
     schedule of remaining work or creates selected retry occurrences; ordinary
     continuation preserves the original frozen clock. Every request admitted
     including initialization failure carries the cumulative ledger. No GPU stage is
-    claimed to be preemptible: elapsed overrun rejects its candidate.
+    claimed to be preemptible. A candidate qualifies only after all required
+    work completes within budget; later improvement exhaustion preserves that
+    independently stored delivery record.
     """
     from .execution_binding import bind_candidate, plain
     from .planning_problem import TimeBindingError
     started = time.monotonic()
     prior = planner = ledger = trajectory = None
+    incumbent = None
     initial_seconds = 0.
     motion_ready, motion_baseline = False, {}
     original_export = original_ik_solve = original_ik_rank = None
@@ -5309,10 +5423,12 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             return outcome
         # BEGIN seed, block and final candidates share one complete binding boundary.
         def qualify_candidate(trajectory, validation, attempt, *, binding_scene=None):
+            nonlocal incumbent
             if not attempt["accepted"] or validation is None:
                 raise ValueError("Only a completely validated candidate may enter execution binding")
-            diagnostics.update(executable_until=trajectory.executable_until,
-                               next_verification=trajectory.next_verification)
+            if incumbent is not None and attempt["fixed_objective"] >= incumbent["report"]["fixed_objective"]:
+                return False
+            bound_scene = scene if binding_scene is None else binding_scene
             binding = bind_candidate(trajectory, problem=problem, scene=scene if binding_scene is None else binding_scene,
                 validation=deepcopy(validation), native_report=attempt)
             for event in problem.events:
@@ -5347,13 +5463,49 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             # All work required to qualify and bind this candidate must
             # finish within budget. Cleanup after that fact is recorded,
             # but cannot erase an already available qualified candidate.
+            # BEGIN freeze all delivery data before a later query replaces native buffers.
+            binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
+            record = {"trajectory": deepcopy(trajectory), "binding": binding,
+                "report": deepcopy(attempt), "validation": deepcopy(validation),
+                "scene": bound_scene.describe(), "event_time_checks": deepcopy(diagnostics["event_time_checks"]),
+                "joint_reference": deepcopy(diagnostics.get("joint_reference")),
+                "reference_clock": deepcopy(diagnostics.get("reference_clock")),
+                "qualified_elapsed_seconds": None}
             check()
-            diagnostics["qualified_candidate_elapsed_seconds"] = time.monotonic()-started
-            outcome.success, outcome.trajectory, outcome.execution_binding = True, trajectory, binding
+            record["qualified_elapsed_seconds"] = time.monotonic()-started
+            incumbent = record
+            # END a completed record does not depend on the planner's last candidate.
+
             # BEGIN only a fully qualified candidate receives this readiness milestone.
             mark_wallclock("qualified_candidate_ready")
             # END report persistence and execution preflight are later stages.
             return True
+
+        def deliver_incumbent():
+            """Restore the selected curve's clock, evidence and binding as one record."""
+            outcome.success = True
+            outcome.trajectory = incumbent["trajectory"]
+            outcome.execution_binding = incumbent["binding"]
+            diagnostics.update(incumbent["report"], returned_candidate=deepcopy(incumbent["report"]),
+                scene=deepcopy(incumbent["scene"]), event_time_checks=deepcopy(incumbent["event_time_checks"]),
+                joint_reference=deepcopy(incumbent["joint_reference"]),
+                reference_clock=deepcopy(incumbent["reference_clock"]),
+                qualified_candidate_elapsed_seconds=incumbent["qualified_elapsed_seconds"],
+                executable_until=incumbent["trajectory"].executable_until,
+                next_verification=incumbent["trajectory"].next_verification)
+            return outcome
+
+        def qualify_native(result, attempt):
+            """Export immediately while the selected native validation still belongs to this curve."""
+            if not attempt["accepted"] or (incumbent is not None
+                    and attempt["fixed_objective"] >= incumbent["report"]["fixed_objective"]):
+                return
+            check()
+            curve, points = planner.export(result, attempt)
+            if points:
+                consumed["validation_passes"] += 1
+                consumed["validation_queries"] += points
+            qualify_candidate(curve, planner.last_validation, attempt)
 
         # BEGIN preserve a supplied polynomial before creating native proposals.
         if joint_reference is not None:
@@ -5370,13 +5522,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             diagnostics["joint_reference"] = {"source_curve_preserved": True,
                 "candidate_kind": "original_joint_curve", "source_duration_s": joint_reference.duration,
                 "bound_duration_s": candidate.duration}
+            diagnostics["reference_clock"] = {"duration": candidate.duration,
+                "sample_times_s": candidate.times.tolist(),
+                "scope": "Supplied polynomial retains its physical clock and bound progress map"}
             check()
             if reference_attempt["accepted"]:
                 qualify_candidate(candidate, planner.last_validation, reference_attempt, binding_scene=candidate_scene)
-                diagnostics.update(reference_candidate=deepcopy(reference_attempt), returned_candidate=deepcopy(reference_attempt),
-                    route="candidate_metrics", scene=candidate_scene.describe())
-                outcome.execution_binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
-                return outcome
+                diagnostics.update(reference_candidate=deepcopy(reference_attempt), route="candidate_metrics")
             # BEGIN explicit observation requests stop at the completed reference verdict.
             policy_failure = _unknown_policy_failure(reference_attempt, candidate_scene.unknown_policy)
             if policy_failure == "needs_observation":
@@ -5393,7 +5545,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     diagnostic_candidate_scope="Supplied joint curve; no execution authorization",
                     failure_scope="Supplied curve lacks current model support; other routes were not evaluated")
                 return outcome
-        # END only a supported, rejected reference enters finite shape repair.
+        # END the supplied curve remains eligible while native proposals improve reference fit.
         grid = _fixed_spline_grid(intervals=planner.budget.knots+4,
             native_dt=planner.budget.maximum_trajectory_dt, interpolation_steps=planner.budget.interpolation_steps,
             interpolation_dt=planner.budget.interpolation_dt)
@@ -5443,18 +5595,20 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             diagnostics["joint_reference"]["source_curve_preserved"] = same
             diagnostics["joint_reference"]["candidate_kind"] = "original_joint_curve" if same else "native_fitted_joint_reference"
         diagnostics["reference_candidate"] = deepcopy(attempt)
+        qualify_native(native_result, attempt)
         recovery = None
         # BEGIN observation policy stops only when completed evidence isolates coverage.
         observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
-        if not attempt["accepted"] and not observation_required:
+        if not observation_required:
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "main_solve"
             native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
             diagnostics["attempts"].append(deepcopy(attempt))
+            qualify_native(native_result, attempt)
             check()
             observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
-            if (not attempt["accepted"] and not observation_required
+            if (incumbent is None and not attempt["accepted"] and not observation_required
                     and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves):
                 # BEGIN mixed scene support/contact failures cannot consume collision recovery.
                 collision_failed = any(value > 0 for value in attempt["collision_residuals"].values())
@@ -5493,35 +5647,26 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     consumed["trajectory_solves"] += 1
                     native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
                     diagnostics["attempts"].append(deepcopy(attempt))
+                    qualify_native(native_result, attempt)
                     check()
         # END mixed failures retain ordinary optimization and recovery.
         diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})
-        if not attempt["accepted"]:
-            # BEGIN finite candidate failure is not proof that the fixed target is impossible.
-            diagnostics.update(failure=(_unknown_policy_failure(attempt, scene.unknown_policy)
-                or "no_feasible_solution_found"), diagnostic_trajectory=trajectory,
-                failure_scope="The selected candidate failed the declared requirements or unknown-space policy; "
-                    "its component evidence does not establish that every route to the fixed target fails")
-            # END external recovery receives evidence without changing the transfer target.
-            return outcome
-        stage = "delivery"
-        check()
-        trajectory, points = planner.export(native_result, attempt)
-        # BEGIN delivery reuses the candidate qualified before recovery routing.
-        # Selection has already charged interval queries. Export returns that
-        # exact curve and its completed validation; reported new work, if any,
-        # remains subject to the same request ledger.
-        if points:
-            consumed["validation_passes"] += 1
-            consumed["validation_queries"] += points
-        # END all physical checks remain required; no capacity is increased.
-        qualify_candidate(trajectory, planner.last_validation, attempt)
-        diagnostics["returned_candidate"] = deepcopy(attempt)
-        limits = planner._verification_native.get_cost("cspace").config.joint_limits
-        outcome.execution_binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
+        if incumbent is not None:
+            return deliver_incumbent()
+        # BEGIN completed finite search reports its selected failure evidence.
+        diagnostics.update(failure=(_unknown_policy_failure(attempt, scene.unknown_policy)
+            or "no_feasible_solution_found"), diagnostic_trajectory=trajectory,
+            failure_scope="The selected candidate failed the declared requirements or unknown-space policy; "
+                "its component evidence does not establish that every route to the fixed target fails")
         return outcome
-        # END success immediately delivers; optional quality work does not exist.
+        # END an executable result is delivered only by the completed incumbent record.
     except Exception as error:
+        # BEGIN improvement exhaustion preserves only work completed within budget.
+        if isinstance(error, PlanningWorkExhausted) and incumbent is not None:
+            diagnostics["improvement_end"] = {"reason": "cumulative_planning_budget_exhausted",
+                "stage": stage, "detail": str(error)}
+            return deliver_incumbent()
+        # END cancellation, deadlines and unexpected errors keep their own failure semantics.
         # BEGIN preserve the original failure stack without repeating any query.
         import traceback
         diagnostics.update(failure=(error.reason if isinstance(error, MotionPlanningError)

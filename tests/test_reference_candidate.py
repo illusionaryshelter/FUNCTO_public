@@ -1,9 +1,11 @@
-"""CPU contracts for preserving supplied curves at the shared delivery boundary.
+# BEGIN describe the actual qualification scope of these CPU fixtures.
+"""CPU contracts for immutable curves and complete candidate qualification.
 
-Native geometry numerics remain integration coverage. These tests substitute
-only its completed metric evidence, leaving request ordering, clock binding,
-Hermite/domain checks and the early-return policy in production code.
+Fixtures provide completed sampled and interval geometry evidence. Production
+request accounting, clock binding, Hermite interpolation and continuous joint
+domain checks determine the resulting candidate and its validation record.
 """
+# END geometric accuracy has separate native-scene and interval test coverage.
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -11,10 +13,12 @@ import numpy as np
 import pytest
 import torch
 
+# BEGIN qualification tests use the production cumulative-budget stop type.
 from manipulation.planning import (
-    JointTrajectory, PlanningBudget, _CuroboPlanner, _ProgressMap,
+    JointTrajectory, PlanningBudget, PlanningWorkExhausted, _CuroboPlanner, _ProgressMap,
     _candidate_sample_times, _phase_aligned_parameters,
 )
+# END the same exception reaches the real request's incumbent delivery path.
 from manipulation.planning_problem import PlanningEvent
 from test_motion_backend_contract import Native, Scene, problem, run
 
@@ -42,10 +46,13 @@ def supplied_curve():
         np.array([0., .3, .6, 1.]), np.array([0., .5, .5, 1.]), (), (), {})
 
 
-def candidate_fixture(*, accepted=True, components=None, native_outcomes=()):
+# BEGIN the candidate fixture separates completed sampled and interval evidence.
+def candidate_fixture(*, accepted=True, components=None, native_outcomes=(), interval_residual=0.):
+    """Exercise real qualification and accounting with explicit geometry results."""
     native = Native(native_outcomes)
     native.problem, native.scene, native.joint_names = problem(), Scene(), ("q",)
     native.start = SimpleNamespace(position=torch.zeros((1, 1)), velocity=torch.zeros((1, 1)))
+    native.anchors = np.array([0., 1.])
     for name in ("bind_reference_candidate", "evaluate_candidate", "_candidate_domain_validation"):
         setattr(native, name, MethodType(getattr(_CuroboPlanner, name), native))
 
@@ -55,24 +62,89 @@ def candidate_fixture(*, accepted=True, components=None, native_outcomes=()):
             "residuals": {"interpolated:process_scene": 0. if accepted else 1.},
             "scene_components": components or {}}, np.array([0., 1.]), 4
     native._candidate_metrics = Mock(side_effect=completed_metrics)
+    # BEGIN fixed objective evidence has the same explicit fixture ownership.
+    native._candidate_objective = Mock(return_value={
+        "fixed_objective": 1., "objective_components": {"fixture_reference": 1.}})
+    # END native cost numerics are covered by the reference-tracking tests.
+    # Interval geometry is a separate required consumer. These two completed
+    # endpoint queries are fixture evidence; production joint-domain checks,
+    # residual combination and remaining query-budget arithmetic stay real.
+    native._candidate_geometry = Mock(return_value={
+        "query_points": 2, "hard_scene_residual": interval_residual,
+        "scene_categories": {"collision": interval_residual}, "scene_components": {},
+        "scope": "CPU fixture of completed interval geometry evidence"})
     return native
+# END geometry accuracy is covered by the native scene and interval test modules.
 
 
-def test_supplied_curve_passes_without_any_fit_ik_or_optimization():
+# BEGIN a qualified original survives exhaustion while improvement is prepared.
+def test_supplied_curve_remains_immutable_when_improvement_budget_ends():
     reference = supplied_curve()
     originals = [value.copy() for value in (reference.times, reference.position, reference.velocity)]
     native = candidate_fixture()
+
+    def exhausted_improvement(joint_reference=None):
+        native.calls.append("seed")
+        # Later solver buffers are independent of the qualified delivery
+        # record. Mutate them to expose any retained alias to the incumbent.
+        native.delivery_candidate.position[:] = .8
+        native.last_validation = None
+        raise PlanningWorkExhausted("CPU fixture ends the admitted improvement work")
+
+    native.reference_seeds = exhausted_improvement
     result, backend = run(native, joint_reference=reference)
     try:
         assert result.success, result.diagnostics
-        assert native.calls == ["candidate"]
+        assert native.calls == ["candidate", "seed"]
         for actual, original in zip((result.trajectory.times, result.trajectory.position, result.trajectory.velocity), originals):
             np.testing.assert_array_equal(actual, original)
+        np.testing.assert_array_equal(result.trajectory.progress_u, reference.progress_u)
+        np.testing.assert_array_equal(result.trajectory.progress_s, reference.progress_s)
         assert result.diagnostics["joint_reference"]["source_curve_preserved"]
+        assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
+        assert result.diagnostics["improvement_end"]["reason"] == "cumulative_planning_budget_exhausted"
+        assert "failure" not in result.diagnostics
         counts = result.request_ledger["consumed_planning"]
-        assert counts["ik_batches"] == counts["trajectory_solves"] == 0
+        assert counts["ik_batches"] == 1 and counts["trajectory_solves"] == 0
+        assert result.execution_binding["request_ledger"]["consumed_planning"] == counts
     finally:
         backend.close()
+# END the original polynomial and progress map keep their completed qualification.
+
+
+# BEGIN a supplied incumbent participates in the same bounded main improvement.
+def test_supplied_curve_keeps_its_own_clock_when_native_improvements_score_worse():
+    reference = supplied_curve()
+    native = candidate_fixture(native_outcomes=(True, True))
+    native.joint_reference_report = {"source_curve_preserved": False,
+        "source_duration_s": reference.duration, "bound_duration_s": 2.}
+    native.curve = JointTrajectory(("q",), np.array([0., 2.]), np.zeros((2, 1)),
+        np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+    select = native.select_candidate
+
+    def worse_native_candidate(value):
+        result, curve, report = select(value)
+        report.update(fixed_objective=2., objective_components={"fixture_reference": 2.})
+        return result, curve, report
+
+    native.select_candidate = worse_native_candidate
+    result, backend = run(native, joint_reference=reference)
+    try:
+        assert result.success, result.diagnostics
+        assert native.calls == ["candidate", "seed", "reference", "solve"]
+        np.testing.assert_array_equal(result.trajectory.times, reference.times)
+        np.testing.assert_array_equal(result.trajectory.position, reference.position)
+        np.testing.assert_array_equal(result.trajectory.velocity, reference.velocity)
+        np.testing.assert_array_equal(result.trajectory.progress_u, reference.progress_u)
+        np.testing.assert_array_equal(result.trajectory.progress_s, reference.progress_s)
+        assert result.diagnostics["joint_reference"]["source_curve_preserved"]
+        assert result.diagnostics["joint_reference"]["bound_duration_s"] == reference.duration
+        assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
+        assert result.diagnostics["attempts"][0]["fixed_objective"] == 2.
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+    finally:
+        backend.close()
+# END finite ranking preserves the selected candidate's physical interpretation.
 
 
 # BEGIN supplied curves obey the same explicit policy as native candidate routes.
@@ -158,14 +230,29 @@ def test_nonuniform_query_grid_retains_every_original_piece_and_bounds_spacing()
     np.testing.assert_allclose(ddq[:, 0], .2, atol=1e-14)
 
 
-def test_completed_native_metrics_use_same_domain_boundary_without_requerying_scene():
-    native = candidate_fixture()
+# BEGIN reuse sampled metrics while independently checking continuous intervals.
+@pytest.mark.parametrize("interval_residual", [0., .01])
+def test_completed_native_metrics_reuse_samples_and_consume_interval_evidence(interval_residual):
+    native = candidate_fixture(interval_residual=interval_residual)
     native._candidate_metrics.side_effect = AssertionError("Completed metrics must not be recomputed")
-    curve, attempt, points = native.evaluate_candidate(supplied_curve(),
+    reference = supplied_curve()
+    curve, attempt, points = native.evaluate_candidate(reference,
         native_report={"accepted": True, "residuals": {"interpolated:process_scene": 0.}})
-    assert attempt["accepted"] and points == 0
-    assert native.last_validation["cubic_derivatives"]["acceleration"]["maximum_bound_excess"] == 0
+    assert attempt["accepted"] is (interval_residual == 0.)
+    assert points == 2
+    assert attempt["residuals"]["interval:process_scene"] == interval_residual
+    native._candidate_metrics.assert_not_called()
+    prior_points = len(reference.times)+len(
+        _ProgressMap(reference.progress_u, reference.progress_s).anchor_parameters(native.anchors))
+    native._candidate_geometry.assert_called_once_with(reference, native.scene,
+        remaining_points=native.budget.max_validation_points-prior_points)
+    if interval_residual == 0.:
+        assert native.last_validation["cubic_derivatives"]["acceleration"]["maximum_bound_excess"] == 0
+        assert native.last_validation["continuous_geometry"] == attempt["continuous_geometry"]
+    else:
+        assert native.last_validation is None
     assert curve is native.delivery_candidate
+# END a positive interval witness rejects the curve despite clear sampled metrics.
 
 
 def test_native_metric_failure_clears_explicit_candidate_context():
@@ -330,6 +417,9 @@ def test_process_manager_consumes_nonuniform_times_and_exact_source_anchor_state
                 "progress": torch.tensor([[0., .15, 1.]]).repeat(2, 1),
                 "anchor_u": torch.tensor([[.55, .65]]).repeat(2, 1),
                 "anchor_s": torch.tensor([[.55, .65]]).repeat(2, 1),
+                # BEGIN physical anchor instants accompany their sampled q/dq.
+                "anchor_times": torch.tensor([[1.1, 1.3]]).repeat(2, 1),
+                # END the consumer does not reconstruct time from rounded u.
                 "anchor_q": torch.tensor([[[4., 0.], [5., 0.]]]).repeat(2, 1, 1),
                 "anchor_dq": torch.zeros((2, 2, 2)), "scene_components": {}}
             fixture.manager.compute_costs(fixture.state)
@@ -366,28 +456,11 @@ def test_terminal_evidence_after_last_tick_is_typed_unchecked_without_native_all
     backend.close()
 
 
-def test_native_pair_replacement_keeps_complete_kinematic_policy_immutable():
-    from curobo._src.robot.types.self_collision_params import SelfCollisionKinematicsCfg
-    complete = SelfCollisionKinematicsCfg(num_spheres=3, sphere_padding=torch.zeros(3),
-        collision_pairs=torch.tensor([[0, 1], [0, 2], [1, 2]], dtype=torch.int16))
-    def cost():
-        return SimpleNamespace(config=SimpleNamespace(self_collision_kin_config=complete), enabled=True,
-            enable_cost=Mock(), disable_cost=Mock(), _batch_size=2)
-    regular, anchor = cost(), cost()
-    manager = SimpleNamespace(get_cost=lambda _: regular, _anchor_self_collision=anchor, _batch_size=2)
-    rollout = SimpleNamespace(_cost_manager_list=[manager])
-    solver = SimpleNamespace(core=SimpleNamespace(get_all_rollout_instances=lambda: [rollout]))
-    planner = _CuroboPlanner.__new__(_CuroboPlanner)
-    planner.torch, planner.ik = torch, solver
-    planner.trajopt = SimpleNamespace(core=solver.core, additional_metrics_rollouts={"dense": rollout})
-    planner._verification_native = manager
-    planner.scene = SimpleNamespace(native_self_collision_pairs=[[0, 2]])
-    planner._bind_native_self_collision_pairs()
-    torch.testing.assert_close(complete.collision_pairs, torch.tensor([[0, 1], [0, 2], [1, 2]], dtype=torch.int16))
-    for item in (regular, anchor):
-        torch.testing.assert_close(item.config.self_collision_kin_config.collision_pairs, torch.tensor([[0, 2]], dtype=torch.int16))
-        assert item._batch_size is None
-    assert manager._batch_size is None
+# BEGIN native robot pair policy is owned by the registered scene model.
+# test_native_scene_contract.test_scene_queries_only_required_pairs_and_serializes_complete_policy
+# exercises required, excluded and mechanical-contact pairs through the current
+# model query and serialization interface. This module covers candidate delivery.
+# END the existing model-policy regression owns this separate component contract.
 
 
 def test_regular_samples_and_exact_anchors_share_one_metric_buffer_capacity():

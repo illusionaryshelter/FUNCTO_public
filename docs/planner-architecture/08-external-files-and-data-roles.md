@@ -85,7 +85,11 @@
 
 `planning-report.json`、场景快照 NPZ、自过滤与分区文件记录计算结果。场景绑定中的 owner query 保存用于复现的几何及坐标；某文件以后被显式加载时，它同时成为该后续阶段的输入。来源路径和实际文件读取须分别说明。
 
-任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。事件 IK 报告保存原目标身份、物理时刻、候选关节状态及独立任务/场景结论；诊断中的 `functional_ik_chains` 保存有限事件序列，`functional_ik_event_fits` 保存事件等式拟合结果和实际插值误差。参考样本、所选事件状态与最终曲线分别记录。`LocalGeometryModels` 属于一次数值求解中的临时优化记录，来源是相同观测场和本块实际候选姿态；场景持久化仍保存原 TSDF 样本和关系声明。
+任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。事件 IK 报告保存原目标身份、物理时刻、候选关节状态及独立任务/场景结论；`functional_ik_chains` 以 `reference_seed_index/shortlist_index` 标明每条参考种子对应的有限事件序列，`selection_cost.normalized_reference_distance` 保存该序列的参考排名分量。`functional_ik_event_fits` 保存短名单逐项实际 QP 结果、插值误差、`reference_rms_joint_units` 及 `applied` 选择。参考样本、所选事件状态与最终曲线分别记录。
+
+完成固定评分的候选报告以 `fixed_objective/objective_components` 保存统一网格上的普通参考和关节成本；`returned_candidate` 指向实际返回曲线的完整验收报告。`native_metrics.rollout/interpolated.ordinary_costs` 分别保存两种实际网格已完成的积分值。`qualified_candidate_elapsed_seconds` 表示该候选在请求内完成验收、复制和执行绑定的时刻，`elapsed_seconds` 表示整次请求耗时。若后续改善预算耗尽，`improvement_end` 保存停止阶段和原因，正式曲线继续使用此前已完成资格的绑定；最终 `request_ledger.consumed_planning` 保存全部实际工作。原始曲线与原生改善曲线的时长、进度映射和来源分别随各候选保存。
+
+`NativeReferenceCost` 的目标缓存由完整技能参考、请求标定和候选时钟生成，供同次求解的重复成本计算使用。`LocalGeometryModels` 属于一次数值求解中的临时优化记录，来源是相同观测场和本块实际候选姿态；场景持久化仍保存原 TSDF 样本和关系声明。原叶节点点集与数值查询复用记录是这些已有模型的计算中间量。
 
 场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存原条件与实体关系的模型对应，独立于实际接触与效果记录。
 

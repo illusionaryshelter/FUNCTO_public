@@ -74,20 +74,28 @@ def test_extreme_failed_poses_do_not_change_warm_starts_or_fitted_seed_branches(
         torch.testing.assert_close(first, second, rtol=0., atol=0.)
 
 
+# BEGIN native reference observations retain independent static failure evidence.
 @pytest.mark.parametrize("failed_check", ["task_satisfied", "model_valid"])
-def test_pose_convergence_without_static_feasibility_is_not_a_solved_reference(failed_check):
+def test_native_reference_success_survives_each_static_failure_for_initialization(failed_check):
+    """A solved reference supplies an initial posture, not trajectory acceptance."""
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
     planner, constant, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(
         pools, flags, report_for=lambda row, success, parameter: {failed_check: False})
     seeds, counts = planner.reference_seeds()
     assert counts == [3]*6  # Native pose convergence is retained separately.
-    assert planner.reference_ik_distinct_counts == [0]*6
-    assert planner.reference_ik_chains == []
-    assert planner.initial_seed_strategies == ["measured_state_constant"]*2
-    assert constant.call_count == 2
+    assert planner.reference_ik_distinct_counts == [3]*6
+    assert len(planner.reference_ik_chains) == 2
+    assert all(strategy.startswith("reference_ik") for strategy in planner.initial_seed_strategies)
+    constant.assert_not_called()
     assert bool(torch.isfinite(seeds).all())
-    assert all(torch.equal(value[:, 0], planner.start.position) for value in warm_starts)
-    assert all(row["reference_status"] == "FAILED_REFERENCE" for row in planner.reference_ik_queries)
+    for query, record in enumerate(planner.reference_ik_queries):
+        assert record["reference_status"] == record["seed_status"] == "SOLVED"
+        assert all(not row["report"][failed_check] for row in record["candidates"])
+        expected = planner.start.position.numpy() if query == 0 else pools[query-1][flags[query-1]]
+        assert {tuple(row) for row in warm_starts[query].numpy()[0]} == {tuple(row) for row in expected}
+    failure_count = "static_task_failure_count" if failed_check == "task_satisfied" else "static_model_failure_count"
+    assert all(chain["selection_cost"][failure_count] == len(pools) for chain in planner.reference_ik_chains)
+# END later complete task and geometry checks determine whether a curve can execute.
 
 
 def test_broken_native_values_keep_json_safe_failure_and_convergence_evidence():

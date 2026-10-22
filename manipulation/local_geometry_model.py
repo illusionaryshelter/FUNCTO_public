@@ -6,6 +6,7 @@ One seed shares its records across every line-search particle and rollout.
 """
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -89,6 +90,27 @@ class LocalGeometryModels:
         self._states = {}
         self._pending = None
         self._previous_layout = None
+        # BEGIN only an explicitly repeated base may share original queries.
+        self.repeated_base = False
+        # END ordinary line-search particles retain separate hard evidence.
+
+    # BEGIN the solver owns this scope because it constructs repeated actions.
+    @contextmanager
+    def repeated_base_evaluation(self):
+        """Declare identical particle inputs while keeping independent gradients.
+
+        The scene reuses numeric query records within one call only. It still
+        forms each row's scalar from that row's differentiable entity poses.
+        A trial evaluation never enters this scope merely because it has the
+        same physical-time layout as a base evaluation.
+        """
+        previous = self.repeated_base
+        self.repeated_base = True
+        try:
+            yield
+        finally:
+            self.repeated_base = previous
+    # END exceptions cannot leave a later trial in the repeated-base scope.
 
     def begin_capture(self, num_seeds, num_particles):
         """Start replacement from one actual base trajectory per seed."""

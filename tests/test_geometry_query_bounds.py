@@ -80,3 +80,36 @@ def test_prepared_bounds_preserve_full_same_pose_evidence(monkeypatch, translati
     reused = native.query_native_field(shape, pose, field, np.eye(4), native_bounds=prepared)
     assert reused == baseline
 # END reuse affects work organization, while original entities own evidence.
+
+
+# BEGIN finite permissions retain independent whole-entity separation bounds.
+@pytest.mark.parametrize("native_first", [False, True])
+def test_permission_cannot_remove_complete_entity_separation_evidence(native_first):
+    field = central_cell()
+    pose = np.eye(4)
+    pose[0, 3] = .1
+    whole = (np.vstack((np.eye(3), -np.eye(3))), np.ones(6))
+    permission = PairPermission(((whole, whole),))
+    if native_first:
+        result = native.query_native_field(coal.Box(.02, .02, .02), pose,
+                                           field, np.eye(4), permission=permission)
+    else:
+        result = query_distance(central_cell(), pose, field, np.eye(4), permission=permission)
+    assert result["status"] == "clear" and result["lower_m"] == 0.
+    assert .07999999 < result["full_entity_lower_m"] <= .08
+
+
+@pytest.mark.parametrize("native_first", [False, True])
+def test_permission_does_not_turn_overlapping_enclosures_into_a_collision(native_first):
+    field = central_cell()
+    whole = (np.vstack((np.eye(3), -np.eye(3))), np.ones(6))
+    permission = PairPermission(((whole, whole),))
+    if native_first:
+        result = native.query_native_field(coal.Box(.02, .02, .02), np.eye(4),
+                                           field, np.eye(4), permission=permission)
+    else:
+        result = query_distance(field, np.eye(4), field, np.eye(4), permission=permission)
+    assert result["status"] == "clear"
+    assert result["full_entity_lower_m"] == 0.
+    assert not result["intersection"]
+# END clipping changes permission evidence, never the complete geometric set.

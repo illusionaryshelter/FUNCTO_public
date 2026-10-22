@@ -436,7 +436,7 @@ class OnlinePlanningScene:
                     "permission_kind": permission_kind, **evidence})
         # END hard residuals and optional proof evidence have separate consumers.
         # BEGIN bind fixed local records by seed, physical time and relation mode.
-        states = {}
+        states, state_keys = {}, {}
         if query_role == "optimization":
             times_cpu, relation_cpu, permission_cpu = (
                 value.detach().cpu().numpy() for value in
@@ -445,7 +445,28 @@ class OnlinePlanningScene:
                 key = local_models.state_key(index[0], times_cpu[index],
                     relation_cpu[index], permission_cpu[index])
                 states[index] = local_models.state(key)
+                state_keys[index] = key
         # END line-search particles share records, never current query witnesses.
+        # BEGIN reuse numeric evidence only for explicitly repeated base inputs.
+        # Capture and block-boundary gradient calls repeat each actual seed.
+        # Query records are independent of autograd; every scalar below still
+        # uses the current row's poses. The dictionary belongs to this call,
+        # and its key retains the query column, seed, physical time and both
+        # relation modes. Distinct columns are never merged merely because
+        # their physical times round to the same native tensor value.
+        base_evidence = ({} if query_role == "optimization"
+                         and (local_models.capturing or local_models.repeated_base) else None)
+
+        def original_query(index, identity, query):
+            if base_evidence is None:
+                return query()
+            key = (identity, index[1], state_keys[index])
+            if key not in base_evidence:
+                base_evidence[key] = query()
+            # Local-model capture may annotate its own witness direction.
+            # That annotation does not mutate another particle's query record.
+            return dict(base_evidence[key])
+        # END ordinary trials always execute their own complete hard queries.
         hand_state, coordinates, half = None, None, None
         complete_q, complete_names = joint_position, tuple(joint_names)
         if self.gripper is not None:
@@ -524,8 +545,9 @@ class OnlinePlanningScene:
                         target_matrix = target_matrices[index]
                         world_normals = normals_cpu[index] @ target_matrix[:3, :3].T
                         world_bounds = bounds_cpu[index]+world_normals @ target_matrix[:3, 3]
-                        evidence = query_region_intersection(target_field, target_matrix,
-                            world_normals, world_bounds, check_request=self.check_request)
+                        evidence = original_query(index, ("contact", rule.rule_id),
+                            lambda: query_region_intersection(target_field, target_matrix,
+                                world_normals, world_bounds, check_request=self.check_request))
                     gap = zero[index] + float(evidence["status"] == "missing_contact")
                     # BEGIN the actual base captures one original target zero.
                     if (query_role == "optimization" and local_models.captures_row(index[0])
@@ -575,10 +597,11 @@ class OnlinePlanningScene:
         q_cpu = complete_q.detach().cpu().numpy()
         self_costs, self_unresolved = [], []
         for index in np.ndindex(tuple(progress.shape)):
-            evidence = self.robot_model.query(joint_names=complete_names,
-                joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
-                # BEGIN acceptance queries use the validator's existing required tuple.
-                pairs=self.robot_validator.required_pairs, check_request=self.check_request)
+            evidence = original_query(index, ("robot", "self"),
+                lambda: self.robot_model.query(joint_names=complete_names,
+                    joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
+                    # BEGIN acceptance queries use the validator's existing required tuple.
+                    pairs=self.robot_validator.required_pairs, check_request=self.check_request))
             # END robot_pairs retains the complete policy for serialization.
             value = zero[index]
             undecided = value
@@ -707,15 +730,25 @@ class OnlinePlanningScene:
                 # BEGIN prepare a world range only for an actual nonempty query.
                 native_bounds = None
                 if actor == "robot" and second.root is not None:
-                    key = (first_id, index)
+                    # BEGIN repeated bases also share their exact world range.
+                    key = (first_id, (index[1], state_keys[index])
+                           if base_evidence is not None else index)
+                    # END different seeds, times and relation sides stay distinct.
                     if key not in native_world_bounds:
                         native_world_bounds[key] = _native_bounds(first, _transform(fm[index]))
                     native_bounds = (self._native_local_bounds[first_id], native_world_bounds[key])
                 # END different partners share only the entity's geometric range.
-                value, evidence = pair_residual(first, (first_pose[0][index], first_pose[1][index]), fm[index],
-                    second, (second_pose[0][index], second_pose[1][index]), sm[index],
-                    permission=permission, check_request=self.check_request, zero=state_zero,
-                    native_bounds=native_bounds)
+                # BEGIN classification evidence can be shared; its zero cannot.
+                # pair_residual defines an intersection as one and all other
+                # classifications as zero. Reconnect that scalar separately
+                # to every row rather than broadcasting the first row's graph.
+                evidence = original_query(index, ("pair", component, first_id, second_id),
+                    lambda: pair_residual(first, (first_pose[0][index], first_pose[1][index]), fm[index],
+                        second, (second_pose[0][index], second_pose[1][index]), sm[index],
+                        permission=permission, check_request=self.check_request, zero=state_zero,
+                        native_bounds=native_bounds)[1])
+                value = state_zero + float(evidence["status"] == "intersection")
+                # END local-model derivatives below also use each row's poses.
                 residuals.append(value)
                 record_pair(index, component, first_id, second_id, evidence,
                     geometry_entity_key=entity_key,
@@ -766,9 +799,10 @@ class OnlinePlanningScene:
             unknown, unresolved = [], []
             rows = []
             for index in np.ndindex(tuple(progress.shape)):
-                evidence = query_coverage(owner.query, matrices[owner.owner_id][index],
-                    self.coverage, self.unknown_policy["conditional_regions"],
-                    check_request=self.check_request)
+                evidence = original_query(index, ("coverage", owner.owner_id),
+                    lambda: query_coverage(owner.query, matrices[owner.owner_id][index],
+                        self.coverage, self.unknown_policy["conditional_regions"],
+                        check_request=self.check_request))
                 unknown.append(float(evidence["status"] == "unknown_witness"))
                 unresolved.append(float(evidence["status"] == "unresolved"))
                 if evidence["status"] != "covered" and len(rows) < 8:

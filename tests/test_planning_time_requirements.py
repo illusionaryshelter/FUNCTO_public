@@ -530,7 +530,9 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
 
     def test_cleanup_overrun_keeps_an_already_qualified_candidate(self):
         from test_motion_backend_contract import Native, Scene
-        planner = Native([True])
+        # BEGIN the completed request includes one main reference improvement.
+        planner = Native([True, True])
+        # END cleanup still happens after complete qualification.
         clock = {"time": 0.}
         planner.close = lambda: clock.update(time=2.)
         with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]), \

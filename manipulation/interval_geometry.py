@@ -349,17 +349,22 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
                 continue
             relative = _add_up(speeds[key[1]], speeds[key[2]])
             finite_permission = any(row.get("permission_kind", "none") != "none" for row in (a, b))
-            if finite_permission:
-                failures.append({**item, "reason": "dynamic_permission"})
-                continue
-            distance = [row.get("lower_m") for row in (a, b)]
+            # BEGIN only complete entity domains prove an entire time span.
+            # Without a permission, lower_m already covers the full pair.
+            # A finite permission has a separate full-entity bound; its
+            # clipped distance cannot be used after that permission moves.
+            distance = [row.get("full_entity_lower_m")
+                        if row.get("permission_kind", "none") != "none"
+                        else row.get("lower_m") for row in (a, b)]
+            # END the existing relative motion bound remains the proof rule.
             change = _mul_up(relative, end-start)
             if (all(value is not None for value in distance)
                     and (max(distance) > change or min(distance) > _mul_up(change, .5))):
                 proofs.append({**item, "basis": "full_entity_distance_and_motion",
                                "endpoint_lower_m": distance, "relative_speed_m_s": relative})
             else:
-                failures.append({**item, "reason": "unresolved_separation"})
+                failures.append({**item, "reason": "dynamic_permission" if finite_permission
+                                 else "unresolved_separation"})
         if not failures:
             proved.append({**base, "pairs": proofs})
             continue

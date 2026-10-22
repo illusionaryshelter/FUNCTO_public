@@ -16,7 +16,7 @@ import test_manipulation_planning as _fixtures
 
 
 # BEGIN optimizer proposals require explicit same-query component evidence.
-def candidate_scene_evidence(terms, *, declared=frozenset({"collision/robot/background"})):
+def candidate_scene_evidence(terms):
     calls = []
     def evaluate(spheres, p, r, s, q, names, *, components_out, **kwargs):
         calls.append(1)
@@ -24,8 +24,7 @@ def candidate_scene_evidence(terms, *, declared=frozenset({"collision/robot/back
                                for name, value in terms.items()})
         return sum((value for name, value in components_out.items()
                     if not name.startswith("conditional/")), torch.zeros_like(s))
-    scene = SimpleNamespace(required_progress_anchors=(), evaluate=evaluate,
-                            native_collision_components=declared)
+    scene = SimpleNamespace(required_progress_anchors=(), evaluate=evaluate)
     s = torch.tensor([[0., 1.]])
     evidence = {}
     _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
@@ -37,24 +36,30 @@ def candidate_scene_evidence(terms, *, declared=frozenset({"collision/robot/back
     return evidence
 
 
-def test_pending_robot_world_candidate_requires_exact_declared_component():
-    terms = {"collision/robot/background": 1., "conditional/contact/uncertain": 100.}
-    assert not candidate_scene_evidence(terms)["optimizer_hard_invalid"].any()
-    assert candidate_scene_evidence(terms, declared=frozenset())["optimizer_hard_invalid"].all()
+# BEGIN registered-entity collision evidence has the same hard rule for every actor.
+@pytest.mark.parametrize("component", ["collision/robot/background", "collision/robot/self",
+                                       "collision/payload/background"])
+def test_entity_collision_is_hard_while_conditional_evidence_stays_separate(component):
+    terms = {component: [[0., 1.]], "conditional/contact/uncertain": 100.}
+    evidence = candidate_scene_evidence(terms)
+    assert evidence["optimizer_hard_invalid"].tolist() == [[0., 1.]]
+    assert evidence["optimizer_hard_value"].tolist() == [[0., 1.]]
+# END the scene query, rather than a component whitelist, supplies hard evidence.
 
 
 @pytest.mark.parametrize("hard", ["collision/robot/self", "collision/payload/background",
     "collision/robot/undeclared", "scene_update/background/robot", "unsupported/contact/robot/owner",
     "unknown/forbidden/robot", "contact/required/rule", "contact/material_band/rule", "gripper/controller"])
-def test_huge_confirmable_cost_cannot_hide_tiny_nonconfirmable_violation(hard):
-    # Float32 aggregate-minus-proxy would lose the 1e-30 term entirely.
-    evidence = candidate_scene_evidence({"collision/robot/background": 1e20, hard: 1e-30})
+def test_large_conditional_evidence_keeps_tiny_hard_violation(hard):
+    # Classification uses the actual hard component independently of the
+    # magnitude of the separate conditional observation.
+    evidence = candidate_scene_evidence({"conditional/collision/robot/background": 1e20, hard: 1e-30})
     assert evidence["optimizer_hard_invalid"].all()
 
 
 @pytest.mark.parametrize("component", ["collision/robot/background", "contact/required/rule"])
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
-def test_nonfinite_proxy_or_hard_component_is_never_pending_eligible(component, bad):
+def test_nonfinite_hard_component_remains_invalid(component, bad):
     assert candidate_scene_evidence({component: [[bad, 0.]]})["optimizer_hard_invalid"].tolist() == [[1., 0.]]
 
 
@@ -73,8 +78,7 @@ def test_candidate_evidence_retains_a_hard_violation_only_on_one_mode_side(hard_
         components_out["scene_update/background/robot"] = side.to(progress.dtype)*1e-30
         components_out["collision/robot/background"] = other.to(progress.dtype)*1e20
         return sum(components_out.values())
-    scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate,
-        native_collision_components=frozenset({"collision/robot/background"}))
+    scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)
     s = torch.tensor([[.5]])
     evidence = {}
     result = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
@@ -85,7 +89,7 @@ def test_candidate_evidence_retains_a_hard_violation_only_on_one_mode_side(hard_
     assert calls == [3], "Exact and both mode sides remain a single batched evaluation"
     assert result.item() == pytest.approx(1e20)
     assert evidence["optimizer_hard_invalid"].item() == 1.
-# END positive broad-phase evidence may be deferred; no original hard requirement is removed.
+# END exact and side-limit queries retain every original hard component.
 
 
 @pytest.mark.parametrize("category", ["scene_update/background/robot", "unsupported/contact/robot/owner",
@@ -159,8 +163,10 @@ def test_collision_mode_max_does_not_follow_support_max_or_change_its_gradient(d
 def collision_result():
     result = _fixtures.PlannerCandidateSelectionTests.native_candidates(flags=(False, False))
     constraints = result.metrics.costs_and_constraints.constraints
-    constraints.names = ["process_scene", "self_collision", "anchor_self_collision"]
-    constraints.values = [torch.ones(2, 9, 1)*100000., torch.zeros(2, 9, 1), torch.zeros(2, 9, 1)]
+    # BEGIN self, world and owner collisions share the registered-entity scene query.
+    constraints.names = ["process_scene"]
+    constraints.values = [torch.ones(2, 9, 1)*100000.]
+    # END the diagnostic fixture carries only current constraint ownership.
     # BEGIN all four channels have explicit seed/time identity.
     result.metrics.debug = torch.zeros(2, 9, 4)
     result.metrics.debug[..., 1] = 100000.
@@ -175,24 +181,18 @@ def test_support_only_dense_peaks_do_not_become_collision_witnesses():
     report = _dense_collision_witnesses(result, regular_horizon=9, anchor_parameters=(), capacity=4)
     # END the dense and ordinary layouts are validated independently.
     assert report["parameters"] == [] and report["peak_count"] == 0
-    assert _collision_metric_residuals(result.interpolated_metrics) == {
-        "scene_collision": 0., "self_collision": 0., "anchor_self_collision": 0.}
+    assert _collision_metric_residuals(result.interpolated_metrics) == {"scene_collision": 0.}
 
 
-@pytest.mark.parametrize("component", ["scene_collision", "self_collision", "anchor_self_collision"])
-def test_regular_only_collisions_remain_routable_and_do_not_invent_dense_times(component):
+def test_regular_only_collisions_remain_routable_and_do_not_invent_dense_times():
     result = collision_result()
-    if component == "scene_collision":
-        result.metrics.debug[1, 3, 0] = 2.
-    else:
-        constraints = result.metrics.costs_and_constraints.constraints
-        constraints.values[constraints.names.index(component)][1, 3] = 2.
+    result.metrics.debug[1, 3, 0] = 2.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     native = planner.native_diagnostics(result, seed_index=1)
-    assert native["rollout"]["collision_residuals"][component] == 2.
+    assert native["rollout"]["collision_residuals"]["scene_collision"] == 2.
     assert all(value == 0 for value in native["interpolated"]["collision_residuals"].values())
     selected = _trajectory_candidate(result, 1)
-    assert _collision_metric_residuals(selected.metrics)[component] == 2.
+    assert _collision_metric_residuals(selected.metrics)["scene_collision"] == 2.
     # BEGIN retain the ordinary positive's actual nine-point time layout.
     assert _dense_collision_witnesses(selected, regular_horizon=9, anchor_parameters=(), capacity=4)["parameters"] == []
     # END ordinary-only evidence cannot invent a missing dense interval.
@@ -389,3 +389,28 @@ def test_native_diagnostics_still_retain_nonfinite_float_convergence(nonfinite):
         if not np.isnan(nonfinite):
             assert actual == nonfinite
 # END discrete diagnostics cannot hide or sanitize nonfinite floating evidence.
+
+
+# BEGIN ordinary-cost diagnostics retain their native grid and selected seed.
+def test_ordinary_cost_diagnostics_sum_each_selected_seed_and_sampling_grid():
+    from curobo._src.rollout.metrics import CostCollection
+
+    result = collision_result()
+    for metrics, values in ((result.metrics, (2., 5.)),
+                            (result.interpolated_metrics, (3., 7.))):
+        ordinary = CostCollection()
+        ordinary.add(torch.tensor(values)[:, None, None].expand(2, 9, 2),
+                     "reference_pose")
+        ordinary.add(torch.tensor(values)[:, None, None].expand(2, 9, 1)*.5,
+                     "joint_regularization")
+        metrics.costs_and_constraints.costs = ordinary
+    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    selected = planner.native_diagnostics(result, seed_index=1)
+    combined = planner.native_diagnostics(result)
+    for grid, selected_value, total in (("rollout", 5., 7.), ("interpolated", 7., 10.)):
+        assert selected[grid]["ordinary_costs"] == {
+            "reference_pose": 18*selected_value, "joint_regularization": 4.5*selected_value}
+        assert combined[grid]["ordinary_costs"] == {
+            "reference_pose": 18*total, "joint_regularization": 4.5*total}
+        assert selected[grid]["collision_residuals"] == {"scene_collision": 0.}
+# END existing scene constraints remain separate from ordinary-cost integrals.

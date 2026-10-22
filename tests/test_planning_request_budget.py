@@ -192,7 +192,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
             backend.close()
 
     def test_delivery_that_reports_new_queries_still_consumes_a_pass(self):
-        native = Native([True])
+        native = Native([True, True])
         export = native.export
 
         def queried_delivery(*args):

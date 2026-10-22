@@ -98,6 +98,9 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
     and world bounds only for this query pose. A standalone query computes
     these bounds directly. Returned distance bounds concern unpermitted point
     pairs at this pose; changing a contact permission changes that domain.
+    ``full_entity_lower_m`` independently bounds complete-entity separation.
+    With a permission it uses the unchanged entities' whole-set enclosures;
+    without one the complete query can supply a tighter bound.
     """
     # BEGIN positive clearance is not part of represented-entity collision.
     precision = float(precision_m)
@@ -111,9 +114,13 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
     # BEGIN retain bounds from every separated search domain, not one leaf.
     separated_lower = np.inf
     # END permitted or empty domains do not contribute a finite distance.
+    full_entity_lower = None
 
     def report(status, lower, *, intersection=None, empty=False):
         output = dict(status=status, lower_m=lower,
+            # BEGIN complete-entity evidence has its own unambiguous domain.
+            full_entity_lower_m=lower if permission is None else full_entity_lower,
+            # END possible enclosure overlap is never collision evidence.
             upper_m=None if not np.isfinite(upper) else float(upper),
             intersection=intersection, queries=visits,
             witness_first=None, witness_second=None,
@@ -139,17 +146,22 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
     else:
         native_local, native_world = native_bounds
     # END reuse concerns only geometry bounds, never query classification.
+    # BEGIN retain the same whole-field range for the root query and proof.
+    root = field.nodes[field.root]
+    field_world = world_bounds(root.lower, root.upper, field_pose)
+    full_entity_lower = box_distance(native_world, field_world)
+    # END this independent bound survives finite permission clipping.
 
     def push(native_box, node, partitioned=False):
         nonlocal separated_lower
         if permission is not None and permission.excludes_cells(-1, node.cell):
             return
         wa = native_world if not partitioned else world_bounds(*native_box, native_pose)
-        wb = world_bounds(node.lower, node.upper, field_pose)
+        wb = field_world if node is root else world_bounds(node.lower, node.upper, field_pose)
         policy = "forbidden" if permission is None else permission.boxes(wa, wb)
         if policy == "permitted":
             return
-        lower = box_distance(wa, wb)
+        lower = full_entity_lower if node is root and not partitioned else box_distance(wa, wb)
         if lower > 0:
             separated_lower = min(separated_lower, lower)
             return
@@ -166,7 +178,7 @@ def query_native_field(geometry, native_pose, field, field_pose, *,
             0. if policy == "mixed" else diameter, next(serial),
             native_box, node, wa, wb, policy, partitioned))
 
-    push(native_local, field.nodes[field.root])
+    push(native_local, root)
     while pending:
         lower, _, _, _, native_box, node, wa, wb, policy, partitioned = heapq.heappop(pending)
         visits += 1

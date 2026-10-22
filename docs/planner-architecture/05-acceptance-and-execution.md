@@ -10,9 +10,11 @@
 
 普通任务指标与连续关节域通过后，`evaluate_candidate` 调用 `_candidate_geometry`，以同一原曲线继续检查几何时间区间。`SceneMotionBounds.from_scene` 绑定完整机器人关节树、官方实体局部范围、原 owner TSDF 范围、工具标定和声明附着。`geometry_motion_bound` 中的局部包围球仅把关节转动上界转为实体点运动上界；实际碰撞查询仍使用原形状。机械臂速度由保存的 Hermite 多项式导数的 Bernstein 包络给界，名义手指曲线在其有效时间范围内提供手指速度，独立 owner 路径由原插值或机构坐标速率提供界。释放后的实体按该候选释放位姿保持静止。
 
-`check_interval_geometry` 以进度映射折点、实体路径折点、关系事件及手指模型有效边界划分时间。端点证据的 `geometry_entity_key` 将机器人、任务实体和背景分别标为 `robot/<ID>`、`owner/<ID>`、`background`；速度表和配对缓存使用相同键。对区间长度 `Δt`，记两个实体的点速度上界为 `v_A,v_B`，令 `L=v_A+v_B`；端点完整实体距离下界为 `d_0,d_1`。`max(d_0,d_1)>LΔt` 或 `min(d_0,d_1)>LΔt/2` 可证明本区间分离。声明刚性组合体的内部对和空已表示集合分别保存其依据。有限接触许可只提供当前未许可点对域的距离，区间检查将这种变化域记录为 `dynamic_permission`。
+`check_interval_geometry` 以进度映射折点、实体路径折点、关系事件及手指模型有效边界划分时间。端点证据的 `geometry_entity_key` 将机器人、任务实体和背景分别标为 `robot/<ID>`、`owner/<ID>`、`background`；速度表和配对缓存使用相同键。对区间长度 `Δt`，记两个实体的点速度上界为 `v_A,v_B`，令 `L=v_A+v_B`；端点完整实体距离下界为 `d_0,d_1`。`max(d_0,d_1)>LΔt` 或 `min(d_0,d_1)>LΔt/2` 可证明本区间分离。声明刚性组合体的内部对和空已表示集合分别保存其依据。
 
-未取得上述证明的区间按实体最大位移继续二分，直到位移上界不超过 `validation_spatial_step_m`、时间无法再分或共享查询容量用尽，保留为 `unresolved_intervals`。新增查询调用原多项式、完整 FK 和相同场景，同时带入该曲线所需释放锚点及同一物理时刻的关系左右侧；进度平台只在入口使用左侧、出口使用右侧。查询发现实际交叠后，保存见证并将其余待查区间记为 `not_checked_after_intersection`。`proved_intervals`、`confirmed_intersections`、`unresolved_intervals`、实际查询数量与时刻共同构成报告。
+存在有限接触或初始支撑许可的端点使用独立的 `full_entity_lower_m`，该界由许可裁剪前的完整实体计算；无许可端点使用覆盖完整实体对的 `lower_m`。因此，完整实体范围已经足够分离的区间可以沿用上述证明。其余具有变化许可域的实体对保留 `dynamic_permission`，受许可裁剪的静态距离仅描述本次姿态下的未许可点对域。
+
+未取得上述证明的区间按实体最大位移继续二分，直到位移上界不超过 `validation_spatial_step_m`、时间无法再分或共享查询容量用尽，保留为 `unresolved_intervals`。新增查询调用原多项式、完整 FK 和相同场景，并计算同一物理时刻的关系左右侧；进度平台只在入口使用左侧、出口使用右侧。第一次查询同时计算该曲线所需的释放锚点，后续细分从候选私有场景读取相同预测释放位姿。查询发现实际交叠后，保存见证并将其余待查区间记为 `not_checked_after_intersection`。`proved_intervals`、`confirmed_intersections`、`unresolved_intervals`、实际查询数量与时刻共同构成报告。
 
 报告范围 `continuous_declared_geometry_model` 指输入数值所描述的连续运动与实体模型。该模型界的含义独立于设备浮点 FK 舍入和实际控制跟踪误差。空间细分截止、未知运动或容量不足均保留未决状态；它们不被解释为连续分离，也不新增碰撞拒绝。新增实际场景正残差以 `interval:process_scene` 进入原验收条件和恢复路径。`validation_joint_step` 继续用于 OMPL 连接检查。
 
@@ -22,13 +24,17 @@
 
 `_candidate_domain_validation` 独立检查保存曲线的入口 `q0,dq0` 及连续关节范围。`cubic_position_report` 对每个标量三次段求位置极值；速度范围来自导数极值；`cubic_derivative_report` 检查每段两端的加速度，并分别包含内部结点左右极限。`JointTrajectory.sample` 通过保存的 `CubicHermiteSpline` 返回 `q,dq,ddq,s`，在内部结点采用右段导数，在最终端点采用左极限。
 
-`evaluate_candidate` 汇总已完成任务指标、连续关节域和区间几何报告。已有 `native_report` 时复用普通与密集指标，并继续检查保存多项式及入口；区间查询消费剩余 `max_validation_points` 容量，包括重复计算的必要释放锚点。所有实际硬残差须为有限数且不大于零。成功候选仍可携带未决几何区间，其范围和原因随结果保存。`select_candidate` 在选择可交付候选前完成这些计算，实际区间碰撞可以进入原有限恢复流程；`export` 返回已完成验收的 `delivery_candidate` 与零新增查询数。
+`evaluate_candidate` 汇总已完成任务指标、连续关节域和区间几何报告。已有 `native_report` 时复用普通与密集指标，并继续检查保存多项式及入口；区间查询消费剩余 `max_validation_points` 容量，包括第一次查询中的必要释放锚点。所有实际硬残差须为有限数且不大于零。成功候选仍可携带未决几何区间，其范围和原因随结果保存。`select_candidate` 在选择可交付候选前完成这些计算，实际区间碰撞可以进入原有限恢复流程；`export` 返回已完成验收的 `delivery_candidate` 与零新增查询数。
 
 ## 2. 结果结构与输入身份
 
 `PlanningResult` 保存 `success`、`trajectory`、`diagnostics`、`execution_binding`、`request_ledger`。成功结果的 `trajectory` 为 `JointTrajectory`；其具名关节、时间、位置、速度、进度映射、原事件、条件、手指曲线及已满足依赖共同定义可执行内容。失败候选以 `diagnostics.diagnostic_trajectory` 保存，用于解释残差。
 
 `execution_binding.bind_candidate` 接受候选、任务、场景、导出验收和原生报告，生成 `candidate_id`，并保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 和同身份验收记录。`curve_snapshot` 还保存实际多项式系数、可执行终点和首个显式效果依赖对应的边界。`plain` 将 NumPy 与公开 dataclass 字段转换为明确的普通数据；无界区间使用具名 JSON 表达。
+
+`plan_trajectory` 将已完成执行绑定的曲线保存为独立最佳候选记录，包含原多项式副本、固定评分与分项、验收、候选场景、事件时间检查及资格完成时间。调用者的原关节曲线可具有自己的物理时长、进度平台和手指时钟；原生改善候选使用已绑定的三次基时钟。每条记录中的曲线、关系、命令和验收共同定义该候选。新候选完成这些计算且固定评分更低时才替换记录，后续求解器暂存值与记录分别保存。
+
+累计工作预算在记录完整构造后检查。已有合格记录时，改善工作遇到 `PlanningWorkExhausted`，结果仍为成功并从该记录恢复曲线与绑定；`diagnostics.improvement_end` 保存改善停止的阶段和原因。没有合格记录时，相同异常产生预算失败。取消、外部截止时间及其他计算异常保留其失败语义。所有返回路径在 `finally` 中保存真实累计工作，资格完成时间与整次请求结束时间分别记录。
 
 `check_result` 要求正式成功结果及完成的验收，读取 `validation.native.accepted` 和导出报告中的有限非正残差，然后核对候选身份、曲线、原始输入、时间和执行范围的一致性。这里消费轨迹验收已完成的结论；完整名义条件继续作为任务输入保存。可选 `execution_limits` 对照已绑定设备限制。返回独立字典副本，供执行入口消费。
 
@@ -79,7 +85,8 @@
 | `needs_observation` | 当前未知空间策略要求取得相关新观察，且完成的分项证据支持该分类 | 覆盖与条件未知分项、涉及对象和样本 |
 | `no_feasible_solution_found` | 有限候选与有限求解工作结束后，所选候选仍不满足声明条件 | 分项残差、种子来源、诊断曲线、搜索记录 |
 | `cancelled` / `deadline_exceeded` | 调用者取消或外部请求期限到达 | 失败阶段、已消耗工作、最后完成候选 |
-| `cumulative_planning_budget_exhausted` | 累计数值工作或请求时间达到预算 | 原预算、累计计数、当前运动块消耗 |
+| 成功且 `improvement_end.reason='cumulative_planning_budget_exhausted'` | 改善预算耗尽前已有完成验收和执行绑定的候选 | 返回候选的评分、完整资格时间、改善停止阶段及最终累计工作 |
+| `cumulative_planning_budget_exhausted` | 累计数值工作或请求时间达到预算，尚无完整合格候选 | 原预算、累计计数、当前运动块消耗 |
 | `continuation_binding_gap` | 续规划数据与原事件/义务/反馈契约无法对应 | 具体绑定错误及原历史 |
 | `event_time_requirement_unsatisfied` | 原事件物理时间要求无法成立 | 时间窗口、发生次数、相关原点 |
 | `physical_domain_initializer_not_constructed` | 在固定入口和物理关节域内未构造出本次需要的初值 | 关节域、入口和构造错误 |

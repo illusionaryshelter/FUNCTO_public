@@ -105,6 +105,27 @@ def test_finite_permission_lower_bound_cannot_be_used_as_whole_entity_separation
     assert all(row["pairs"][0]["reason"] == "dynamic_permission" for row in result["unresolved_intervals"])
 
 
+# BEGIN independent complete-entity evidence can prove a permitted pair clear.
+def test_finite_permission_uses_separate_full_entity_bound_without_subdivision():
+    query = callback(lambda time, side: [pair(lower_m=0., full_entity_lower_m=.04,
+                                              permission_kind="finite_region")])
+    result = check_interval_geometry(trajectory(), ConstantMotion(), query,
+        max_query_points=2, spatial_step_m=.001)
+    assert result["query_points"] == 2 and len(query.calls) == 1
+    assert len(result["proved_intervals"]) == 1
+    assert not result["unresolved_intervals"] and not result["confirmed_intersections"]
+
+
+def test_large_clipped_bound_cannot_replace_inconclusive_complete_entity_bound():
+    query = callback(lambda time, side: [pair(lower_m=100., full_entity_lower_m=0.,
+                                              permission_kind="finite_region")])
+    result = check_interval_geometry(trajectory(), ConstantMotion(), query,
+        max_query_points=40, spatial_step_m=.001)
+    assert not result["proved_intervals"] and not result["confirmed_intersections"]
+    assert result["unresolved_intervals"] and result["query_points"] == 33
+# END enclosure overlap remains unresolved under the existing sampling rule.
+
+
 def test_actual_anchor_points_consume_shared_budget_and_capacity_remains_unresolved():
     query = callback(lambda time, side: [pair(lower_m=0.)], anchor_cost=1)
     result = check_interval_geometry(trajectory(), ConstantMotion(), query,

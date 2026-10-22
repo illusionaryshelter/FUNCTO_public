@@ -145,6 +145,9 @@ class _Node:
     upper: np.ndarray
     children: tuple = ()
     cell: int = -1
+    # BEGIN original leaves own immutable local points; refined nodes do not.
+    points: object = None
+    # END node identity and bounds determine whether precomputation applies.
 
 
 class ObservedField:
@@ -202,6 +205,9 @@ class ObservedField:
         # of map size. Subdivision later uses the same scalar tighten method.
         cell_lower, cell_upper = self._initial_cell_bounds()
         # END the indexed set and its floating-point bounds remain identical.
+        # BEGIN precompute original-leaf material once in bounded NumPy batches.
+        leaf_points = self._initial_occupied_points(cell_lower, cell_upper)
+        # END world poses and dynamic subdivisions never enter this storage.
 
         def build(node):
             indices = self.tree.indices[node.start_idx:node.end_idx]
@@ -214,7 +220,7 @@ class ObservedField:
                 for index in indices:
                     children.append(len(self.nodes))
                     self.nodes.append(_Node(cell_lower[index], cell_upper[index],
-                                            cell=int(index)))
+                                            cell=int(index), points=leaf_points[index]))
             else:
                 children = [build(node.lesser), build(node.greater)]
             self.nodes[identity] = _Node(lower, upper, tuple(children))
@@ -230,6 +236,9 @@ class ObservedField:
             self.values, self.observed, self.valid_cells, self.cells,
             self.cell_origins, self._cell_values, self._zero_cell_ids,
             self._boundary_only_cells)) + 256 * len(self.nodes)
+        # BEGIN each point array and its ndarray header remain scene-owned.
+        self.storage_nbytes += sum(points.nbytes + 128 for points in leaf_points)
+        # END this storage participates in the existing request admission.
         if self._zero_tree is not None:
             self._zero_tree.data.flags.writeable = False
             self.storage_nbytes += self._zero_tree.data.nbytes + self._zero_tree.indices.nbytes
@@ -280,6 +289,52 @@ class ObservedField:
                             np.nextafter(value + error, np.inf))
         return lower, upper
     # END vectorization changes construction cost, not represented geometry.
+
+    # BEGIN original-leaf precomputation retains occupied_points ordering.
+    def _initial_occupied_points(self, lower, upper):
+        """Batch the same corner, original-sample and edge-root arithmetic.
+
+        Only the immutable original leaves use these arrays. Query-time
+        subdivision still evaluates its own smaller bounds with the scalar
+        method below. Batches bound temporary storage independently of field
+        size, and each retained array contains only that leaf's actual points.
+        """
+        output = []
+        edge_a, edge_b = np.asarray(_EDGES).T
+        for start in range(0, len(self.cells), 1024):
+            stop = min(start + 1024, len(self.cells))
+            cells = np.arange(start, stop)
+            lo, hi = lower[start:stop], upper[start:stop]
+            corners = lo[:, None] + CORNERS * (hi - lo)[:, None]
+            values, _, errors = self.cell_value(cells[:, None], corners)
+            original = self.cell_origins[cells, None] + CORNERS * self.voxel_size
+            inside = ((original >= lo[:, None]) & (original <= hi[:, None])).all(-1)
+            points = np.empty((len(cells), 16 + len(_EDGES), 3))
+            kept = np.zeros(points.shape[:2], dtype=bool)
+            points[:, :8], points[:, 8:16] = corners, original
+            kept[:, :8] = values <= -errors
+            kept[:, 8:16] = inside & (self._cell_values[cells] <= 0)
+            rows, edges = np.nonzero(values[:, edge_a] * values[:, edge_b] < 0)
+            if len(rows):
+                a, b = edge_a[edges], edge_b[edges]
+                va, vb = values[rows, a], values[rows, b]
+                fraction = va / (va - vb)
+                point = corners[rows, a] + fraction[:, None] * (corners[rows, b] - corners[rows, a])
+                negative_index = np.where(va < 0, a, b)
+                negative = corners[rows, negative_index]
+                v, _, e = self.cell_value(cells[rows], point)
+                fraction = np.minimum(1., np.maximum(64 * _EPS,
+                    4 * (np.abs(v) + e) / np.abs(values[rows, negative_index])))
+                point = point + fraction[:, None] * (negative - point)
+                v, _, e = self.cell_value(cells[rows], point)
+                points[rows, 16 + edges] = point
+                kept[rows, 16 + edges] = v <= -e
+            for row in range(len(cells)):
+                local = points[row, kept[row]]
+                local.flags.writeable = False
+                output.append(local)
+        return output
+    # END precomputation changes neither membership tests nor zero-root seeds.
 
     @property
     def bounds(self):
@@ -386,6 +441,10 @@ class ObservedField:
         """Return points belonging to the local cell set, including zero roots."""
         if node.cell < 0:
             return np.empty((0, 3))
+        # BEGIN only the original immutable leaf carries precomputed points.
+        if node.points is not None:
+            return node.points
+        # END refined nodes retain the same bound-dependent scalar query.
         points = box_corners(node.lower, node.upper)
         values, _, errors = self.cell_value(node.cell, points)
         kept = list(points[values <= -errors])
@@ -488,11 +547,18 @@ def query_distance(first, first_pose, second, second_pose, *,
         raise ValueError("Penetration queries need positive finite numerical precision")
     if first.root is None or second.root is None:
         return {"status": "clear", "lower_m": None, "upper_m": None, "empty_set": True,
+                "full_entity_lower_m": None,
                 "intersection": False, "queries": 0, "witness_first": None,
                 "witness_second": None, "scope": "represented_observed_occupancy",
                 "distance_scope": "unpermitted_point_pairs_at_query_pose"}
     poses = (np.asarray(first_pose, float), np.asarray(second_pose, float))
     fields = (first, second)
+    # BEGIN a separate whole-entity enclosure precedes permission clipping.
+    roots = first.nodes[first.root], second.nodes[second.root]
+    root_world = tuple(world_bounds(node.lower, node.upper, pose)
+                       for node, pose in zip(roots, poses))
+    full_entity_lower = box_distance(*root_world)
+    # END a zero lower bound is inconclusive, never an intersection verdict.
     pending, serial = [], count()
     upper, witness = math.inf, None
     unresolved_lower = math.inf
@@ -505,11 +571,12 @@ def query_distance(first, first_pose, second, second_pose, *,
         nonlocal separated_lower
         if permission is not None and permission.excludes_cells(a.cell, b.cell):
             return
-        wa, wb = world_bounds(a.lower, a.upper, poses[0]), world_bounds(b.lower, b.upper, poses[1])
+        wa = root_world[0] if a is roots[0] else world_bounds(a.lower, a.upper, poses[0])
+        wb = root_world[1] if b is roots[1] else world_bounds(b.lower, b.upper, poses[1])
         policy = "forbidden" if permission is None else permission.boxes(wa, wb)
         if policy == "permitted":
             return
-        lower = box_distance(wa, wb)
+        lower = full_entity_lower if a is roots[0] and b is roots[1] else box_distance(wa, wb)
         if lower > 0:
             separated_lower = min(separated_lower, lower)
         else:
@@ -522,7 +589,7 @@ def query_distance(first, first_pose, second, second_pose, *,
                 0. if policy == "mixed" else diameter, next(serial), a, b, wa, wb))
             # END only traversal order changes; every geometric bound is retained.
 
-    push(first.nodes[first.root], second.nodes[second.root])
+    push(*roots)
     while pending:
         lower, _, _, _, a, b, wa, wb = heapq.heappop(pending)
         visits += 1
@@ -587,6 +654,7 @@ def query_distance(first, first_pose, second, second_pose, *,
                             (point, point), (point, point)) != "forbidden":
                         continue
                     return {"status": "intersection", "lower_m": 0., "upper_m": 0.,
+                            "full_entity_lower_m": 0.,
                             "intersection": True, "queries": visits,
                             "witness_first": point.tolist(), "witness_second": point.tolist(),
                             "scope": "represented_observed_occupancy",
@@ -618,6 +686,9 @@ def query_distance(first, first_pose, second, second_pose, *,
     # END finite permission regions remain specific to this query's pose.
     return {"status": "unresolved" if unresolved else "clear",
             "lower_m": lower,
+            # BEGIN unclipped queries may retain their tighter whole-set bound.
+            "full_entity_lower_m": lower if permission is None else full_entity_lower,
+            # END a clipped domain never substitutes for the complete entities.
             "upper_m": upper if np.isfinite(upper) else None,
             "intersection": None if unresolved else False,
             "queries": visits,

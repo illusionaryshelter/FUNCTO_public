@@ -208,7 +208,8 @@ class PhysicalGradientCore(GradientOptCore):
         self._candidate_objective.fill_(float("inf"))
         self._candidate_valid.zero_()
         # BEGIN initial and ordinary line searches share a captured base model.
-        self._refresh_local_geometry(action)
+        if self._local_geometry_models is not None:
+            self._refresh_local_geometry(action)
         # END no trial-dependent geometry direction enters the first gradient.
 
     def _refresh_local_geometry(self, action):
@@ -218,13 +219,13 @@ class PhysicalGradientCore(GradientOptCore):
         same ``optimizer_rollout_configs[i]``. FUNCTO binds the same cubic
         clock and process manager to those instances. Their geometry query
         layouts therefore coincide, and the ordinary rollout captures the
-        model shared by initial and ordinary gradient callbacks. Capture
-        values never enter ranking or a line search.
+        model shared by initial and ordinary gradient callbacks. The same
+        completed rollout also supplies original hard evidence and a fixed
+        candidate score at block boundaries. Its changing local-model value
+        never enters candidate ranking or a line search.
         """
         models = self._local_geometry_models
         count, particles = self.config.num_problems, self.config.num_particles
-        if models is None:
-            return torch.zeros(count, dtype=torch.bool, device=action.device)
         base = action.detach().view(count, self.action_horizon, self.action_dim)
         repeated = base[:, None].expand(-1, particles, -1, -1).contiguous().flatten(0, 1)
         models.begin_capture(count, particles)
@@ -234,14 +235,16 @@ class PhysicalGradientCore(GradientOptCore):
                 # SolverCore's shared optimizer rollout configuration is the
                 # construction contract; the initial callback reads this store.
                 self._check_request()
-                self.rollout_fn.evaluate_action(repeated, use_cuda_graph=False)
+                trajectories = self.rollout_fn.evaluate_action(repeated, use_cuda_graph=False)
                 # END both gradient entry points consume these frozen records.
             changed = models.finish_capture()
         except BaseException:
             models.abort_capture()
             raise
         self._check_request(wait_for_device=True)
-        return torch.as_tensor(changed, dtype=torch.bool, device=action.device)
+        # BEGIN the exact capture query owns reusable hard candidate evidence.
+        return torch.as_tensor(changed, dtype=torch.bool, device=action.device), trajectories
+        # END no second observation of the same base is required.
 
     @torch.no_grad()
     def _retain_sampled_candidate(self, action, feasible, objective):
@@ -286,14 +289,18 @@ class PhysicalGradientCore(GradientOptCore):
         count, particles = self.config.num_problems, self.config.num_particles
         base = state.exploration_action.detach().clone()
         repeated = base[:, None].expand(-1, particles, -1, -1).contiguous().view(count, particles, self.opt_dim)
-        # BEGIN the old objective supplies residuals and candidate evidence only.
-        # Its gradient is never consumed after the multipliers change. Keep the
-        # exact exploration base and candidate-retention side effect, but do
-        # not construct an autograd graph for this observation.
+        # BEGIN capture and hard evidence consume the same actual base query.
+        # Hard residuals and fixed ranking exclude the local geometry cost,
+        # so this query can capture the replacement model and supply both.
+        # A changed objective still receives a new gradient below.
         self._check_request()
         with torch.no_grad():
             action = repeated.view(count * particles, self.action_horizon, self.action_dim)
-            trajectories = self.rollout_fn.evaluate_action(action, use_cuda_graph=False)
+            if self._local_geometry_models is None:
+                changed = torch.zeros(count, dtype=torch.bool, device=base.device)
+                trajectories = self.rollout_fn.evaluate_action(action, use_cuda_graph=False)
+            else:
+                changed, trajectories = self._refresh_local_geometry(base)
             feasible, raw_signed, objective = (
                 self.rollout_fn.constraint_manager.optimizer_evidence(trajectories))
             self._last_functional_signed = raw_signed
@@ -301,15 +308,20 @@ class PhysicalGradientCore(GradientOptCore):
             signed = {name: value.view(count, particles)[:, 0]
                       for name, value in raw_signed.items()}
         self._check_request(wait_for_device=True)
-        # END changed-objective costs/gradients below still restart its history.
+        # END the completed query preserves every sampled-candidate decision.
         # BEGIN geometry and functional multipliers independently change cost.
-        changed = self._refresh_local_geometry(base)
         changed |= owner.update(signed)
         # END empty functional keys cannot suppress a real geometry refresh.
         self._check_request(wait_for_device=True)
         if not bool(changed.any()):
             return state
-        costs, gradients = self._compute_cost_constraint_and_gradient(repeated)
+        # BEGIN this exact base layout also shares numeric geometry evidence.
+        if self._local_geometry_models is None:
+            costs, gradients = self._compute_cost_constraint_and_gradient(repeated)
+        else:
+            with self._local_geometry_models.repeated_base_evaluation():
+                costs, gradients = self._compute_cost_constraint_and_gradient(repeated)
+        # END each particle still backpropagates through its own FK and scalar.
         cost = costs.detach()[:, 0, 0]
         gradient = gradients.detach().view(count, particles, self.action_horizon, self.action_dim)[:, 0]
         if not bool((torch.isfinite(cost) & torch.isfinite(gradient).flatten(1).all(-1))[changed].all()):

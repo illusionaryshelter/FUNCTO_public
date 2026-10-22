@@ -62,19 +62,21 @@
 | `integrate_entity/freeze_mapper` | 明确实体像素、原深度、K、T_entity_camera 和资源范围 | 原始样本、权重、支持构成的 `FrozenObservedField`；建图 |
 | `FrozenObservedField.record/from_record/save/load` | 固定场或结构化样本记录 | 同一样本及坐标的场/记录；保存与复用 |
 | `ObservedField.sample/cell_value` | 原场支持内的局部点或具体单元 | 值、有效性、梯度、数值误差；距离、过滤与接触 |
+| `ObservedField._initial_occupied_points/occupied_points` | 不可变原始叶节点或当前动态子节点的范围与原场样本 | 原叶节点复用只读局部点集，动态节点计算本域点集；占据距离查询与存储计数 |
 | `ObservedField.local_zero` | 查询点及原场中完整支持、非恒定且包含零的单元索引 | 最多八个局部单元中的零点、单位梯度方向及距离，或 None；优化块模型捕获 |
-| `query_distance` | 两个原场、刚体变换、数值精度和有限许可 | clear/intersection/unresolved、未许可点对在当前姿态的距离界和见证；同一非穿透规则 |
+| `query_distance` | 两个原场、刚体变换、数值精度和有限许可 | clear/intersection/unresolved、当前未许可域的 lower_m、完整实体的 full_entity_lower_m 及见证；静态分类与区间几何分别消费 |
 | `pair_residual` | 原生实体—场或场—场、可微位姿、同值矩阵、精度、许可及可选共享零值/原生界 | 原查询证据与分类残差（intersection 为1，其余0）；硬分项，分类梯度为零 |
 | `pair_local_model` | 原实体、实际基准位姿及已完成交叠证据 | 原材料点和原场零面形成的 LocalPairModel，或 None；只在优化块起点调用 |
 | `LocalPairModel.value` | 固定局部点、零点、单位法向、场间距及当前两个实体位姿 | 有量纲 softplus 标量，含点与法向刚体导数；固定块目标 |
 | `LocalContactModel.value` | 固定目标零点及本次相同坐标系中的半空间系数 | 正部半空间超差范数；required contact 的连续优化目标 |
 | `LocalGeometryModels.begin_capture/state/finish_capture/abort_capture` | seed 数、particle 数、物理时间和关系/许可进度 | 冻结或替换模型、按 seed 的变更掩码；初始和常规 rollout 共享，取消保留前一完整记录 |
+| `LocalGeometryModels.repeated_base_evaluation` | 明确按 seed 重复的实际基准状态布局 | 在上下文内共享数值几何查询，逐粒子独立计算可微标量；块边界的梯度重算 |
 | `query_region_intersection` | 原场、位姿、有限半空间 | 受支持零表面 contact/missing_contact/unresolved；required接触 |
 | `query_minimum_height` | 原场、位姿与声明平面 | 整体最低高度区间及见证；初始支撑 |
 | `robot_self_filter.classify_depth` | 原深度、采集时FK放置的原生组件、明确shadow padding | SELF/AMBIGUOUS_SHADOW/ENVIRONMENT、原自由射线及来源；建图 |
 | `ObservedSpace/query_coverage` | 原自由射线格、运动实体场及条件区域 | covered/unknown_witness/unresolved；场景按明确策略解释条件区域及未知 |
 | `NativeSolid/NativePrimitive` | 原凸组件顶点或解析尺寸、所属连杆、固定变换和来源 | 原生机器人实体；共享检查器 |
-| `native_field_distance.query_native_field` | Coal 原实体、原任务场、两个位姿、精度、许可及可选同实体 local/world bounds | 当前未许可点对域的 clear/intersection/unresolved、距离区间与可行点区间；场景按模型/本次状态复用界 |
+| `native_field_distance.query_native_field` | Coal 原实体、原任务场、两个位姿、精度、许可及可选同实体 local/world bounds | 当前未许可域的状态与 lower_m、完整实体的 full_entity_lower_m、可行点区间；场景与区间检查消费各自域的证据 |
 | `native_pair_lower_bound` | 两个官方机器人原实体、当前变换及候选分离轴 | 完整实体支持投影的分离下界；区间几何证据，原生容差不作为误差界 |
 | `RobotGeometryChecker.model_record` | 已消费的原模型 | URDF和原顶点/解析尺寸/局部变换的独立副本；输入绑定 |
 | `DifferentiableRobotKinematics.poses` | 纯运动学配置和完整具名关节 | 可微世界连杆位姿；场景再合成原实体局部变换 |
@@ -83,7 +85,7 @@
 | `OnlinePlanningScene.components/evaluate` | 同时刻关节、工具位姿、进度、时间、query_role；optimization 另需 local_models | components 返回实际硬分项，另输出连续目标；evaluate 按角色汇总硬项或目标，原证据独立保留；IK、优化、验收共用非穿透规则 |
 | `OnlinePlanningScene.components(..., geometry_evidence_out=...)` | 同一实际场景查询及显式证据容器 | 全量逐实体对的状态、当前距离下界、许可与内部关系；geometry_entity_key 以 robot/、owner/ 或 background 区分实体类别，供区间检查 |
 | `describe/to_execution_binding` | 场景已有输入、工具成员及实体附着 | `collision_rule='nonpenetration'`、`tool_geometry_names` 描述与 `native_robot_observed_scene_v1` 快照；结果绑定 |
-| `clone_for_rollout/with_release_history` | 同一原始场及已选搜索前缀 | 私有关系状态、共享不可变场；搜索与优化 |
+| `clone_for_rollout/with_release_history` | 同一原始场及已选搜索前缀，或固定候选的释放锚点 FK | 私有关系状态、共享不可变场；搜索前缀与候选区间几何复用预测释放位姿 |
 | `estimated_workspace_allocation` | batch/horizon和实体数 | 共享场与逐状态临时存储估计；资源准入 |
 
 ## 3. 关系、任务接触与手指
@@ -113,7 +115,7 @@
 |---|---|---|
 | `PlanningBudget` | 规定本次维数、工作和资源范围 | 显式预算或默认值 → 不可变预算；后端与账本 |
 | `MotionBackend.bind_request/plan/close` | 管理复用求解器、请求与资源 | 任务、场景、预算、可选续规划 → 后端绑定/规划结果/释放；调用者 |
-| `plan_trajectory` | 组织参考验收、优化、有限恢复和交付 | 任务/场景/机器人/验证器、预算、参考、续规划与取消接口 → `PlanningResult` |
+| `plan_trajectory` | 组织参考完整资格、持续改善、有限恢复和最佳候选交付 | 任务/场景/机器人/验证器、预算、参考、续规划与取消接口 → `PlanningResult`，独立保存候选绑定与最终累计工作 |
 | `CubicBasis.weights/weights_at_knot_times` | 查询公共三次基导数权重 | 归一化时间或结点坐标、阶数 → 动作/入口速度权重；CPU 域与 Torch 转移 |
 | `CubicTrajectoryStep.bind_clock/update_dt/update_batch_size` | 绑定固定物理步长与缓冲布局 | 请求时钟、batch/horizon → 更新局部状态；原生初始化 |
 | `CubicTrajectoryStep.sample/forward` | 将系数变为同一曲线的原生状态 | 动作、入口、索引、输出容量/时钟 → `q,dq,ddq,jerk,dt`；rollout/导出 |
@@ -125,23 +127,31 @@
 | `recover_position_step` | 在当前完整曲线位置域中构造下降方向 | 物理域、仿射基、梯度与原生步长范围 → 步方向及可行性报告；主优化恢复 |
 | `bind_solver_components` | 将物理域扩展装入一个原生实例 | cuRobo solver、domain、graph 设置 → 已绑定实例；后端初始化 |
 | `PhysicalGradientCore.optimize/reinitialize/bind_domain` | 管理原生迭代、候选保留与请求域 | 合法种子、重置掩码或新域 → 优化动作/更新状态；IK 与轨迹 solver |
-| `PhysicalGradientCore._refresh_local_geometry` | 在当前实际基准动作上捕获固定局部几何 | seed 动作、常规 rollout、共享 LocalGeometryModels → 各 seed 模型变更掩码；每块一次捕获，初始与常规梯度入口共用 |
+| `PhysicalGradientCore._refresh_local_geometry` | 在当前实际基准动作上同时捕获局部几何与原硬证据 | seed 动作、常规 rollout、共享 LocalGeometryModels → `(changed, trajectories)`；块边界读取同次残差和固定目标，初始与常规梯度入口共用模型 |
 | `PhysicalGradientCore._retain_sampled_candidate` | 在每个种子的固定槽中保留采样硬条件合格候选 | 当前动作、同次 feasible 与固定排序目标 → 按目标较小值更新动作；最终曲线验收继续决定交付 |
 | `PhysicalGradientCore.solve_diagnostics/extra_workspace_bytes` | 导出本次数值恢复与存储量 | 当前优化核心 → 报告/字节；请求诊断/准入 |
-| `ProcessCostManager.compute_costs` | 计算同次任务、场景及功能 AL，并形成候选依据 | 机器人状态、已绑定问题/时钟/场景、有效网格与锚点 → 代价和约束；场景只查询整批有效列并集，回填后按行归约 |
-| `ProcessCostManager.optimizer_evidence` | 以 AL/场景张量身份核对同次原始硬证据，合并其余原生约束 | trajectories → `(feasible, signed, fixed_objective)`；排序目标排除 AL 和 process_scene，优化核心跨块保留候选 |
+| `ProcessCostManager.compute_costs` | 按配置分别计算普通参考成本或任务/场景约束 | reference_objective 消费普通时钟并返回加权原生关节项与 continuous_reference；trajectory_optimizer/metrics 消费有效列和确切锚点，输出原硬证据与求解项 |
+| `ProcessCostManager.optimizer_evidence` | 以 AL/场景张量身份核对同次原始硬证据，合并其余原生约束 | trajectories → `(feasible, signed, fixed_objective)`；固定目标只汇总普通成本，优化核心跨块保留采样合格候选 |
+| `physical_time_mean_weights` | 实际物理时间 [A,H] 与各行有效前缀长度 [A] | 归一化梯形积分权重，padding 为零；参考与原生普通成本共用 |
+| `NativeReferenceCost.bind/row_indices/time_weights/forward` | 完整问题、原配置位姿权重、候选时长/进度映射、普通网格与已有原生工具 FK | 预采样目标、显式行映射、积分权重及 [B,H] 连续参考成本；普通优化与固定候选评分 |
+| `NativeRigidToolTransform.apply` | 原生连杆位姿与固定 TCP 平移/旋转标定 | TCP 位姿及符合原生 FK 反向协议的导数；NativeReferenceCost |
+| `freeze_cspace_time_weights` | 原普通 STATE 成本配置的副本、本请求 native_dt | 一次固化时间系数并启用外部梯度权重的配置；请求绑定时构造关节成本 |
+| `FixedTimeStateCSpaceCost.setup_batch_tensors/forward` | 上述配置、固定系数时间尺度与真实物理关节状态 | 原生 STATE 成本；仅成本用固定 dt 视图，轨迹与积分时钟保持各自物理含义 |
 | `ProcessCostManagerCfg.bind_ik_goals` | 为一次 IK 绑定同刻原目标身份 | pose/coordinate/support 的 exact-progress 身份集合，或空集合 → 事件允许集合/普通参考计算上下文；事件候选生成 |
 | `FunctionalAugmentedLagrangian.bind/reset/terms/update` | 分种子保存并更新功能乘子 | 条件键、种子布局、有符号残差 → 优化项或更新掩码；代价与块间更新 |
 | `FunctionalAugmentedLagrangian.snapshot/report` | 导出功能约束数值状态 | 已完成求解状态 → 乘子/罚参数/更新记录；诊断 |
-| `rank_ik_candidates/select_ik_chains` | 排序并连接参考或事件 IK 状态 | 结果、任务/场景报告、测得入口、实际时间、signed velocity bounds 与 query_kind → 有限关节链；functional 要求逐事件合格及必要速度可连接 |
-| `_CuroboPlanner._build_goal_ik_candidates/_fit_event_seeds` | 求同刻连续任务允许集合并构造事件插值初值 | 原要求、已绑定时钟、参考曲线、原 IK 预算 → 事件候选/关节序列/等式拟合报告；主求解仍消费任务允许集合 |
+| `rank_ik_candidates/select_ik_chains` | 排序并连接参考或事件 IK 状态 | 结果、任务/场景报告、入口、实际时间、有符号速度界、query_kind 及可选 reference_positions → 有限关节链；参考一致性在短名单截断前参与可加排名 |
+| `_CuroboPlanner._build_goal_ik_candidates/_fit_event_seeds` | 求同刻连续任务允许集合，为每个参考种子构造并比较事件等式初值 | 原要求、时钟、参考种子、原 IK 预算 → 原事件池、带 reference_seed_index 的有限短名单、实际 QP 结果及被选 fit；主求解消费原任务允许集合 |
 | `_CuroboPlanner.reference_seeds/ompl_seed` | 生成固定基参考或搜索种子 | 原参考/可选外部曲线、场景、当前候选 → 系数及来源/搜索报告；请求主流程 |
+| `_CuroboPlanner._native_request` | 将类型化任务要求与完整路径普通成本绑定为统一 constrained 请求 | 具名种子布局 → 原生 SolveState 与空末端位姿目标；参考验收和主求解 |
 | `_CuroboPlanner.evaluate_reference/optimize` | 运行完整参考 metrics 或原生优化 | 动作种子 → 原生结果；候选选择 |
-| `_CuroboPlanner.select_candidate/native_diagnostics` | 按普通与密集轨迹验收条件选择并解释已有候选 | `select_candidate` 返回 `(candidate, trajectory, report)`；`native_diagnostics` 返回指定种子的指标报告；主流程 |
+| `_CuroboPlanner._candidate_objective` | 在请求固定归一化网格上评价一条候选的普通成本 | 原多项式、自身时长与进度映射 → fixed_objective/objective_components；跨种子和跨求解候选排序 |
+| `_CuroboPlanner.select_candidate/native_diagnostics` | 按原硬指标、固定评分和完整区间验收选择候选 | `select_candidate` 返回 `(candidate, trajectory, report)`；`native_diagnostics` 返回指定种子的硬指标和各实际网格 ordinary_costs；统一候选排名另读 fixed_objective |
 | `_CuroboPlanner.evaluate_candidate/export` | 验收原多项式并输出完整曲线 | `evaluate_candidate` 返回 `(trajectory, attempt, points)`；`export` 复用同身份报告后返回 `(trajectory, points)`；请求入口随后生成执行绑定 |
 | `SceneMotionBounds.from_scene/partition_times/interval` | 完整机器人树、原实体局部范围、声明关系、工具标定及原曲线 | 固定连续模型的时间分区、按 geometry_entity_key 保存的逐实体点速度界和缺失运动状态；区间验收 |
 | `check_interval_geometry` | 原曲线、运动界、指定时刻的几何查询回调、剩余点数及最大位移尺度 | 已证明区间、交叠见证、未决区间、实际查询数与时刻；候选报告 |
-| `_CuroboPlanner._candidate_geometry` | 通过任务/关节检查的曲线、同一场景及剩余查询容量 | 原曲线 FK、释放锚点和事件侧查询所得区间报告及实际硬残差；候选选择前验收 |
+| `_CuroboPlanner._candidate_geometry` | 通过任务/关节检查的曲线、同一场景及剩余查询容量 | 首次查询绑定该候选释放锚点，后续新增时刻复用；返回区间证明/未决与原实际硬残差；候选选择前验收 |
+| `plan_trajectory.qualify_candidate/qualify_native/deliver_incumbent` | 完整合格候选、同身份验收、场景与固定评分 | 在预算内构造独立执行绑定及曲线记录，按较低评分替换，最终恢复选中记录；请求交付与改善预算停止 |
 | `AttemptWitnesses.add_native/add_validation/set_current` | 收集本次实际失败时刻并记录当前候选 | 完成的 native/export metrics → 有限参数集合；诊断采样 |
 | `AttemptWitnesses.select_parameters` | 在固定容量内合并必须点与可选见证 | 固定/普通参数和最大点数 → 诊断查询参数；报告生成 |
 | `capture_component_failures/scene_component_failures` | 保存具体失败状态和来源 | 分项、时刻、进度、关节/工具状态和许可 → 可解释失败记录；报告 |

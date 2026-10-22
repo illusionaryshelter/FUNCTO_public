@@ -84,6 +84,7 @@ class Native:
         return next(self.outcomes)
     def select_candidate(self, accepted):
         report = {"accepted": accepted, "native_success": accepted, "seed_provenance": "test",
+                  "fixed_objective": 1., "objective_components": {"continuous_reference": 1.},
                   "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.},
                   # BEGIN recovery evidence is distinct from the hard scene aggregate.
                   "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)},
@@ -121,11 +122,11 @@ def run(native, *, budget=None, scene=None, **kwargs):
     return result, backend
 
 
-def test_feasible_reference_delivers_once_without_optimization():
-    native = Native([True])
+def test_feasible_reference_is_retained_through_one_main_improvement():
+    native = Native([True, True])
     result, backend = run(native)
-    assert result.success and native.calls == ["seed", "reference", "export"]
-    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 0
+    assert result.success and native.calls == ["seed", "reference", "export", "solve"]
+    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
     assert result.execution_binding["verification_joint_limits"]["joint_names"] == ["q"]
     assert backend._planner is native
     backend.close()
@@ -141,7 +142,7 @@ def test_real_candidate_binding_preserves_observed_geometry_and_rejects_mutation
 
     # BEGIN the native candidate retains the current unified scene record.
     scene = make_scene(tmp_path)
-    native = Native([True])
+    native = Native([True, True])
     backend = MotionBackend({}, robot_validator=object())
     try:
         with patch("manipulation.planning._CuroboPlanner", return_value=native):
@@ -505,7 +506,7 @@ def test_failed_ompl_cannot_spend_an_al_or_second_solve_slot():
 
 
 def test_two_requests_reuse_native_instances_and_reset_binding():
-    native = Native([True, True])
+    native = Native([True, True, True, True])
     backend = MotionBackend({}, robot_validator=object())
     with patch("manipulation.planning._CuroboPlanner", return_value=native) as factory, \
          patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
@@ -594,3 +595,71 @@ def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, col
     finally:
         backend.close()
 # END only completed hard metrics determine whether a fixed transfer is achieved.
+
+
+# BEGIN qualified incumbents own delivery independently of later solver buffers.
+@pytest.mark.parametrize("improved_score,expected_end,exports", [(0.5, .2, 2), (2., .1, 1)])
+def test_complete_candidates_compare_one_fixed_objective(improved_score, expected_end, exports):
+    native = Native([(True, 1., .1), (True, improved_score, .2)])
+    select = native.select_candidate
+
+    def scored(outcome):
+        accepted, score, end = outcome
+        native.curve = JointTrajectory(("q",), np.array([0., 1.]), np.array([[0.], [end]]),
+            np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+        result, curve, report = select(accepted)
+        report.update(fixed_objective=score, objective_components={"continuous_reference": score})
+        return result, curve, report
+
+    native.select_candidate = scored
+    result, backend = run(native)
+    try:
+        assert result.success
+        assert result.trajectory.position[-1, 0] == expected_end
+        assert result.diagnostics["returned_candidate"]["fixed_objective"] == min(1., improved_score)
+        assert native.calls.count("solve") == 1 and native.calls.count("export") == exports
+    finally:
+        backend.close()
+
+
+def test_improvement_budget_keeps_completed_record_after_mutable_buffers_change():
+    from manipulation.planning import PlanningWorkExhausted
+    native = Native([True])
+    original = native.curve.position.copy()
+
+    def exhausted(seed):
+        native.calls.append("solve")
+        native.curve.position[:] = .8
+        native.last_validation["violations"][:] = 10.
+        raise PlanningWorkExhausted("Test improvement exhausted its existing allowance")
+
+    native.optimize = exhausted
+    result, backend = run(native)
+    try:
+        assert result.success and result.execution_binding is not None
+        np.testing.assert_array_equal(result.trajectory.position, original)
+        assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
+        assert result.diagnostics["improvement_end"]["reason"] == "cumulative_planning_budget_exhausted"
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+        assert "failure" not in result.diagnostics
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize("error", [MotionPlanningError("cancelled", "cancelled during improvement"),
+    MotionPlanningError("deadline_exceeded", "deadline during improvement"), RuntimeError("native error")])
+def test_nonbudget_improvement_errors_retain_failure_semantics(error):
+    native = Native([True])
+
+    def fail(seed):
+        raise error
+
+    native.optimize = fail
+    result, backend = run(native)
+    try:
+        assert not result.success and result.execution_binding is None and result.trajectory is None
+        assert result.diagnostics["error_type"] == type(error).__name__
+        assert "improvement_end" not in result.diagnostics
+    finally:
+        backend.close()
+# END budget exhaustion cannot promote an unfinished or cancelled computation.

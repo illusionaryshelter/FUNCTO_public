@@ -129,7 +129,7 @@ class FunctionalGoalScalingTests(unittest.TestCase):
         for tolerance in (1e-2, 1e-4):
             goal = PoseEventRequirement(1., np.eye(4), np.eye(4), tolerance, .01, "declared precision")
             # BEGIN this pose-only fixture explicitly has no mechanism directions.
-            problem = SimpleNamespace(pose_relations=(), pose_events=(goal,), coordinate_events=(), mechanisms=())
+            problem = SimpleNamespace(pose_relations=(), pose_events=(goal,), coordinate_events=(), mechanisms=(), supports=())
             # END the full problem contract remains strict in production.
             p = torch.tensor([[[2*tolerance, 0., 0.]]], requires_grad=True)
             q = torch.tensor([[[1., 0., 0., 0.]]])

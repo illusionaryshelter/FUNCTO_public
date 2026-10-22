@@ -101,15 +101,17 @@ def main():
     pattern = r'\| \[([^\]]+\.py)\]\(api/([^\)]+)\.md\) \| \d+ \| \[(\d+)\]'
     modules = [(p, page, chapter) for p, page, chapter in re.findall(pattern, index.read_text())
                if page not in RETIRED]
+    # BEGIN include the native continuous reference component in source generation.
     for module, chapter in [('implicit_distance','02'), ('observed_mapping','02'),
                             ('observed_robot','02'), ('observed_collision','02'),
                             ('observed_coverage','02'), ('grasp_region','03'),
                             ('native_field_distance','02'), ('tool_geometry','02'),
                             ('local_geometry_model','02'), ('geometry_motion_bound','05'),
-                            ('interval_geometry','05')]:
+                            ('interval_geometry','05'), ('reference_tracking','04')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:
             modules.append(row)
+    # END generation reads the current component source without imports.
     row = ('tests/planning/observed_robot_fixture.py', 'adapter-observed_robot_fixture', '05')
     if row not in modules:
         modules.append(row)

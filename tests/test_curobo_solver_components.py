@@ -153,7 +153,7 @@ class NativeComponentTest(unittest.TestCase):
         self.assertFalse(models.capturing)
 
     def test_geometry_only_block_refresh_restarts_exactly_the_changed_seed(self):
-        optimizer, _, owner, _ = self.make_geometry_solver(2)
+        optimizer, rollouts, owner, _ = self.make_geometry_solver(2)
         core, history = optimizer._core, optimizer._qn
         seed = torch.tensor([.25, .6]).view(2, 1, 1)
         core._begin_functional_solve(seed)
@@ -164,8 +164,12 @@ class NativeComponentTest(unittest.TestCase):
         for name in ("s", "y", "rho", "alpha"):
             getattr(history, name).fill_(3.)
         core._al_blocks_remaining = 2
+        before_queries = len(rollouts[0].evaluations)
         with patch.object(core, "_restart_changed_objective", wraps=core._restart_changed_objective) as restart:
             core._finish_functional_block(state)
+        # BEGIN one combined capture/evidence query, then the changed gradient.
+        self.assertEqual(len(rollouts[0].evaluations) - before_queries, 2)
+        # END original base evidence does not cause a third rollout.
         self.assertEqual(restart.call_count, 1)
         self.assertEqual(restart.call_args.args[-1].tolist(), [True, False])
         for name in ("s", "y", "rho", "alpha"):

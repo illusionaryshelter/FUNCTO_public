@@ -1158,10 +1158,27 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                 {"joint_position": target_postures[1], "report": valid}]}}
         seeds, success = planner.reference_seeds()
         self.assertNotIn(.47, (np.arange(6)+1.)/8.)
-        selected = np.asarray([chain["joint_positions"][0] for chain in planner.goal_ik_chains])
+        # BEGIN each reference branch retains its shortlist and applies one fitted chain.
+        applied = sorted((row for row in planner.goal_ik_event_fits if row["applied"]),
+                         key=lambda row: row["branch"])
+        self.assertEqual([row["branch"] for row in applied], list(range(seeds.shape[1])))
+        selected = np.asarray([row["joint_positions"][0] for row in applied])
         after = planner.physical_domain.evaluate(seeds[0], np.array([.47]))[:, 0]
         np.testing.assert_allclose(after, selected, atol=planner.problem.numerical.joint)
-        np.testing.assert_allclose(selected, [target_postures[1], target_postures[0]])
+        for chosen in applied:
+            shortlist = [row for row in planner.goal_ik_event_fits
+                         if row["branch"] == chosen["branch"]]
+            self.assertEqual(len(shortlist), 2)
+            self.assertEqual([row["proposal_reports"] for row in shortlist], [[valid], [unobserved]])
+            best = min(shortlist, key=lambda row: (row["fit"]["reference_rms_joint_units"],
+                                                   row["shortlist_index"]))
+            self.assertIs(chosen, best)
+            chain = next(row for row in planner.goal_ik_chains
+                         if row["reference_seed_index"] == chosen["branch"]
+                         and row["shortlist_index"] == chosen["shortlist_index"])
+            self.assertEqual(chosen["joint_positions"], chain["joint_positions"])
+            self.assertEqual(chosen["candidate_indices"], chain["candidate_indices"])
+        # END event equality is checked on the applied fit for its own reference seed.
         np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0], np.array([0.]))[:, 0],
                                    np.broadcast_to(original_q.numpy(), (2, 3)), atol=1e-14)
         np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0], np.array([0.]), 1)[:, 0],
@@ -1169,10 +1186,11 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         torch.testing.assert_close(planner.start.position, original_q, rtol=0, atol=0)
         torch.testing.assert_close(planner.start.velocity, original_dq, rtol=0, atol=0)
         self.assertEqual(success, [3]*6)
-        self.assertEqual(len(planner.goal_ik_event_fits), 2)
-        self.assertTrue(all(row["event_u"] == [.47] and row["applied"]
-                            for row in planner.goal_ik_event_fits))
-        self.assertEqual(planner.goal_ik_event_fits[1]["proposal_reports"], [unobserved])
+        # BEGIN the diagnostic retains both event proposals for each reference seed.
+        self.assertEqual(len(planner.goal_ik_chains), 4)
+        self.assertEqual(len(planner.goal_ik_event_fits), 4)
+        self.assertTrue(all(row["event_u"] == [.47] for row in planner.goal_ik_event_fits))
+        # END static model failure remains visible on its unselected proposal.
         self.assertTrue(all(value.endswith("+event_equalities") for value in planner.seed_strategies))
 
     def test_functional_events_sharing_a_nearest_control_keep_separate_equalities(self):
@@ -1213,10 +1231,16 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         with patch.object(planner.physical_domain, "fit_reference", side_effect=fit):
             seeds, _ = planner.reference_seeds()
         torch.testing.assert_close(seeds, baseline, atol=0., rtol=0.)
-        fit = planner.reference_seed_fits[0]["event_fit"]
+        # BEGIN failed event fits belong to the per-proposal diagnostic record.
+        self.assertEqual(len(planner.goal_ik_event_fits), 1)
+        event_fit = planner.goal_ik_event_fits[0]
+        self.assertEqual((event_fit["branch"], event_fit["shortlist_index"]), (0, 0))
+        fit = event_fit["fit"]
         self.assertFalse(fit["success"])
         self.assertEqual(fit["reason"], "declared_event_fit_failure")
-        self.assertFalse(planner.goal_ik_event_fits[0]["applied"])
+        self.assertFalse(event_fit["applied"])
+        self.assertEqual(planner.reference_seed_fits, baseline_planner.reference_seed_fits)
+        # END a rejected event fit leaves both the original controls and their fit record intact.
         self.assertEqual(planner.initial_seed_strategies, baseline_planner.initial_seed_strategies)
     # END failed initialization does not change the independently fitted reference.
 # END native-result diversity and whole-window initializer selection contracts.
@@ -1708,7 +1732,9 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
             feasible, _, objective = fixture.manager.optimizer_evidence(result)
             self.assertFalse(bool(feasible.any()))
             self.assertEqual(float(costs.values[costs.names.index("skill_process")].sum()), 0.)
-            self.assertTrue(bool((objective > 0).all()))
+            # BEGIN cross-candidate scores contain ordinary costs only.
+            torch.testing.assert_close(objective, torch.zeros_like(objective))
+            # END constraint preferences still participate in native optimization.
             fixture.problem.residuals = lambda p, *args, **kwargs: {"other": torch.zeros_like(p[..., 0])}
             later = fixture.manager.compute_costs(fixture.state)
             with self.assertRaisesRegex(RuntimeError, "different native query"):
@@ -2546,6 +2572,8 @@ def test_native_selection_uses_shared_residuals_and_exports_no_rejected_seed():
     planner.last_optimizer_diagnostics = []
     planner._native_curve = Mock(return_value=object())
     # BEGIN this selection fixture isolates the separately tested interval checker.
+    planner._candidate_objective = Mock(return_value={
+        "fixed_objective": 2.5, "objective_components": {"continuous_reference": 2.5}})
     planner.evaluate_candidate = Mock(side_effect=lambda curve, *, native_report:
         (curve, native_report, 3))
     # END rejected native seeds do not start continuous geometry queries.
@@ -2553,7 +2581,11 @@ def test_native_selection_uses_shared_residuals_and_exports_no_rejected_seed():
     candidates = PlannerCandidateSelectionTests.native_candidates()
     _, curve, report = planner.select_candidate(candidates)
     assert report["accepted"] and report["selected_seed_index"] == 1
-    assert [row["accepted"] for row in report["candidates"]] == [False, True]
+    # BEGIN candidates are visited in qualified-score order until one passes.
+    assert [(row["seed_index"], row["accepted"]) for row in report["candidates"]] == [(1, True)]
+    assert report["fixed_objective"] == 2.5
+    planner._candidate_objective.assert_called_once_with(curve)
+    # END the rejected native seed never enters score or interval evaluation.
     planner._native_curve.assert_called_once()
     planner.evaluate_candidate.assert_called_once()
     assert planner.evaluate_candidate.call_args.args[0] is curve
@@ -2641,8 +2673,13 @@ class ExportedCurveContractTests(unittest.TestCase):
     # BEGIN every delivered curve has completed the real candidate domain check.
     def qualify(self, planner, result):
         trajectory = planner._native_curve(result)
+        # BEGIN this fixture supplies the independent ordinary score explicitly.
+        # These cases exercise exact polynomial bounds, event timing and
+        # delivery reuse. Reference-cost numerics have their own native tests.
         returned, report, points = planner.evaluate_candidate(trajectory,
-            native_report={"accepted": True, "residuals": {}})
+            native_report={"accepted": True, "residuals": {}, "fixed_objective": 0.})
+        self.assertEqual(report["fixed_objective"], 0.)
+        # END polynomial qualification retains its separate hard residuals.
         self.assertIs(returned, trajectory)
         self.assertEqual(points, 0)
         return trajectory, report
