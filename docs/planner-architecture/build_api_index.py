@@ -34,11 +34,15 @@ RETIRED = {
 
 
 def definitions(body, parent=''):
+    # BEGIN retain definitions inside control-flow statements in their scope.
     for item in body:
         if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
             name = f'{parent}.{item.name}' if parent else item.name
             yield name, item
             yield from definitions(item.body, name)
+        else:
+            yield from definitions(ast.iter_child_nodes(item), parent)
+    # END conditional and exception-handler definitions share the lexical owner.
 
 
 def local_nodes(node):

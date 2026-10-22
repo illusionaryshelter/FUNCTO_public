@@ -1,6 +1,6 @@
 # `manipulation/representation.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_timeline`
@@ -904,4 +904,74 @@ progress
 ```python
 len
 path.sample_numpy
+```
+
+## `generate_reference.mechanism_path`
+
+[定义位置](../../../manipulation/representation.py#L335)。
+
+输入签名：
+
+```python
+def mechanism_path(clock):
+```
+
+显式输出分支：
+
+```python
+PosePath(_progress(clock), motion_model.poses(values), source='current mechanism FK from source scalar displacement', motion_model=motion_model, coordinates=values)
+```
+
+读取的对象属性：
+
+```python
+np.interp
+motion_model.poses
+```
+
+写入目标：
+
+```python
+values
+```
+
+直接调用符号：
+
+```python
+np.interp
+PosePath
+_progress
+motion_model.poses
+```
+
+## `generate_reference.material_path`
+
+[定义位置](../../../manipulation/representation.py#L368)。
+
+输入签名：
+
+```python
+def material_path(clock):
+```
+
+显式输出分支：
+
+```python
+_component_path(Q, times, clock, source='source chart-invariant relative displacement', parent=function_path(clock), attachment=_inverse(Qc))
+```
+
+读取的对象属性：
+
+无显式条目。
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+_component_path
+function_path
+_inverse
 ```

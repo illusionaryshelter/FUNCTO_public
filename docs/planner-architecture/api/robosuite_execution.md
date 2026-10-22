@@ -1,6 +1,6 @@
 # `manipulation/robosuite_execution.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `RobosuiteExecutionBackend`
@@ -1304,6 +1304,49 @@ result['step_accounting'].append
 result.get
 RuntimeError
 abs
+```
+
+## `RobosuiteExecutionBackend.abort_hold.retain_position_faults`
+
+[定义位置](../../../manipulation/robosuite_execution.py#L493)。
+
+输入签名：
+
+```python
+def retain_position_faults(positions, *, phase, sim_time):
+```
+
+显式输出分支：
+
+```python
+outside
+```
+
+读取的对象属性：
+
+```python
+np.flatnonzero
+outside.size
+result['joint_position_violation_samples'].append
+self.joint_names
+```
+
+写入目标：
+
+```python
+outside
+result['joint_position_bounds_satisfied']
+j
+```
+
+直接调用符号：
+
+```python
+np.flatnonzero
+bool
+result['joint_position_violation_samples'].append
+float
+int
 ```
 
 ## `RobosuiteExecutionBackend.proprioception`

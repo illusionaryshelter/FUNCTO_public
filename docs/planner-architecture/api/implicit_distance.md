@@ -1,6 +1,6 @@
 # `manipulation/implicit_distance.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `transform_points`
@@ -545,11 +545,12 @@ lower: np.ndarray
 upper: np.ndarray
 children: tuple = ()
 cell: int = -1
+points: object = None
 ```
 
 ## `ObservedField`
 
-[定义位置](../../../manipulation/implicit_distance.py#L150)。
+[定义位置](../../../manipulation/implicit_distance.py#L153)。
 
 ```python
 class ObservedField():
@@ -569,7 +570,7 @@ class ObservedField():
 
 ## `ObservedField.__init__`
 
-[定义位置](../../../manipulation/implicit_distance.py#L158)。
+[定义位置](../../../manipulation/implicit_distance.py#L161)。
 
 输入签名：
 
@@ -620,6 +621,7 @@ self._cell_values.max
 np.flatnonzero
 self._zero_cell_ids
 self._initial_cell_bounds
+self._initial_occupied_points
 self.tree
 self.tree.tree
 self.valid_cells
@@ -627,6 +629,7 @@ self._boundary_only_cells
 array.flags
 a.nbytes
 self.nodes
+points.nbytes
 self._zero_tree
 self._zero_tree.data.flags
 self._zero_tree.data
@@ -663,11 +666,13 @@ self._zero_tree
 self.nodes
 cell_lower
 cell_upper
+leaf_points
 self.root
 array
 array.flags.writeable
 self.storage_nbytes
 a
+points
 self._zero_tree.data.flags.writeable
 ```
 
@@ -701,13 +706,14 @@ self._cell_values.min
 self._cell_values.max
 np.flatnonzero
 self._initial_cell_bounds
+self._initial_occupied_points
 build
 sum
 ```
 
 ## `ObservedField.__init__.build`
 
-[定义位置](../../../manipulation/implicit_distance.py#L206)。
+[定义位置](../../../manipulation/implicit_distance.py#L212)。
 
 输入签名：
 
@@ -768,7 +774,7 @@ tuple
 
 ## `ObservedField._initial_cell_bounds`
 
-[定义位置](../../../manipulation/implicit_distance.py#L239)。
+[定义位置](../../../manipulation/implicit_distance.py#L248)。
 
 输入签名：
 
@@ -875,9 +881,120 @@ np.nextafter
 np.minimum
 ```
 
+## `ObservedField._initial_occupied_points`
+
+[定义位置](../../../manipulation/implicit_distance.py#L294)。
+
+输入签名：
+
+```python
+def _initial_occupied_points(self, lower, upper):
+```
+
+实现说明：
+
+> Batch the same corner, original-sample and edge-root arithmetic.
+>
+> Only the immutable original leaves use these arrays. Query-time
+> subdivision still evaluates its own smaller bounds with the scalar
+> method below. Batches bound temporary storage independently of field
+> size, and each retained array contains only that leaf's actual points.
+
+显式输出分支：
+
+```python
+output
+```
+
+读取的对象属性：
+
+```python
+np.asarray(_EDGES).T
+np.asarray
+self.cells
+np.arange
+self.cell_value
+self.cell_origins
+self.voxel_size
+((original >= lo[:, None]) & (original <= hi[:, None])).all
+np.empty
+np.zeros
+points.shape
+self._cell_values
+np.nonzero
+np.where
+np.minimum
+np.maximum
+np.abs
+local.flags
+output.append
+```
+
+写入目标：
+
+```python
+output
+edge_a
+edge_b
+start
+stop
+cells
+lo
+hi
+corners
+values
+_
+errors
+original
+inside
+points
+kept
+points[:, :8]
+points[:, 8:16]
+kept[:, :8]
+kept[:, 8:16]
+rows
+edges
+a
+b
+va
+vb
+fraction
+point
+negative_index
+negative
+v
+e
+points[rows, 16 + edges]
+kept[rows, 16 + edges]
+row
+local
+local.flags.writeable
+```
+
+直接调用符号：
+
+```python
+np.asarray
+range
+len
+min
+np.arange
+self.cell_value
+((original >= lo[:, None]) & (original <= hi[:, None])).all
+np.empty
+np.zeros
+np.nonzero
+np.where
+np.minimum
+np.maximum
+np.abs
+output.append
+```
+
 ## `ObservedField.bounds`
 
-[定义位置](../../../manipulation/implicit_distance.py#L285)。
+[定义位置](../../../manipulation/implicit_distance.py#L340)。
 
 输入签名：
 
@@ -913,7 +1030,7 @@ root
 
 ## `ObservedField.cell_value`
 
-[定义位置](../../../manipulation/implicit_distance.py#L291)。
+[定义位置](../../../manipulation/implicit_distance.py#L346)。
 
 输入签名：
 
@@ -969,7 +1086,7 @@ np.sum
 
 ## `ObservedField.sample`
 
-[定义位置](../../../manipulation/implicit_distance.py#L309)。
+[定义位置](../../../manipulation/implicit_distance.py#L364)。
 
 输入签名：
 
@@ -1094,7 +1211,7 @@ error.reshape
 
 ## `ObservedField.node_values`
 
-[定义位置](../../../manipulation/implicit_distance.py#L352)。
+[定义位置](../../../manipulation/implicit_distance.py#L407)。
 
 输入签名：
 
@@ -1130,7 +1247,7 @@ box_corners
 
 ## `ObservedField.tighten`
 
-[定义位置](../../../manipulation/implicit_distance.py#L355)。
+[定义位置](../../../manipulation/implicit_distance.py#L410)。
 
 输入签名：
 
@@ -1222,7 +1339,7 @@ _Node
 
 ## `ObservedField.occupied_points`
 
-[定义位置](../../../manipulation/implicit_distance.py#L385)。
+[定义位置](../../../manipulation/implicit_distance.py#L440)。
 
 输入签名：
 
@@ -1238,6 +1355,7 @@ def occupied_points(self, node):
 
 ```python
 np.empty((0, 3))
+node.points
 np.asarray(kept, dtype=float).reshape(-1, 3)
 ```
 
@@ -1246,6 +1364,7 @@ np.asarray(kept, dtype=float).reshape(-1, 3)
 ```python
 node.cell
 np.empty
+node.points
 node.lower
 node.upper
 self.cell_value
@@ -1300,7 +1419,7 @@ np.asarray
 
 ## `ObservedField.split`
 
-[定义位置](../../../manipulation/implicit_distance.py#L418)。
+[定义位置](../../../manipulation/implicit_distance.py#L477)。
 
 输入签名：
 
@@ -1372,7 +1491,7 @@ self.tighten
 
 ## `ObservedField.local_zero`
 
-[定义位置](../../../manipulation/implicit_distance.py#L436)。
+[定义位置](../../../manipulation/implicit_distance.py#L495)。
 
 输入签名：
 
@@ -1453,7 +1572,7 @@ np.linalg.norm
 
 ## `query_distance`
 
-[定义位置](../../../manipulation/implicit_distance.py#L475)。
+[定义位置](../../../manipulation/implicit_distance.py#L534)。
 
 输入签名：
 
@@ -1474,9 +1593,9 @@ def query_distance(first, first_pose, second, second_pose, *, precision_m=0.0001
 显式输出分支：
 
 ```python
-{'status': 'clear', 'lower_m': None, 'upper_m': None, 'empty_set': True, 'intersection': False, 'queries': 0, 'witness_first': None, 'witness_second': None, 'scope': 'represented_observed_occupancy', 'distance_scope': 'unpermitted_point_pairs_at_query_pose'}
-{'status': 'intersection', 'lower_m': 0.0, 'upper_m': 0.0, 'intersection': True, 'queries': visits, 'witness_first': point.tolist(), 'witness_second': point.tolist(), 'scope': 'represented_observed_occupancy', 'distance_scope': 'unpermitted_point_pairs_at_query_pose'}
-{'status': 'unresolved' if unresolved else 'clear', 'lower_m': lower, 'upper_m': upper if np.isfinite(upper) else None, 'intersection': None if unresolved else False, 'queries': visits, 'witness_first': None if witness is None else witness[0].tolist(), 'witness_second': None if witness is None else witness[1].tolist(), 'scope': 'represented_observed_occupancy', 'distance_scope': 'unpermitted_point_pairs_at_query_pose'}
+{'status': 'clear', 'lower_m': None, 'upper_m': None, 'empty_set': True, 'full_entity_lower_m': None, 'intersection': False, 'queries': 0, 'witness_first': None, 'witness_second': None, 'scope': 'represented_observed_occupancy', 'distance_scope': 'unpermitted_point_pairs_at_query_pose'}
+{'status': 'intersection', 'lower_m': 0.0, 'upper_m': 0.0, 'full_entity_lower_m': 0.0, 'intersection': True, 'queries': visits, 'witness_first': point.tolist(), 'witness_second': point.tolist(), 'scope': 'represented_observed_occupancy', 'distance_scope': 'unpermitted_point_pairs_at_query_pose'}
+{'status': 'unresolved' if unresolved else 'clear', 'lower_m': lower, 'full_entity_lower_m': lower if permission is None else full_entity_lower, 'upper_m': upper if np.isfinite(upper) else None, 'intersection': None if unresolved else False, 'queries': visits, 'witness_first': None if witness is None else witness[0].tolist(), 'witness_second': None if witness is None else witness[1].tolist(), 'scope': 'represented_observed_occupancy', 'distance_scope': 'unpermitted_point_pairs_at_query_pose'}
 ```
 
 读取的对象属性：
@@ -1486,9 +1605,11 @@ np.isfinite
 first.root
 second.root
 np.asarray
-math.inf
 first.nodes
 second.nodes
+node.lower
+node.upper
+math.inf
 heapq.heappop
 a.cell
 b.cell
@@ -1539,6 +1660,11 @@ witness[1].tolist
 precision
 poses
 fields
+roots
+root_world
+node
+pose
+full_entity_lower
 pending
 serial
 upper
@@ -1594,6 +1720,10 @@ float
 np.isfinite
 ValueError
 np.asarray
+tuple
+world_bounds
+zip
+box_distance
 count
 push
 heapq.heappop
@@ -1634,7 +1764,7 @@ witness[1].tolist
 
 ## `query_distance.push`
 
-[定义位置](../../../manipulation/implicit_distance.py#L504)。
+[定义位置](../../../manipulation/implicit_distance.py#L570)。
 
 输入签名：
 

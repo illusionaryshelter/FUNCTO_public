@@ -1,6 +1,6 @@
 # `manipulation/execution.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pose_goal_schedule`
@@ -3052,4 +3052,48 @@ step_callback
 deepcopy
 type
 str
+```
+
+## `TrajectoryExecutor.execute.persist`
+
+[定义位置](../../../manipulation/execution.py#L2158)。
+
+输入签名：
+
+```python
+def persist(name, write):
+```
+
+实现说明：
+
+> Attempt every artifact and retain exact write failures in memory.
+
+显式输出分支：
+
+```python
+False
+True
+```
+
+读取的对象属性：
+
+```python
+persistence_errors.append
+report.setdefault('persistence_errors', []).append
+report.setdefault
+type(error).__name__
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+write
+persistence_errors.append
+report.setdefault('persistence_errors', []).append
+report.setdefault
+type
 ```

@@ -1,6 +1,6 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -986,6 +986,8 @@ np.ndindex
 progress.shape
 local_models.state_key
 local_models.state
+local_models.capturing
+local_models.repeated_base
 self.gripper
 self.gripper.state
 hand_state.coordinates
@@ -1141,12 +1143,15 @@ evidence_progress
 evidence_permission
 value
 states
+state_keys
 times_cpu
 relation_cpu
 permission_cpu
 index
 key
 states[index]
+state_keys[index]
+base_evidence
 hand_state
 coordinates
 half
@@ -1335,6 +1340,7 @@ active.detach
 policy['active'].detach().cpu().numpy
 policy['active'].detach().cpu
 policy['active'].detach
+original_query
 query_region_intersection
 float
 local_models.captures_row
@@ -1451,9 +1457,44 @@ list
 float
 ```
 
+## `OnlinePlanningScene.components.original_query`
+
+[定义位置](../../../manipulation/online_geometry.py#L460)。
+
+输入签名：
+
+```python
+def original_query(index, identity, query):
+```
+
+显式输出分支：
+
+```python
+query()
+dict(base_evidence[key])
+```
+
+读取的对象属性：
+
+无显式条目。
+
+写入目标：
+
+```python
+key
+base_evidence[key]
+```
+
+直接调用符号：
+
+```python
+query
+dict
+```
+
 ## `OnlinePlanningScene.evaluate`
 
-[定义位置](../../../manipulation/online_geometry.py#L789)。
+[定义位置](../../../manipulation/online_geometry.py#L823)。
 
 输入签名：
 
@@ -1506,7 +1547,7 @@ name.startswith
 
 ## `OnlinePlanningScene.estimated_workspace_allocation`
 
-[定义位置](../../../manipulation/online_geometry.py#L801)。
+[定义位置](../../../manipulation/online_geometry.py#L835)。
 
 输入签名：
 
@@ -1559,7 +1600,7 @@ dict
 
 ## `OnlinePlanningScene.describe`
 
-[定义位置](../../../manipulation/online_geometry.py#L813)。
+[定义位置](../../../manipulation/online_geometry.py#L847)。
 
 输入签名：
 
@@ -1603,7 +1644,7 @@ deepcopy
 
 ## `OnlinePlanningScene.to_execution_binding`
 
-[定义位置](../../../manipulation/online_geometry.py#L825)。
+[定义位置](../../../manipulation/online_geometry.py#L859)。
 
 输入签名：
 

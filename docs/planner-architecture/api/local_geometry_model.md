@@ -1,11 +1,11 @@
 # `manipulation/local_geometry_model.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_point_world`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L17)。
+[定义位置](../../../manipulation/local_geometry_model.py#L18)。
 
 输入签名：
 
@@ -44,7 +44,7 @@ quaternion_rotate
 
 ## `LocalPairModel`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L24)。
+[定义位置](../../../manipulation/local_geometry_model.py#L25)。
 
 ```python
 class LocalPairModel():
@@ -71,7 +71,7 @@ length_scale_m: float
 
 ## `LocalPairModel.value`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L39)。
+[定义位置](../../../manipulation/local_geometry_model.py#L40)。
 
 输入签名：
 
@@ -122,7 +122,7 @@ torch_functional.softplus
 
 ## `LocalContactModel`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L51)。
+[定义位置](../../../manipulation/local_geometry_model.py#L52)。
 
 ```python
 class LocalContactModel():
@@ -140,7 +140,7 @@ point: tuple
 
 ## `LocalContactModel.value`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L56)。
+[定义位置](../../../manipulation/local_geometry_model.py#L57)。
 
 输入签名：
 
@@ -193,7 +193,7 @@ torch.linalg.vector_norm
 
 ## `_StateModels`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L69)。
+[定义位置](../../../manipulation/local_geometry_model.py#L70)。
 
 ```python
 class _StateModels():
@@ -208,7 +208,7 @@ contacts: dict = field(default_factory=dict)
 
 ## `LocalGeometryModels`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L74)。
+[定义位置](../../../manipulation/local_geometry_model.py#L75)。
 
 ```python
 class LocalGeometryModels():
@@ -231,7 +231,7 @@ class LocalGeometryModels():
 
 ## `LocalGeometryModels.__init__`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L85)。
+[定义位置](../../../manipulation/local_geometry_model.py#L86)。
 
 输入签名：
 
@@ -256,6 +256,49 @@ self.capturing
 self._states
 self._pending
 self._previous_layout
+self.repeated_base
+```
+
+直接调用符号：
+
+无显式条目。
+
+## `LocalGeometryModels.repeated_base_evaluation`
+
+[定义位置](../../../manipulation/local_geometry_model.py#L99)。
+
+输入签名：
+
+```python
+def repeated_base_evaluation(self):
+```
+
+实现说明：
+
+> Declare identical particle inputs while keeping independent gradients.
+>
+> The scene reuses numeric query records within one call only. It still
+> forms each row's scalar from that row's differentiable entity poses.
+> A trial evaluation never enters this scope merely because it has the
+> same physical-time layout as a base evaluation.
+
+显式输出分支：
+
+```python
+None
+```
+
+读取的对象属性：
+
+```python
+self.repeated_base
+```
+
+写入目标：
+
+```python
+previous
+self.repeated_base
 ```
 
 直接调用符号：
@@ -264,7 +307,7 @@ self._previous_layout
 
 ## `LocalGeometryModels.begin_capture`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L93)。
+[定义位置](../../../manipulation/local_geometry_model.py#L115)。
 
 输入签名：
 
@@ -308,7 +351,7 @@ int
 
 ## `LocalGeometryModels.state_key`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L104)。
+[定义位置](../../../manipulation/local_geometry_model.py#L126)。
 
 输入签名：
 
@@ -350,7 +393,7 @@ float
 
 ## `LocalGeometryModels.state`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L113)。
+[定义位置](../../../manipulation/local_geometry_model.py#L135)。
 
 输入签名：
 
@@ -392,7 +435,7 @@ RuntimeError
 
 ## `LocalGeometryModels.captures_row`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L122)。
+[定义位置](../../../manipulation/local_geometry_model.py#L144)。
 
 输入签名：
 
@@ -429,7 +472,7 @@ int
 
 ## `LocalGeometryModels.finish_capture`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L126)。
+[定义位置](../../../manipulation/local_geometry_model.py#L148)。
 
 输入签名：
 
@@ -487,7 +530,7 @@ self._pending.get
 
 ## `LocalGeometryModels.abort_capture`
 
-[定义位置](../../../manipulation/local_geometry_model.py#L141)。
+[定义位置](../../../manipulation/local_geometry_model.py#L163)。
 
 输入签名：
 

@@ -1,6 +1,6 @@
 # `manipulation/program.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `ReferenceGenerationError`
@@ -1262,6 +1262,42 @@ components.items
 check_inside
 _interior
 checks.append
+```
+
+## `_object_reference.radius`
+
+[定义位置](../../../manipulation/program.py#L732)。
+
+输入签名：
+
+```python
+def radius(item):
+```
+
+显式输出分支：
+
+```python
+min(np.pi, item['rotation_tolerance_rad'] + yaw)
+```
+
+读取的对象属性：
+
+```python
+item.get
+np.pi
+```
+
+写入目标：
+
+```python
+yaw
+```
+
+直接调用符号：
+
+```python
+item.get
+min
 ```
 
 ## `ground_object_program`

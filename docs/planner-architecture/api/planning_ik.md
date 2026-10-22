@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_validate_reports`
@@ -292,7 +292,7 @@ int
 输入签名：
 
 ```python
-def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s, velocity_limits, *, count, joint_tolerance, query_kind='reference'):
+def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s, velocity_limits, *, count, joint_tolerance, query_kind='reference', reference_positions=None):
 ```
 
 实现说明：
@@ -328,12 +328,17 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 >
 > Dynamic programming retains at most ``count`` paths at each last candidate.
 > Failed static task/model check counts rank proposals first, without
-> removing the only available transferred-reference chain. Edges then
+> removing the only available transferred-reference chain. When supplied,
+> ``reference_positions[query,joint]`` contributes squared joint displacement
+> from that reference, normalized by each velocity scale and the final time,
+> then averaged over queries and joints. This additive soft distance precedes
+> velocity energy before any shortlist truncation. Edges then
 > integrate squared joint velocity divided by the square of the
 > joint's largest absolute native velocity bound. Dividing by the final
 > query time and D yields the normalized velocity energy of the selected
-> joint-space polyline. This first-order additive cost makes the bounded
-> dynamic program exact for these supplied candidates. Clearance and joint
+> joint-space polyline. These additive costs make the bounded dynamic program
+> exact for its supplied node/edge ranking. A subsequent whole-curve equality
+> fit has a different objective and compares only this finite shortlist. Clearance and joint
 > margin break only equal-energy ties. They never certify the edges.
 
 显式输出分支：
@@ -360,6 +365,8 @@ bounds.shape
 np.isfinite(bounds).all
 np.max
 np.abs
+reference.shape
+np.isfinite(reference).all
 values.ndim
 values.shape
 row.get
@@ -367,6 +374,7 @@ np.flatnonzero
 np.isfinite(values).all
 retained.append
 layers.append
+np.mean
 states.items
 np.errstate
 np.dot
@@ -392,6 +400,7 @@ start
 times
 bounds
 scales
+reference
 layers
 query
 rows
@@ -410,6 +419,7 @@ next_states
 quality
 task_failure
 model_failure
+node_reference
 options
 preceding_index
 paths
@@ -453,6 +463,7 @@ type
 ValueError
 np.max
 np.abs
+np.isfinite(reference).all
 enumerate
 zip
 _validate_reports
@@ -467,6 +478,7 @@ _quality
 retained.append
 layers.append
 float
+np.mean
 states.items
 np.errstate
 np.dot

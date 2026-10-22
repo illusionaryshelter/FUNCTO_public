@@ -1,6 +1,6 @@
 # `manipulation/native_field_distance.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_transform`
@@ -298,6 +298,9 @@ def query_native_field(geometry, native_pose, field, field_pose, *, precision_m=
 > and world bounds only for this query pose. A standalone query computes
 > these bounds directly. Returned distance bounds concern unpermitted point
 > pairs at this pose; changing a contact permission changes that domain.
+> ``full_entity_lower_m`` independently bounds complete-entity separation.
+> With a permission it uses the unchanged entities' whole-set enclosures;
+> without one the complete query can supply a tighter bound.
 
 显式输出分支：
 
@@ -317,6 +320,8 @@ np.inf
 field.root
 np.eye
 field.nodes
+root.lower
+root.upper
 heapq.heappop
 node.cell
 field._boundary_only_cells
@@ -360,8 +365,11 @@ witness
 visits
 unresolved_lower
 separated_lower
+full_entity_lower
 native_local
 native_world
+root
+field_world
 lower
 _
 native_box
@@ -419,6 +427,8 @@ count
 report
 _native_bounds
 np.eye
+world_bounds
+box_distance
 push
 heapq.heappop
 check_request
@@ -451,7 +461,7 @@ field.split
 
 ## `query_native_field.report`
 
-[定义位置](../../../manipulation/native_field_distance.py#L115)。
+[定义位置](../../../manipulation/native_field_distance.py#L119)。
 
 输入签名：
 
@@ -502,7 +512,7 @@ np.asarray(b).tolist
 
 ## `query_native_field.push`
 
-[定义位置](../../../manipulation/native_field_distance.py#L143)。
+[定义位置](../../../manipulation/native_field_distance.py#L155)。
 
 输入签名：
 

@@ -1,6 +1,6 @@
 # `manipulation/planning_problem.py` 实现契约
 
-代码基线：`a2b3f686b866aea18af47c302bafb62e44212e22`。
+代码基线：`fe0a4f8`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_tensor`
@@ -1440,6 +1440,41 @@ np.isfinite(values).all
 np.isfinite
 float
 min
+tuple
+```
+
+## `resolve_event_window.selected`
+
+[定义位置](../../../manipulation/planning_problem.py#L497)。
+
+输入签名：
+
+```python
+def selected(row):
+```
+
+显式输出分支：
+
+```python
+event_occurrence_key(row) == key and row.get('check_target') == target and ('goal_id' not in constraint.origin_event or tuple(row.get('goal_id') or ()) == tuple(constraint.origin_event['goal_id'])) and ('condition_id' not in constraint.origin_event or row.get('condition_id') == constraint.origin_event['condition_id'])
+```
+
+读取的对象属性：
+
+```python
+row.get
+constraint.origin_event
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+event_occurrence_key
+row.get
 tuple
 ```
 
