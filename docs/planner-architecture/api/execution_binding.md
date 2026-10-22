@@ -1,6 +1,6 @@
 # `manipulation/execution_binding.py` 实现契约
 
-代码基线：`fe0a4f8`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `plain`
@@ -76,7 +76,7 @@ type
 
 ## `curve_snapshot`
 
-[定义位置](../../../manipulation/execution_binding.py#L43)。
+[定义位置](../../../manipulation/execution_binding.py#L44)。
 
 输入签名：
 
@@ -86,7 +86,11 @@ def curve_snapshot(trajectory):
 
 实现说明：
 
-> Keep the polynomial, original events and this finite block's authority.
+> Record the polynomial, original events and conditional time interval.
+>
+> Initialization diagnostics and accepted candidates use this same numeric
+> record. Execution authorization is produced by ``bind_candidate`` after
+> complete candidate qualification.
 
 显式输出分支：
 
@@ -128,7 +132,7 @@ trajectory.finger_trajectory.describe
 
 ## `bind_candidate`
 
-[定义位置](../../../manipulation/execution_binding.py#L59)。
+[定义位置](../../../manipulation/execution_binding.py#L66)。
 
 输入签名：
 
@@ -195,7 +199,7 @@ deepcopy
 
 ## `_relaxed_pose_contract`
 
-[定义位置](../../../manipulation/execution_binding.py#L90)。
+[定义位置](../../../manipulation/execution_binding.py#L97)。
 
 输入签名：
 
@@ -279,7 +283,7 @@ contract.get
 
 ## `relax_pose_goal_tolerances`
 
-[定义位置](../../../manipulation/execution_binding.py#L150)。
+[定义位置](../../../manipulation/execution_binding.py#L157)。
 
 输入签名：
 
@@ -351,7 +355,7 @@ PlanningResult
 
 ## `check_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L189)。
+[定义位置](../../../manipulation/execution_binding.py#L196)。
 
 输入签名：
 
@@ -436,7 +440,7 @@ deepcopy
 
 ## `validate_controller_policy`
 
-[定义位置](../../../manipulation/execution_binding.py#L241)。
+[定义位置](../../../manipulation/execution_binding.py#L248)。
 
 输入签名：
 
@@ -492,7 +496,7 @@ np.any
 
 ## `validate_result_only_goal_ids`
 
-[定义位置](../../../manipulation/execution_binding.py#L269)。
+[定义位置](../../../manipulation/execution_binding.py#L276)。
 
 输入签名：
 
@@ -551,7 +555,7 @@ binding['problem'].get
 
 ## `rebind_execution_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L308)。
+[定义位置](../../../manipulation/execution_binding.py#L315)。
 
 输入签名：
 

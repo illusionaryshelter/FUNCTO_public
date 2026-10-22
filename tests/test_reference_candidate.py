@@ -105,7 +105,7 @@ def test_supplied_curve_remains_immutable_when_improvement_budget_ends():
         assert result.diagnostics["improvement_end"]["reason"] == "cumulative_planning_budget_exhausted"
         assert "failure" not in result.diagnostics
         counts = result.request_ledger["consumed_planning"]
-        assert counts["ik_batches"] == 1 and counts["trajectory_solves"] == 0
+        assert counts["ik_batches"] == 1 and counts["trajectory_solves"] == 1
         assert result.execution_binding["request_ledger"]["consumed_planning"] == counts
     finally:
         backend.close()

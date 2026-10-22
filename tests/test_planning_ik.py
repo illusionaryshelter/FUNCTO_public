@@ -1,6 +1,6 @@
 """CPU counterexamples for IK policies without native solver allocation."""
 
-# BEGIN qualification, whole-chain continuity and explicit recovery are separate contracts.
+# BEGIN native evidence, coarse-chain continuity and trajectory qualification are separate.
 from itertools import product
 from unittest.mock import Mock
 
@@ -22,7 +22,8 @@ def select(values, reports, *, count=1, tolerance=1e-5, query_kind="reference"):
                               count=count, joint_tolerance=tolerance, query_kind=query_kind).tolist()
 
 
-def chains(values, reports=None, *, count=2, times=None, velocity=None, tolerance=1e-5):
+def chains(values, reports=None, *, count=2, times=None, velocity=None,
+           positions=None, pose_costs=None, tolerance=1e-5):
     pools = [np.asarray(pool, float) for pool in values]
     joints = pools[0].shape[1]
     if reports is None:
@@ -30,6 +31,8 @@ def chains(values, reports=None, *, count=2, times=None, velocity=None, toleranc
     return select_ik_chains(pools, reports, np.zeros((1, joints)),
         np.arange(1, len(pools)+1, dtype=float) if times is None else times,
         np.array([[-1.]*joints, [1.]*joints]) if velocity is None else velocity,
+        position_limits=np.array([[-10.]*joints, [10.]*joints]) if positions is None else positions,
+        pose_costs_by_query=[np.zeros(len(pool)) for pool in pools] if pose_costs is None else pose_costs,
         count=count, joint_tolerance=tolerance)
 
 
@@ -89,10 +92,10 @@ def test_all_broken_values_produce_no_candidate_instead_of_a_fabricated_state():
 def test_validity_must_be_explicit_not_a_missing_default():
     with pytest.raises(ValueError, match="explicit booleans"):
         select([[0.]], [{"task_satisfied": True, "model_valid": True}])
-    with pytest.raises(ValueError, match="explicit candidate_source"):
+    with pytest.raises(ValueError, match="native_ik source"):
         chains([[[.1]]], [[{key: value for key, value in report().items()
                            if key != "candidate_source"}]])
-    with pytest.raises(ValueError, match="cannot claim native"):
+    with pytest.raises(ValueError, match="native_ik source"):
         chains([[[.1]]], [[report(candidate_source="carried_previous")]])
 
 
@@ -101,43 +104,74 @@ def test_complete_chain_looks_past_the_nearest_first_query_and_keeps_two_histori
     assert [row["candidate_indices"] for row in selected] == [[1, 0], [0, 0]]
     assert selected[0]["selection_cost"]["normalized_velocity_energy"] == pytest.approx(8.5)
     assert selected[1]["selection_cost"]["normalized_velocity_energy"] == pytest.approx(12.5)
-    assert all(row["reference_success"] and not row["recovery_queries"] for row in selected)
+    assert all(row["reference_success"] and not row["interpolated_queries"] for row in selected)
 
 
-def test_chain_success_cannot_be_replaced_by_a_stationary_failed_reference():
+def test_successful_chain_precedes_legal_approximate_alternative_without_deleting_it():
     selected = chains([[[.5], [0.]], [[1.], [0.]]],
         [[report(), report(native_pose_ik_success=False, environment_clearance_m=100.)]]*2)
-    assert len(selected) == 1
+    assert len(selected) == 2
     assert selected[0]["candidate_indices"] == [0, 0]
     assert selected[0]["reference_success"]
+    assert selected[1]["selection_cost"]["nonconverged_candidate_count"] == 1
+    assert not selected[1]["reference_success"]
+    assert "APPROXIMATE_PROPOSAL" in selected[1]["query_statuses"]
 
 
 # BEGIN missing task/model evidence cannot discard a successful reference proposal.
 def test_task_and_source_screening_are_independent_of_reference_pose_success():
     selected = chains([[[.1], [.5]]],
         [[report(model_valid=False), report(native_pose_ik_success=False)]])
-    assert len(selected) == 1 and selected[0]["candidate_indices"] == [0]
+    assert len(selected) == 2 and selected[0]["candidate_indices"] == [0]
     assert selected[0]["reference_success"]
-    assert selected[0]["selection_cost"]["static_model_failure_count"] == 1
+    assert selected[0]["selection_cost"]["static_model_unqualified_count"] == 1
 
 
 def test_static_failures_rank_chains_without_erasing_the_only_native_solution():
-    selected = chains([[[.1], [.5]], [[.2], [.6]]],
+    # Symmetric paths have equal pose energy and equal velocity energy, so
+    # the existing static evidence can decide their otherwise exact tie.
+    selected = chains([[[-.1], [.1]], [[-.2], [.2]]],
         [[report(task_satisfied=False, model_valid=False), report()]]*2, count=4)
     assert selected[0]["candidate_indices"] == [1, 1]
     assert len(selected) == 4
     only = chains([[[.1]], [[.2]]], [[report(task_satisfied=False, model_valid=False)]]*2)
     assert only[0]["candidate_indices"] == [0, 0]
-    assert only[0]["selection_cost"]["static_task_failure_count"] == 2
-    assert only[0]["selection_cost"]["static_model_failure_count"] == 2
+    assert only[0]["selection_cost"]["static_task_unqualified_count"] == 2
+    assert only[0]["selection_cost"]["static_model_unqualified_count"] == 2
 # END whole-curve task and scene acceptance is not asserted by these proposals.
 
 
-def test_failed_and_carried_queries_cannot_supply_reference_anchors():
-    selected = chains([[[.1], [.9]], [[.1]]],
-        [[report(native_pose_ik_success=False), report(native_pose_ik_success=False)],
-         [report(native_pose_ik_success=False, candidate_source="carried_previous", model_valid=False)]])
-    assert selected == []
+def test_legal_failed_states_are_coarse_nodes_with_original_success_evidence():
+    rows = [[report(native_pose_ik_success=False), report(native_pose_ik_success=False)],
+            [report(native_pose_ik_success=False)]]
+    selected = chains([[[.1], [.9]], [[.2]]], rows, pose_costs=[[.2, .1], [.3]])
+    assert selected[0]["candidate_indices"] == [1, 0]
+    assert selected[0]["selection_cost"]["quadratic_pose_energy"] == pytest.approx(.4)
+    assert selected[0]["query_statuses"] == ["APPROXIMATE_PROPOSAL"]*2
+    assert selected[0]["interpolated_queries"] == []
+    assert not selected[0]["reference_success"]
+    assert all(not item["native_pose_ik_success"] for row in rows for item in row)
+
+
+def test_position_domain_and_finite_energy_define_nodes_without_a_soft_pose_threshold():
+    values = [[[float("nan")], [-1.], [1.], [1.01], [.5]], [[.25]]]
+    rows = [[report(native_pose_ik_success=False) for _ in pool] for pool in values]
+    selected = chains(values, rows, positions=[[-1.], [1.]],
+        pose_costs=[[0., 1e8, 1e8, 0., float("inf")], [1e8]], count=2,
+        velocity=[[-.01], [.01]], times=[.1, .2])
+    assert {tuple(item["candidate_indices"]) for item in selected} == {(1, 0), (2, 0)}
+    assert all(item["query_statuses"] == ["APPROXIMATE_PROPOSAL"]*2 for item in selected)
+    # These are coarse numerical proposals. Their large pose/velocity
+    # errors remain for the tool-space optimizer and continuous validation.
+    assert all(item["selection_cost"]["quadratic_pose_energy"] == 2e8 for item in selected)
+
+
+def test_pose_energy_ranks_before_continuity_and_static_screening():
+    selected = chains([[[.1], [2.]]], [[report(), report(model_valid=False)]],
+                      pose_costs=[[1., .1]])
+    assert selected[0]["candidate_indices"] == [1]
+    assert selected[0]["selection_cost"]["static_model_unqualified_count"] == 1
+    assert selected[1]["candidate_indices"] == [0]
 
 
 def test_velocity_bounds_scale_named_joints_before_comparing_postures():
@@ -171,18 +205,25 @@ def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
     times = np.array([.3, .7, 1.4, 2.])
     bounds = np.array([[-2., -3.], [1., 2.]])
     scale = np.array([2., 3.])
+    costs = rng.uniform(size=(4, 3))
+    solved = rng.random(size=(4, 3)) > .4
+    rows = [[report(native_pose_ik_success=bool(flag)) for flag in row] for row in solved]
     expected = []
     for path in product(range(3), repeat=4):
         postures = np.stack([pools[query, index] for query, index in enumerate(path)])
         changes = np.diff(np.r_[np.zeros((1, 2)), postures], axis=0)
         intervals = np.diff(np.r_[0., times])
         energy = np.sum(changes**2/scale**2/intervals[:, None])/(times[-1]*2)
-        expected.append((float(energy), path))
+        failures = sum(not solved[query, index] for query, index in enumerate(path))
+        pose_energy = sum(costs[query, index] for query, index in enumerate(path))
+        expected.append(((failures, float(pose_energy), float(energy)), path))
     expected.sort()
-    actual = chains(pools, times=times, velocity=bounds, count=3)
+    actual = chains(pools, rows, times=times, velocity=bounds, pose_costs=costs, count=3)
     assert [tuple(row["candidate_indices"]) for row in actual] == [path for _, path in expected[:3]]
     np.testing.assert_allclose([row["selection_cost"]["normalized_velocity_energy"] for row in actual],
-                               [energy for energy, _ in expected[:3]], rtol=1e-14)
+                               [score[2] for score, _ in expected[:3]], rtol=1e-14)
+    np.testing.assert_allclose([row["selection_cost"]["quadratic_pose_energy"] for row in actual],
+                               [score[1] for score, _ in expected[:3]], rtol=1e-14)
 
 
 @pytest.mark.parametrize("times", [[0., 1.], [1., 1.], [2., 1.], [1., float("nan")]])
@@ -370,7 +411,9 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
         disable_tool_pose_tracking=Mock(), enable_tool_pose_tracking=Mock())
     planner._rank_ik_candidates = lambda values, success, previous, u, goals: (
         np.array([1, 0]), [{"static": "first"}, {"static": "second"}])
-    pool = planner._build_goal_ik_candidates(torch.zeros((1, 1, 6, 3), dtype=torch.float64))
+    check_search = Mock()
+    pool = planner._build_goal_ik_candidates(torch.zeros((1, 1, 6, 3), dtype=torch.float64),
+                                             check_search=check_search)
     assert len(queries) == len(pool) == 2
     assert [row[0] for row in queries] == [.4, .8]
     assert queries[0][1] == .2 and queries[1][1] == pytest.approx(11/15)
@@ -381,4 +424,5 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     assert len(pool[.2]["candidates"]) == 2
     assert planner.ik.disable_tool_pose_tracking.call_count == 2
     assert planner.ik.enable_tool_pose_tracking.call_count == 2
+    check_search.assert_called()
 # END mocked queries test orchestration, not CUDA geometry or actual IK convergence.

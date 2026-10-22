@@ -1,11 +1,70 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`fe0a4f8`。
+代码基线：`IMPLEMENTATION_COMMIT_PENDING`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+
+## `select_ik_tracking_candidate`
+
+[定义位置](../../../manipulation/planning_ik.py#L14)。
+
+输入签名：
+
+```python
+def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous):
+```
+
+实现说明：
+
+> Select one supplied numerical proposal by pose energy, then continuity.
+>
+> ``candidates`` contains named-order joint positions with shape ``[N,D]``;
+> ``candidate_indices`` identifies the caller's finite, position-domain
+> proposals. ``pose_costs[N]`` contains their finite native pose energies
+> for the same reference query. ``previous[1,D]`` is the preceding tracking
+> state, initially the measured entrance. The caller retains native pose
+> success and residuals separately, including for an un-converged proposal.
+>
+> Energy ranks candidates before Euclidean displacement in the supplied
+> joint-coordinate units; the original candidate index breaks exact ties. The returned index names
+> at most one warm start. The native SeedManager fills the remaining fixed
+> seed budget. An empty input index set has no tracking proposal.
+
+显式输出分支：
+
+```python
+None if selected is None else int(selected)
+```
+
+读取的对象属性：
+
+```python
+np.asarray
+np.linalg.norm
+np.linalg
+```
+
+写入目标：
+
+```python
+values
+costs
+prior
+selected
+```
+
+直接调用符号：
+
+```python
+np.asarray
+min
+float
+np.linalg.norm
+int
+```
 
 ## `_validate_reports`
 
-[定义位置](../../../manipulation/planning_ik.py#L13)。
+[定义位置](../../../manipulation/planning_ik.py#L39)。
 
 输入签名：
 
@@ -47,7 +106,7 @@ report.get
 
 ## `_measurement`
 
-[定义位置](../../../manipulation/planning_ik.py#L23)。
+[定义位置](../../../manipulation/planning_ik.py#L49)。
 
 输入签名：
 
@@ -90,7 +149,7 @@ np.isfinite
 
 ## `_quality`
 
-[定义位置](../../../manipulation/planning_ik.py#L32)。
+[定义位置](../../../manipulation/planning_ik.py#L58)。
 
 输入签名：
 
@@ -133,7 +192,7 @@ tuple
 
 ## `_tier`
 
-[定义位置](../../../manipulation/planning_ik.py#L41)。
+[定义位置](../../../manipulation/planning_ik.py#L67)。
 
 输入签名：
 
@@ -165,7 +224,7 @@ def _tier(report, query_kind):
 
 ## `rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning_ik.py#L47)。
+[定义位置](../../../manipulation/planning_ik.py#L73)。
 
 输入签名：
 
@@ -246,7 +305,7 @@ int
 
 ## `rank_ik_candidates.key`
 
-[定义位置](../../../manipulation/planning_ik.py#L74)。
+[定义位置](../../../manipulation/planning_ik.py#L100)。
 
 输入签名：
 
@@ -287,64 +346,37 @@ int
 
 ## `select_ik_chains`
 
-[定义位置](../../../manipulation/planning_ik.py#L90)。
+[定义位置](../../../manipulation/planning_ik.py#L116)。
 
 输入签名：
 
 ```python
-def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s, velocity_limits, *, count, joint_tolerance, query_kind='reference', reference_positions=None):
+def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s, velocity_limits, *, position_limits, pose_costs_by_query, count, joint_tolerance):
 ```
 
 实现说明：
 
-> Connect qualified reference anchors and interpolate missing seed samples.
+> Form bounded coarse joint paths from finite position-domain IK states.
 >
-> Inputs retain the caller's candidate indices. ``previous`` is the measured
-> start of shape ``[1,D]`` at t=0; strictly increasing ``query_times_s`` are
-> physical seconds, and ``velocity_limits`` contains named-order native
-> lower/upper bounds of shape ``[2,D]``. No wraparound, retiming or extra IK
-> query is introduced. Each report requires an explicit ``candidate_source``;
-> only ``native_ik`` may report native pose success.
+> Every numerical node retains its native pose-success flag. A legal
+> nonconverged state is an approximate proposal, not a solved reference.
+> 'pose_costs_by_query' supplies the untruncated native quadratic pose
+> energy in the same candidate order. Position bounds admit nodes; velocity
+> bounds only normalize the polyline's continuity cost. Neither the nodes
+> nor their connecting edges certify the later continuous trajectory.
 >
-> Finite native IK successes can be anchors even when static task or source
-> checks fail. Native success includes the native solver's constraints and
-> convergence; it does not establish observation coverage or task success.
-> Failed native queries do not become graph vertices or joint targets.
-> The graph connects successive SOLVED queries using their actual time gap;
-> missing samples are interpolated between the measured start and selected
-> anchors, with constant continuation after the last anchor. Those samples
-> are explicitly FALLBACK_SEED, not solutions to their requested tool pose.
-> With no qualified anchor, return no reference chain: the caller owns its
-> independent measured-state initializer. Every emitted chain still needs
-> whole-curve optimization and validation.
->
-> ``query_kind='functional'`` instead requires a task-qualified state at
-> every supplied event and rejects connections whose average velocity is
-> outside any joint's signed model bounds. Native pose-centre convergence
-> is irrelevant to these continuous allowed sets. Static scene failures
-> remain explicit proposal quality; the whole curve still owns acceptance.
-> Reference samples are soft observations and do not impose those mandatory
-> interpolation nodes or a hard velocity test on a reference polyline.
->
-> Dynamic programming retains at most ``count`` paths at each last candidate.
-> Failed static task/model check counts rank proposals first, without
-> removing the only available transferred-reference chain. When supplied,
-> ``reference_positions[query,joint]`` contributes squared joint displacement
-> from that reference, normalized by each velocity scale and the final time,
-> then averaged over queries and joints. This additive soft distance precedes
-> velocity energy before any shortlist truncation. Edges then
-> integrate squared joint velocity divided by the square of the
-> joint's largest absolute native velocity bound. Dividing by the final
-> query time and D yields the normalized velocity energy of the selected
-> joint-space polyline. These additive costs make the bounded dynamic program
-> exact for its supplied node/edge ranking. A subsequent whole-curve equality
-> fit has a different objective and compares only this finite shortlist. Clearance and joint
-> margin break only equal-energy ties. They never certify the edges.
+> Dynamic programming first minimizes the number of nonconverged nodes,
+> then their total pose energy, then normalized joint velocity energy.
+> Existing static evidence breaks only these ties. Unqualified counts
+> include rows whose static query was not performed. Each last node keeps
+> 'count' histories. Samples with no finite legal proposal are filled
+> between available nodes and measured q0, without inventing pose success.
+> The resulting values initialize the common direct tool-space optimizer;
+> they never become mandatory event interpolation conditions.
 
 显式输出分支：
 
 ```python
-[]
 []
 result
 ```
@@ -363,22 +395,23 @@ np.any
 np.diff
 bounds.shape
 np.isfinite(bounds).all
+positions_bounds.shape
+np.isfinite(positions_bounds).all
 np.max
 np.abs
-reference.shape
-np.isfinite(reference).all
 values.ndim
 values.shape
+energy.shape
 row.get
-np.flatnonzero
 np.isfinite(values).all
+(values >= positions_bounds[0]).all
+(values <= positions_bounds[1]).all
+np.flatnonzero
 retained.append
 layers.append
-np.mean
 states.items
 np.errstate
 np.dot
-np.isfinite(combined).all
 options.append
 states.values
 np.stack
@@ -396,19 +429,21 @@ positions.tolist
 pools
 values
 reports
+costs
 start
 times
 bounds
+positions_bounds
 scales
-reference
 layers
 query
 rows
+energy
 row
-source
-qualified
-index
+legal
 retained
+order
+index
 states
 previous_time
 normalizer
@@ -416,22 +451,16 @@ layer
 indices
 dt
 next_states
-quality
-task_failure
-model_failure
-node_reference
+report
 options
 preceding_index
 paths
 preceding
-displacement
 scaled_velocity
 edge
 cost
 path
 combined
-old
-new
 next_states[index]
 result
 item
@@ -444,7 +473,8 @@ positions
 joint
 prior
 indices[query]
-recovery
+statuses
+status
 ```
 
 直接调用符号：
@@ -459,30 +489,27 @@ np.isfinite(times).all
 np.any
 np.diff
 np.isfinite(bounds).all
+np.isfinite(positions_bounds).all
 type
 ValueError
 np.max
 np.abs
-np.isfinite(reference).all
 enumerate
 zip
 _validate_reports
 row.get
-isinstance
-int
-np.flatnonzero
 np.isfinite(values).all
+(values >= positions_bounds[0]).all
+(values <= positions_bounds[1]).all
 sorted
-_tier
-_quality
+np.flatnonzero
 retained.append
+int
 layers.append
 float
-np.mean
 states.items
 np.errstate
 np.dot
-np.isfinite(combined).all
 options.append
 states.values
 np.stack
@@ -493,4 +520,5 @@ range
 any
 result.append
 positions.tolist
+all
 ```

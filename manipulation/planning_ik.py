@@ -10,6 +10,32 @@ from __future__ import annotations
 import numpy as np
 
 
+# BEGIN one numerical tracking state leaves the remaining native seed slots free.
+def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous):
+    """Select one supplied numerical proposal by pose energy, then continuity.
+
+    ``candidates`` contains named-order joint positions with shape ``[N,D]``;
+    ``candidate_indices`` identifies the caller's finite, position-domain
+    proposals. ``pose_costs[N]`` contains their finite native pose energies
+    for the same reference query. ``previous[1,D]`` is the preceding tracking
+    state, initially the measured entrance. The caller retains native pose
+    success and residuals separately, including for an un-converged proposal.
+
+    Energy ranks candidates before Euclidean displacement in the supplied
+    joint-coordinate units; the original candidate index breaks exact ties. The returned index names
+    at most one warm start. The native SeedManager fills the remaining fixed
+    seed budget. An empty input index set has no tracking proposal.
+    """
+    values = np.asarray(candidates, dtype=float)
+    costs = np.asarray(pose_costs, dtype=float)
+    prior = np.asarray(previous, dtype=float)[0]
+    selected = min(candidate_indices, default=None,
+        key=lambda index: (float(costs[index]),
+                           float(np.linalg.norm(values[index]-prior)), int(index)))
+    return None if selected is None else int(selected)
+# END task/scene qualification and native success are not changed by warm-start ranking.
+
+
 def _validate_reports(reports, count):
     """Require separate evidence for task checks, source geometry and pose IK."""
     if len(reports) != count:
@@ -88,154 +114,100 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
 
 def select_ik_chains(candidates_by_query, reports_by_query, previous, query_times_s,
-                     velocity_limits, *, count, joint_tolerance, query_kind="reference",
-                     reference_positions=None):
-    """Connect qualified reference anchors and interpolate missing seed samples.
+                     velocity_limits, *, position_limits, pose_costs_by_query,
+                     count, joint_tolerance):
+    """Form bounded coarse joint paths from finite position-domain IK states.
 
-    Inputs retain the caller's candidate indices. ``previous`` is the measured
-    start of shape ``[1,D]`` at t=0; strictly increasing ``query_times_s`` are
-    physical seconds, and ``velocity_limits`` contains named-order native
-    lower/upper bounds of shape ``[2,D]``. No wraparound, retiming or extra IK
-    query is introduced. Each report requires an explicit ``candidate_source``;
-    only ``native_ik`` may report native pose success.
+    Every numerical node retains its native pose-success flag. A legal
+    nonconverged state is an approximate proposal, not a solved reference.
+    'pose_costs_by_query' supplies the untruncated native quadratic pose
+    energy in the same candidate order. Position bounds admit nodes; velocity
+    bounds only normalize the polyline's continuity cost. Neither the nodes
+    nor their connecting edges certify the later continuous trajectory.
 
-    Finite native IK successes can be anchors even when static task or source
-    checks fail. Native success includes the native solver's constraints and
-    convergence; it does not establish observation coverage or task success.
-    Failed native queries do not become graph vertices or joint targets.
-    The graph connects successive SOLVED queries using their actual time gap;
-    missing samples are interpolated between the measured start and selected
-    anchors, with constant continuation after the last anchor. Those samples
-    are explicitly FALLBACK_SEED, not solutions to their requested tool pose.
-    With no qualified anchor, return no reference chain: the caller owns its
-    independent measured-state initializer. Every emitted chain still needs
-    whole-curve optimization and validation.
-
-    ``query_kind='functional'`` instead requires a task-qualified state at
-    every supplied event and rejects connections whose average velocity is
-    outside any joint's signed model bounds. Native pose-centre convergence
-    is irrelevant to these continuous allowed sets. Static scene failures
-    remain explicit proposal quality; the whole curve still owns acceptance.
-    Reference samples are soft observations and do not impose those mandatory
-    interpolation nodes or a hard velocity test on a reference polyline.
-
-    Dynamic programming retains at most ``count`` paths at each last candidate.
-    Failed static task/model check counts rank proposals first, without
-    removing the only available transferred-reference chain. When supplied,
-    ``reference_positions[query,joint]`` contributes squared joint displacement
-    from that reference, normalized by each velocity scale and the final time,
-    then averaged over queries and joints. This additive soft distance precedes
-    velocity energy before any shortlist truncation. Edges then
-    integrate squared joint velocity divided by the square of the
-    joint's largest absolute native velocity bound. Dividing by the final
-    query time and D yields the normalized velocity energy of the selected
-    joint-space polyline. These additive costs make the bounded dynamic program
-    exact for its supplied node/edge ranking. A subsequent whole-curve equality
-    fit has a different objective and compares only this finite shortlist. Clearance and joint
-    margin break only equal-energy ties. They never certify the edges.
+    Dynamic programming first minimizes the number of nonconverged nodes,
+    then their total pose energy, then normalized joint velocity energy.
+    Existing static evidence breaks only these ties. Unqualified counts
+    include rows whose static query was not performed. Each last node keeps
+    'count' histories. Samples with no finite legal proposal are filled
+    between available nodes and measured q0, without inventing pose success.
+    The resulting values initialize the common direct tool-space optimizer;
+    they never become mandatory event interpolation conditions.
     """
     pools = [np.asarray(values, dtype=float) for values in candidates_by_query]
     reports = list(reports_by_query)
+    costs = [np.asarray(values, dtype=float) for values in pose_costs_by_query]
     start = np.asarray(previous, dtype=float)
     times = np.asarray(query_times_s, dtype=float)
     bounds = np.asarray(velocity_limits, dtype=float)
-    if (not pools or len(pools) != len(reports) or start.ndim != 2 or start.shape[0] != 1
-            or start.shape[1] < 1 or not np.isfinite(start).all()
-            or times.shape != (len(pools),) or not np.isfinite(times).all()
-            or times[0] <= 0 or np.any(np.diff(times) <= 0)
+    positions_bounds = np.asarray(position_limits, dtype=float)
+    if (not pools or len(pools) != len(reports) or len(pools) != len(costs)
+            or start.ndim != 2 or start.shape[0] != 1 or start.shape[1] < 1
+            or not np.isfinite(start).all() or times.shape != (len(pools),)
+            or not np.isfinite(times).all() or times[0] <= 0 or np.any(np.diff(times) <= 0)
             or bounds.shape != (2, start.shape[1]) or not np.isfinite(bounds).all()
-            or np.any(bounds[0] >= bounds[1]) or type(count) is not int or count < 1
-            or not np.isfinite(joint_tolerance) or joint_tolerance <= 0
-            or query_kind not in {"reference", "functional"}):
-        raise ValueError("IK chains need finite measured start, increasing physical times and ordered velocity bounds")
+            or np.any(bounds[0] >= bounds[1]) or positions_bounds.shape != bounds.shape
+            or not np.isfinite(positions_bounds).all()
+            or np.any(positions_bounds[0] >= positions_bounds[1])
+            or type(count) is not int or count < 1
+            or not np.isfinite(joint_tolerance) or joint_tolerance <= 0):
+        raise ValueError("IK chains need measured start, increasing physical times and named physical bounds")
     scales = np.max(np.abs(bounds), axis=0)
-    if np.any(scales <= 0):
-        raise ValueError("IK chain velocity scales must be positive")
-
-    # BEGIN explicit reference observations rank functional chains before truncation.
-    reference = None if reference_positions is None else np.asarray(reference_positions, dtype=float)
-    if reference is not None and (reference.shape != (len(pools), start.shape[1])
-                                   or not np.isfinite(reference).all()):
-        raise ValueError("Event-chain reference observations must align with query times and joint columns")
-    # END the reference is soft data, not another event acceptance condition.
-
-    # BEGIN only native failure excludes a reference initializer from the graph.
     layers = []
-    for query, (values, rows) in enumerate(zip(pools, reports)):
-        if values.ndim != 2 or values.shape[1] != start.shape[1]:
-            raise ValueError("Every IK query pool must use the same named joint layout")
+    for query, (values, rows, energy) in enumerate(zip(pools, reports, costs)):
+        if values.ndim != 2 or values.shape[1] != start.shape[1] or energy.shape != (len(values),):
+            raise ValueError("IK states, pose energies and reports must share candidate and joint axes")
         _validate_reports(rows, len(values))
         for row in rows:
-            source = row.get("candidate_source")
-            if not isinstance(source, str) or not source:
-                raise ValueError("IK chain candidates require an explicit candidate_source")
-            if source != "native_ik" and row["native_pose_ik_success"]:
-                raise ValueError("A recovery source cannot claim native pose IK success")
-        # BEGIN task events use their actual allowed-set qualification.
-        qualified = [int(index) for index in np.flatnonzero(np.isfinite(values).all(axis=-1))
-                     if (rows[index]["task_satisfied"] if query_kind == "functional" else
-                         rows[index]["candidate_source"] == "native_ik"
-                         and rows[index]["native_pose_ik_success"])]
+            if row.get("candidate_source") != "native_ik":
+                raise ValueError("Reference chain nodes must retain their native_ik source")
+        legal = (np.isfinite(values).all(-1) & np.isfinite(energy)
+                 & (values >= positions_bounds[0]).all(-1)
+                 & (values <= positions_bounds[1]).all(-1))
         retained = []
-        for index in sorted(qualified,
-                            key=lambda index: (*_tier(rows[index], query_kind), *_quality(rows[index]), index)):
+        order = sorted(np.flatnonzero(legal), key=lambda index:
+            (not rows[index]["native_pose_ik_success"], energy[index], index))
+        for index in order:
             if retained and np.any(np.max(np.abs(values[retained]-values[index]), axis=-1) <= joint_tolerance):
                 continue
-            retained.append(index)
+            retained.append(int(index))
         if retained:
             layers.append((query, retained))
-        elif query_kind == "functional":
-            return []
-        # END a missing event candidate cannot be replaced by interpolation.
     if not layers:
         return []
-    # END all discarded native results remain in the caller's original query reports.
 
-    # State tuples contain the additive rank and original candidate-index
-    # sequence. Keeping K predecessors per terminal node suffices for K best
-    # complete paths because all future edge costs depend only on that node.
-    # BEGIN static failures rank proposals; they cannot erase all native successes.
-    states = {None: [((0, 0, 0., 0., 0, 0., 0, 0., 0, 0.), ())]}
+    # BEGIN fixed node evidence and physical-time continuity define one ranking.
+    # Pose energy and continuity remain separate lexicographic quantities; no
+    # task-specific conversion weight or extra rejection threshold is added.
+    states = {None: [((0, 0., 0., 0, 0), ())]}
     previous_time = 0.
     normalizer = times[-1]*start.shape[1]
     for layer, (query, indices) in enumerate(layers):
         dt = float(times[query]-previous_time)
         next_states = {}
         for index in indices:
-            quality = _quality(reports[query][index])
-            task_failure = int(not reports[query][index]["task_satisfied"])
-            model_failure = int(not reports[query][index]["model_valid"])
-            node_reference = (0. if reference is None else float(np.mean(
-                ((pools[query][index]-reference[query])/(scales*times[-1]))**2))/len(pools))
+            report = reports[query][index]
             options = []
             for preceding_index, paths in states.items():
                 preceding = start[0] if layer == 0 else pools[layers[layer-1][0]][preceding_index]
-                # BEGIN integrate the signed joint-speed bounds over this edge.
-                # This is a necessary condition at fixed physical times; a
-                # passing edge still needs continuous curve validation.
-                displacement = pools[query][index]-preceding
-                if query_kind == "functional" and (np.any(displacement < bounds[0]*dt)
-                                                     or np.any(displacement > bounds[1]*dt)):
-                    continue
-                # END no collision proxy or task-specific margin is used.
                 with np.errstate(over="ignore", invalid="ignore"):
-                    scaled_velocity = displacement/(scales*dt)
+                    scaled_velocity = (pools[query][index]-preceding)/(scales*dt)
                     edge = float(dt*np.dot(scaled_velocity, scaled_velocity)/normalizer)
                 if not np.isfinite(edge):
                     continue
                 for cost, path in paths:
-                    combined = (cost[0]+task_failure, cost[1]+model_failure,
-                                cost[2]+node_reference, cost[3]+edge,
-                                *(old+new for old, new in zip(cost[4:], quality)))
-                    if np.isfinite(combined).all():
-                        options.append((combined, (*path, index)))
+                    combined = (cost[0]+int(not report["native_pose_ik_success"]),
+                                cost[1]+float(costs[query][index]), cost[2]+edge,
+                                cost[3]+int(not report["task_satisfied"]),
+                                cost[4]+int(not report["model_valid"]))
+                    options.append((combined, (*path, index)))
             next_states[index] = sorted(options)[:count]
         states = next_states
         previous_time = times[query]
+    # END the native trajectory objective owns the eventual pose/continuity tradeoff.
 
     result = []
     for cost, path in sorted(item for paths in states.values() for item in paths):
-        # BEGIN gap samples derive only from measured q0 and successful native anchors.
         anchor_queries = [query for query, _ in layers]
         anchors = np.stack([pools[query][index] for query, index in zip(anchor_queries, path)])
         anchor_times = np.r_[0., times[anchor_queries]]
@@ -248,26 +220,18 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
         indices = [None]*len(pools)
         for query, index in zip(anchor_queries, path):
             indices[query] = int(index)
-        recovery = [{"query_index": query, "candidate_index": None,
-                     "candidate_source": "interpolated_success_anchors",
-                     "reasons": ["reference_query_has_no_qualified_native_candidate"]}
-                    for query, index in enumerate(indices) if index is None]
+        statuses = [("INTERPOLATED_PROPOSAL" if index is None else
+                     "SOLVED" if reports[query][index]["native_pose_ik_success"]
+                     else "APPROXIMATE_PROPOSAL")
+                    for query, index in enumerate(indices)]
         result.append({"candidate_indices": indices, "joint_positions": positions.tolist(),
-            "anchor_query_indices": anchor_queries,
-            "query_statuses": ["FALLBACK_SEED" if index is None else "SOLVED" for index in indices],
-            "selection_cost": {"static_task_failure_count": int(cost[0]),
-                "static_model_failure_count": int(cost[1]),
-                "normalized_reference_distance": float(cost[2]), "normalized_velocity_energy": float(cost[3]),
-                "environment_clearance_missing_count": int(cost[4]),
-                "environment_clearance_sum_m": float(-cost[5]),
-                "self_clearance_missing_count": int(cost[6]),
-                "self_clearance_sum_m": float(-cost[7]),
-                "joint_margin_missing_count": int(cost[8]),
-                "joint_margin_sum": float(-cost[9])},
-            "recovery_queries": recovery, "reference_success": not recovery})
-        # END interpolated joint samples initialize a curve; they never claim pose convergence.
+            "anchor_query_indices": anchor_queries, "query_statuses": statuses,
+            "selection_cost": {"nonconverged_candidate_count": int(cost[0]),
+                "quadratic_pose_energy": float(cost[1]), "normalized_velocity_energy": float(cost[2]),
+                "static_task_unqualified_count": int(cost[3]), "static_model_unqualified_count": int(cost[4])},
+            "interpolated_queries": [query for query, index in enumerate(indices) if index is None],
+            "reference_success": all(status == "SOLVED" for status in statuses)})
         if len(result) == count:
             break
     return result
-    # END finite proposal ranking leaves static failures visible for full-curve checks.
 # END candidate evidence initializes fixed-clock curves; it never accepts executable motion.

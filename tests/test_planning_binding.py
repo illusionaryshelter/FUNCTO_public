@@ -182,7 +182,7 @@ class PlanningBindingTest(unittest.TestCase):
             np.array([[0., 0.]]), count=1, joint_tolerance=1e-6, query_kind="reference")
         np.testing.assert_array_equal(selected, [1])
 
-    def test_structural_routes_bind_real_terminal_pose_or_no_pose_goal(self):
+    def test_all_declared_pose_events_use_shared_task_constraints(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.problem = self.problem()
         target = PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal")
@@ -193,14 +193,14 @@ class PlanningBindingTest(unittest.TestCase):
         goal = SimpleNamespace(tool_frames=["tool"])
         planner._functional_goal = Mock(return_value=goal)
         _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
-        self.assertIs(bound, goal)
-        planner._functional_goal.assert_called_once_with(target)
-        self.assertEqual(planner.route, "native_pose")
+        self.assertIsNone(bound)
+        planner._functional_goal.assert_not_called()
+        self.assertEqual(planner.route, "constrained")
         planner.problem.pose_events = ()
         _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
         self.assertIsNone(bound)
         self.assertEqual(planner.route, "constrained")
-        planner.trajopt.disable_tool_pose_tracking.assert_called_once()
+        self.assertEqual(planner.trajopt.disable_tool_pose_tracking.call_count, 2)
     # END full functional tolerances are checked by typed process residuals only.
 
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
@@ -455,7 +455,7 @@ class PlanningBindingTest(unittest.TestCase):
         observations = []
         # BEGIN the unchanged material-mode fixture declares no arrival pair permission.
         def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                     contact_permission_progress, query_role):
+                     contact_permission_progress, query_role, local_models, geometry_evidence_out):
             observations.append((s.clone(), joints.clone(), trajectory_time.clone()))
             return ((s < .5) & (joints[..., 0] > 0)).to(s.dtype)
         scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=evaluate)

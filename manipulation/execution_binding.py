@@ -40,8 +40,14 @@ def plain(value):
     raise TypeError(f"Execution binding contains an undeclared input type: {type(value).__name__}")
 
 
+# BEGIN shared curve records describe a conditional interval and its events.
 def curve_snapshot(trajectory):
-    """Keep the polynomial, original events and this finite block's authority."""
+    """Record the polynomial, original events and conditional time interval.
+
+    Initialization diagnostics and accepted candidates use this same numeric
+    record. Execution authorization is produced by ``bind_candidate`` after
+    complete candidate qualification.
+    """
     return plain({"joint_names": trajectory.joint_names, "times": trajectory.times,
         "position": trajectory.position, "velocity": trajectory.velocity,
         "coefficients": trajectory._curve.c,
@@ -54,6 +60,7 @@ def curve_snapshot(trajectory):
         # END rebinding cannot silently reset a previously consumed dependency.
         "fingers": None if trajectory.finger_trajectory is None else
             trajectory.finger_trajectory.describe()})
+# END serialization alone does not qualify the recorded trajectory.
 
 
 def bind_candidate(trajectory, *, problem, scene, validation, native_report):

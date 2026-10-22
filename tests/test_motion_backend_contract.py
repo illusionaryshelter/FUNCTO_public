@@ -62,7 +62,10 @@ class Native:
         self.route = "constrained"
         self.functional_constraints = SimpleNamespace(keys=("event",))
         self.reference_ik_distinct_counts = self.reference_ik_queries = self.reference_ik_chains = []
-        self.reference_seed_fits = self.goal_ik_event_fits = self.goal_ik_chains = []
+        self.reference_seed_fits = []
+        self.goal_ik_candidates = {}
+        self.reference_initialization = {"status": "completed", "scene_constraints": "not_evaluated"}
+        self.main_trajectory_iterations = self.budget.trajectory_iterations//2
         self.joint_reference_report = None
         self.initial_seed_strategies = self.seed_strategies = ["test", "test"]
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
@@ -79,7 +82,7 @@ class Native:
     def evaluate_reference(self, seed):
         self.calls.append("reference")
         return next(self.outcomes)
-    def optimize(self, seed):
+    def optimize(self, seed, *, iterations=None):
         self.calls.append("solve")
         return next(self.outcomes)
     def select_candidate(self, accepted):
@@ -332,7 +335,7 @@ def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(st
         assert native.calls == ([] if stage == "initial" else
             ["seed", "reference"] if stage == "reference" else ["seed", "reference", "solve"])
         assert result.request_ledger["consumed_planning"]["search_queries"] == 0
-        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == int(stage == "main")
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == int(stage != "initial")
     finally:
         backend.close()
 
@@ -427,9 +430,9 @@ def test_new_dense_witnesses_continue_current_controls_without_search_or_third_s
         return {"changed": True, "parameters": [.37], "added_count": 1}
 
     original_optimize = native.optimize
-    def optimize(seed):
+    def optimize(seed, *, iterations=None):
         recovery_seeds.append(seed.clone())
-        return original_optimize(seed)
+        return original_optimize(seed, iterations=iterations)
 
     native.select_candidate, native.promote_collision_witnesses = select, promote
     native.optimize = optimize
@@ -627,7 +630,7 @@ def test_improvement_budget_keeps_completed_record_after_mutable_buffers_change(
     native = Native([True])
     original = native.curve.position.copy()
 
-    def exhausted(seed):
+    def exhausted(seed, *, iterations=None):
         native.calls.append("solve")
         native.curve.position[:] = .8
         native.last_validation["violations"][:] = 10.
@@ -651,7 +654,7 @@ def test_improvement_budget_keeps_completed_record_after_mutable_buffers_change(
 def test_nonbudget_improvement_errors_retain_failure_semantics(error):
     native = Native([True])
 
-    def fail(seed):
+    def fail(seed, *, iterations=None):
         raise error
 
     native.optimize = fail

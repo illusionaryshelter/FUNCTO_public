@@ -12,7 +12,6 @@ from __future__ import annotations
 import numpy as np
 import quadprog
 from scipy.interpolate import BSpline, PPoly
-from scipy.linalg import null_space
 import torch
 
 # BEGIN one coefficient definition serves CPU programs and tensor rollouts.
@@ -25,33 +24,24 @@ def _numpy(value):
             else np.asarray(value, dtype=float))
 
 
-# BEGIN seed event equalities use the installed QP solver's equality rows.
-def _solve_qp(hessian, linear, rows, lower, upper, *, equality_rows=None,
-              equality_values=None):
-    """Solve linear equalities and two-sided bounds in the same coefficient space."""
+# BEGIN continuous position and velocity rows share one two-sided QP.
+def _solve_qp(hessian, linear, rows, lower, upper):
+    """Solve two-sided linear bounds in the free-coefficient space."""
     nonzero = np.any(rows != 0., axis=1)
     if np.any(lower[~nonzero] > 0.) or np.any(upper[~nonzero] < 0.):
         return None
     rows, lower, upper = rows[nonzero], lower[nonzero], upper[nonzero]
-    if equality_rows is None:
-        equality_rows, equality_values = np.empty((0, len(linear))), np.empty(0)
-    nonzero = np.any(equality_rows != 0., axis=1)
-    # A zero row is a fixed entrance value, not an adjustable coefficient.
-    if np.any(equality_values[~nonzero] != 0.):
-        return None
-    equality_rows, equality_values = equality_rows[nonzero], equality_values[nonzero]
     try:
         # quadprog minimizes .5*x'G*x-a'x with C'x >= b. Position
         # constraints have two sides; unconstrained free coefficients do not
         # receive the robot's joint-position box.
         return quadprog.solve_qp(np.asarray(hessian, dtype=float), -linear,
-            np.concatenate((equality_rows.T, rows.T, -rows.T), axis=1),
-            np.r_[equality_values, lower, -upper], meq=len(equality_values))[0]
+            np.concatenate((rows.T, -rows.T), axis=1), np.r_[lower, -upper])[0]
     except ValueError as error:
         if "constraints are inconsistent" not in str(error):
             raise
         return None
-# END the ordinary position recovery caller has no event equality rows.
+# END the measured entrance is already fixed by the cubic coefficient map.
 
 
 class CubicAffineMap(CubicBasis):
@@ -131,15 +121,13 @@ class CubicAffineMap(CubicBasis):
 
     def solve_joint(self, hessian, linear, lower, upper, joint, *, origin,
                     initial, native_dtype, step_limit=None, velocity_bounds=None,
-                    interior=False, equality_rows=None, equality_values=None):
+                    interior=False):
         """Exchange violated analytic extrema for linear QP rows, at most 24 times.
 
         The optimization variable is a coefficient increment from ``origin``.
         For fitting, the origin is zero. For recovery it is the current legal
         action. Checking the rounded candidate, rather than the double QP
         answer, also exposes violations introduced by the actual action dtype.
-        Optional equality rows constrain the complete controls, so their right
-        sides are shifted by ``origin`` when solving for an increment.
         """
         bounds = {0: (lower, upper)}
         if velocity_bounds is not None:
@@ -151,11 +139,6 @@ class CubicAffineMap(CubicBasis):
         # limits, and optimizer recovery never activates this margin.
         coordinate_scale = max(1., abs(lower), abs(upper), float(np.max(np.abs(initial))))
         roundoff = 32*np.finfo(native_dtype).eps*coordinate_scale if interior else 0.
-        # BEGIN an interior anchor stays in the event equality affine space.
-        equality_rhs = (None if equality_rows is None else equality_values-equality_rows@origin)
-        movable_basis = (null_space(equality_rows) if interior and equality_rows is not None
-                         else None)
-        # END a row fixed by an event may lie exactly on a physical boundary.
         report = {"rounds": 0, "constraint_count": 0}
         for iteration in range(24):
             row_parts, lower_parts, upper_parts = [], [], []
@@ -165,13 +148,7 @@ class CubicAffineMap(CubicBasis):
                 offset = fixed[:, joint]+weights@origin
                 # END numerical cancellation cannot fabricate an entrance QP row.
                 # BEGIN inward construction margins act only on free directions.
-                movable = weights if movable_basis is None else weights@movable_basis
-                if movable_basis is not None:
-                    rank_precision = (np.finfo(float).eps*max(equality_rows.shape)
-                                      * np.linalg.norm(weights, axis=1))
-                    fixed_row = np.linalg.norm(movable, axis=1) <= rank_precision
-                    movable = np.where(fixed_row[:, None], 0., movable)
-                margin = roundoff*np.abs(movable).sum(-1)
+                margin = roundoff*np.abs(weights).sum(-1)
                 # END the original physical acceptance bounds remain unchanged.
                 row_parts.append(weights)
                 lower_parts.append(lo_bound-offset+margin)
@@ -180,10 +157,8 @@ class CubicAffineMap(CubicBasis):
             if step_limit is not None:
                 rows = np.r_[rows, np.eye(self.knots)]
                 lo, hi = np.r_[lo, -step_limit], np.r_[hi, step_limit]
-            report.update(rounds=iteration+1, constraint_count=int(2*len(rows))
-                          +(0 if equality_rows is None else len(equality_rows)))
-            increment = _solve_qp(hessian, linear, rows, lo, hi,
-                equality_rows=equality_rows, equality_values=equality_rhs)
+            report.update(rounds=iteration+1, constraint_count=int(2*len(rows)))
+            increment = _solve_qp(hessian, linear, rows, lo, hi)
             if increment is None:
                 return None, {**report, "reason": "sampled_curve_qp_infeasible"}
             # Match base + direction in the actual float dtype. In particular,
@@ -301,14 +276,13 @@ def _fit_feasible(domain, curve, action, velocity_bounds):
             and bool(np.all(extrema[1] <= velocity_bounds[1])))
 
 
-# BEGIN rounded seed recovery retains every selected event interpolation row.
-def _fit_anchor(domain, curve, dtype, device, velocity_bounds, *,
-                equality_rows=None, equality_values=None):
-    """Construct an anchor for the same physical bounds and event equalities.
+# BEGIN rounded seed recovery uses a continuous position-and-velocity anchor.
+def _fit_anchor(domain, curve, dtype, device, velocity_bounds):
+    """Construct an anchor for the fit's position and velocity bounds.
 
     A position initializer can be reused only after the velocity check.
     Otherwise a small strictly convex QP constructs a numerical interior
-    anchor for the same two domains; there is no position-only downgrade.
+    anchor satisfying both sets of bounds.
     """
     from .physical_joint_domain import JointDomainInitializationError
     try:
@@ -316,7 +290,7 @@ def _fit_anchor(domain, curve, dtype, device, velocity_bounds, *,
                   else domain._construct_anchor(dtype, device))[0].to(dtype=dtype, device=device)
     except JointDomainInitializationError as error:
         return None, {"fit_anchor_source": "not_constructed", "detail": str(error)}
-    if equality_rows is None and _fit_feasible(domain, curve, anchor, velocity_bounds):
+    if _fit_feasible(domain, curve, anchor, velocity_bounds):
         return anchor, {"fit_anchor_source": "validated_position_initializer"}
     initial = _numpy(anchor)
     lower, upper = _numpy(domain.lower), _numpy(domain.upper)
@@ -326,49 +300,28 @@ def _fit_anchor(domain, curve, dtype, device, velocity_bounds, *,
         candidate, detail = curve.solve_joint(np.eye(domain.knots), -initial[:, joint],
             lower[joint], upper[joint], joint, origin=np.zeros(domain.knots),
             initial=initial[:, joint], native_dtype=native_dtype,
-            velocity_bounds=None if velocity_bounds is None else velocity_bounds[:, joint],
-            interior=True, equality_rows=equality_rows,
-            equality_values=None if equality_values is None else equality_values[:, joint])
+            velocity_bounds=velocity_bounds[:, joint], interior=True)
         if candidate is None:
             return None, {"fit_anchor_source": "not_constructed", "detail": detail["reason"]}
         controls[:, joint] = candidate
     anchor = torch.as_tensor(controls, dtype=dtype, device=device)
     if not _fit_feasible(domain, curve, anchor, velocity_bounds):
         return None, {"fit_anchor_source": "not_constructed", "detail": "rounded_anchor_outside_domain"}
-    source = "position_velocity_qp" if velocity_bounds is not None else "position_qp"
-    return anchor, {"fit_anchor_source": ("event_" if equality_rows is not None else "")+source}
-# END an unrelated cached position initializer supplies only the QP objective.
+    return anchor, {"fit_anchor_source": "position_velocity_qp"}
+# END the returned anchor satisfies the same bounds as the fitted curve.
 
 
-# BEGIN event samples and ordinary reference samples have separate fit roles.
-def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, velocity_bounds=None,
-                        *, event_progress=None, event_positions=None):
-    """Fit soft references with optional event-position interpolation equalities.
+# BEGIN reference samples remain soft under continuous physical bounds.
+def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, velocity_bounds=None):
+    """Fit soft references with the measured entrance and fixed cubic clock.
 
     Every production caller passes the model's [lower,upper] velocity bounds.
-    Position-only numerical users may omit them; a requested position-and-
-    velocity initialization is never silently weakened on construction failure.
-    ``event_progress`` is a one-dimensional array of normalized physical times
-    in [0,1]; ``event_positions`` has shape [event,joint] in this domain's named
-    joint order. Their equalities apply to this initializer only. The returned
-    event errors measure the actual native-dtype curve, whose FK still needs
-    the caller's original task-allowed-set check.
+    Position-only numerical users may omit them. The returned curve satisfies
+    every supplied physical bound, including after native-dtype rounding.
     """
     values = _numpy(targets)
     weights, offset = curve.query(progress)
     count, dof = domain.knots, len(domain.lower)
-    if (event_progress is None) != (event_positions is None):
-        raise ValueError("Event interpolation needs both normalized times and joint positions")
-    event_times = np.empty(0) if event_progress is None else _numpy(event_progress)
-    event_targets = np.empty((0, dof)) if event_positions is None else _numpy(event_positions)
-    if (event_times.ndim != 1 or event_targets.shape != (len(event_times), dof)
-            or not np.isfinite(event_times).all() or not np.isfinite(event_targets).all()
-            or np.any(event_times < 0.) or np.any(event_times > 1.)):
-        raise ValueError("Event interpolation needs finite [event] times in [0,1] and [event,joint] positions")
-    equality_rows, equality_values = None, None
-    if len(event_times):
-        equality_rows, event_offset = curve.query(event_times)
-        equality_values = event_targets-event_offset
     if velocity_bounds is not None:
         velocity_bounds = _numpy(velocity_bounds)
         if (velocity_bounds.shape != (2, dof) or not np.isfinite(velocity_bounds).all()
@@ -392,18 +345,13 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
     controls = np.empty((count, dof))
     report = {"success": False, "reason": "fit_initializer_not_constructed", "rounds": 0,
               "constraint_count": 0, "joint_qp_status": [],
-              "velocity_bounds_enforced": velocity_bounds is not None,
-              "event_count": len(event_times)}
-    if np.any(event_targets[event_times == 0.] != curve.start_q):
-        return None, {**report, "reason": "event_position_conflicts_with_fixed_entrance"}
+              "velocity_bounds_enforced": velocity_bounds is not None}
     lower, upper = _numpy(domain.lower), _numpy(domain.upper)
     for joint in range(dof):
         candidate, detail = curve.solve_joint(hessian, linear[:, joint],
             lower[joint], upper[joint], joint, origin=np.zeros(count),
             initial=prior[:, joint], native_dtype=native_dtype,
-            velocity_bounds=None if velocity_bounds is None else velocity_bounds[:, joint],
-            equality_rows=equality_rows,
-            equality_values=None if equality_values is None else equality_values[:, joint])
+            velocity_bounds=None if velocity_bounds is None else velocity_bounds[:, joint])
         report["rounds"] = max(report["rounds"], detail["rounds"])
         report["constraint_count"] += detail["constraint_count"]
         report["joint_qp_status"].append(detail["reason"])
@@ -421,7 +369,7 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
         # record both the pre-contraction violation and the actual contraction.
         low, high = domain.extrema(action[None])
         excess = torch.maximum(domain.lower-low, high-domain.upper).max()
-        if velocity_bounds is None and equality_rows is None:
+        if velocity_bounds is None:
             from .physical_joint_domain import JointDomainInitializationError
             try:
                 initialized = domain.initialize(action[None])[0]
@@ -430,21 +378,17 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
             anchor = domain._anchor[0]
             report["fit_anchor_source"] = "position_initializer"
         else:
-            if velocity_bounds is not None:
-                velocity_extrema = curve.velocity_extrema(action)
-                report["maximum_velocity_bound_excess_before_contraction"] = max(0.,
-                    float(np.max(velocity_bounds[0]-velocity_extrema[0])),
-                    float(np.max(velocity_extrema[1]-velocity_bounds[1])))
-            anchor, anchor_report = _fit_anchor(domain, curve, dtype, device, velocity_bounds,
-                equality_rows=equality_rows, equality_values=equality_values)
+            velocity_extrema = curve.velocity_extrema(action)
+            report["maximum_velocity_bound_excess_before_contraction"] = max(0.,
+                float(np.max(velocity_bounds[0]-velocity_extrema[0])),
+                float(np.max(velocity_extrema[1]-velocity_bounds[1])))
+            anchor, anchor_report = _fit_anchor(domain, curve, dtype, device, velocity_bounds)
             report.update(anchor_report)
             if anchor is None:
                 return None, {**report, "reason": "fit_initializer_not_constructed"}
-            # Both domains are convex in the free coefficients. The anchor
-            # and fitted controls share every event equality, so contraction
-            # stays in their affine space before native-dtype rounding. Recheck the
-            # actual native-dtype sum at each trial; a rounded optimum or a
-            # position-only anchor need not satisfy the velocity bounds.
+            # Both domains are convex in the free coefficients. Contract
+            # toward the validated anchor and recheck the actual native-dtype
+            # sum at each trial because rounding can cross either boundary.
             delta, low_scale, high_scale = action-anchor, 0., 1.
             for _ in range(24):
                 middle = .5*(low_scale+high_scale)
@@ -463,13 +407,10 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, v
         action = initialized
     residual = curve.evaluate(action, progress)-values
     velocity_extrema = curve.velocity_extrema(action)
-    event_errors = curve.evaluate(action, event_times)-event_targets
     return action, {**report, "success": True, "reason": "physical_reference_fit",
         "reference_rms_joint_units": float(np.sqrt(np.mean(residual**2))),
         "reference_max_error_joint_units": float(np.max(np.abs(residual))),
         "query_max_abs_velocity_joint_units_per_s": np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist(),
-        "continuous_max_abs_velocity_joint_units_per_s": np.max(np.abs(velocity_extrema), axis=0).tolist(),
-        "event_interpolation_errors_joint_units": event_errors.tolist(),
-        "event_max_error_joint_units": float(np.max(np.abs(event_errors))) if event_errors.size else 0.}
-# END actual event errors are reported without inventing another task tolerance.
+        "continuous_max_abs_velocity_joint_units_per_s": np.max(np.abs(velocity_extrema), axis=0).tolist()}
+# END reference residuals describe the fitted curve in the model's joint units.
 # END the complete curve validator and rollout own final feasibility/acceptance.
