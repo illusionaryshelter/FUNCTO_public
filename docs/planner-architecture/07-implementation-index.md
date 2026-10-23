@@ -1,10 +1,10 @@
 # 实现符号索引
 
-代码基线：`ae2603f`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：`39880e5`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **57 个文件、922 个定义**。
+覆盖 **57 个文件、924 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -62,6 +62,6 @@
 | [manipulation/interval_geometry.py](api/interval_geometry.md) | 12 | [05](05-acceptance-and-execution.md) |
 | [manipulation/timed_reference.py](api/timed_reference.md) | 11 | [01](01-inputs-and-task-model.md) |
 | [manipulation/reference_visualization.py](api/reference_visualization.md) | 3 | [01](01-inputs-and-task-model.md) |
-| [manipulation/unified_solver.py](api/unified_solver.md) | 16 | [04](04-solver-and-search.md) |
+| [manipulation/unified_solver.py](api/unified_solver.md) | 18 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_constraints.py](api/cubic_constraints.md) | 11 | [04](04-solver-and-search.md) |
 | [manipulation/pin_kinematics.py](api/pin_kinematics.md) | 13 | [04](04-solver-and-search.md) |

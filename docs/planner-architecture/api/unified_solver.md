@@ -1,11 +1,11 @@
 # `manipulation/unified_solver.py` 实现契约
 
-代码基线：`ae2603f`。
+代码基线：`39880e5`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `time_mean_weights`
 
-[定义位置](../../../manipulation/unified_solver.py#L22)。
+[定义位置](../../../manipulation/unified_solver.py#L23)。
 
 输入签名：
 
@@ -51,7 +51,7 @@ ValueError
 
 ## `motion_cost`
 
-[定义位置](../../../manipulation/unified_solver.py#L31)。
+[定义位置](../../../manipulation/unified_solver.py#L32)。
 
 输入签名：
 
@@ -122,7 +122,7 @@ zip
 
 ## `robot_tool_states`
 
-[定义位置](../../../manipulation/unified_solver.py#L59)。
+[定义位置](../../../manipulation/unified_solver.py#L60)。
 
 输入签名：
 
@@ -220,7 +220,7 @@ torch.linalg.cross
 
 ## `TrajectoryComputation`
 
-[定义位置](../../../manipulation/unified_solver.py#L96)。
+[定义位置](../../../manipulation/unified_solver.py#L97)。
 
 ```python
 class TrajectoryComputation():
@@ -243,7 +243,7 @@ class TrajectoryComputation():
 
 ## `TrajectoryComputation.__init__`
 
-[定义位置](../../../manipulation/unified_solver.py#L107)。
+[定义位置](../../../manipulation/unified_solver.py#L108)。
 
 输入签名：
 
@@ -352,7 +352,7 @@ np.flatnonzero
 
 ## `TrajectoryComputation.states`
 
-[定义位置](../../../manipulation/unified_solver.py#L146)。
+[定义位置](../../../manipulation/unified_solver.py#L147)。
 
 输入签名：
 
@@ -391,7 +391,7 @@ tuple
 
 ## `TrajectoryComputation.robot_states`
 
-[定义位置](../../../manipulation/unified_solver.py#L150)。
+[定义位置](../../../manipulation/unified_solver.py#L151)。
 
 输入签名：
 
@@ -432,7 +432,7 @@ robot_tool_states
 
 ## `TrajectoryComputation.task`
 
-[定义位置](../../../manipulation/unified_solver.py#L155)。
+[定义位置](../../../manipulation/unified_solver.py#L156)。
 
 输入签名：
 
@@ -495,7 +495,7 @@ group.values
 
 ## `TrajectoryComputation.objective_components`
 
-[定义位置](../../../manipulation/unified_solver.py#L165)。
+[定义位置](../../../manipulation/unified_solver.py#L166)。
 
 输入签名：
 
@@ -566,7 +566,7 @@ self.scene.optimization_objective
 
 ## `ConstrainedSolution`
 
-[定义位置](../../../manipulation/unified_solver.py#L184)。
+[定义位置](../../../manipulation/unified_solver.py#L185)。
 
 ```python
 class ConstrainedSolution():
@@ -585,7 +585,7 @@ report: dict
 
 ## `task_jacobian`
 
-[定义位置](../../../manipulation/unified_solver.py#L191)。
+[定义位置](../../../manipulation/unified_solver.py#L192)。
 
 输入签名：
 
@@ -663,7 +663,7 @@ column.detach
 
 ## `solver_storage_bytes`
 
-[定义位置](../../../manipulation/unified_solver.py#L222)。
+[定义位置](../../../manipulation/unified_solver.py#L223)。
 
 输入签名：
 
@@ -716,12 +716,12 @@ max
 
 ## `solve_trajectory`
 
-[定义位置](../../../manipulation/unified_solver.py#L258)。
+[定义位置](../../../manipulation/unified_solver.py#L259)。
 
 输入签名：
 
 ```python
-def solve_trajectory(computation, initial, *, iterations, check_request, pending_geometry_bytes):
+def solve_trajectory(computation, initial, *, iterations, check_request, pending_geometry_bytes, report_out):
 ```
 
 实现说明：
@@ -737,6 +737,10 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
 > storage plus one live geometry/FK evaluation. Existing field/model arrays
 > and previously constructed material samples already belong to measured
 > RSS. The caller recomputes this quantity before each serial seed solve.
+>
+> ``report_out`` is caller-owned and remains available when a request check
+> raises. Its bounded snapshots describe actual evaluated controls and the
+> last SLSQP callback iterate; none is a candidate-acceptance certificate.
 
 显式输出分支：
 
@@ -750,6 +754,8 @@ ConstrainedSolution(result.x.reshape(shape).copy(), report)
 ```python
 np.asarray
 initial.shape
+report.update
+computation.parameters
 torch.tensor
 torch.float64
 computation.task
@@ -758,11 +764,9 @@ initial_task[0][computation.fixed_equality_rows].detach().numpy
 initial_task[0][computation.fixed_equality_rows].detach
 computation.fixed_equality_rows
 computation.equality_keys
-computation.parameters
 computation.variable_equality_rows
 np.all
 np.isfinite
-report.update
 initial.copy
 computation.domain.intervals
 computation.domain
@@ -777,18 +781,18 @@ initial.ravel
 np.abs(initial_gradient).max
 np.abs
 constraints.append
+result.x
 result.success
 result.status
 result.message
 result.nit
 result.fun
 np.max
-result.x
 np.array_equal
-computation.geometry_report.copy
-computation.geometry_report
+matched.get
 result.x.reshape(shape).copy
 result.x.reshape
+type(error).__name__
 ```
 
 写入目标：
@@ -800,16 +804,18 @@ cache
 cache_x
 counts
 started
+report
+trial_index
 initial_controls
-initial_task
 counts['task_evaluations']
+initial_task
+report['completed_evaluations']['task']
 full_eq_count
 inequality_count
 value
 fixed_values
 fixed_report
 index
-report
 eq_count
 physical_count
 memory
@@ -824,7 +830,9 @@ initial_value
 initial_gradient
 objective_scale
 constraints
+report['solver_called']
 result
+matched
 ```
 
 直接调用符号：
@@ -832,6 +840,8 @@ result
 ```python
 np.asarray
 perf_counter
+report.update
+len
 check_request
 torch.tensor
 computation.task
@@ -841,10 +851,8 @@ initial_task[0][computation.fixed_equality_rows].detach().numpy
 initial_task[0][computation.fixed_equality_rows].detach
 float
 zip
-len
 np.all
 np.isfinite
-report.update
 ConstrainedSolution
 initial.copy
 solver_storage_bytes
@@ -861,18 +869,100 @@ np.abs
 constraints.append
 minimize
 int
+snapshot_for
 bool
 str
 np.max
 np.array_equal
-computation.geometry_report.copy
+deepcopy
+matched.get
 result.x.reshape(shape).copy
 result.x.reshape
+type
+```
+
+## `solve_trajectory.snapshot_for`
+
+[定义位置](../../../manipulation/unified_solver.py#L290)。
+
+输入签名：
+
+```python
+def snapshot_for(x):
+```
+
+显式输出分支：
+
+```python
+snapshot
+None
+```
+
+读取的对象属性：
+
+```python
+np.array_equal
+np.asarray(snapshot['controls']).ravel
+np.asarray
+```
+
+写入目标：
+
+```python
+name
+snapshot
+```
+
+直接调用符号：
+
+```python
+np.array_equal
+np.asarray(snapshot['controls']).ravel
+np.asarray
+```
+
+## `solve_trajectory.callback`
+
+[定义位置](../../../manipulation/unified_solver.py#L297)。
+
+输入签名：
+
+```python
+def callback(x):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+x.reshape(shape).tolist
+x.reshape
+```
+
+写入目标：
+
+```python
+report['callback_iterations']
+matched
+report['last_callback_iterate']
+```
+
+直接调用符号：
+
+```python
+snapshot_for
+x.reshape(shape).tolist
+x.reshape
+list
+check_request
 ```
 
 ## `solve_trajectory.admit_task_derivatives`
 
-[定义位置](../../../manipulation/unified_solver.py#L322)。
+[定义位置](../../../manipulation/unified_solver.py#L354)。
 
 输入签名：
 
@@ -906,7 +996,7 @@ require_host_memory
 
 ## `solve_trajectory.evaluate`
 
-[定义位置](../../../manipulation/unified_solver.py#L334)。
+[定义位置](../../../manipulation/unified_solver.py#L366)。
 
 输入签名：
 
@@ -927,9 +1017,10 @@ output
 np.array_equal
 cache.clear
 x.copy
+x.reshape(shape).tolist
+x.reshape
 computation.domain.signed_constraints
 computation.domain
-x.reshape
 torch.tensor
 torch.float64
 computation.objective_components
@@ -947,12 +1038,18 @@ inequality.numel
 torch.cat
 values.detach().numpy
 values.detach
+snapshot['completed_components'].append
+snapshot.update
+computation.geometry_report
+required.issubset
 ```
 
 写入目标：
 
 ```python
 cache_x
+trial_index
+report['latest_trial']
 counts[kind + '_evaluations']
 output
 controls
@@ -965,6 +1062,10 @@ sizes
 values
 jacobian
 cache[kind]
+report['completed_evaluations'][kind]
+snapshot
+required
+report['latest_complete_trial']
 ```
 
 直接调用符号：
@@ -974,8 +1075,9 @@ check_request
 np.array_equal
 cache.clear
 x.copy
-computation.domain.signed_constraints
+x.reshape(shape).tolist
 x.reshape
+computation.domain.signed_constraints
 torch.tensor
 computation.objective_components
 sum
@@ -993,11 +1095,16 @@ torch.cat
 task_jacobian
 values.detach().numpy
 values.detach
+snapshot['completed_components'].append
+snapshot.update
+deepcopy
+set
+required.issubset
 ```
 
 ## `solve_trajectory.scaled_objective`
 
-[定义位置](../../../manipulation/unified_solver.py#L373)。
+[定义位置](../../../manipulation/unified_solver.py#L420)。
 
 输入签名：
 

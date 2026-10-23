@@ -1,6 +1,6 @@
 # `manipulation/tensor_cpu_snapshot.py` 实现契约
 
-代码基线：`ae2603f`。
+代码基线：`39880e5`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `masked_cpu_snapshot`

@@ -1,6 +1,6 @@
 # `tests/planning/recorded_task_planning.py` 实现契约
 
-代码基线：`ae2603f`。
+代码基线：`39880e5`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_json_value`
@@ -156,7 +156,7 @@ temporary.unlink
 输入签名：
 
 ```python
-def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status='completed', joint_limits=None, planning_result=None):
+def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status='completed', joint_limits=None, planning_result=None, source=None):
 ```
 
 实现说明：
@@ -242,7 +242,7 @@ path.with_suffix
 
 ## `plan_and_record`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L137)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L140)。
 
 输入签名：
 

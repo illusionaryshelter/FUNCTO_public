@@ -1,6 +1,6 @@
 # `manipulation/regions.py` 实现契约
 
-代码基线：`ae2603f`。
+代码基线：`39880e5`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `SupportReferenceNotFound`
