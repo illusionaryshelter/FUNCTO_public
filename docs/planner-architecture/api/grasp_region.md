@@ -1,6 +1,6 @@
 # `manipulation/grasp_region.py` 实现契约
 
-代码基线：`2498027；包含已实现的中断状态记录改动，待对应实现提交更新`。
+代码基线：`d7bcafc`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_array`

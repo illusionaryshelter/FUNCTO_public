@@ -1,6 +1,6 @@
 # 原生几何区间接口
 
-代码基线：`2498027`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。
+代码基线：`d7bcafc`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。
 
 `manipulation/_coal_scene_batch.cpp` 的 `native_projection_bounds(geometry, transform, direction)` 返回原生实体在指定世界方向上的投影上下界。它复用已有形状支持计算与外向区间算术；`native_field_distance` 用其证明距离下界。
 
