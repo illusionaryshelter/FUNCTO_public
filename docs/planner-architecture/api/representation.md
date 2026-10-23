@@ -1,11 +1,11 @@
 # `manipulation/representation.py` 实现契约
 
-代码基线：`39880e5`。
+代码基线：`本次同步实现提交（前置检查点 4510b8b）`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_timeline`
 
-[定义位置](../../../manipulation/representation.py#L18)。
+[定义位置](../../../manipulation/representation.py#L22)。
 
 输入签名：
 
@@ -43,7 +43,7 @@ len
 
 ## `_progress`
 
-[定义位置](../../../manipulation/representation.py#L23)。
+[定义位置](../../../manipulation/representation.py#L27)。
 
 输入签名：
 
@@ -76,7 +76,7 @@ np.zeros
 
 ## `_aligned_poses`
 
-[定义位置](../../../manipulation/representation.py#L27)。
+[定义位置](../../../manipulation/representation.py#L31)。
 
 输入签名：
 
@@ -110,7 +110,7 @@ ValueError
 
 ## `sample_poses`
 
-[定义位置](../../../manipulation/representation.py#L34)。
+[定义位置](../../../manipulation/representation.py#L38)。
 
 输入签名：
 
@@ -171,7 +171,7 @@ path.sample_numpy
 
 ## `trajectory_summary`
 
-[定义位置](../../../manipulation/representation.py#L51)。
+[定义位置](../../../manipulation/representation.py#L55)。
 
 输入签名：
 
@@ -215,7 +215,7 @@ sample_poses
 
 ## `_sampled_summary`
 
-[定义位置](../../../manipulation/representation.py#L64)。
+[定义位置](../../../manipulation/representation.py#L68)。
 
 输入签名：
 
@@ -269,7 +269,7 @@ max
 
 ## `_relative`
 
-[定义位置](../../../manipulation/representation.py#L88)。
+[定义位置](../../../manipulation/representation.py#L92)。
 
 输入签名：
 
@@ -310,7 +310,7 @@ zip
 
 ## `build_representation`
 
-[定义位置](../../../manipulation/representation.py#L93)。
+[定义位置](../../../manipulation/representation.py#L97)。
 
 输入签名：
 
@@ -382,7 +382,7 @@ trajectory_summary
 
 ## `_component_path`
 
-[定义位置](../../../manipulation/representation.py#L162)。
+[定义位置](../../../manipulation/representation.py#L166)。
 
 输入签名：
 
@@ -435,7 +435,7 @@ np.eye
 
 ## `_right_path`
 
-[定义位置](../../../manipulation/representation.py#L179)。
+[定义位置](../../../manipulation/representation.py#L183)。
 
 输入签名：
 
@@ -476,7 +476,7 @@ len
 
 ## `_require_same_pose`
 
-[定义位置](../../../manipulation/representation.py#L185)。
+[定义位置](../../../manipulation/representation.py#L189)。
 
 输入签名：
 
@@ -511,9 +511,198 @@ max
 ValueError
 ```
 
+## `_RotationOffsetPath`
+
+[定义位置](../../../manipulation/representation.py#L197)。
+
+```python
+class _RotationOffsetPath(PosePath):
+```
+
+类字段：
+
+无显式条目。
+
+实现说明：
+
+> Rotate a material frame in F while preserving its world position curve.
+>
+> ``nominal`` gives T_W_M(s), ``functional`` gives T_W_F(s), and ``rotation``
+> is the constant left correction D expressed in F. This path evaluates
+> R_W_M(s) = R_W_F(s) D R_W_F(s)^T R_nominal(s), with the original material
+> origin p_W_M(s). Sampling both parents before composition preserves their
+> continuous source interpolation and progress derivatives. Body and tool
+> offsets are applied by the ordinary child PosePath after this operation.
+
+## `_RotationOffsetPath.__init__`
+
+[定义位置](../../../manipulation/representation.py#L208)。
+
+输入签名：
+
+```python
+def __init__(self, nominal, functional, rotation, *, source):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+Rotation.from_matrix(rotation).as_quat
+Rotation.from_matrix
+nominal.sample_numpy
+nominal.progress
+functional.sample_numpy
+np.swapaxes
+super().__init__
+```
+
+写入目标：
+
+```python
+self.nominal
+self.functional
+self.rotation_quaternion
+poses
+frame
+poses[:, :3, :3]
+```
+
+直接调用符号：
+
+```python
+Rotation.from_matrix(rotation).as_quat
+Rotation.from_matrix
+nominal.sample_numpy
+functional.sample_numpy
+np.swapaxes
+super().__init__
+super
+```
+
+## `_RotationOffsetPath.sample`
+
+[定义位置](../../../manipulation/representation.py#L219)。
+
+输入签名：
+
+```python
+def sample(self, progress, *, side='right'):
+```
+
+显式输出分支：
+
+```python
+(position, quaternion_multiply(functional, corrected))
+```
+
+读取的对象属性：
+
+```python
+self.nominal.sample
+self.nominal
+self.functional.sample
+self.functional
+self.rotation_quaternion
+```
+
+写入目标：
+
+```python
+position
+orientation
+_
+functional
+local
+corrected
+```
+
+直接调用符号：
+
+```python
+self.nominal.sample
+self.functional.sample
+quaternion_multiply
+quaternion_conjugate
+_tensor
+```
+
+## `_initial_rotation_offset`
+
+[定义位置](../../../manipulation/representation.py#L227)。
+
+输入签名：
+
+```python
+def _initial_rotation_offset(nominal, functional, current, flags):
+```
+
+实现说明：
+
+> Select the initial RPY anchor, then retain the full relative rotation.
+>
+> All rotations here map the same moving material frame M into functional
+> reference F. ``flags`` is [roll, pitch, yaw] in SciPy's extrinsic ``xyz``
+> convention: R = Rz(yaw) Ry(pitch) Rx(roll). True selects the current-run
+> initial component; False selects the functional nominal initial component.
+> The selection occurs once at entry. D = R_selected R_nominal(0)^T then
+> carries the full SO(3) relative motion, including noncommuting rotations.
+> For a yaw-only selection, D is a pure F-z rotation throughout the path.
+
+显式输出分支：
+
+```python
+(rotation, {'is_initial_relative_rotation_rpy': flags.tolist(), 'rpy_convention': 'extrinsic xyz; Rz(yaw) Ry(pitch) Rx(roll); radians', 'rotation_frame': 'current functional reference F', 'moving_frame': 'fixed material frame M; calibrated tool E for a tool reference', 'nominal_initial_rpy_rad': nominal_rpy, 'current_initial_rpy_rad': current_rpy, 'selected_initial_rpy_rad': selected, 'functional_rotation_offset': rotation, 'meaning': 'select initial RPY anchor, preserve complete initial-relative SO(3) motion'})
+```
+
+读取的对象属性：
+
+```python
+functional.sample_numpy
+frame.T
+nominal.sample_numpy
+Rotation.from_matrix(nominal_initial).as_euler
+Rotation.from_matrix
+Rotation.from_matrix(current_initial).as_euler
+np.where
+Rotation.from_euler('xyz', selected).as_matrix
+Rotation.from_euler
+nominal_initial.T
+flags.tolist
+```
+
+写入目标：
+
+```python
+frame
+nominal_initial
+current_initial
+nominal_rpy
+current_rpy
+selected
+rotation
+```
+
+直接调用符号：
+
+```python
+functional.sample_numpy
+nominal.sample_numpy
+Rotation.from_matrix(nominal_initial).as_euler
+Rotation.from_matrix
+Rotation.from_matrix(current_initial).as_euler
+np.where
+Rotation.from_euler('xyz', selected).as_matrix
+Rotation.from_euler
+flags.tolist
+```
+
 ## `generate_reference`
 
-[定义位置](../../../manipulation/representation.py#L192)。
+[定义位置](../../../manipulation/representation.py#L259)。
 
 输入签名：
 
@@ -532,15 +721,16 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
 > model; the equality does not verify physical holding or target arrival.
 > # END no simulator body measurement is required to bind held motion.
 > Free object motion is bound in a fixed material frame, independently of
-> the body's coordinate chart and the grasp. The original motion supplies
-> the nominal interaction goal. Returned paths retain this complete nominal
-> composition; their separately named boundaries enter BoundToolReference
+> the body's coordinate chart and the grasp. The original motion and any
+> explicit initial-relative rotation declaration supply the nominal goal.
+> Returned paths retain this complete nominal composition; their separately
+> named boundaries enter BoundToolReference
 > only after the planner has bound physical time and measured TCP velocity.
 >
 > Grasp motion requires actual E. A scalar mechanism instead uses its current
 > model and current coordinate, preserving its physical manifold and winding.
 > Production object/tool paths stop at release or an earlier held_until_time.
-> Full source evidence and unadapted bound diagnostics remain separately named.
+> Full source evidence and generated bound diagnostics remain separately named.
 > Missing entry/interaction evidence cannot produce a boundary declaration.
 > Reference geometry and its boundary data remain separate from task/scene
 > qualification and the eventual planned joint trajectory.
@@ -557,11 +747,14 @@ result
 
 ```python
 representation.get
+np.asarray
+rotation_flags.shape
+rotation_flags.dtype
+np.dtype
 np.isfinite
 np.unique
 np.r_
 np.asarray(T_world_function).shape
-np.asarray
 result.get
 raw.sample_numpy
 motion_model.kind
@@ -586,6 +779,7 @@ frames
 times
 result
 kind
+rotation_flags
 extra
 key
 value
@@ -603,6 +797,8 @@ current_body
 current_eef
 result['missing']['eef_poses']
 raw
+correction
+result['rotation_transfer']
 result['method']
 raw_body
 result['missing']['object_poses']
@@ -618,6 +814,7 @@ Q
 Qc
 L_body
 result['L_body_material']
+original
 raw_material
 inverse_A
 raw_eef
@@ -633,6 +830,8 @@ dict
 deepcopy
 representation.get
 ValueError
+np.asarray
+np.dtype
 float
 any
 np.isfinite
@@ -640,13 +839,14 @@ np.unique
 min
 _pose_array
 _aligned_poses
-np.asarray
 len
 result.get
 _inverse
 _require_same_pose
 _component_path
 function_path
+_initial_rotation_offset
+_RotationOffsetPath
 diagnostic
 publish
 raw.sample_numpy
@@ -668,7 +868,7 @@ raw_eef.sample_numpy
 
 ## `generate_reference.function_path`
 
-[定义位置](../../../manipulation/representation.py#L265)。
+[定义位置](../../../manipulation/representation.py#L345)。
 
 输入签名：
 
@@ -698,7 +898,7 @@ _component_path
 
 ## `generate_reference.diagnostic`
 
-[定义位置](../../../manipulation/representation.py#L268)。
+[定义位置](../../../manipulation/representation.py#L348)。
 
 输入签名：
 
@@ -734,7 +934,7 @@ _progress
 
 ## `generate_reference.publish`
 
-[定义位置](../../../manipulation/representation.py#L272)。
+[定义位置](../../../manipulation/representation.py#L352)。
 
 输入签名：
 
@@ -788,7 +988,7 @@ _sampled_summary
 
 ## `generate_reference.publish.sample`
 
-[定义位置](../../../manipulation/representation.py#L289)。
+[定义位置](../../../manipulation/representation.py#L369)。
 
 输入签名：
 
@@ -823,7 +1023,7 @@ path.sample_numpy
 
 ## `generate_reference.mechanism_path`
 
-[定义位置](../../../manipulation/representation.py#L321)。
+[定义位置](../../../manipulation/representation.py#L408)。
 
 输入签名：
 
@@ -861,7 +1061,7 @@ motion_model.poses
 
 ## `generate_reference.material_path`
 
-[定义位置](../../../manipulation/representation.py#L354)。
+[定义位置](../../../manipulation/representation.py#L452)。
 
 输入签名：
 
@@ -872,7 +1072,8 @@ def material_path(clock):
 显式输出分支：
 
 ```python
-_component_path(Q, times, clock, source='source chart-invariant relative displacement', parent=function_path(clock), attachment=_inverse(Qc))
+_RotationOffsetPath(nominal, functional, correction, source=result['rotation_transfer'])
+nominal
 ```
 
 读取的对象属性：
@@ -881,12 +1082,16 @@ _component_path(Q, times, clock, source='source chart-invariant relative displac
 
 写入目标：
 
-无显式条目。
+```python
+functional
+nominal
+```
 
 直接调用符号：
 
 ```python
-_component_path
 function_path
+_component_path
 _inverse
+_RotationOffsetPath
 ```

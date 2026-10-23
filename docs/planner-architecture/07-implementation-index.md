@@ -1,14 +1,14 @@
 # 实现符号索引
 
-代码基线：`39880e5`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：本次同步实现提交（前置检查点 `4510b8b`）。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **57 个文件、924 个定义**。
+覆盖 **58 个文件、932 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
-| [manipulation/representation.py](api/representation.md) | 18 | [01](01-inputs-and-task-model.md) |
+| [manipulation/representation.py](api/representation.md) | 22 | [01](01-inputs-and-task-model.md) |
 | [manipulation/program.py](api/program.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/motion.py](api/motion.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/function_motion.py](api/function_motion.md) | 5 | [01](01-inputs-and-task-model.md) |
@@ -65,3 +65,4 @@
 | [manipulation/unified_solver.py](api/unified_solver.md) | 18 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_constraints.py](api/cubic_constraints.md) | 11 | [04](04-solver-and-search.md) |
 | [manipulation/pin_kinematics.py](api/pin_kinematics.md) | 13 | [04](04-solver-and-search.md) |
+| [config/ground_skill.py](api/adapter-ground_skill.md) | 4 | [01](01-inputs-and-task-model.md) |

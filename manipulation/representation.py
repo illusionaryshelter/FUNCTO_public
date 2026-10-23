@@ -9,10 +9,14 @@ frame.  These functions neither infer task tolerances nor verify an attachment.
 from copy import deepcopy
 
 import numpy as np
+# BEGIN initial-relative rotation uses the existing SO(3) and differentiable path primitives.
+from scipy.spatial.transform import Rotation
 
 from .grasp import validate_timeline
 from .motion import MotionModel, _errors, _inverse, _pose_array, _poses_array
-from .planning_problem import PosePath
+from .planning_problem import (PosePath, _tensor, quaternion_conjugate,
+                               quaternion_multiply)
+# END no additional rotation convention or numerical dependency is introduced.
 
 
 def _timeline(timestamps):
@@ -189,6 +193,69 @@ def _require_same_pose(first, second, message):
         raise ValueError(message)
 
 
+# BEGIN continuous orientation adjustment in an explicitly supplied functional frame.
+class _RotationOffsetPath(PosePath):
+    """Rotate a material frame in F while preserving its world position curve.
+
+    ``nominal`` gives T_W_M(s), ``functional`` gives T_W_F(s), and ``rotation``
+    is the constant left correction D expressed in F. This path evaluates
+    R_W_M(s) = R_W_F(s) D R_W_F(s)^T R_nominal(s), with the original material
+    origin p_W_M(s). Sampling both parents before composition preserves their
+    continuous source interpolation and progress derivatives. Body and tool
+    offsets are applied by the ordinary child PosePath after this operation.
+    """
+
+    def __init__(self, nominal, functional, rotation, *, source):
+        self.nominal = nominal
+        self.functional = functional
+        self.rotation_quaternion = Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]]
+        # PosePath.poses remains an exact cache of this path at its own knots;
+        # continuous consumers always call the overridden sample method.
+        poses = nominal.sample_numpy(nominal.progress)
+        frame = functional.sample_numpy(nominal.progress)[:, :3, :3]
+        poses[:, :3, :3] = frame @ rotation @ np.swapaxes(frame, -1, -2) @ poses[:, :3, :3]
+        super().__init__(nominal.progress, poses, source=source)
+
+    def sample(self, progress, *, side="right"):
+        position, orientation = self.nominal.sample(progress, side=side)
+        _, functional = self.functional.sample(progress, side=side)
+        local = quaternion_multiply(quaternion_conjugate(functional), orientation)
+        corrected = quaternion_multiply(_tensor(self.rotation_quaternion, progress), local)
+        return position, quaternion_multiply(functional, corrected)
+
+
+def _initial_rotation_offset(nominal, functional, current, flags):
+    """Select the initial RPY anchor, then retain the full relative rotation.
+
+    All rotations here map the same moving material frame M into functional
+    reference F. ``flags`` is [roll, pitch, yaw] in SciPy's extrinsic ``xyz``
+    convention: R = Rz(yaw) Ry(pitch) Rx(roll). True selects the current-run
+    initial component; False selects the functional nominal initial component.
+    The selection occurs once at entry. D = R_selected R_nominal(0)^T then
+    carries the full SO(3) relative motion, including noncommuting rotations.
+    For a yaw-only selection, D is a pure F-z rotation throughout the path.
+    """
+    frame = functional.sample_numpy(0.)[:3, :3]
+    nominal_initial = frame.T @ nominal.sample_numpy(0.)[:3, :3]
+    current_initial = frame.T @ current[:3, :3]
+    nominal_rpy = Rotation.from_matrix(nominal_initial).as_euler("xyz")
+    current_rpy = Rotation.from_matrix(current_initial).as_euler("xyz")
+    selected = np.where(flags, current_rpy, nominal_rpy)
+    rotation = Rotation.from_euler("xyz", selected).as_matrix() @ nominal_initial.T
+    return rotation, {
+        "is_initial_relative_rotation_rpy": flags.tolist(),
+        "rpy_convention": "extrinsic xyz; Rz(yaw) Ry(pitch) Rx(roll); radians",
+        "rotation_frame": "current functional reference F",
+        "moving_frame": "fixed material frame M; calibrated tool E for a tool reference",
+        "nominal_initial_rpy_rad": nominal_rpy,
+        "current_initial_rpy_rad": current_rpy,
+        "selected_initial_rpy_rad": selected,
+        "functional_rotation_offset": rotation,
+        "meaning": "select initial RPY anchor, preserve complete initial-relative SO(3) motion",
+    }
+# END one frame-defined rotation rule serves every declared Boolean combination.
+
+
 def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                        T_world_eef=None, T_world_body=None, motion_model=None,
                        source_coordinates=None, current_coordinates=None,
@@ -202,15 +269,16 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     model; the equality does not verify physical holding or target arrival.
     # END no simulator body measurement is required to bind held motion.
     Free object motion is bound in a fixed material frame, independently of
-    the body's coordinate chart and the grasp. The original motion supplies
-    the nominal interaction goal. Returned paths retain this complete nominal
-    composition; their separately named boundaries enter BoundToolReference
+    the body's coordinate chart and the grasp. The original motion and any
+    explicit initial-relative rotation declaration supply the nominal goal.
+    Returned paths retain this complete nominal composition; their separately
+    named boundaries enter BoundToolReference
     only after the planner has bound physical time and measured TCP velocity.
 
     Grasp motion requires actual E. A scalar mechanism instead uses its current
     model and current coordinate, preserving its physical manifold and winding.
     Production object/tool paths stop at release or an earlier held_until_time.
-    Full source evidence and unadapted bound diagnostics remain separately named.
+    Full source evidence and generated bound diagnostics remain separately named.
     Missing entry/interaction evidence cannot produce a boundary declaration.
     Reference geometry and its boundary data remain separate from task/scene
     qualification and the eventual planned joint trajectory.
@@ -225,6 +293,18 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
         raise ValueError("Unknown representation kind")
     if A is not None and contact_motion:
         raise ValueError("Choose a rigid attachment model or time-varying contact, not both")
+    # BEGIN the optional Boolean declaration selects an initial orientation anchor.
+    # The order is roll/pitch/yaw. True uses the current-run initial component;
+    # False uses the functional nominal initial component. This is reference
+    # construction data, not a tolerance, robot goal, or execution condition.
+    rotation_flags = None
+    if "is_initial_relative_rotation_rpy" in representation:
+        rotation_flags = np.asarray(representation["is_initial_relative_rotation_rpy"])
+        if rotation_flags.shape != (3,) or rotation_flags.dtype != np.dtype(bool):
+            raise ValueError("is_initial_relative_rotation_rpy must contain exactly three Boolean values")
+        if motion_model is not None:
+            raise ValueError("Functional-frame rotation transfer requires a pose reference; mechanism orientation is defined by its FK")
+    # END scalar mechanism coordinates retain their independently declared FK meaning.
     extra = [representation.get(key) for key in ("approach_time", "interaction_time", "release_time")]
     extra += [held_until_time]
     extra = [float(value) for value in extra if value is not None]
@@ -297,8 +377,15 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
         elif current_eef is None:
             result["missing"]["eef_poses"] = "Grasp reference needs the actual current EEF pose"
         else:
+            # BEGIN use the calibrated tool frame as the material frame for tool motion.
             raw = _component_path(result["H_g"], times, path_times,
                                   source="bound source grasp relation", parent=function_path(path_times))
+            if rotation_flags is not None:
+                correction, result["rotation_transfer"] = _initial_rotation_offset(
+                    raw, function_path(path_times), current_eef, rotation_flags)
+                raw = _RotationOffsetPath(raw, function_path(path_times), correction,
+                                          source=result["rotation_transfer"])
+            # END attachment-free tool references consume the same declared rotation rule.
             diagnostic("eef", raw, path_times)
             publish("eef", raw, current_eef, raw.sample_numpy(event_progress))
             result["method"] = "nominal grasp relation with declared tool boundaries"
@@ -351,9 +438,26 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
             Qc = sample_poses(Q, times, interaction)
             L_body = _inverse(result["J"]) @ _inverse(H0) @ _inverse(Qc)
             result["L_body_material"] = L_body
+            # BEGIN select the material-frame entry once and reuse it on every clock.
+            # M is fixed on the body and coincides with F at the original
+            # nominal interaction. E @ A @ L_body supplies its current modelled
+            # pose; source/current body coordinate changes cancel in this pose.
+            correction = None
+            if rotation_flags is not None:
+                original = _component_path(Q, times, path_times,
+                    source="source chart-invariant relative displacement",
+                    parent=function_path(path_times), attachment=_inverse(Qc))
+                correction, result["rotation_transfer"] = _initial_rotation_offset(
+                    original, function_path(path_times), current_body @ L_body, rotation_flags)
             def material_path(clock):
-                return _component_path(Q, times, clock, source="source chart-invariant relative displacement",
-                    parent=function_path(clock), attachment=_inverse(Qc))
+                functional = function_path(clock)
+                nominal = _component_path(Q, times, clock, source="source chart-invariant relative displacement",
+                    parent=functional, attachment=_inverse(Qc))
+                if correction is not None:
+                    return _RotationOffsetPath(nominal, functional, correction,
+                                               source=result["rotation_transfer"])
+                return nominal
+            # END material position stays on the original continuous path before body/tool offsets.
             raw_material = material_path(path_times)
             raw_body = _right_path(raw_material, _inverse(L_body), "bound source body diagnostic")
             diagnostic("object", _right_path(material_path(full_times), _inverse(L_body),

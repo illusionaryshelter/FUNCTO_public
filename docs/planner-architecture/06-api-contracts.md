@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`39880e5`；本次文档提交同步该实现的基线标记与索引，规划器代码内容与该代码提交相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：本次同步实现提交（前置检查点 `4510b8b`）。实际实现提交在提交后记录；仅文档提交与代码基线分别标注。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -14,7 +14,10 @@
 |---|---|---|
 | `representation.build_representation` | 建立源示教的相对功能运动；各位姿须共用源世界坐标 | 帧/时间、源物体/工具位姿、功能局部变换、事件 → 相对关系与来源记录；`generate_reference` |
 | `sample_poses` | 在源时间轴上插值位姿 | 有序时刻及位姿、查询时刻 → 刚体变换序列；参考适配 |
-| `generate_reference` | 将源功能运动组合到当前功能坐标，并声明工具/物体入口和名义事件 | 表示、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 完整名义组合路径、采样数组、显式 `*_boundaries` 及缺失状态；任务适配器与 reference_phase |
+| `generate_reference` | 将源功能运动组合到当前功能坐标，按显式布尔字段选择初始旋转基准，并声明工具/物体入口和名义事件 | 表示及可选 `is_initial_relative_rotation_rpy`、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 完整名义组合路径、采样数组、显式 `*_boundaries`、`rotation_transfer` 及缺失状态；任务适配器与 reference_phase |
+| `_initial_rotation_offset` | 在同一功能参考坐标 F 中选择移动材料坐标 M 的初始 RPY 来源 | 原连续材料路径、功能路径、当前材料位姿、三个布尔值 → 固定左旋转 D 及入口选择记录；generate_reference |
+| `_RotationOffsetPath.__init__/sample` | 保持材料功能点位置，逐次求值后在 F 中施加固定旋转 D | 原材料路径、功能路径、D、来源及查询进度/侧别 → 连续位置与 wxyz 四元数，保留进度导数；物体/工具子路径与边界求值 |
+| `config.ground_skill.ground_skill` | 从当前 RGB-D 实体观测得到功能区域并生成同一声明的参考 | 技能目录、场景目录、输出目录、任务指令、J/A 及来源 → 区域记录、reference.npz、含 reference_rotation_transfer 的 report.json 与网页；命令行入口 |
 | `program.ground_program` | 按程序声明绑定当前几何；持物声明与入口须代数一致 | `program,scene` → 工具参考、事件及几何诊断；`build_planning_problem` |
 | `ground_object_program` | 生成当前物体参考 | 物体程序、当前关系与功能绑定 → 物体路径；持物参考调用者 |
 | `function_motion.optimize_trajectory/transfer_function_motion` | 对已有参考施加明确的入口和功能关键帧 | 位姿序列、静态/当前入口、功能目标 → 适配位姿；`program` |

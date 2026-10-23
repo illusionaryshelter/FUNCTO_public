@@ -183,6 +183,12 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
                       reference_boundaries={name: _plain(reference[name + "_boundaries"])
                           for name in ("object", "eef") if name + "_boundaries" in reference},
                       reference_scope=reference["scope"], reference_method=reference.get("method"))
+        # BEGIN retain the exact declared rotation anchor alongside its generated poses.
+        # This is reference-generation provenance in the functional frame, not
+        # measured object orientation or an execution acceptance condition.
+        if "rotation_transfer" in reference:
+            record["reference_rotation_transfer"] = _plain(reference["rotation_transfer"])
+        # END the report can identify the same rotation computation used by the path.
         # END physical correction binds later to the robot feedback and planner clock.
         if "eef_poses" in reference:
             from manipulation.planning_problem import reference_phase

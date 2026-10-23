@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`39880e5`；本次文档提交同步该实现的基线标记与索引，规划器代码内容与该代码提交相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：本次同步实现提交（前置检查点 `4510b8b`）。阶段实验与计划对照位于项目外 `sim-version-plans`；提交后在此记录实际实现提交，并将仅文档提交与代码基线区分。
 
 ## 1. 输入的来源与相互依赖
 
@@ -52,6 +52,16 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 抓取名义路径由源抓取关系和当前功能坐标组合生成。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数依次组合当前功能路径、`Q(t)`、`Q(t_c)⁻¹` 和 `L_body_material⁻¹`，得到完整名义物体路径。给定声明附着 `A` 后，名义工具路径由该物体路径右乘 `A⁻¹` 唯一确定。父路径与固定右乘在每次求值时组合，旋转引起的 TCP 杆臂运动由同一函数保留。
 
 对于转动或移动机构，输入提供源标量坐标与当前坐标。参考在标量坐标中保留源运动增量与累计转角，再通过当前机构模型的正运动学生成位姿。`contact_motion=True` 与固定附着 `A` 是互斥输入分支，分别对应时变接触关系与刚性附着关系；同时给定时产生 `ValueError`。
+
+功能位姿参考可在技能表示中声明 `is_initial_relative_rotation_rpy`。该字段必须为三个布尔值，顺序为 roll、pitch、yaw，表示初始朝向的分量来源。旋转分量使用功能参考坐标 F 中的 XYZ 外禀约定，即 `R=Rz(yaw) Ry(pitch) Rx(roll)`。`true` 选择本次运行初态的对应分量，`false` 选择原功能参考迁移入口的对应分量。选择发生在入口；后续运动通过完整旋转矩阵保留相对于入口的旋转变化。标量机构参考的姿态由其正运动学定义，该声明适用于功能位姿参考。
+
+对于物体运动，旋转对象是上述固定材料功能坐标 M。记原名义路径为 `T_W_M(s)`，功能路径为 `T_W_F(s)`，技能进度为 s。原初始旋转在 F 中为 `R_n0=R_W_F(0)^T R_W_M(0)`，当前初始旋转为 `R_c=R_W_F(0)^T R_W_body(0) R_body_M`。当前物体模型位姿由已有观测或 `T_W_E A` 给出。`_initial_rotation_offset` 将二者转换为上述 RPY，按布尔值选定入口 `R_a`，计算固定修正 `D=R_a R_n0^T`，同时返回选择依据与修正矩阵。抓取工具参考使用同一规则，移动坐标 M 取已标定的 E。
+
+`_RotationOffsetPath` 保存原连续材料路径、连续功能路径与 D。每次查询时先求两个父路径，再计算 `R'_W_M(s)=R_W_F(s) D R_W_F(s)^T R_W_M(s)`，材料原点位置 `p_W_M(s)` 保持原函数。其 `sample` 返回保持 Torch 进度导数的位置和 wxyz 四元数；继承的 `sample_numpy` 返回同一位姿函数。该类型的 `poses` 为自身节点处的精确缓存，物体和末端变换通过普通子 `PosePath` 在每次查询时右乘。因而旋转偏移造成的物体原点与 TCP 杆臂位移仍属于同一连续函数。当前入口的三个分量全部选择运行初态时，材料入口朝向与本次模型初态一致；仅 yaw 选择运行初态时，D 是 F-z 轴的固定旋转，原参考的 roll/pitch 曲线保持原值。
+
+`generate_reference` 在字段的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
+
+`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer` 获得 `T_world_region`，再传给 `generate_reference`。它将数组写入 `reference.npz`，将旋转选择依据写入 `report.json.reference_rotation_transfer`，将连续工具路径与边界传给 `reference_phase`，最后调用参考网页输出。这个报告字段是上述参考运算的可追溯结果，其坐标与计算入口与路径对象一致。
 
 输出包括 `object_path/eef_path`、对应时间和名义位姿数组、`object_boundaries/eef_boundaries`、`boundary_checks`、`summaries`、`missing` 与 `status`。受控路径的终点为源释放时间与显式持物终点中的较早者；`bound_*` 另保存原名义绑定诊断。每份边界声明包含 `initial_pose`、带局部进度/位姿/来源的 `goals` 以及声明来源；`boundary_checks` 记录 `declared_for_physical_time_binding`。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
 

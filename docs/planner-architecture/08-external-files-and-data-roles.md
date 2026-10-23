@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`39880e5`；本次文档提交同步该实现的基线标记与索引，规划器代码内容与该代码提交相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：本次同步实现提交（前置检查点 `4510b8b`）。实际实现提交在提交后记录；仅文档提交与代码基线分别标注。
 
 ## 1. 技能表示与运行环境状态
 
@@ -19,11 +19,13 @@
 | `skill.json` | 技能包格式及各成员文件名 | `load_grounding_skill` 定位成员 |
 | `metadata.json` | 技能身份、技能类别、对象角色、语义描述与源事件信息 | 技能选择、语义对象选择与 grounding |
 | `source.json` + `source.npz` + `rgb.png` | 源图像、深度、相机标定、裁剪、源实体/功能区域、源点观测、特征和功能坐标 | `load_grounding_skill` 恢复源记录；`run_region_transfer` 使用源区域与特征提出并选择当前区域 |
-| `representation.json` + `motion.npz` | 源帧与时间、源物体/工具轨迹、`L_G/L_R`、`C_D/H_g/H_m`、交互/释放时刻与事件 | `generate_reference` 适配源运动并生成连续物体/工具参考 |
+| `representation.json` + `motion.npz` | 源帧与时间、源物体/工具轨迹、`L_G/L_R`、`C_D/H_g/H_m`、交互/释放时刻与事件，以及可选布尔数组 `is_initial_relative_rotation_rpy` | `generate_reference` 根据功能参考与声明的初始旋转选择生成连续物体/工具参考 |
 | `program.json` | 另一任务入口使用的源示教、功能事件、开闭指令与任务关系 | `prepare_candidate` → `build_planning_problem` → `ground_program`；部分实验入口直接由 representation 构造问题 |
 | 源 `episode.h5`、`trajectories.h5`、`masks.h5`、`regions.json`、`evidence.json` | 提取技能时使用的演示记录、区域及事件依据 | 技能导入/导出组件产生上述技能包；独立技能包加载按其成员文件读取 |
 
 `C_D` 表示源工具相对源物体的变换，`H_g` 表示源工具相对抓取功能坐标的变换，`H_m` 表示源物体相对操作功能坐标的变换。它们是参考运动的内容。源 `release_time` 决定参考受控区间的结束时刻；源开爪命令保留自身时刻。两者共同保留，并分别表达源物理事件与源控制意图。
+
+`is_initial_relative_rotation_rpy` 是技能的参考构造声明，依次选择 roll、pitch、yaw 的初始基准。`true` 使用本次运行初态，`false` 使用原功能参考迁移初态；后续旋转保留完整矩阵表示的源相对变化。该计算使用当前机器人反馈和已有物体—工具模型确定材料初态，坐标与组合顺序见[输入与任务模型](01-inputs-and-task-model.md)。
 
 ## 3. 当前感知与 grounding 文件
 
@@ -39,6 +41,7 @@
 | `surface.npz` | 多视角表面元素、观测像素、视图身份、观测与元素对应 | 区域几何和各图的区域投影 |
 | `region.npz` | 选定功能区域的表面元素掩码等结果 | 当前功能区域、支撑面选择与可视化 |
 | grounding 的 `report.json.functional_frame` | 迁移所得当前功能坐标 `T_world_region` | 实验 `reference_inputs` 实际读取并传给 `generate_reference`；该字段是计算输入 |
+| grounding 的 `report.json.reference_rotation_transfer` | 布尔选择、功能坐标中的原名义/当前/选定入口 RPY，以及固定旋转修正矩阵 | `config.ground_skill` 保存 `generate_reference.rotation_transfer`；用于解释生成结果及复核参考运算 |
 | 关系 JSON 中的 `J`、`A` | `J` 为当前物体坐标到源物体坐标的明确对应；`A=T_eef_body` 为名义附着 | 参考生成、任务点坐标与附着模型 |
 | `reference.npz` | 保存采样后的工具/物体参考、时间和相关数组 | 用于结果保存及指定入口的对照；是否重新读取由调用代码决定，不能替代连续路径对象的实际消费说明 |
 
