@@ -236,7 +236,7 @@ class FingerTrajectory:
     timestamp_s: float
     _curve: CubicHermiteSpline = field(init=False, repr=False)
     _bounds_report: dict = field(init=False, repr=False)
-    # BEGIN keep immutable polynomial tensors at stable capture addresses.
+    # BEGIN reuse immutable polynomial tensors across repeated rollout queries.
     _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
     # END this runtime cache is excluded from the archived reference schema.
 
@@ -421,13 +421,8 @@ class FingerTrajectory:
         message = "Finger reference queries must stay inside the original finite trajectory duration"
         if not isinstance(times, torch.Tensor) or not times.is_floating_point():
             raise ValueError(message)
-        valid = require_tensor(torch.isfinite(times).all() & ~(times < 0.).any()
-                               & ~(times > self.duration).any(), message)
-        if valid is not None:
-            # Deferred errors must never feed invalid search/index arithmetic;
-            # zero is an admitted time in every validated reference. The block
-            # reports this fault before any optimizer result can be returned.
-            times = torch.where(valid, times, torch.zeros_like(times))
+        require_tensor(torch.isfinite(times).all() & ~(times < 0.).any()
+                       & ~(times > self.duration).any(), message)
         key = (times.device, times.dtype)
         if key not in self._torch_cache:
             self._torch_cache[key] = (

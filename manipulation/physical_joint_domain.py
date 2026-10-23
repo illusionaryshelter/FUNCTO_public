@@ -1,25 +1,25 @@
-"""Physical joint domains for native IK and cubic L-BFGS updates.
+"""Physical joint domains for native IK and continuous projected-gradient updates.
 
 The domains restrict numerical iterates, not the demonstration or task goal.
 No position is clipped after optimization. Cubic checks include the measured
 instantaneous entrance and the analytic extrema of q, dq, ddq and jerk.
 """
 
-# BEGIN physical-domain step restriction shared by initialization and L-BFGS.
+# BEGIN physical-domain computation shared by initialization and ordinary descent.
 from __future__ import annotations
 
 import numpy as np
 import torch
 from scipy.interpolate import CubicHermiteSpline, PPoly
 
-# BEGIN a graph scope records errors without changing any domain arithmetic.
-from .optimizer_device_checks import has_active_device_checks, require_tensor
-# END public calls outside an optimizer graph still raise synchronously.
+# BEGIN the eager optimizer checks each physical predicate synchronously.
+from .optimizer_device_checks import require_tensor
+# END validation keeps the same physical predicate and exception type.
 
 # BEGIN CPU QPs share the exact cubic representation used by the tensor domain.
 from .physical_joint_qp import (CubicAffineMap, construct_cubic_anchor,
-                               fit_cubic_reference, recover_position_step)
-# END no CPU solver is called by a captured tensor limiter.
+                               fit_cubic_reference, projected_descent_step, program_work_report)
+# END CPU programs and tensor predicates use the same physical curve.
 
 
 class JointDomainInitializationError(ValueError):
@@ -60,27 +60,23 @@ class JointPositionDomain:
         values = action.to(torch.float64)
         return (torch.isfinite(values) & (values >= self.lower) & (values <= self.upper)).all(dim=(-1, -2))
 
-    # BEGIN graph-external recovery for single-state IK position boundaries.
-    def recovery_step(self, base, gradient, step_limits, scales):
+    # BEGIN host-side projected directions for single-state position boundaries.
+    def descent_step(self, base, gradient, step_limits, scales, *, check_request=None, work_report=None):
         """Return a legal descent direction; the caller must verify cost decrease."""
-        return recover_position_step(self, base, gradient, step_limits, scales)
+        return projected_descent_step(self, base, gradient, step_limits, scales,
+                                      check_request=check_request, work_report=work_report)
     # END independent coordinates are not frozen when another hits its bound.
 
     # BEGIN keep host validation separate from the unchanged tensor step map.
-    def validate(self, action: torch.Tensor) -> torch.Tensor | None:
-        """Raise outside a graph; return a recorded predicate inside its scope.
-
-        Graph callers must use the predicate to isolate invalid actions before
-        a rollout. Recording an error alone would still let a captured kernel
-        consume that action before the enclosing block reports the failure.
-        """
-        return require_tensor(self.feasible(action).all(),
+    def validate(self, action: torch.Tensor) -> None:
+        """Raise synchronously before an illegal action reaches a rollout."""
+        require_tensor(self.feasible(action).all(),
             "An optimizer action left the physical joint domain",
             error_type=JointDomainInitializationError)
 
     @staticmethod
     def validate_scales(scales: torch.Tensor) -> None:
-        """Validate the fixed native line-search multipliers outside capture."""
+        """Validate the fixed native line-search multipliers."""
         require_tensor(torch.isfinite(scales).all() & (scales >= 0).all(),
             "A domain-restricted line search needs finite nonnegative scales")
 
@@ -102,10 +98,9 @@ class JointPositionDomain:
                           scales: torch.Tensor) -> torch.Tensor:
         """Apply the exact step map to an already validated base/scales.
 
-        Eager calls can return an unchanged full step after checking every
-        actual trial. Graph/warmup scopes retain device-only control flow.
-        The optimizer separately validates the resulting trial predicates
-        before calling either native rollout.
+        Return an unchanged full step when every actual trial is feasible.
+        Otherwise the fixed bisection preserves the direction ratios and
+        checks rounding in the exact arithmetic used by the trial rollout.
         """
         finite = torch.isfinite(step).all(dim=(-1, -2), keepdim=True)
         step = torch.where(finite, step, torch.zeros_like(step))
@@ -118,15 +113,9 @@ class JointPositionDomain:
         # throughout. Checking every native-dtype trial also proves that none
         # of the eight rounding guards would halve this step. A failed proof
         # continues through the unchanged limiter below, including mixed rows.
-        # Exclude both the owned warmup scope and external CUDA capture: a host
-        # predicate must neither specialize a graph nor synchronize its stream.
-        eager = (not has_active_device_checks()
-                 and (step.device.type != "cuda"
-                      or not torch.cuda.is_current_stream_capturing()))
-        if eager:
-            trials = base[:, None]+scales*step[:, None]
-            if bool(full.all() & self.feasible(trials).all()):
-                return step
+        trials = base[:, None]+scales*step[:, None]
+        if bool(full.all() & self.feasible(trials).all()):
+            return step
         # END the finite-row mask, physical bounds and trial arithmetic survive.
         low = torch.where(full[:, None, None], high, low)
         # A fixed bound keeps resource use independent of requested precision.
@@ -174,6 +163,7 @@ class CubicJointDomain(JointPositionDomain):
         if q.shape != self.lower.shape or dq.shape != q.shape:
             raise ValueError("Cubic model bounds and measured entrance must share the named joint axis")
         self._anchor = None
+        self.initialization_report = {**program_work_report(), "reason": "not_started"}
         # BEGIN eliminate only the two measured instantaneous equalities.
         self._start_q, self._start_dq = q, dq
         self._curve_map = CubicAffineMap(q, dq, knots, knot_dt)
@@ -202,19 +192,21 @@ class CubicJointDomain(JointPositionDomain):
         return self._curve_map.evaluate(actions, progress, derivative)
 
     # BEGIN reference fitting uses the same measured entrance and cubic clock.
-    def fit_reference(self, progress, joint_targets, prior_controls=None):
+    def fit_reference(self, progress, joint_targets, prior_controls=None, *, check_request=None):
         """Fit soft joint references in this complete continuous physical domain.
 
         Returns [controls,joints] or None with a construction report.
         Progress uses the normalized physical clock; targets use this domain's
         joint column order. The report includes actual joint-reference errors.
         """
-        return fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls)
+        return fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls,
+                                   check_request=check_request)
     # END task-space constraints are evaluated by the planner on the fitted curve.
 
-    def recovery_step(self, base, gradient, step_limits, scales):
+    def descent_step(self, base, gradient, step_limits, scales, *, check_request=None, work_report=None):
         """Find a curve-feasible direction without boxing its free coefficients."""
-        return recover_position_step(self, base, gradient, step_limits, scales, self._curve_map)
+        return projected_descent_step(self, base, gradient, step_limits, scales, self._curve_map,
+                                      check_request=check_request, work_report=work_report)
     # END references are soft observations, never new trajectory task equalities.
 
     def coefficients(self, action: torch.Tensor) -> torch.Tensor:
@@ -295,35 +287,53 @@ class CubicJointDomain(JointPositionDomain):
                 & (low >= self.bounds[:, 0]).all(dim=(-1, -2))
                 & (high <= self.bounds[:, 1]).all(dim=(-1, -2)))
 
-    def _construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-        """Construct a same-domain QP anchor independently of fit/initialization."""
+    def _construct_anchor(self, dtype: torch.dtype, device: torch.device, *, check_request=None) -> torch.Tensor:
+        """Construct an original-domain LP anchor independently of reference fit."""
+        # BEGIN one construction records its actual LP calls, including an interruption.
+        self.initialization_report = {**program_work_report(), "reason": "constructing_anchor"}
         constant = self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone()
         if not bool(self._entrance_valid):
+            self.initialization_report["reason"] = "algebraic_entrance_invalid"
             raise JointDomainInitializationError(
                 "algebraic_entrance_invalid: measured q0/dq0 violate model bounds or the position tangent")
         if bool(self.feasible(constant).all()):
+            self.initialization_report["reason"] = "constant_curve_feasible"
             return constant
-        anchor, report = construct_cubic_anchor(self, self._curve_map, dtype, device)
+        anchor, report = construct_cubic_anchor(self, self._curve_map, dtype, device,
+            check_request=check_request, report=self.initialization_report)
+        self.initialization_report = report
         if anchor is None:
             raise JointDomainInitializationError(
                 f"No physical-domain cubic initializer was constructed: {report}; "
                 "measured q0/dq0 and the frozen knot clock were retained")
         return anchor
+        # END reusing this anchor never repeats or recharges its native solve.
 
-    def initialize(self, proposals: torch.Tensor) -> torch.Tensor:
+    def initialize(self, proposals: torch.Tensor, *, check_request=None) -> torch.Tensor:
         """Keep legal reference seeds and contract only illegal initializers."""
         shape = proposals.shape
         values = proposals.reshape(-1, self.knots, len(self.lower))
+        self.initialization_report = {**program_work_report(), "reason": "checking_proposals",
+                                      "proposal_count": len(values)}
         if bool(self.feasible(values).all()):
+            self.initialization_report["reason"] = "proposals_already_feasible"
             return proposals
+        anchor_source = "existing_anchor"
         if self._anchor is None:
             valid = self.feasible(values)
-            self._anchor = (values[valid][:1].clone() if bool(valid.any()) else
-                            self._construct_anchor(proposals.dtype, proposals.device))
+            if bool(valid.any()):
+                self._anchor = values[valid][:1].clone()
+                anchor_source = "feasible_proposal"
+            else:
+                self._anchor = self._construct_anchor(proposals.dtype, proposals.device,
+                                                       check_request=check_request)
+                anchor_source = "physical_domain_anchor"
         base = self._anchor.expand_as(values)
         scales = values.new_ones((1, 1, 1, 1))
         step = self.limit_step(base, values-base, scales)
         initialized = base+step
         self.validate(initialized)
+        self.initialization_report.update(reason="physical_proposals_initialized",
+            proposal_count=len(values), anchor_source=anchor_source)
         return initialized.reshape(shape)
 # END every accepted/exploration/best action represents a domain-valid curve.

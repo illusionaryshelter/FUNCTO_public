@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`82a3d66`；本文同时描述本次工作区内已实现、待统一提交的参考初始化与约束方向改动。实现提交后统一更新代码基线引用。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -85,11 +85,15 @@
 
 `planning-report.json`、场景快照 NPZ、自过滤与分区文件记录计算结果。场景绑定中的 owner query 保存用于复现的几何及坐标；某文件以后被显式加载时，它同时成为该后续阶段的输入。来源路径和实际文件读取须分别说明。
 
-任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。`reference_ik_queries` 保存普通参考 IK 的原成功标志、原生连杆位置与真实转角误差、位置域资格、二次位姿能量，以及下一查询的跟踪来源。`warm_start_count/generated_seed_count` 表达固定种子总槽位中的实际分配；`proposal_candidate_indices` 与 `qualified_candidate_indices` 分别表示数值提议和原生收敛候选。`reference_ik_chains` 保存实际粗链、被选候选索引及 `SOLVED/APPROXIMATE_PROPOSAL/INTERPOLATED_PROPOSAL` 状态；`reference_seed_fits` 保存各粗曲线的构造结果。
+任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。`reference_ik_queries` 保存普通参考 IK 的原成功标志、原生连杆位置与真实转角误差、位置域资格、二次位姿能量，以及下一查询的跟踪来源。`warm_start_count/generated_seed_count` 表达固定种子总槽位中的实际分配；`proposal_candidate_indices` 与 `qualified_candidate_indices` 分别表示数值提议和原生收敛候选。`reference_ik_chains` 保存完整数值链、原候选索引、生产查询及 `SOLVED/APPROXIMATE_PROPOSAL/INTERPOLATED_PROPOSAL` 身份。链中的有限状态共同形成自由系数提议，`initial_seed_strategies` 保存其来源。
 
-`reference_initialization` 的 `iteration_allocation` 保存总更新数、原生内迭代块长度以及初始化/主求解分配；`geometry_scope="robot"` 表示共享官方机器人自身与名义手部计算，`task_scene_constraints="not_evaluated"` 表示任务观测场的计算范围。`coarse`、`selected`、`refined` 及 `enrichment.proposed` 中的 `seeds` 按实际 `seed_index` 保存自由系数、`trajectory` 标准快照、同次采样资格、固定普通目标、完整优化目标、原生约束、完整任务有符号不等式以及连续位置/速度/加速度/分段 jerk 报告。`reference_times_s/reference_point_costs` 保留普通原生网格上的时间和已加权参考贡献。`enrichment` 另保存新增调用及其工作量、重选链、拟合和逐槽选用的来源。
+`reference_initialization.iteration_allocation` 保存总更新数、原生内迭代块长度以及初始化/主求解分配；`geometry_scope="robot"` 表示共享官方机器人自身与名义手部计算，`task_scene_constraints="not_evaluated"` 表示任务观测场的计算范围。`coarse` 是物理域初始化后的数值初值，`refined` 是完整工具目标优化的实际输出。两者的 `seeds` 按 `seed_index` 保存自由系数、标准 `trajectory` 快照、同次采样资格、固定普通目标、完整优化目标、原生约束、完整任务有符号不等式，以及连续位置/速度/加速度/分段 jerk 报告。`reference_times_s/reference_point_costs` 保留普通原生网格上的时间和已加权参考贡献。
 
-快照保留具名关节、物理时刻、位置/速度、多项式系数、进度映射、事件、条件与手指时钟；其中 `executable_until/next_verification` 描述事件依赖定义的条件区间，完整执行资格由候选验收与绑定记录提供。`refined` 对应实际返回并交给完整主求解的系数。查询日志按实际执行顺序追加，链同时保存物理时间顺序和生产节点身份；`observation_mask` 明确哪些原生成功行用于关节拟合。中断后只保留已完成记录，原始失败与缺失状态随阶段记录保存。
+快照保留具名关节、物理时刻、位置/速度、多项式系数、进度映射、事件、条件与手指时钟；`executable_until/next_verification` 描述事件依赖定义的条件区间，完整执行资格由候选验收与绑定提供。`refined` 对应实际返回并交给完整主求解的系数。查询日志按执行顺序追加，数值链同时保存时间顺序与生产节点身份。中断后保留已完成记录，失败与缺失随对应阶段保存。
+
+`reference_initialization.optimizer_runtime` 和 `last_optimizer_runtime` 分别记录初始化与最后一次主求解的各 optimizer 诊断，包含实际方向、线搜索和 QP/LP 调用数及相应时段。方向工作按种子保存；同一个 optimizer 各种子重复保存的 `shared_batch_work` 表示同一批量前向、反向、局部几何捕获、基点证据与设备等待，汇总时取一次。主机时段与后续显式流等待分别测量，报告保留其实际墙钟含义。物理域的 `initialization_report` 另记录构造初始锚点的 LP 工作。
+
+省略初值完整验收时，`reference_candidate` 保存 `qualification="skipped_known_functional_failure"`、`source="reference_initialization.refined"` 以及每个种子的有限正原始功能不等式。该记录来自同系数、同入口、同时钟与进度映射的终态快照，说明随后进入主优化的调度依据；已完成的候选验收另有实际 `accepted` 及完整报告。
 
 事件 IK 由 OMPL 搜索入口实际调用时，`functional_ik_candidates` 保存原目标身份、物理时刻、候选关节状态及独立任务/场景结论；其用途是搜索边界提议。完整轨迹的事件约束由同一任务允许集合求值。
 

@@ -15,7 +15,7 @@ import torch
 
 from manipulation.planning import (
     JointTrajectory, MotionBackend, MotionPlanningError, PlanningBudget,
-    _ProgressMap, _bind_motion_work_ledger, _verified_dependency_outcomes,
+    _CuroboPlanner, _ProgressMap, _bind_motion_work_ledger, _verified_dependency_outcomes,
 )
 from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath
 
@@ -63,7 +63,6 @@ class Native:
         self.route = "constrained"
         self.functional_constraints = SimpleNamespace(keys=("event",))
         self.reference_ik_distinct_counts = self.reference_ik_queries = self.reference_ik_chains = []
-        self.reference_seed_fits = []
         self.goal_ik_candidates = {}
         self.reference_initialization = {"status": "completed", "scene_constraints": "not_evaluated"}
         self.main_trajectory_iterations = self.budget.trajectory_iterations//2
@@ -81,6 +80,9 @@ class Native:
     def reference_seeds(self, joint_reference=None):
         self.calls.append("seed")
         return torch.zeros((1, 2, 8, 1)), []
+    # BEGIN request fixtures use the same terminal-evidence dispatch predicate.
+    known_initialization_failures = _CuroboPlanner.known_initialization_failures
+    # END missing terminal evidence preserves the existing qualification route.
     def evaluate_reference(self, seed):
         self.calls.append("reference")
         return next(self.outcomes)

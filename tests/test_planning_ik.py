@@ -42,15 +42,16 @@ def test_extra_clearance_cannot_buy_a_large_continuity_loss():
     assert select([[.001], [2.]], [report(environment_clearance_m=.00005), report()]) == [0]
 
 
-@pytest.mark.parametrize("first,second", [
+@pytest.mark.parametrize("first,second,reference,functional", [
     (report(task_satisfied=False, task_violations={"coordinate:0": .1},
             environment_clearance_m=100.),
-     report(model_valid=False, native_violations={"cspace": .1})),
-    (report(model_valid=False, native_violations={"cspace": .1}, environment_clearance_m=100.), report()),
-    (report(native_pose_ik_success=False, environment_clearance_m=100.), report()),
+     report(model_valid=False, native_violations={"cspace": .1}), 0, 1),
+    (report(model_valid=False, native_violations={"cspace": .1}, environment_clearance_m=100.), report(), 0, 1),
+    (report(native_pose_ik_success=False, environment_clearance_m=100.), report(), 1, 0),
 ])
-def test_same_query_qualification_precedes_any_continuity_or_clearance_advantage(first, second):
-    assert select([[0.], [2.]], [first, second]) == [1]
+def test_reference_numerical_continuity_and_functional_qualification_have_separate_priorities(first, second, reference, functional):
+    assert select([[0.], [2.]], [first, second]) == [reference]
+    assert select([[0.], [2.]], [first, second], query_kind="functional") == [functional]
 
 
 def test_functional_allowed_set_does_not_require_nominal_center_ik_success():
@@ -73,12 +74,13 @@ def test_unknown_distance_never_masquerades_as_infinite_clearance(missing):
                                  report(environment_clearance_m=-.01)]) == [1]
 
 
-def test_duplicate_representative_retains_the_better_evidence_before_deduplication():
+def test_duplicate_representative_obeys_the_declared_numerical_or_functional_role():
     values = [[0.], [.25e-5], [.5], [float("nan")]]
     reports = [report(model_valid=False, native_violations={"cspace": .1}),
                report(), report(), report(environment_clearance_m=100.)]
-    assert select(values, reports, count=4) == [1, 2]
-    assert select(values, reports, count=1) == [1]
+    assert select(values, reports, count=4) == [0, 2]
+    assert select(values, reports, count=1) == [0]
+    assert select(values, reports, count=4, query_kind="functional") == [1, 2]
 
 
 def test_nearest_previous_state_precedes_extra_clearance():
@@ -241,20 +243,20 @@ def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
         successful_energy = sum(costs[query, index] for query, index in enumerate(path)
                                 if solved[query, index])
         evidence_counts = (sum(task_states[q, i] == 1 for q, i in enumerate(path)),
-                           sum(model_states[q, i] == 1 for q, i in enumerate(path)), failures,
+                           sum(model_states[q, i] == 1 for q, i in enumerate(path)),
                            sum(task_states[q, i] == 2 for q, i in enumerate(path)),
                            sum(model_states[q, i] == 2 for q, i in enumerate(path)))
-        expected.append(((*evidence_counts, float(failed_energy), float(energy),
-                          float(successful_energy)), path))
+        expected.append(((failures, float(failed_energy), float(energy),
+                          float(successful_energy), *evidence_counts), path))
     expected.sort()
     actual = chains(pools, rows, times=times, velocity=bounds, pose_costs=costs, count=3)
     assert [tuple(row["candidate_indices"]) for row in actual] == [path for _, path in expected[:3]]
     np.testing.assert_allclose([row["selection_cost"]["normalized_velocity_energy"] for row in actual],
-                               [score[6] for score, _ in expected[:3]], rtol=1e-14)
+                               [score[2] for score, _ in expected[:3]], rtol=1e-14)
     np.testing.assert_allclose([row["selection_cost"]["failed_pose_energy"] for row in actual],
-                               [score[5] for score, _ in expected[:3]], rtol=1e-14)
+                               [score[1] for score, _ in expected[:3]], rtol=1e-14)
     np.testing.assert_allclose([row["selection_cost"]["successful_pose_energy"] for row in actual],
-                               [score[7] for score, _ in expected[:3]], rtol=1e-14)
+                               [score[3] for score, _ in expected[:3]], rtol=1e-14)
 
 
 @pytest.mark.parametrize("times", [[0., 1.], [1., 1.], [2., 1.], [1., float("nan")]])
@@ -264,7 +266,7 @@ def test_invalid_clock_is_rejected_instead_of_retimed(times):
 # END these candidates are initialization evidence, never a checked continuous trajectory.
 
 
-# BEGIN one qualification prefix governs ranking, tracking and whole chains.
+# BEGIN all reference consumers preserve success and numerical continuity first.
 def policy_first_indices(values, rows, *, pose_costs=None):
     """Compare the three consumers using identical, explicitly supplied evidence."""
     values = np.asarray(values, float)
@@ -278,9 +280,10 @@ def policy_first_indices(values, rows, *, pose_costs=None):
 
 @pytest.mark.parametrize("component", ["collision/robot/self", "collision/entity/background",
     "contact/declared_relation", "initial_support/declared_relation", "gripper/controller"])
-def test_same_definite_model_violation_precedes_nearer_joint_state_in_all_consumers(component):
+def test_definite_model_report_does_not_override_numerical_reference_continuity(component):
     rows = [report(model_valid=False, scene_components={component: {"maximum": .01}}), report()]
-    assert policy_first_indices([[.01], [.8]], rows, pose_costs=[1e-12, 1e-6]) == (1, 1, 1)
+    assert policy_first_indices([[.01], [.8]], rows, pose_costs=[1e-12, 1e-6]) == (0, 0, 0)
+    assert select([[.01], [.8]], rows, query_kind="functional") == [1]
 
 
 @pytest.mark.parametrize("unknown", [
@@ -299,7 +302,7 @@ def test_unknown_model_never_becomes_a_definite_collision_or_failure(unknown):
     rows = [report(model_valid=False,
                    scene_components={"collision/robot/self": {"maximum": .01}}),
             report(model_valid=False, **unknown)]
-    assert policy_first_indices([[.01], [.8]], rows) == (1, 1, 1)
+    assert policy_first_indices([[.01], [.8]], rows) == (0, 0, 0)
     selected = chains([[[.8]]], [[rows[1]]])[0]
     assert selected["selection_cost"]["static_model_failed_count"] == 0
     assert selected["selection_cost"]["static_model_not_established_count"] == 1
@@ -323,18 +326,20 @@ def test_known_collision_and_unknown_relation_keep_the_same_original_report():
     assert set(row["scene_components"]) == {"collision/robot/self", "unresolved/coverage/entity"}
 
 
-def test_task_then_model_failure_priority_is_identical_in_all_consumers():
+def test_task_then_model_failure_priority_belongs_to_functional_queries():
     rows = [report(task_satisfied=False, task_violations={"coordinate:0": .1}),
             report(model_valid=False, native_violations={"cspace": .1})]
-    assert policy_first_indices([[.01], [.8]], rows) == (1, 1, 1)
+    assert policy_first_indices([[.01], [.8]], rows) == (0, 0, 0)
+    assert select([[.01], [.8]], rows, query_kind="functional") == [1]
 
 
-def test_unknown_verdict_breaks_equal_native_success_before_continuity():
+def test_unknown_verdict_only_breaks_equal_numerical_reference_ties():
     rows = [report(task_satisfied=False, model_valid=False), report()]
-    assert policy_first_indices([[.01], [.8]], rows) == (1, 1, 1)
+    assert policy_first_indices([[.01], [.8]], rows) == (0, 0, 0)
+    assert policy_first_indices([[-.8], [.8]], rows) == (1, 1, 1)
 
 
-def test_unqueried_reference_counts_neither_static_failure_and_keeps_failed_observation():
+def test_unqueried_reference_counts_neither_static_failure_and_keeps_failed_status():
     row = report(task_satisfied=False, model_valid=False, native_pose_ik_success=False,
         static_model_query="not_run_native_reference_ik_failed")
     selected = chains([[[.1]]], [[row]])[0]
@@ -344,19 +349,18 @@ def test_unqueried_reference_counts_neither_static_failure_and_keeps_failed_obse
         "static_task_not_established_count": 1, "static_model_not_established_count": 1,
         "failed_pose_energy": 0., "normalized_velocity_energy": pytest.approx(.01),
         "successful_pose_energy": 0.}
-    assert selected["observation_mask"] == [False]
+    assert selected["query_statuses"] == ["APPROXIMATE_PROPOSAL"]
 
 
-def test_observation_mask_retains_original_pool_indices_and_excludes_interpolated_rows():
+def test_numerical_chain_retains_original_pool_indices_and_interpolated_status():
     values = [[[float("nan")], [.1]], [[float("nan")]], [[.3]], [[.4]]]
     rows = [[report(), report()], [report()], [report(native_pose_ik_success=False)], [report()]]
     selected = chains(values, rows)[0]
     assert selected["candidate_indices"] == [1, None, 0, 0]
     assert selected["anchor_query_indices"] == [0, 2, 3]
-    assert selected["observation_mask"] == [True, False, False, True]
     assert selected["query_statuses"] == ["SOLVED", "INTERPOLATED_PROPOSAL", "APPROXIMATE_PROPOSAL", "SOLVED"]
     assert not selected["reference_success"]
-# END only successful original nodes become fitting observations.
+# END no observation mask limits the independent full-reference objective.
 
 
 # BEGIN production IK screening uses the same native and online residuals.

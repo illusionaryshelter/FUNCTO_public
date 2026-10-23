@@ -1,6 +1,6 @@
 # `manipulation/contact_binding.py` 实现契约
 
-代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。
+代码基线：`82a3d66；包含本次工作区已实现改动，待统一实现提交后更新`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `bind_grasp_contact_rules`

@@ -1,7 +1,8 @@
-"""CPU oracles for fixed-clock fitting and continuous-boundary recovery."""
+"""CPU oracles for fixed-clock fitting and continuous-boundary descent."""
 
 # BEGIN independent curve and objective checks for the shared CPU QP interface.
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from scipy.interpolate import BSpline, PPoly
@@ -9,6 +10,7 @@ import torch
 
 from manipulation.physical_joint_domain import (CubicJointDomain, JointPositionDomain,
                                                 JointDomainInitializationError)
+from manipulation import physical_joint_qp as qp
 
 
 class PhysicalJointQPTest(unittest.TestCase):
@@ -81,7 +83,7 @@ class PhysicalJointQPTest(unittest.TestCase):
         limits = torch.full((8, 1), .1)
         scales = self.scales()
         raw = domain.limit_step(base, -.1*gradient, scales)
-        direction, report = domain.recovery_step(base, gradient, limits, scales)
+        direction, report = domain.descent_step(base, gradient, limits, scales)
         self.assertTrue(report["success"], report)
         self.assertGreater(report["rounds"], 1)
         self.assertLess(report["gradient_dot_step"], 0.)
@@ -95,7 +97,7 @@ class PhysicalJointQPTest(unittest.TestCase):
         base = torch.tensor([[[1., 0.]]])
         gradient = torch.tensor([[[-1., 1.]]])
         scales = self.scales(2.)
-        direction, report = domain.recovery_step(base, gradient, torch.ones((1, 2)), scales)
+        direction, report = domain.descent_step(base, gradient, torch.ones((1, 2)), scales)
         self.assertTrue(report["success"], report)
         self.assertEqual(float(direction[0, 0, 0]), 0.)
         self.assertLess(float(direction[0, 0, 1]), -.1)
@@ -114,20 +116,51 @@ class PhysicalJointQPTest(unittest.TestCase):
         gradient = torch.full_like(base, -1.)
         gradient[..., 0] = -6.
         scales = self.scales(1.5)
-        direction, report = domain.recovery_step(base, gradient, torch.full((16, 2), 1.96), scales)
+        direction, report = domain.descent_step(base, gradient, torch.full((16, 2), 1.96), scales)
         self.assertTrue(report["success"], report)
         self.assertGreater(float(direction[..., 1].abs().min()), .1)
         self.assertEqual(report["per_joint_limiter_scale"][1], 1.)
         self.assertTrue(bool(domain.feasible(base[:, None]+scales*direction[:, None]).all()))
         self.assertLessEqual(float((scales.max()*direction).abs().max()), 1.96)
 
-    def test_constrained_stationary_state_has_no_fabricated_recovery(self):
+    def test_constrained_stationary_state_has_no_fabricated_descent(self):
         domain = JointPositionDomain(torch.tensor([-1.]), torch.tensor([1.]))
         base = torch.ones((1, 1, 1))
-        direction, report = domain.recovery_step(base, -base, base[0], self.scales())
+        direction, report = domain.descent_step(base, -base, base[0], self.scales())
         self.assertFalse(report["success"])
         self.assertEqual(report["reason"], "no_representable_descent_direction")
         torch.testing.assert_close(direction, torch.zeros_like(base))
+
+    # BEGIN active large gradients cannot normalize away another joint's motion.
+    def test_large_blocked_gradient_preserves_independent_negative_gradient(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        base = torch.tensor([[[1., 0.]]])
+        direction, report = domain.descent_step(base, torch.tensor([[[-1e8, .2]]]),
+                                               torch.ones((1, 2)), self.scales())
+        self.assertTrue(report["success"], report)
+        torch.testing.assert_close(direction, torch.tensor([[[0., -.2]]]), rtol=0, atol=0)
+
+    def test_zero_radius_anchor_retains_exact_boundary_braking_solution(self):
+        bounds = torch.tensor([[-10., 10.], [-2., 2.], [-.75, .75], [-3., 3.]])[:, :, None]
+        domain = CubicJointDomain(bounds, torch.tensor([0.]), torch.tensor([1.59375]), .25, 8)
+        anchor = domain._construct_anchor(torch.float32, torch.device("cpu"))
+        self.assertTrue(bool(domain.feasible(anchor).all()))
+        # Maximal braking reaches the fixed stop exactly; a mandatory positive
+        # coefficient margin would incorrectly remove this feasible curve.
+        np.testing.assert_array_equal(domain.evaluate(anchor, [0., 1.], 1)[0, :, 0], [1.59375, 0.])
+        low, high = domain.all_extrema(anchor)
+        self.assertEqual(float(low[0, 2, 0]), -.75)
+        self.assertEqual(float(high[0, 3, 0]), 3.)
+
+    def test_anchor_keeps_measured_position_and_velocity_at_original_bounds(self):
+        for q, dq in ((1., 0.), (0., .5)):
+            with self.subTest(q=q, dq=dq):
+                domain = self.domain(q, dq, limits=(1., .5, 2., 20.))
+                anchor = domain._construct_anchor(torch.float32, torch.device("cpu"))
+                self.assertTrue(bool(domain.feasible(anchor).all()))
+                np.testing.assert_array_equal(domain.evaluate(anchor, [0.])[0, 0], [q])
+                np.testing.assert_array_equal(domain.evaluate(anchor, [0.], 1)[0, 0], [dq])
+    # END all constructions and directions use the unmodified physical bounds.
 
     def test_seed_fit_enforces_continuous_velocity_at_moving_acceleration_roots(self):
         domain = self.domain(.2, .1, limits=(1., .5, 1000., 10000.))
@@ -179,7 +212,7 @@ class PhysicalJointQPTest(unittest.TestCase):
         torch.testing.assert_close(domain._start_dq, original_dq, rtol=0, atol=0)
 
     # BEGIN nonzero measured velocity is feasible only with sufficient braking room.
-    def test_qp_anchor_brakes_with_the_full_model_acceleration_and_jerk_limits(self):
+    def test_original_domain_anchor_brakes_with_the_full_model_acceleration_and_jerk_limits(self):
         domain = self.domain(.8, .6, limits=(1., .8, 2., 20.))
         proposal = torch.full((1, 8, 1), .8)
         self.assertFalse(bool(domain.feasible(proposal).all()))
@@ -225,7 +258,7 @@ class PhysicalJointQPTest(unittest.TestCase):
         self.assertEqual(float(domain._start_q), 0.)
         self.assertEqual(float(domain._start_dq), 1.)
 
-    def test_tight_acceleration_and_jerk_fit_and_recovery_share_all_trial_bounds(self):
+    def test_tight_acceleration_and_jerk_fit_and_descent_share_all_trial_bounds(self):
         domain = self.domain(0., .1, limits=(1., .5, .2, 1.))
         progress = np.linspace(0., 1., 41)
         fitted, report = domain.fit_reference(progress, np.linspace(0., .2, 41)[:, None])
@@ -241,14 +274,165 @@ class PhysicalJointQPTest(unittest.TestCase):
             self.assertGreaterEqual(float(values.min()), float(domain.bounds[derivative, 0, 0]))
             self.assertLessEqual(float(values.max()), float(domain.bounds[derivative, 1, 0]))
         base = domain.initialize(torch.zeros((1, 8, 1)))
-        direction, recovery = domain.recovery_step(base, -torch.ones_like(base),
+        direction, descent = domain.descent_step(base, -torch.ones_like(base),
                                                    torch.full((8, 1), .1), self.scales(1.5))
-        self.assertTrue(recovery["success"], recovery)
+        self.assertTrue(descent["success"], descent)
         trials = base[:, None]+self.scales(1.5)*direction[:, None]
         self.assertTrue(bool(domain.feasible(trials).all()))
         self.assertLessEqual(float((1.5*direction).abs().max()), float(torch.tensor(.1)))
     # END algebraic entrance checks and bounded continuous construction stay distinct.
 
+    # BEGIN measured work follows actual library calls and reused affine rows.
+    def test_qp_exchange_reuses_fixed_rows_and_appends_each_new_witness_once(self):
+        domain = self.domain()
+        curve = domain._curve_map
+        base = torch.ones((1, 8, 1))
+        gradient = torch.tensor([1., 1., 1., 1., 1., 1., -1., -1.]).reshape_as(base)
+        known = [set(times) for times in curve.fixed_constraint_times]
+        original_rows, native = curve.query_knot_times, qp.quadprog.solve_qp
+        rows_seen, calls = [], []
+
+        def query_only_new(times, derivative=0):
+            for moment in times:
+                self.assertNotIn(moment, known[derivative])
+                known[derivative].add(moment)
+            rows_seen.extend((derivative, float(moment)) for moment in times)
+            return original_rows(times, derivative)
+
+        def solve(hessian, linear, matrix, rhs):
+            calls.append((matrix.copy(), rhs.copy()))
+            return native(hessian, linear, matrix, rhs)
+
+        with patch.object(curve, "query_knot_times", side_effect=query_only_new), \
+             patch.object(qp.quadprog, "solve_qp", side_effect=solve):
+            direction, report = domain.descent_step(base, gradient, torch.full((8, 1), .1), self.scales())
+        self.assertTrue(report["success"], report)
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(report["qp_calls"], len(calls))
+        self.assertEqual(report["lp_calls"], 0)
+        self.assertTrue(rows_seen)
+        for (old_matrix, old_rhs), (matrix, rhs) in zip(calls, calls[1:]):
+            old_count, count = old_matrix.shape[1]//2, matrix.shape[1]//2
+            self.assertGreater(count, old_count)
+            # quadprog receives lower rows then upper rows. Existing rows
+            # and bounds retain exactly their original numeric values.
+            np.testing.assert_array_equal(matrix[:, :old_count], old_matrix[:, :old_count])
+            np.testing.assert_array_equal(matrix[:, count:count+old_count], old_matrix[:, old_count:])
+            np.testing.assert_array_equal(rhs[:old_count], old_rhs[:old_count])
+            np.testing.assert_array_equal(rhs[count:count+old_count], old_rhs[old_count:])
+        for name in ("extrema_seconds", "assembly_seconds", "qp_solve_seconds", "host_transfer_seconds"):
+            self.assertGreater(report[name], 0.)
+        self.assertTrue(bool(domain.feasible(base[:, None]+self.scales()*direction[:, None]).all()))
+
+    def test_qp_count_sums_native_joint_calls_with_request_checks_at_each_boundary(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        base, events = torch.zeros(1, 1, 2), []
+        native = qp.quadprog.solve_qp
+
+        def solve(*args):
+            events.append("qp")
+            return native(*args)
+
+        with patch.object(qp.quadprog, "solve_qp", side_effect=solve):
+            _, report = domain.descent_step(base, -torch.ones_like(base), torch.ones(1, 2), self.scales(),
+                                            check_request=lambda: events.append("check"))
+        self.assertEqual(report["qp_calls"], 2)
+        self.assertEqual(report["rounds"], 1)
+        self.assertEqual(events, ["check", "qp", "check"]*2)
+
+    def test_lp_reuses_bound_rows_and_only_charges_new_anchor_construction(self):
+        domain = self.domain(.8, .6, limits=(1., .8, 2., 20.))
+        curve = domain._curve_map
+        known = [set(times) for times in curve.fixed_constraint_times]
+        original_rows, native = curve.query_knot_times, qp.linprog
+        events = []
+
+        def query_only_new(times, derivative=0):
+            for moment in times:
+                self.assertNotIn(moment, known[derivative])
+                known[derivative].add(moment)
+            return original_rows(times, derivative)
+
+        def solve(*args, **kwargs):
+            events.append("lp")
+            return native(*args, **kwargs)
+
+        proposal = torch.full((1, 8, 1), .8)
+        with patch.object(curve, "query_knot_times", side_effect=query_only_new), \
+             patch.object(qp, "linprog", side_effect=solve):
+            initialized = domain.initialize(proposal, check_request=lambda: events.append("check"))
+        report = domain.initialization_report
+        self.assertGreater(report["lp_calls"], 0)
+        self.assertEqual(events, ["check", "lp", "check"]*report["lp_calls"])
+        self.assertEqual(report["qp_calls"], 0)
+        self.assertGreater(report["lp_solve_seconds"], 0.)
+        self.assertTrue(bool(domain.feasible(initialized).all()))
+        with patch.object(qp, "linprog", side_effect=AssertionError("Existing anchor was recomputed")):
+            domain.initialize(proposal)
+        self.assertEqual(domain.initialization_report["lp_calls"], 0)
+        self.assertEqual(domain.initialization_report["anchor_source"], "existing_anchor")
+
+    def test_reference_fit_checks_the_request_around_every_native_qp(self):
+        domain = self.domain(.2, .1, limits=(1., .5, 1000., 10000.))
+        progress, events = np.linspace(0., 1., 41), []
+        native = qp.quadprog.solve_qp
+
+        def solve(*args):
+            events.append("qp")
+            return native(*args)
+
+        with patch.object(qp.quadprog, "solve_qp", side_effect=solve):
+            fitted, report = domain.fit_reference(progress, np.sin(6*np.pi*progress)[:, None],
+                                                   check_request=lambda: events.append("check"))
+        self.assertTrue(report["success"], report)
+        self.assertEqual(events, ["check", "qp", "check"]*report["qp_calls"])
+        self.assertGreater(report["qp_calls"], 1)
+        self.assertTrue(bool(domain.feasible(fitted[None]).all()))
+
+    def test_interruption_keeps_actual_qp_or_lp_calls_without_starting_the_next(self):
+        for kind in ("position_qp", "cubic_qp", "lp"):
+            for boundary in (1, 2):
+                with self.subTest(kind=kind, boundary=boundary):
+                    checks, work = [], {}
+                    interruption = TimeoutError("original request ended")
+
+                    def guard():
+                        checks.append(True)
+                        if len(checks) == boundary:
+                            raise interruption
+
+                    if kind == "lp":
+                        domain = self.domain(.8, .6, limits=(1., .8, 2., 20.))
+                        native = patch.object(qp, "linprog", wraps=qp.linprog)
+                        operation = lambda: domain.initialize(torch.full((1, 8, 1), .8), check_request=guard)
+                    else:
+                        domain = (JointPositionDomain(-torch.ones(1), torch.ones(1))
+                                  if kind == "position_qp" else self.domain())
+                        base = torch.zeros(1, 1 if kind == "position_qp" else 8, 1)
+                        native = patch.object(qp.quadprog, "solve_qp", wraps=qp.quadprog.solve_qp)
+                        operation = lambda: domain.descent_step(base, -torch.ones_like(base),
+                            torch.ones_like(base[0]), self.scales(), check_request=guard, work_report=work)
+                    with native as solve, self.assertRaises(TimeoutError) as raised:
+                        operation()
+                    self.assertIs(raised.exception, interruption)
+                    self.assertEqual(solve.call_count, boundary-1)
+                    if kind == "lp":
+                        self.assertIsNone(domain._anchor)
+                        self.assertEqual(domain.initialization_report["lp_calls"], solve.call_count)
+                    else:
+                        self.assertEqual(work["qp_calls"], solve.call_count)
+                        if solve.call_count:
+                            self.assertGreater(work["qp_solve_seconds"], 0.)
+
+    def test_unexpected_native_numerical_error_retains_its_exception_and_call_count(self):
+        domain = JointPositionDomain(-torch.ones(1), torch.ones(1))
+        error, work = ValueError("declared nonpositive factorization"), {}
+        with patch.object(qp.quadprog, "solve_qp", side_effect=error), self.assertRaises(ValueError) as raised:
+            domain.descent_step(torch.zeros(1, 1, 1), -torch.ones(1, 1, 1), torch.ones(1, 1),
+                                self.scales(), work_report=work)
+        self.assertIs(raised.exception, error)
+        self.assertEqual(work["qp_calls"], 1)
+    # END work evidence preserves the physical domain and the failure outcome.
 
 
 if __name__ == "__main__":

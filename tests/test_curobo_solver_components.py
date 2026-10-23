@@ -1,7 +1,7 @@
-"""Exercise FUNCTO composition using native CPU L-BFGS and goal allocation."""
+"""CPU regressions for constrained native gradients, task blocks and goal layout."""
 
 # BEGIN regression coverage for the behavior moved out of third-party source.
-from dataclasses import fields, replace
+from dataclasses import fields
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -16,13 +16,14 @@ from curobo._src.types.device_cfg import DeviceCfg
 from curobo.types import GoalToolPose, JointState
 
 from manipulation.curobo_solver_components import (
-    LayoutGoalManager, PhysicalGradientCore, bind_solver_components,
+    LayoutGoalManager, PhysicalGradientCore, PhysicalLineSearch, bind_solver_components,
 )
 from manipulation.physical_joint_domain import (
     CubicJointDomain, JointDomainInitializationError, JointPositionDomain,
 )
 from manipulation.functional_augmented_lagrangian import FunctionalAugmentedLagrangian
 from manipulation.local_geometry_model import LocalGeometryModels, LocalPairModel
+from manipulation import physical_joint_qp
 
 
 class AnalyticRollout:
@@ -55,7 +56,7 @@ class AnalyticGeometryRollout(AnalyticRollout):
 
     The analytic query here supplies the test's actual base tangent. Production
     LocalPairModel and LocalGeometryModels own the scalar and frozen lifecycle;
-    the unchanged native optimizer owns every cost and gradient callback.
+    the native gradient core owns every cost and gradient callback.
     """
 
     def __init__(self, domain, owner, models):
@@ -99,6 +100,7 @@ class AnalyticGeometryRollout(AnalyticRollout):
 # END hard feasibility remains separate from the sphere tangent objective.
 
 
+# BEGIN the installed core uses one physical direction and one ordinary line search.
 class NativeComponentTest(unittest.TestCase):
     device = DeviceCfg("cpu")
 
@@ -114,7 +116,7 @@ class NativeComponentTest(unittest.TestCase):
             optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
         return solver, optimizer, rollouts
 
-    # BEGIN local geometry has its own lifecycle even with no functional keys.
+
     def make_geometry_solver(self, count=1):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         owner, models = FunctionalAugmentedLagrangian(()), LocalGeometryModels()
@@ -127,12 +129,14 @@ class NativeComponentTest(unittest.TestCase):
             device_cfg=self.device, config=SimpleNamespace(use_cuda_graph=False),
             optimizers=[optimizer], goal_registry_manager=GoalManager(self.device)))
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.update_num_problems(count)
         return optimizer, rollouts, owner, models
 
+
     def test_initial_and_regular_callbacks_share_frozen_models_across_particles(self):
         optimizer, rollouts, owner, models = self.make_geometry_solver(2)
-        core = optimizer._core
+        core = optimizer
         seed = torch.tensor([.25, .6]).view(2, 1, 1)
         core._begin_functional_solve(seed)
         self.assertEqual(owner.keys, ())
@@ -152,56 +156,55 @@ class NativeComponentTest(unittest.TestCase):
         self.assertNotEqual(ids[0], ids[3])
         self.assertFalse(models.capturing)
 
+
     def test_geometry_only_block_refresh_restarts_exactly_the_changed_seed(self):
         optimizer, rollouts, owner, _ = self.make_geometry_solver(2)
-        core, history = optimizer._core, optimizer._qn
         seed = torch.tensor([.25, .6]).view(2, 1, 1)
-        core._begin_functional_solve(seed)
-        state = core._create_initial_iteration_state(seed)
+        optimizer._begin_functional_solve(seed)
+        state = optimizer._create_initial_iteration_state(seed)
         state.exploration_action[0].fill_(.5)
         state.current_iteration.fill_(2)
-        core._iterations.fill_(2)
-        for name in ("s", "y", "rho", "alpha"):
-            getattr(history, name).fill_(3.)
-        core._al_blocks_remaining = 2
+        optimizer._iterations.fill_(2)
+        peer = {field.name: getattr(state, field.name)[1].clone() for field in fields(state)
+                if isinstance(getattr(state, field.name), torch.Tensor)}
+        optimizer._al_blocks_remaining = 2
         before_queries = len(rollouts[0].evaluations)
-        with patch.object(core, "_restart_changed_objective", wraps=core._restart_changed_objective) as restart:
-            core._finish_functional_block(state)
-        # BEGIN one combined capture/evidence query, then the changed gradient.
-        self.assertEqual(len(rollouts[0].evaluations) - before_queries, 2)
-        # END original base evidence does not cause a third rollout.
+        with patch.object(optimizer, "_restart_changed_objective", wraps=optimizer._restart_changed_objective) as restart:
+            optimizer._finish_functional_block(state)
+        # One base capture supplies geometry and hard evidence; the second
+        # query differentiates the changed frozen objective at that same base.
+        self.assertEqual(len(rollouts[0].evaluations)-before_queries, 2)
         self.assertEqual(restart.call_count, 1)
         self.assertEqual(restart.call_args.args[-1].tolist(), [True, False])
-        for name in ("s", "y", "rho", "alpha"):
-            self.assertEqual(float(getattr(history, name)[:, 0].abs().sum()), 0.)
-            self.assertTrue(bool((getattr(history, name)[:, 1] == 3.).all()))
-        self.assertEqual(core._iterations.tolist(), [2, 2])
+        self.assertEqual(optimizer._iterations.tolist(), [2, 2])
+        self.assertEqual(optimizer._objective_updates.tolist(), [1, 0])
+        self.assertEqual(optimizer._direction_calls, [1, 0])
         self.assertEqual([row["outer_updates"] for row in owner.snapshot()["seeds"]], [0, 0])
-        self.assertEqual(core._history_resets.tolist(), [1, 0])
         self.assertEqual(float(state.exploration_action[0]), .5)
+        for name, saved in peer.items():
+            torch.testing.assert_close(getattr(state, name)[1], saved, rtol=0, atol=0)
 
-    def test_unchanged_geometry_and_empty_functional_keys_keep_history(self):
+    def test_unchanged_geometry_and_empty_functional_keys_preserve_the_objective(self):
         optimizer, _, _, _ = self.make_geometry_solver()
-        core, history = optimizer._core, optimizer._qn
         seed = torch.full((1, 1, 1), .25)
-        core._begin_functional_solve(seed)
-        state = core._create_initial_iteration_state(seed)
-        for name in ("s", "y", "rho", "alpha"):
-            getattr(history, name).fill_(3.)
-        before = {name: getattr(history, name).clone() for name in ("s", "y", "rho", "alpha")}
-        core._al_blocks_remaining = 2
-        with patch.object(core, "_restart_changed_objective", wraps=core._restart_changed_objective) as restart, \
-                patch.object(core, "_compute_cost_constraint_and_gradient",
-                             wraps=core._compute_cost_constraint_and_gradient) as gradients:
-            self.assertIs(core._finish_functional_block(state), state)
-        self.assertEqual(restart.call_count, 0)
-        self.assertEqual(gradients.call_count, 0)
-        for name, saved in before.items():
-            torch.testing.assert_close(getattr(history, name), saved, rtol=0, atol=0)
+        optimizer._begin_functional_solve(seed)
+        state = optimizer._create_initial_iteration_state(seed)
+        saved = {field.name: getattr(state, field.name).clone() for field in fields(state)
+                 if isinstance(getattr(state, field.name), torch.Tensor)}
+        optimizer._al_blocks_remaining = 2
+        with patch.object(optimizer, "_restart_changed_objective", wraps=optimizer._restart_changed_objective) as restart, \
+                patch.object(optimizer, "_compute_cost_constraint_and_gradient",
+                             wraps=optimizer._compute_cost_constraint_and_gradient) as gradients:
+            self.assertIs(optimizer._finish_functional_block(state), state)
+        restart.assert_not_called()
+        gradients.assert_not_called()
+        self.assertEqual(optimizer._objective_updates.tolist(), [0])
+        for name, value in saved.items():
+            torch.testing.assert_close(getattr(state, name), value, rtol=0, atol=0)
 
     def test_interrupted_geometry_refresh_discards_only_its_pending_records(self):
         optimizer, rollouts, _, models = self.make_geometry_solver()
-        core = optimizer._core
+        core = optimizer
         seed = torch.full((1, 1, 1), .25)
         core._begin_functional_solve(seed)
         key = models.state_key(0, 0., .5, .5)
@@ -217,10 +220,8 @@ class NativeComponentTest(unittest.TestCase):
         # END the previous block survives a partially completed capture.
         self.assertFalse(models.capturing)
         self.assertIs(models.state(key).pairs["sphere"], original)
-    # END refresh never changes hard evidence, native budgets or peer histories.
 
-    # BEGIN block updates exercise the real CPU native optimizer, not a fake loop.
-    # BEGIN the same fixture can place its fixed minimizer beyond a joint bound.
+
     def attach_functional_objective(self, rollouts, owner, residual, *, target=1.):
         for rollout in rollouts:
             rollout.constraint_manager = rollout
@@ -245,7 +246,7 @@ class NativeComponentTest(unittest.TestCase):
 
             rollout.evaluate_action = evaluate
             rollout.optimizer_evidence = evidence
-    # END all fixture variants retain the real production AL calculation.
+
 
     def test_original_100_steps_four_blocks_keep_seed_parameters_and_total_work(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
@@ -254,6 +255,7 @@ class NativeComponentTest(unittest.TestCase):
         self.attach_functional_objective(rollouts, owner,
             lambda action, count: action.new_tensor([1., -1.]).repeat_interleave(action.shape[0]//count))
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.update_num_problems(2)
         optimizer.config.num_iters, optimizer.config.inner_iters = 100, 25
         seed = torch.ones((2, 1, 1))
@@ -261,46 +263,37 @@ class NativeComponentTest(unittest.TestCase):
             optimizer.reinitialize(seed)
             result = optimizer.optimize(seed)
         self.assertEqual(tuple(result.shape), tuple(seed.shape))
-        reports = optimizer._core.solve_diagnostics
+        reports = optimizer.solve_diagnostics
         self.assertEqual([row["functional_continuation"]["outer_updates"] for row in reports], [3, 3])
         self.assertEqual([row["functional_continuation"]["penalty"] for row in reports], [200., 2.])
         self.assertEqual(reports[0]["iterations"], 100)
-        self.assertEqual(reports[1]["iterations"], 25)
+        self.assertEqual(reports[1]["iterations"], 100)
         self.assertEqual([row["sampled_feasible_candidate"] for row in reports], [False, True])
-        self.assertEqual(reports[0]["recovery_attempts"], 4)
-        self.assertEqual(reports[1]["recovery_attempts"], 1)
         self.assertEqual(optimizer.config.num_iters, 100)
 
-    def test_changed_objective_clears_only_its_row_and_preserves_cumulative_counters(self):
+
+    def test_changed_objective_restarts_its_row_and_preserves_cumulative_counters(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
-        solver, optimizer, _ = self.make_solver(domain, 1)
+        solver, _, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.update_num_problems(2)
-        core, history = optimizer._core, optimizer._qn
-        state = core._create_initial_iteration_state(torch.ones((2, 1, 1)))
+        state = optimizer._create_initial_iteration_state(torch.ones((2, 1, 1)))
         state.current_iteration.fill_(25)
-        core._iterations.fill_(25)
-        core._exhausted.fill_(True)
-        core._stalled_steps.fill_(25)
-        core._recovery_reports = [[{"accepted": False}], [{"accepted": False}]]
-        for name in ("s", "y", "rho", "alpha"):
-            getattr(history, name).fill_(3.)
+        optimizer._iterations.fill_(25)
         peer = {field.name: getattr(state, field.name)[1].clone() for field in fields(state)
                 if isinstance(getattr(state, field.name), torch.Tensor)}
-        core._restart_changed_objective(state, torch.zeros((2, 1, 1)),
+        optimizer._restart_changed_objective(state, torch.zeros((2, 1, 1)),
             torch.tensor([7., 8.]), torch.tensor([[[2.]], [[3.]]]), torch.tensor([True, False]))
-        for name in ("s", "y", "rho", "alpha"):
-            self.assertEqual(float(getattr(history, name)[:, 0].abs().sum()), 0.)
-            self.assertTrue(bool((getattr(history, name)[:, 1] == 3.).all()))
         for name, value in peer.items():
-            torch.testing.assert_close(getattr(state, name)[1], value)
-        torch.testing.assert_close(core._iterations, torch.tensor([25, 25]))
-        torch.testing.assert_close(state.current_iteration, torch.tensor([25, 25], dtype=state.current_iteration.dtype))
-        self.assertEqual(core._exhausted.tolist(), [False, True])
-        self.assertEqual(core._stalled_steps.tolist(), [0, 25])
-        self.assertEqual([len(rows) for rows in core._recovery_reports], [1, 1])
+            torch.testing.assert_close(getattr(state, name)[1], value, rtol=0, atol=0)
+        self.assertEqual(optimizer._iterations.tolist(), [25, 25])
+        self.assertEqual(state.current_iteration.tolist(), [25, 25])
+        self.assertEqual(optimizer._objective_updates.tolist(), [1, 0])
+        self.assertEqual(optimizer._direction_calls, [1, 0])
         self.assertEqual(float(state.best_cost[0]), 7.)
-        self.assertEqual(float(history.grad_0[0]), 2.)
+        self.assertEqual(float(state.exploration_gradient[0]), 2.)
+        self.assertLess(float(state.step_direction[0]), 0.)
 
     def test_feasible_particle_survives_lower_augmented_cost_and_resets_for_new_solve(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
@@ -308,7 +301,8 @@ class NativeComponentTest(unittest.TestCase):
         owner = FunctionalAugmentedLagrangian(("event",))
         self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         core._begin_functional_solve(torch.zeros((1, 1, 1)))
         first = torch.tensor([[[-.5], [.5], [1.]]])
         costs, _ = core._compute_cost_constraint_and_gradient(first)
@@ -319,25 +313,21 @@ class NativeComponentTest(unittest.TestCase):
         owner.update({"event": torch.tensor([1.])})
         core._compute_cost_constraint_and_gradient(torch.tensor([[[-.25], [.2], [.3]]]))
         torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.25]]]))
-        # BEGIN solve reset and capture warmup preserve the graded slot allocation.
+        # A new solve resets candidate validity and multipliers in the same
+        # allocated seed layout; the previous feasible action owns no new score.
         pointers = {name: getattr(core, name).data_ptr() for name in core._candidate_buffers}
-        snapshot = core._capture_state()
         core._begin_functional_solve(torch.ones((1, 1, 1)))
         self.assertFalse(bool(core._candidate_valid.any()))
         self.assertEqual(pointers, {name: getattr(core, name).data_ptr() for name in core._candidate_buffers})
         self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
-        core._restore_capture_state(snapshot)
-        self.assertEqual(core._candidate_valid.tolist(), [True])
-        torch.testing.assert_close(core._candidate_action, torch.tensor([[[-.25]]]))
-        # END CUDA capture owns these exact addresses, not replacement tensors.
 
-    # BEGIN a lower objective cannot replace a feasible candidate with a failure.
     def test_candidate_feasibility_precedes_objective_independently_for_each_seed(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.update_num_problems(2)
-        core = optimizer._core
+        core = optimizer
         actions = torch.tensor([.1, .2, .3, .4, .5, .6]).view(6, 1, 1)
         core._retain_sampled_candidate(actions,
             torch.tensor([True, True, False, False, True, False]),
@@ -356,12 +346,14 @@ class NativeComponentTest(unittest.TestCase):
         torch.testing.assert_close(core._candidate_action.flatten(), torch.tensor([.3, .5]))
         torch.testing.assert_close(core._candidate_objective, torch.tensor([2., 20.]))
 
+
     def test_candidate_retention_rejects_nonfinite_values_and_failed_hard_evidence(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.update_num_problems(2)
-        core = optimizer._core
+        core = optimizer
         core._retain_sampled_candidate(
             torch.tensor([float("nan"), .2, .3, .4, .5, .6]).view(6, 1, 1),
             torch.tensor([True, True, False, True, True, False]),
@@ -370,25 +362,27 @@ class NativeComponentTest(unittest.TestCase):
         torch.testing.assert_close(core._candidate_action[1], torch.tensor([[.4]]))
         self.assertTrue(bool(torch.isinf(core._candidate_objective[0])))
 
+
     def test_native_result_retains_common_sampled_feasibility(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, rollouts = self.make_solver(domain, 1)
         owner = FunctionalAugmentedLagrangian(("event",))
         self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.config.num_iters = optimizer.config.inner_iters
         seed = torch.full((1, 1, 1), -.5)
         with patch("curobo._src.runtime.cuda_event_timers", False):
             result = optimizer.optimize(seed)
         self.assertEqual(tuple(result.shape), tuple(seed.shape))
         self.assertTrue(bool((result <= 0).all()))
-        torch.testing.assert_close(result, optimizer._core._candidate_action)
-        report = optimizer._core.solve_diagnostics[0]
+        torch.testing.assert_close(result, optimizer._candidate_action)
+        report = optimizer.solve_diagnostics[0]
         self.assertTrue(report["sampled_feasible_candidate"])
         self.assertIsNotNone(report["retained_candidate_objective"])
         self.assertEqual(report["iterations"], optimizer.config.num_iters)
         self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
-    # END final native confirmation remains outside every optimizer callback.
+
 
     def test_block_update_measures_actual_continuation_instead_of_last_trial(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
@@ -396,7 +390,8 @@ class NativeComponentTest(unittest.TestCase):
         owner = FunctionalAugmentedLagrangian(("event",))
         self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         seed = torch.full((1, 1, 1), .25)
         core._begin_functional_solve(seed)
         state = core._create_initial_iteration_state(seed)
@@ -410,24 +405,7 @@ class NativeComponentTest(unittest.TestCase):
         core._finish_functional_block(state)
         self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 1)
 
-    def test_native_result_uses_retained_sampled_candidate_without_an_extra_seed(self):
-        domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
-        solver, optimizer, rollouts = self.make_solver(domain, 1)
-        owner = FunctionalAugmentedLagrangian(("event",))
-        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
-        bind_solver_components(solver, domain)
-        optimizer.config.num_iters = optimizer.config.inner_iters
-        seed = torch.full((1, 1, 1), -.5)
-        with patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-            result = optimizer.optimize(seed)
-        self.assertEqual(tuple(result.shape), tuple(seed.shape))
-        self.assertTrue(bool((result <= 0).all()))
-        torch.testing.assert_close(result, optimizer._core._candidate_action)
-        self.assertTrue(optimizer._core.solve_diagnostics[0]["sampled_feasible_candidate"])
-        self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
 
-    # BEGIN direct consecutive calls must not depend on an outer reinitialize.
     def test_consecutive_optimize_clears_old_phr_best_before_new_seed_evaluation(self):
         domain = JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2)
         solver, optimizer, rollouts = self.make_solver(domain, 1)
@@ -435,7 +413,8 @@ class NativeComponentTest(unittest.TestCase):
         self.attach_functional_objective(rollouts, owner,
             lambda action, count: torch.ones_like(action[:, 0, 0]))
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         names = ("cost", "action", "iteration", "current_iteration", "converged")
         pointers = {name: getattr(core._best, name).data_ptr() for name in names}
         with patch("curobo._src.runtime.cuda_event_timers", False):
@@ -455,7 +434,6 @@ class NativeComponentTest(unittest.TestCase):
                 self.assertEqual(int(state.current_iteration[0]), 0)
                 self.assertEqual(int(core._iterations[0]), 0)
                 self.assertEqual(owner.snapshot()["seeds"][0]["outer_updates"], 0)
-                self.assertEqual(float(optimizer._qn.s.abs().sum()), 0.)
                 return initial(state)
 
             with patch.object(core, "_run_initial_evaluation", side_effect=inspect_entry):
@@ -465,15 +443,14 @@ class NativeComponentTest(unittest.TestCase):
         self.assertEqual(tuple(result.shape), (1, 1, 1))
         self.assertGreater(float(result[0, 0, 0]), -.5)
         self.assertEqual(pointers, {name: getattr(core._best, name).data_ptr() for name in names})
-    # END within-solve block tests separately prove cumulative clocks are kept.
-    # END no dense metric or extra native solve is used by candidate retention.
 
-    # BEGIN actual CPU native steps exercise request cancellation inside a block.
+
     def test_request_guard_stops_after_one_actual_step_inside_native_inner_block(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
         solver, optimizer, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         seed = torch.zeros((1, 1, 2))
         def guard():
             if int(core._iterations[0]) >= 1:
@@ -485,13 +462,14 @@ class NativeComponentTest(unittest.TestCase):
                 optimizer.optimize(seed)
         self.assertEqual(core.config.inner_iters, 2)
         self.assertEqual(int(core._iterations[0]), 1)
-        self.assertEqual(core._recovery_reports, [[]])
+
 
     def test_expired_forward_never_starts_backward_for_either_native_callback(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
         solver, optimizer, rollouts = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         for initial in (False, True):
             with self.subTest(initial=initial):
                 expired, backward = [False], []
@@ -515,27 +493,30 @@ class NativeComponentTest(unittest.TestCase):
                         callback(x)
                 self.assertEqual(backward, [])
 
+
     def test_completed_cuda_boundary_waits_only_current_stream_before_guard(self):
         # Mock the CUDA interface only: no CUDA tensor or environment is needed
         # to prove that elapsed-device work precedes the deadline observation.
         core = object.__new__(PhysicalGradientCore)
         core.device_cfg = SimpleNamespace(device=torch.device("cuda:0"))
+        core._batch_work = {"device_wait_seconds": 0.}
         events = []
         core.request_guard = lambda: events.append("guard")
         stream = SimpleNamespace(synchronize=lambda: events.append("stream_done"))
         with patch("torch.cuda.current_stream", return_value=stream) as current, \
-             patch("torch.cuda.is_current_stream_capturing", return_value=False), \
              patch("torch.cuda.synchronize", side_effect=AssertionError("global device synchronization")):
             core._check_request()
             core._check_request(wait_for_device=True)
         self.assertEqual(events, ["guard", "stream_done", "guard"])
         current.assert_called_once_with(torch.device("cuda:0"))
 
+
     def test_deadline_crossed_by_backward_rejects_completed_cost_callback(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
         solver, optimizer, rollouts = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         expired = [False]
         original = rollouts[0].evaluate_action
         def forward(action, **kwargs):
@@ -556,11 +537,13 @@ class NativeComponentTest(unittest.TestCase):
                 core._compute_cost_constraint_and_gradient(x)
         self.assertTrue(expired[0])
 
+
     def test_guarded_cost_and_gradient_preserve_both_native_callbacks(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
         solver, optimizer, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        core = optimizer
         x = torch.full((core.config.num_problems, core.config.num_particles, core.opt_dim), .4)
         checked = []
         core.request_guard = lambda: checked.append(True)
@@ -571,60 +554,6 @@ class NativeComponentTest(unittest.TestCase):
                 torch.testing.assert_close(before, after, rtol=0., atol=0.)
         self.assertEqual(len(checked), 6)
 
-    def test_recovery_rejects_a_qp_finishing_after_deadline_before_any_trial(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        seed = torch.ones((1, 1, 2))
-        with patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-        core = optimizer._core
-        core._stalled_steps.fill_(core.config.inner_iters)
-        expired = [False]
-        def proposal(*args):
-            expired[0] = True
-            return -torch.full_like(seed, .1), {"success": True, "reason": "synthetic QP"}
-        def guard():
-            if expired[0]:
-                raise TimeoutError("QP consumed deadline")
-        core.request_guard = guard
-        with patch.object(domain, "recovery_step", side_effect=proposal), \
-             patch.object(core, "_compute_cost_constraint_and_gradient",
-                          wraps=core._compute_cost_constraint_and_gradient) as evaluations:
-            with self.assertRaisesRegex(TimeoutError, "QP consumed deadline"):
-                core._recover_stalled(core._iteration_state)
-        # Current/best references were re-evaluated; no backtracking trial ran.
-        self.assertEqual(evaluations.call_count, 2)
-        self.assertEqual(core._recovery_reports, [[]])
-    def test_recovery_deadline_after_first_trial_prevents_another_backtrack(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        seed = torch.ones((1, 1, 2))
-        with patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-        core = optimizer._core
-        core._stalled_steps.fill_(core.config.inner_iters)
-        expired, count = [False], [0]
-        original = core._compute_cost_constraint_and_gradient
-        def evaluate(x):
-            result = original(x)
-            count[0] += 1
-            expired[0] = count[0] >= 3
-            return result
-        def guard():
-            if expired[0]:
-                raise TimeoutError("first recovery trial consumed deadline")
-        core.request_guard = guard
-        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed, .1),
-                {"success": True, "reason": "inward ascending counterexample"})), \
-             patch.object(core, "_compute_cost_constraint_and_gradient", side_effect=evaluate):
-            with self.assertRaisesRegex(TimeoutError, "first recovery trial consumed deadline"):
-                core._recover_stalled(core._iteration_state)
-        self.assertEqual(count[0], 3)
-        self.assertEqual(core._recovery_reports, [[]])
-
-    # END deadline failures never become completed optimization candidates.
 
     def test_both_rollouts_obey_domains_through_native_resize_and_reinitialize(self):
         lower, upper = torch.tensor([.1, -.8]), torch.tensor([1., .9])
@@ -641,6 +570,7 @@ class NativeComponentTest(unittest.TestCase):
             with self.subTest(horizon=horizon):
                 solver, optimizer, rollouts = self.make_solver(domain, horizon)
                 bind_solver_components(solver, domain)
+                optimizer = solver.core.optimizers[0]
                 with patch("curobo._src.runtime.cuda_event_timers", False):
                     for count in (2, 1, 2):
                         optimizer.update_num_problems(count)
@@ -652,22 +582,29 @@ class NativeComponentTest(unittest.TestCase):
                         self.assertEqual(tuple(result.shape), (count, horizon, 2))
                 self.assertTrue(all(len(rollout.evaluations) >= 3 for rollout in rollouts))
 
+
     def test_initial_best_is_legal_even_when_native_cost_sentinel_is_smaller(self):
         domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
         solver, optimizer, _ = self.make_solver(domain, 1, offset=1e20)
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         seed = torch.full((1, 1, 2), .4)
         with patch("curobo._src.runtime.cuda_event_timers", False):
             optimizer.reinitialize(seed)
             result = optimizer.optimize(seed)
         torch.testing.assert_close(result, seed)
+        torch.testing.assert_close(optimizer._best.cost, torch.full_like(optimizer._best.cost, 1e20))
+
 
     def test_illegal_seed_never_reaches_either_rollout_and_binding_is_local(self):
         domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
         owned, optimizer, rollouts = self.make_solver(domain, 1)
         ordinary, native, _ = self.make_solver(domain, 1)
+        old_stages = owned.core.optimizers
         bind_solver_components(owned, domain)
-        self.assertIsInstance(optimizer._core, PhysicalGradientCore)
+        optimizer = owned.core.optimizers[0]
+        self.assertIs(owned.core.optimizers, old_stages)
+        self.assertIsInstance(optimizer, PhysicalGradientCore)
         self.assertIs(type(native._core), GradientOptCore)
         self.assertIs(type(ordinary.core.goal_registry_manager), GoalManager)
         with self.assertRaises(JointDomainInitializationError):
@@ -677,438 +614,248 @@ class NativeComponentTest(unittest.TestCase):
         bind_solver_components(owned, domain)
         self.assertIs(owned.core.goal_registry_manager, manager)
 
-    # BEGIN actual displacement, per-row history and recovery acceptance contracts.
-    def test_zero_displacement_preserves_history_and_references_current_gradient(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        core, history = optimizer._core, optimizer._qn
-        state = core._create_initial_iteration_state(torch.full((1, 1, 2), .4))
-        state.exploration_gradient.fill_(2.)
-        history.set_reference(state.exploration_action.reshape_as(history.x_0),
-                              state.exploration_gradient.reshape_as(history.grad_0))
-        history.s.fill_(.5)
-        history.y.fill_(1.)
-        history.rho.fill_(1.)
-        before = {name: getattr(history, name).clone() for name in ("s", "y", "rho", "alpha")}
-        direction = core._guarded_step_direction(state)
-        for name, value in before.items():
-            torch.testing.assert_close(getattr(history, name), value, rtol=0, atol=0)
-        torch.testing.assert_close(direction, -optimizer.config.initial_step_scale*state.exploration_gradient)
-        torch.testing.assert_close(history.x_0, state.exploration_action.reshape_as(history.x_0))
-        torch.testing.assert_close(history.grad_0, state.exploration_gradient.reshape_as(history.grad_0))
-        self.assertEqual(core.solve_diagnostics[0]["history_skips"], 1)
 
-    def test_negative_curvature_resets_only_affected_row_and_rebinds_reference(self):
+    # BEGIN ordinary directions and Armijo decisions operate independently per seed.
+    def test_first_physical_direction_moves_free_coordinate_with_a_stationary_peer(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
+        solver, _, _ = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
         optimizer.update_num_problems(2)
-        core, history = optimizer._core, optimizer._qn
-        state = core._create_initial_iteration_state(torch.full((2, 1, 2), .4))
-        state.exploration_gradient.copy_(torch.tensor([[[1., 1.]], [[3., 3.]]]))
-        history.x_0.fill_(.2)
-        history.grad_0.fill_(2.)
-        direction = core._guarded_step_direction(state)
-        self.assertTrue(torch.equal(history.s[:, 0], torch.zeros_like(history.s[:, 0])))
-        self.assertTrue(torch.any(history.s[:, 1] != 0))
-        torch.testing.assert_close(direction[0], -optimizer.config.initial_step_scale*state.exploration_gradient[0])
-        torch.testing.assert_close(history.x_0, state.exploration_action.reshape_as(history.x_0))
-        torch.testing.assert_close(history.grad_0, state.exploration_gradient.reshape_as(history.grad_0))
-        self.assertEqual([row["history_resets"] for row in core.solve_diagnostics], [1, 0])
-
-    def test_retired_seed_keeps_history_references_when_a_peer_is_evaluated(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        optimizer.update_num_problems(2)
-        core, history = optimizer._core, optimizer._qn
-        state = core._create_initial_iteration_state(torch.full((2, 1, 2), .4))
-        state.exploration_gradient.fill_(3.)
-        history.x_0.fill_(.2)
-        history.grad_0.fill_(2.)
-        core._exhausted[0] = True
-        core._last_curvature[0] = .25
-        before = {name: getattr(history, name).clone()
-                  for name in ("s", "y", "rho", "alpha", "x_0", "grad_0")}
-        direction = core._guarded_step_direction(state)
-        for name, value in before.items():
-            actual = getattr(history, name)
-            index = (slice(None), 0) if actual.ndim == 4 else 0
-            torch.testing.assert_close(actual[index], value[index], rtol=0, atol=0)
-        torch.testing.assert_close(direction[0], torch.zeros_like(direction[0]))
-        self.assertEqual(core.solve_diagnostics[0]["last_curvature"], .25)
-
-    def test_legal_recovery_without_armijo_descent_is_rejected_and_seed_stops(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        seed = torch.ones((1, 1, 2))
-        with patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-        core = optimizer._core
-        state = core._iteration_state
-        core._stalled_steps.fill_(core.config.inner_iters)
-        # A move into the position domain increases this objective. A legal
-        # QP proposal alone must not be accepted as optimization progress.
-        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed, .1),
-                {"success": True, "reason": "test_inward_but_ascending"})):
-            core._recover_stalled(state)
-        torch.testing.assert_close(state.exploration_action, seed)
-        torch.testing.assert_close(optimizer._qn.x_0, seed.reshape_as(optimizer._qn.x_0))
-        self.assertTrue(core.solve_diagnostics[0]["exhausted"])
-        self.assertEqual(core.solve_diagnostics[0]["recovery_accepted"], 0)
-        self.assertTrue(core._all_exhausted)
-
-    def test_all_stalled_seeds_stop_before_fixed_iteration_budget(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        optimizer.config.num_iters = 100
-        seed = torch.ones((1, 1, 2))
-        with patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-            result = optimizer.optimize(seed)
-        torch.testing.assert_close(result, seed)
-        report = optimizer._core.solve_diagnostics[0]
-        self.assertEqual(report["iterations"], optimizer.config.inner_iters)
-        self.assertEqual(report["recovery_attempts"], 1)
-        self.assertTrue(report["exhausted"])
-
-    # BEGIN partial block tails recover without changing AL or retirement cadence.
-    def test_first_update_then_24_stalls_recovers_before_the_first_al_update(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, rollouts = self.make_solver(domain, 1)
-        owner = FunctionalAugmentedLagrangian(("event",))
-        self.attach_functional_objective(rollouts, owner,
-            lambda action, count: action[:, 0, 0]*0+1., target=4.)
-        bind_solver_components(solver, domain)
-        optimizer.config.num_iters, optimizer.config.inner_iters = 50, 25
-        core = optimizer._core
-        seed = torch.tensor([[[.9, 0.]]])
-        boundaries = []
-        recover, update = core._recover_stalled, owner.update
-
-        def recover_at_boundary(state):
-            boundaries.append(("recovery", core._iterations.tolist(),
-                core._stalled_steps.tolist(), core._effective_updates.tolist()))
-            return recover(state)
-
-        def update_at_boundary(signed):
-            boundaries.append(("AL", core._iterations.tolist(),
-                core._stalled_steps.tolist(), core._effective_updates.tolist()))
-            return update(signed)
-
-        with patch("curobo._src.runtime.cuda_event_timers", False), \
-                patch.object(core, "_recover_stalled", side_effect=recover_at_boundary), \
-                patch.object(owner, "update", side_effect=update_at_boundary):
-            optimizer.reinitialize(seed)
-            result = optimizer.optimize(seed)
-        # These counters come from the actual native 25-step block. Recovery
-        # sees its one effective move and 24 subsequent ineffective steps.
-        self.assertEqual(boundaries[0], ("recovery", [25], [24], [1]))
-        self.assertEqual(boundaries[1], ("AL", [25], [0], [2]))
-        self.assertEqual(sum(row[0] == "AL" for row in boundaries), 1)
-        report = core.solve_diagnostics[0]
-        first = report["recoveries"][0]
-        self.assertEqual(first["stalled_steps_before"], 24)
-        self.assertTrue(first["accepted"])
-        self.assertFalse(first["retired"])
-        self.assertEqual(report["iterations"], 50)
-        self.assertEqual(report["functional_continuation"]["outer_updates"], 1)
-        torch.testing.assert_close(result, torch.ones_like(seed), rtol=0, atol=0)
-
-    def test_partial_failed_recovery_refreshes_main_gradient_and_keeps_peer_state(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, rollouts = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        optimizer.update_num_problems(2)
-        core, history = optimizer._core, optimizer._qn
-        seed = torch.ones((2, 1, 2))
-
-        def initial_objective(action, use_cuda_graph=False):
-            domain.validate(action)
-            costs = ((action+4.)**2).sum((-1, -2))
-            return SimpleNamespace(costs_and_constraints=SimpleNamespace(
-                get_sum_cost_and_constraint=lambda sum_horizon: costs))
-
-        with patch("curobo._src.runtime.cuda_event_timers", False), \
-                patch.object(rollouts[1], "evaluate_action", side_effect=initial_objective):
-            optimizer.reinitialize(seed)
-        state = core._iteration_state
-        self.assertTrue(bool((state.exploration_gradient > 0).all()))
-        core._stalled_steps[0] = 1
-        for name in ("s", "y", "rho", "alpha"):
-            getattr(history, name).fill_(3.)
-        peer_state = {field.name: getattr(state, field.name)[1].clone() for field in fields(state)
-            if isinstance(getattr(state, field.name), torch.Tensor)}
-        peer_history = {name: getattr(history, name).clone() for name in
-            ("s", "y", "rho", "alpha", "x_0", "grad_0", "step_q_buffer")}
-        # The supplied inward direction is legal but increases the main
-        # objective. Its rejection must not retire a one-step block tail.
-        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed[:1], .1),
-                {"success": True, "reason": "inward_ascending_trial"})):
-            core._recover_stalled(state)
-        torch.testing.assert_close(state.exploration_action, seed, rtol=0, atol=0)
-        torch.testing.assert_close(state.exploration_gradient[0], torch.full_like(seed[0], -6.))
-        torch.testing.assert_close(state.exploration_cost[0], torch.tensor(18.))
-        torch.testing.assert_close(state.step_direction[0],
-            -optimizer.config.initial_step_scale*state.exploration_gradient[0])
-        torch.testing.assert_close(history.x_0[0], state.exploration_action[0].reshape_as(history.x_0[0]))
-        torch.testing.assert_close(history.grad_0[0], state.exploration_gradient[0].reshape_as(history.grad_0[0]))
-        for name in ("s", "y", "rho", "alpha"):
-            self.assertEqual(float(getattr(history, name)[:, 0].abs().sum()), 0.)
-        for name, saved in peer_state.items():
-            torch.testing.assert_close(getattr(state, name)[1], saved, rtol=0, atol=0)
-        for name, saved in peer_history.items():
-            index = (slice(None), 1) if saved.ndim == 4 else 1
-            torch.testing.assert_close(getattr(history, name)[index], saved[index], rtol=0, atol=0)
-        self.assertEqual(core._exhausted.tolist(), [False, False])
-        self.assertEqual(core._stalled_steps.tolist(), [1, 0])
-        self.assertEqual(core._effective_updates.tolist(), [0, 0])
-        self.assertEqual(core._history_resets.tolist(), [1, 0])
-        recovery = core.solve_diagnostics[0]["recoveries"][0]
-        self.assertFalse(recovery["accepted"])
-        self.assertFalse(recovery["retired"])
-        self.assertEqual(recovery["stalled_steps_before"], 1)
-        # Native steps remain available. Once the original complete-stall
-        # condition is reached, its genuine constrained stationary point retires.
-        core._dispatch("_opt_iters", state)
-        self.assertEqual(core._iterations.tolist(), [2, 2])
-        self.assertTrue(core.solve_diagnostics[0]["recoveries"][-1]["retired"])
-
-    def test_partial_failed_recovery_keeps_feasible_trials_outside_armijo_selection(self):
-        domain = JointPositionDomain(-torch.ones(1), torch.ones(1))
-        solver, optimizer, rollouts = self.make_solver(domain, 1)
-        owner = FunctionalAugmentedLagrangian(("event",))
-        self.attach_functional_objective(rollouts, owner, lambda action, count: action[:, 0, 0])
-        bind_solver_components(solver, domain)
-        seed = torch.full((1, 1, 1), .5)
-        with patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-        core, state = optimizer._core, optimizer._core._iteration_state
-        self.assertFalse(bool(core._candidate_valid.any()))
-        core._stalled_steps.fill_(1)
-        # At .5 the augmented quadratic is stationary. The negative trial
-        # satisfies the original event but raises that quadratic, so the two
-        # independent production decisions must retain it without moving base.
-        with patch.object(domain, "recovery_step", return_value=(-torch.full_like(seed, .6),
-                {"success": True, "reason": "feasible_non_armijo_trial"})):
-            core._recover_stalled(state)
-        torch.testing.assert_close(state.exploration_action, seed, rtol=0, atol=0)
-        self.assertFalse(bool(core._exhausted.any()))
-        self.assertEqual(core._effective_updates.tolist(), [0])
-        self.assertEqual(core._candidate_valid.tolist(), [True])
-        self.assertLess(float(core._candidate_action[0, 0, 0]), 0.)
-        torch.testing.assert_close(core._candidate_objective,
-            ((core._candidate_action-1.)**2).sum((-1, -2)))
-        self.assertFalse(core.solve_diagnostics[0]["recoveries"][0]["accepted"])
-    # END actual trial evidence and original stopping thresholds remain independent.
-
-    def test_recovery_recomputes_main_gradient_and_backtracks_oversized_descent(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, rollouts = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        seed = torch.zeros((1, 1, 2))
-
-        def objective(target, weight):
-            def evaluate(action, use_cuda_graph=False):
-                domain.validate(action)
-                costs = weight*((action-target)**2).sum(dim=(-1, -2))
-                return SimpleNamespace(costs_and_constraints=SimpleNamespace(
-                    get_sum_cost_and_constraint=lambda sum_horizon: costs))
-            return evaluate
-
-        # Opposing initial/main gradients expose stale-reference use. The
-        # main minimizer is so near that all original trial scales overshoot.
-        with patch.object(rollouts[0], "evaluate_action", new=objective(.01, 10000.)), \
-                patch.object(rollouts[1], "evaluate_action", new=objective(-.1, 1.)), \
-                patch("curobo._src.runtime.cuda_event_timers", False):
-            optimizer.reinitialize(seed)
-            core = optimizer._core
-            state = core._iteration_state
-            self.assertTrue(bool((state.exploration_gradient > 0).all()))
-            core._stalled_steps.fill_(core.config.inner_iters)
-            with patch.object(domain, "recovery_step", wraps=domain.recovery_step) as recovery:
-                core._recover_stalled(state)
-            self.assertTrue(bool((recovery.call_args.args[1] < 0).all()))
-        report = core.solve_diagnostics[0]["recoveries"][0]
-        self.assertTrue(report["accepted"])
-        self.assertGreater(report["line_search_evaluations"], 1)
-        self.assertLess(report["cost_after"], report["cost_before"])
-        self.assertTrue(bool((state.exploration_action > 0).all()))
-        torch.testing.assert_close(state.best_action, state.exploration_action)
-        torch.testing.assert_close(state.best_cost, state.exploration_cost)
-        torch.testing.assert_close(optimizer._qn.grad_0,
-                                  state.exploration_gradient.reshape_as(optimizer._qn.grad_0))
-
-    def test_boundary_recovery_moves_free_coordinate_and_keeps_retired_peer_fixed(self):
-        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        bind_solver_components(solver, domain)
-        optimizer.update_num_problems(2)
-        optimizer.config.num_iters = 12
         seed = torch.tensor([[[1., 1.]], [[1., .2]]])
         with patch("curobo._src.runtime.cuda_event_timers", False):
             optimizer.reinitialize(seed)
-            result = optimizer.optimize(seed)
-        domain.validate(result)
-        torch.testing.assert_close(result[0], seed[0])
-        self.assertGreater(float(result[1, 0, 1]), float(seed[1, 0, 1]))
-        reports = optimizer._core.solve_diagnostics
-        self.assertEqual(reports[0]["iterations"], optimizer.config.inner_iters)
-        self.assertGreater(reports[1]["iterations"], reports[0]["iterations"])
-        self.assertGreater(reports[1]["recovery_accepted"], 0)
-    # END recovered motion must decrease the same objective and preserve peers.
+            state = optimizer._iteration_state
+            torch.testing.assert_close(state.step_direction[0], torch.zeros_like(seed[0]), rtol=0, atol=0)
+            self.assertEqual(float(state.step_direction[1, 0, 0]), 0.)
+            self.assertGreater(float(state.step_direction[1, 0, 1]), 0.)
+            initial_cost = state.exploration_cost.clone()
+            result = optimizer._opt_step(state)
+        domain.validate(result.exploration_action)
+        torch.testing.assert_close(result.exploration_action[0], seed[0], rtol=0, atol=0)
+        self.assertEqual(float(result.exploration_action[1, 0, 0]), 1.)
+        self.assertGreater(float(result.exploration_action[1, 0, 1]), .2)
+        self.assertLess(float(result.exploration_cost[1]), float(initial_cost[1]))
+        self.assertEqual(optimizer._iterations.tolist(), [1, 1])
+        self.assertEqual(optimizer._effective_updates.tolist(), [0, 1])
 
-    # BEGIN exercise capture lifecycle and fail-closed behavior on CPU tensors.
-    def test_deferred_bad_iteration_only_constructs_legal_search_points(self):
-        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
+    def test_armijo_backtracks_one_seed_and_keeps_the_peers_first_accepted_state(self):
+        from curobo._src.optim.gradient.line_search_context import LineSearchContext
+        from curobo._src.optim.optimization_iteration_state import OptimizationIterationState
+
+        weights = torch.tensor([1e6, 1.], dtype=torch.float64).view(2, 1, 1)
+        base = torch.tensor([.003, .2], dtype=torch.float64).view(2, 1, 1)
+        costs, gradient = (.5*weights*base.square()).flatten(), weights*base
+        calls = []
+
+        def evaluate(actions):
+            calls.append(actions.detach().clone())
+            return .5*weights*actions.square(), weights*actions
+
+        state = OptimizationIterationState(action=base.clone(), cost=costs.clone(), gradient=gradient.clone(),
+            exploration_action=base.clone(), exploration_gradient=gradient.clone(), exploration_cost=costs.clone(),
+            step_direction=torch.full_like(base, -.1), best_action=base.clone(), best_cost=costs.clone(),
+            best_iteration=torch.zeros(2, dtype=torch.int32), current_iteration=torch.zeros(2, dtype=torch.int32),
+            converged=torch.zeros(2, dtype=torch.bool))
+        context = LineSearchContext(device_cfg=DeviceCfg("cpu", dtype=torch.float64),
+            line_search_scale=[0., .1, .3, .7, 1.], line_search_c_1=1e-5, line_search_c_2=.9,
+            num_problems=2, opt_dim=1, action_horizon=1, action_dim=1, step_scale=1.,
+            fix_terminal_action=False, action_horizon_step_max=torch.tensor([.1], dtype=torch.float64),
+            use_cuda_kernel_line_search=False, compute_costs_and_gradients=evaluate,
+            convergence_iteration=0, cost_delta_threshold=0., cost_relative_threshold=0.)
+        search = PhysicalLineSearch(JointPositionDomain(-torch.ones(1), torch.ones(1)))
+        result = search.search(state, context)
+        # The first seed's smallest original move overshoots its quadratic;
+        # halving the direction admits -.002. The peer accepts .1 immediately.
+        torch.testing.assert_close(result.action.flatten(), torch.tensor([-.002, .1], dtype=torch.float64))
+        torch.testing.assert_close(result.gradient.flatten(), torch.tensor([-2000., .1], dtype=torch.float64))
+        torch.testing.assert_close(result.cost, (.5*weights*result.action.square()).flatten())
+        torch.testing.assert_close(result.best_action, result.action)
+        torch.testing.assert_close(result.best_cost, result.cost)
+        self.assertEqual(result.current_iteration.tolist(), [1, 1])
+        self.assertEqual(search.backtracks.tolist(), [1, 0])
+        self.assertEqual(search.evaluations, len(calls))
+        self.assertEqual(len(calls), 2)
+    # END one iteration owns all of its backtracking function evaluations.
+
+    # BEGIN the same request guard bounds forward, host QP and backtracking work.
+    def test_expired_request_stops_before_either_rollout_forward(self):
+        domain = JointPositionDomain(-torch.ones(1), torch.ones(1))
+        solver, _, rollouts = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
-        seed = torch.full((1, 1, 2), .4)
-        core._prepare_solve(seed)
-        checks = core._device_checks
-        with checks.scope():
-            points, _ = core._line_search_strategy._prepare_search_points(
-                torch.zeros_like(seed), torch.ones_like(seed), core._line_search_context)
-        domain.validate(points.reshape(1, 3, 1, 2))
-        with self.assertRaises(JointDomainInitializationError):
-            checks.raise_if_failed()
+        optimizer = solver.core.optimizers[0]
 
-    def test_capture_warmup_restores_history_and_clears_only_warmup_faults(self):
-        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
+        def expired():
+            raise TimeoutError("before forward")
+
+        optimizer.request_guard = expired
+        actions = torch.zeros(1, optimizer.config.num_particles, optimizer.opt_dim)
+        for callback in (optimizer._compute_cost_constraint_and_gradient,
+                         optimizer._compute_cost_constraint_and_gradient_initial):
+            with self.assertRaisesRegex(TimeoutError, "before forward"):
+                callback(actions)
+        self.assertTrue(all(not rollout.evaluations for rollout in rollouts))
+
+    def test_qp_finishing_after_deadline_cannot_start_an_objective_trial(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, _, rollouts = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
-        records = core._capture_state()
+        optimizer = solver.core.optimizers[0]
+        seed = torch.zeros(1, 1, 2)
+        state = optimizer._create_initial_iteration_state(seed)
+        state.exploration_gradient.fill_(-1.)
+        completed = []
+        solve = domain.descent_step
 
-        class MutatingExecutor:
-            is_initialized = False
+        def finishing_qp(*args, **kwargs):
+            result = solve(*args, **kwargs)
+            completed.append(True)
+            return result
 
-            def warmup(self, *args):
-                self._graph_input = tuple(value.clone() for value in args)
-                for _, _, tensor, _ in records:
-                    tensor.fill_(1)
-                domain.validate(torch.zeros((1, 1, 2)))
-                self.is_initialized = True
+        def guard():
+            if completed:
+                raise TimeoutError("QP consumed deadline")
 
-            def __call__(self, value):
-                for _, _, tensor, saved in records:
-                    assert torch.equal(tensor, saved), "Warmup changed native closure state"
-                return value
+        optimizer.request_guard = guard
+        with patch.object(domain, "descent_step", side_effect=finishing_qp):
+            with self.assertRaisesRegex(TimeoutError, "QP consumed deadline"):
+                optimizer._physical_step_direction(state)
+        self.assertEqual(completed, [True])
+        self.assertTrue(all(not rollout.evaluations for rollout in rollouts))
+        torch.testing.assert_close(state.exploration_action, seed, rtol=0, atol=0)
 
-            def reset(self):
-                self.is_initialized = False
-
-        executor = MutatingExecutor()
-        core._executors["_opt_step"] = executor
-        core.use_cuda_graph = True
-        value = core._create_initial_iteration_state(torch.full((1, 1, 2), .4))
-        with patch("torch.cuda.memory_allocated", return_value=0):
-            result = core._dispatch("_opt_iters", value)
-        self.assertTrue(torch.equal(result.action, value.action))
-        # The native executor's action-pointer shortcut misses this changed
-        # field. The owned dispatch must copy it even though action aliases.
-        changed = replace(result, step_direction=torch.full_like(result.step_direction, .25))
-        replayed = core._dispatch("_opt_iters", changed)
-        self.assertTrue(torch.equal(replayed.step_direction, changed.step_direction))
-        self.assertTrue(executor.is_initialized)
-        core.bind_domain(domain)
-        self.assertFalse(executor.is_initialized)
-
-    def test_step_replays_keep_faults_until_one_original_block_check(self):
-        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
+    def test_deadline_after_first_joint_qp_keeps_its_count_and_stops_the_second_joint(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, _, rollouts = self.make_solver(domain, 1)
         bind_solver_components(solver, domain)
-        core = optimizer._core
+        optimizer = solver.core.optimizers[0]
+        state = optimizer._create_initial_iteration_state(torch.zeros(1, 1, 2))
+        state.exploration_gradient.fill_(-1.)
+        completed = []
+        native = physical_joint_qp.quadprog.solve_qp
 
-        class FaultingExecutor:
-            is_initialized = False
-            calls = 0
+        def solve(*args):
+            result = native(*args)
+            completed.append(True)
+            return result
 
-            def warmup(self, value):
-                self._graph_input = (value.clone(),)
-                self.is_initialized = True
+        def guard():
+            if completed:
+                raise TimeoutError("first joint consumed deadline")
 
-            def __call__(self, value):
-                self.calls += 1
-                # The later legal replay must not clear an earlier fault.
-                domain.validate(torch.full_like(value.action, 0. if self.calls == 1 else .4))
-                return value
+        optimizer.request_guard = guard
+        with patch.object(physical_joint_qp.quadprog, "solve_qp", side_effect=solve):
+            with self.assertRaisesRegex(TimeoutError, "first joint consumed deadline"):
+                optimizer._physical_step_direction(state)
+        self.assertEqual(completed, [True])
+        self.assertEqual(optimizer._direction_work[0]["qp_calls"], 1)
+        self.assertGreater(optimizer._direction_work[0]["qp_solve_seconds"], 0.)
+        self.assertEqual(optimizer._direction_reports[0]["reason"], "direction_evaluation_interrupted")
+        self.assertEqual(optimizer._direction_reports[0]["qp_calls"], 1)
+        self.assertTrue(all(not rollout.evaluations for rollout in rollouts))
 
-            def reset(self):
-                self.is_initialized = False
+    def test_completed_trial_exhausting_deadline_prevents_another_backtrack(self):
+        domain = JointPositionDomain(-torch.ones(1), torch.ones(1))
+        solver, _, rollouts = self.make_solver(domain, 1)
 
-        executor = FaultingExecutor()
-        core._executors["_opt_step"] = executor
-        core.use_cuda_graph = True
-        value = core._create_initial_iteration_state(torch.full((1, 1, 2), .4))
-        with patch("torch.cuda.memory_allocated", return_value=0), \
-                patch.object(core._device_checks, "raise_if_failed",
-                             wraps=core._device_checks.raise_if_failed) as host_check:
-            with self.assertRaises(JointDomainInitializationError):
-                core._dispatch("_opt_iters", value)
-            self.assertEqual(executor.calls, core.config.inner_iters)
-            self.assertEqual(host_check.call_count, 1)
-            core._dispatch("_opt_iters", value)
-            self.assertEqual(executor.calls, 2*core.config.inner_iters)
-            self.assertEqual(host_check.call_count, 2)
+        def quadratic(action, use_cuda_graph=False):
+            domain.validate(action)
+            costs = (5e5*action.square()).sum((-1, -2))
+            return SimpleNamespace(costs_and_constraints=SimpleNamespace(
+                get_sum_cost_and_constraint=lambda sum_horizon: costs))
 
-    def test_explicit_graph_request_rejects_cpu_without_changing_backend(self):
-        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
-        solver, optimizer, _ = self.make_solver(domain, 1)
-        original = optimizer._core
-        with self.assertRaisesRegex(ValueError, "native CUDA L-BFGS"):
-            bind_solver_components(solver, domain, use_optimizer_graph=True)
-        self.assertIs(optimizer._core, original)
-
-    def test_native_shift_keeps_buffers_and_shape_reset_invalidates_graph(self):
-        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
-        solver, optimizer, rollouts = self.make_solver(domain, 4)
+        for rollout in rollouts:
+            rollout.evaluate_action = quadratic
         bind_solver_components(solver, domain)
-        core = optimizer._core
-        cached = core._create_initial_iteration_state(torch.full((1, 4, 2), .4))
-        core._iteration_state = cached
-        history = optimizer._qn.s
+        optimizer = solver.core.optimizers[0]
+        with patch("curobo._src.runtime.cuda_event_timers", False):
+            optimizer.reinitialize(torch.full((1, 1, 1), .003))
+            context = optimizer._line_search_context
+            evaluate = context.compute_costs_and_gradients
+            completed = []
 
-        class CapturedExecutor:
-            is_initialized = True
+            def completed_trial(actions):
+                result = evaluate(actions)
+                completed.append(True)
+                return result
 
-            def reset(self):
-                self.is_initialized = False
+            def guard():
+                if completed:
+                    raise TimeoutError("first trial consumed deadline")
 
-        executor = CapturedExecutor()
-        core._executors["_opt_step"] = executor
-        core.use_cuda_graph = True
-        optimizer.shift(0)
-        self.assertTrue(executor.is_initialized)
-        optimizer.shift(1)
-        # The installed shift helper copies into its inputs before returning
-        # the same tensors; its tuple assignment does not replace storage.
-        self.assertTrue(executor.is_initialized)
-        self.assertIs(optimizer._qn.s, history)
-        self.assertIs(core._iteration_state, cached)
+            optimizer.request_guard = guard
+            with patch.object(context, "compute_costs_and_gradients", side_effect=completed_trial):
+                with self.assertRaisesRegex(TimeoutError, "first trial consumed deadline"):
+                    optimizer._opt_step(optimizer._iteration_state)
+        self.assertEqual(completed, [True])
+        self.assertEqual(optimizer._iterations.tolist(), [0])
+    # END unfinished directions and iterations do not publish completed candidates.
 
-        resets = []
-        for index, rollout in enumerate(rollouts):
-            rollout.reset_shape = lambda index=index: resets.append(index)
-        executor.is_initialized = True
-        core.reset_shape()
-        self.assertFalse(executor.is_initialized)
-        self.assertEqual(resets, list(range(len(rollouts))))
-        self.assertIs(core._iteration_state, cached)
-    # END production CUDA capture itself is checked by a separate bounded probe.
+    def test_rebinding_domain_discards_cached_iteration_and_keeps_native_layout(self):
+        domain = JointPositionDomain(torch.tensor([.1, .1]), torch.ones(2))
+        solver, _, rollouts = self.make_solver(domain, 4)
+        bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
+        cached = optimizer._create_initial_iteration_state(torch.full((1, 4, 2), .4))
+        optimizer._iteration_state = cached
+        optimizer._iterations.fill_(2)
+        replacement = JointPositionDomain(domain.lower.clone(), domain.upper.clone())
+        bind_solver_components(solver, replacement)
+        self.assertIs(solver.core.optimizers[0], optimizer)
+        self.assertIsNone(optimizer._iteration_state)
+        self.assertIs(optimizer.domain, replacement)
+        self.assertIs(optimizer._line_search_strategy.domain, replacement)
+        self.assertIs(optimizer._initial_line_search_strategy.domain, replacement)
+        self.assertEqual(optimizer._iterations.tolist(), [0])
+        self.assertEqual(optimizer.get_all_rollout_instances(), rollouts)
+
+    def test_equal_initial_trial_costs_still_allow_smaller_armijo_descent(self):
+        from curobo._src.optim.gradient.line_search_context import LineSearchContext
+        from curobo._src.optim.optimization_iteration_state import OptimizationIterationState
+
+        evaluations = []
+
+        def evaluate(values):
+            x = values.detach().requires_grad_(True)
+            costs = -x*(x-.125)*(x-.25)*(x-.5)*(x-1.)
+            gradient, = torch.autograd.grad(costs.sum(), x)
+            evaluations.append(costs.detach().clone())
+            return costs, gradient
+
+        base = torch.zeros((1, 1, 1), dtype=torch.float64)
+        gradient = torch.full_like(base, -.015625)
+        state = OptimizationIterationState(action=base.clone(), cost=torch.zeros(1, dtype=base.dtype),
+            gradient=gradient.clone(), exploration_action=base.clone(), exploration_gradient=gradient.clone(),
+            exploration_cost=torch.zeros(1, dtype=base.dtype), step_direction=torch.ones_like(base),
+            best_action=base.clone(), best_cost=torch.zeros(1, dtype=base.dtype),
+            best_iteration=torch.zeros(1, dtype=torch.int32), current_iteration=torch.zeros(1, dtype=torch.int32),
+            converged=torch.zeros(1, dtype=torch.bool))
+        context = LineSearchContext(device_cfg=DeviceCfg("cpu", dtype=torch.float64),
+            line_search_scale=[0., .125, .25, .5, 1.], line_search_c_1=1e-5, line_search_c_2=.9,
+            num_problems=1, opt_dim=1, action_horizon=1, action_dim=1, step_scale=1.,
+            fix_terminal_action=False, action_horizon_step_max=torch.ones(1),
+            use_cuda_kernel_line_search=False, compute_costs_and_gradients=evaluate,
+            convergence_iteration=0, cost_delta_threshold=0., cost_relative_threshold=0.)
+        search = PhysicalLineSearch(JointPositionDomain(-torch.ones(1)*2, torch.ones(1)*2))
+        result = search.search(state, context)
+        # These binary-exact roots give equal first-batch values even though
+        # the derivative at zero is negative and x=1/16 decreases the scalar.
+        torch.testing.assert_close(evaluations[0], torch.zeros_like(evaluations[0]), rtol=0, atol=0)
+        self.assertEqual(float(result.action), .0625)
+        self.assertEqual(float(result.cost), -.00030040740966796875)
+        self.assertEqual(search.backtracks.tolist(), [1])
+        self.assertEqual(result.current_iteration.tolist(), [1])
 
     def goal(self, count, value):
         return GoalToolPose(tool_frames=["tool"],
             position=torch.full((1, 1, 1, count, 3), float(value)),
             quaternion=torch.tensor([1., 0., 0., 0.]).repeat(1, 1, 1, count, 1))
 
+
     def state(self, seeds, goals=1):
         return SolveState(SolveMode.SINGLE, batch_size=1, num_envs=1,
             num_seeds=seeds, num_trajopt_seeds=seeds, num_goalset=goals, tool_frames=["tool"])
+
 
     def test_goal_seed_indices_reallocate_for_2_1_2_and_reuse_same_layout(self):
         manager = LayoutGoalManager(self.device)
@@ -1129,6 +876,7 @@ class NativeComponentTest(unittest.TestCase):
             self.assertTrue(bool((reused.link_goal_poses.position == seeds+1).all()))
             previous = buffer
 
+
     def test_smaller_goalset_still_uses_native_padding(self):
         manager = LayoutGoalManager(self.device)
         buffer, _ = manager.update_goal_buffer(self.state(2, 3), self.goal(3, 1.))
@@ -1139,6 +887,7 @@ class NativeComponentTest(unittest.TestCase):
         self.assertTrue(bool((reused.link_goal_poses.position == 2.).all()))
 
 
+# END objective changes, sampled candidates and cumulative work have separate roles.
+
 if __name__ == "__main__":
     unittest.main()
-# END no physical robot, scene substitution, or CUDA allocation is needed here.

@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_domain.py` 实现契约
 
-代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。
+代码基线：`82a3d66；包含本次工作区已实现改动，待统一实现提交后更新`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `JointDomainInitializationError`
@@ -203,14 +203,14 @@ action.to
 torch.isfinite
 ```
 
-## `JointPositionDomain.recovery_step`
+## `JointPositionDomain.descent_step`
 
 [定义位置](../../../manipulation/physical_joint_domain.py#L64)。
 
 输入签名：
 
 ```python
-def recovery_step(self, base, gradient, step_limits, scales):
+def descent_step(self, base, gradient, step_limits, scales, *, check_request=None, work_report=None):
 ```
 
 实现说明：
@@ -220,7 +220,7 @@ def recovery_step(self, base, gradient, step_limits, scales):
 显式输出分支：
 
 ```python
-recover_position_step(self, base, gradient, step_limits, scales)
+projected_descent_step(self, base, gradient, step_limits, scales, check_request=check_request, work_report=work_report)
 ```
 
 读取的对象属性：
@@ -234,32 +234,26 @@ recover_position_step(self, base, gradient, step_limits, scales)
 直接调用符号：
 
 ```python
-recover_position_step
+projected_descent_step
 ```
 
 ## `JointPositionDomain.validate`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L70)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L71)。
 
 输入签名：
 
 ```python
-def validate(self, action: torch.Tensor) -> torch.Tensor | None:
+def validate(self, action: torch.Tensor) -> None:
 ```
 
 实现说明：
 
-> Raise outside a graph; return a recorded predicate inside its scope.
->
-> Graph callers must use the predicate to isolate invalid actions before
-> a rollout. Recording an error alone would still let a captured kernel
-> consume that action before the enclosing block reports the failure.
+> Raise synchronously before an illegal action reaches a rollout.
 
 显式输出分支：
 
-```python
-require_tensor(self.feasible(action).all(), 'An optimizer action left the physical joint domain', error_type=JointDomainInitializationError)
-```
+无显式条目。
 
 读取的对象属性：
 
@@ -283,7 +277,7 @@ self.feasible
 
 ## `JointPositionDomain.validate_scales`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L82)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L78)。
 
 输入签名：
 
@@ -293,7 +287,7 @@ def validate_scales(scales: torch.Tensor) -> None:
 
 实现说明：
 
-> Validate the fixed native line-search multipliers outside capture.
+> Validate the fixed native line-search multipliers.
 
 显式输出分支：
 
@@ -323,7 +317,7 @@ torch.isfinite
 
 ## `JointPositionDomain.limit_step`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L87)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L83)。
 
 输入签名：
 
@@ -371,7 +365,7 @@ self.limit_step_tensor
 
 ## `JointPositionDomain.limit_step_tensor`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L101)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L97)。
 
 输入签名：
 
@@ -383,10 +377,9 @@ def limit_step_tensor(self, base: torch.Tensor, step: torch.Tensor, scales: torc
 
 > Apply the exact step map to an already validated base/scales.
 >
-> Eager calls can return an unchanged full step after checking every
-> actual trial. Graph/warmup scopes retain device-only control flow.
-> The optimizer separately validates the resulting trial predicates
-> before calling either native rollout.
+> Return an unchanged full step when every actual trial is feasible.
+> Otherwise the fixed bisection preserves the direction ratios and
+> checks rounding in the exact arithmetic used by the trial rollout.
 
 显式输出分支：
 
@@ -406,10 +399,6 @@ torch.zeros_like
 scales.max
 torch.ones_like
 self.feasible
-step.device.type
-step.device
-torch.cuda.is_current_stream_capturing
-torch.cuda
 full.all
 self.feasible(trials).all
 ```
@@ -423,7 +412,6 @@ maximum
 low
 high
 full
-eager
 trials
 _
 middle
@@ -442,8 +430,6 @@ torch.zeros_like
 scales.max
 torch.ones_like
 self.feasible
-has_active_device_checks
-torch.cuda.is_current_stream_capturing
 bool
 full.all
 self.feasible(trials).all
@@ -452,7 +438,7 @@ range
 
 ## `CubicJointDomain`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L152)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L141)。
 
 ```python
 class CubicJointDomain(JointPositionDomain):
@@ -473,7 +459,7 @@ class CubicJointDomain(JointPositionDomain):
 
 ## `CubicJointDomain.__init__`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L161)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L150)。
 
 输入签名：
 
@@ -534,6 +520,7 @@ self.knots
 q
 dq
 self._anchor
+self.initialization_report
 self._start_q
 self._start_dq
 self._curve_map
@@ -561,6 +548,7 @@ start_q.detach
 start_dq.detach().reshape(-1).to
 start_dq.detach().reshape
 start_dq.detach
+program_work_report
 CubicAffineMap
 torch.as_tensor
 torch.isfinite(q).all
@@ -575,7 +563,7 @@ torch.isfinite(dq).all
 
 ## `CubicJointDomain.evaluate`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L196)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L186)。
 
 输入签名：
 
@@ -615,12 +603,12 @@ self._curve_map.evaluate
 
 ## `CubicJointDomain.fit_reference`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L205)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L195)。
 
 输入签名：
 
 ```python
-def fit_reference(self, progress, joint_targets, prior_controls=None):
+def fit_reference(self, progress, joint_targets, prior_controls=None, *, check_request=None):
 ```
 
 实现说明：
@@ -634,7 +622,7 @@ def fit_reference(self, progress, joint_targets, prior_controls=None):
 显式输出分支：
 
 ```python
-fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls)
+fit_cubic_reference(self, self._curve_map, progress, joint_targets, prior_controls, check_request=check_request)
 ```
 
 读取的对象属性：
@@ -653,14 +641,14 @@ self._curve_map
 fit_cubic_reference
 ```
 
-## `CubicJointDomain.recovery_step`
+## `CubicJointDomain.descent_step`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L215)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L206)。
 
 输入签名：
 
 ```python
-def recovery_step(self, base, gradient, step_limits, scales):
+def descent_step(self, base, gradient, step_limits, scales, *, check_request=None, work_report=None):
 ```
 
 实现说明：
@@ -670,7 +658,7 @@ def recovery_step(self, base, gradient, step_limits, scales):
 显式输出分支：
 
 ```python
-recover_position_step(self, base, gradient, step_limits, scales, self._curve_map)
+projected_descent_step(self, base, gradient, step_limits, scales, self._curve_map, check_request=check_request, work_report=work_report)
 ```
 
 读取的对象属性：
@@ -686,12 +674,12 @@ self._curve_map
 直接调用符号：
 
 ```python
-recover_position_step
+projected_descent_step
 ```
 
 ## `CubicJointDomain.coefficients`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L220)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L212)。
 
 输入签名：
 
@@ -730,7 +718,7 @@ self._relative_coefficients
 
 ## `CubicJointDomain._relative_coefficients`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L227)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L219)。
 
 输入签名：
 
@@ -769,7 +757,7 @@ action.to
 
 ## `CubicJointDomain.all_extrema`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L231)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L223)。
 
 输入签名：
 
@@ -881,7 +869,7 @@ value.amax
 
 ## `CubicJointDomain.extrema`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L286)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L278)。
 
 输入签名：
 
@@ -921,7 +909,7 @@ self.all_extrema
 
 ## `CubicJointDomain.feasible`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L291)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L283)。
 
 输入签名：
 
@@ -971,17 +959,17 @@ torch.isfinite(high).all
 
 ## `CubicJointDomain._construct_anchor`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L298)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L290)。
 
 输入签名：
 
 ```python
-def _construct_anchor(self, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _construct_anchor(self, dtype: torch.dtype, device: torch.device, *, check_request=None) -> torch.Tensor:
 ```
 
 实现说明：
 
-> Construct a same-domain QP anchor independently of fit/initialization.
+> Construct an original-domain LP anchor independently of reference fit.
 
 显式输出分支：
 
@@ -1001,6 +989,7 @@ self._start_q.to
 self._start_q
 self.knots
 self._entrance_valid
+self.initialization_report
 self.feasible(constant).all
 self.feasible
 self._curve_map
@@ -1010,7 +999,9 @@ torch.Tensor
 写入目标：
 
 ```python
+self.initialization_report
 constant
+self.initialization_report['reason']
 anchor
 report
 ```
@@ -1018,6 +1009,7 @@ report
 直接调用符号：
 
 ```python
+program_work_report
 self._start_q.to(dtype=dtype, device=device).expand(1, self.knots, -1).clone
 self._start_q.to(dtype=dtype, device=device).expand
 self._start_q.to
@@ -1030,12 +1022,12 @@ construct_cubic_anchor
 
 ## `CubicJointDomain.initialize`
 
-[定义位置](../../../manipulation/physical_joint_domain.py#L313)。
+[定义位置](../../../manipulation/physical_joint_domain.py#L312)。
 
 输入签名：
 
 ```python
-def initialize(self, proposals: torch.Tensor) -> torch.Tensor:
+def initialize(self, proposals: torch.Tensor, *, check_request=None) -> torch.Tensor:
 ```
 
 实现说明：
@@ -1059,6 +1051,7 @@ self.knots
 self.lower
 self.feasible(values).all
 self.feasible
+self.initialization_report
 self._anchor
 valid.any
 values[valid][:1].clone
@@ -1069,6 +1062,7 @@ self._anchor.expand_as
 values.new_ones
 self.limit_step
 self.validate
+self.initialization_report.update
 initialized.reshape
 ```
 
@@ -1077,6 +1071,9 @@ initialized.reshape
 ```python
 shape
 values
+self.initialization_report
+self.initialization_report['reason']
+anchor_source
 valid
 self._anchor
 base
@@ -1090,6 +1087,7 @@ initialized
 ```python
 proposals.reshape
 len
+program_work_report
 bool
 self.feasible(values).all
 self.feasible
@@ -1100,5 +1098,6 @@ self._anchor.expand_as
 values.new_ones
 self.limit_step
 self.validate
+self.initialization_report.update
 initialized.reshape
 ```

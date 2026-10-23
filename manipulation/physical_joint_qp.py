@@ -2,16 +2,18 @@
 
 The cubic action is an affine curve with an immutable entrance and clock.
 Position, velocity, acceleration and jerk rows constrain both seed fits and
-recovery steps. Analytic extrema and the same tensor domain determine
+descent steps. Analytic extrema and the same tensor domain determine
 physical feasibility. These routines run only outside CUDA capture.
 """
 
-# BEGIN fixed-clock affine sampling and bounded continuous-domain QP recovery.
+# BEGIN fixed-clock affine sampling and continuous-domain constrained programs.
 from __future__ import annotations
 
 import numpy as np
 import quadprog
+from time import perf_counter
 from scipy.interpolate import BSpline, PPoly
+from scipy.optimize import linprog
 import torch
 
 # BEGIN one coefficient definition serves CPU programs and tensor rollouts.
@@ -19,28 +21,68 @@ from .cubic_trajectory import CubicBasis
 # END no native CUDA trajectory kernel participates in this representation.
 
 
-def _numpy(value):
-    return (value.detach().cpu().numpy().astype(float) if isinstance(value, torch.Tensor)
-            else np.asarray(value, dtype=float))
+# BEGIN actual program calls and named computation phases share one report schema.
+PROGRAM_WORK_FIELDS = ("qp_calls", "lp_calls", "extrema_seconds", "assembly_seconds",
+                       "qp_solve_seconds", "lp_solve_seconds", "host_transfer_seconds")
+
+
+def program_work_report():
+    """Start counters for actual library calls and measured computation phases."""
+    return {name: 0 if name.endswith("calls") else 0. for name in PROGRAM_WORK_FIELDS}
+
+
+def _numpy(value, report=None):
+    if not isinstance(value, torch.Tensor):
+        return np.asarray(value, dtype=float)
+    started = perf_counter()
+    result = value.detach().cpu().numpy().astype(float)
+    if report is not None:
+        report["host_transfer_seconds"] += perf_counter()-started
+    return result
+
+
+def _tensor(value, *, dtype, device, report):
+    """Measure the explicit NumPy-to-native-array handoff, including dtype copy."""
+    started = perf_counter()
+    result = torch.as_tensor(value, dtype=dtype, device=device)
+    report["host_transfer_seconds"] += perf_counter()-started
+    return result
+# END timings describe these phases, not an inferred decomposition of whole-request time.
 
 
 # BEGIN all four physical derivatives share one two-sided QP.
-def _solve_qp(hessian, linear, rows, lower, upper):
+def _solve_qp(hessian, linear, rows, lower, upper, *, report, check_request=None):
     """Solve two-sided linear bounds in the free-coefficient space."""
+    started = perf_counter()
     nonzero = np.any(rows != 0., axis=1)
     if np.any(lower[~nonzero] > 0.) or np.any(upper[~nonzero] < 0.):
+        report["assembly_seconds"] += perf_counter()-started
         return None
     rows, lower, upper = rows[nonzero], lower[nonzero], upper[nonzero]
+    matrix = np.concatenate((rows.T, -rows.T), axis=1)
+    rhs = np.r_[lower, -upper]
+    report["assembly_seconds"] += perf_counter()-started
+    if check_request is not None:
+        check_request()
+    started = perf_counter()
+    report["qp_calls"] += 1
     try:
         # quadprog minimizes .5*x'G*x-a'x with C'x >= b. Physical
         # constraints have two sides; unconstrained free coefficients do not
         # receive the robot's joint-position box.
-        return quadprog.solve_qp(np.asarray(hessian, dtype=float), -linear,
-            np.concatenate((rows.T, -rows.T), axis=1), np.r_[lower, -upper])[0]
+        result = quadprog.solve_qp(np.asarray(hessian, dtype=float), -linear, matrix, rhs)[0]
     except ValueError as error:
         if "constraints are inconsistent" not in str(error):
             raise
-        return None
+        result = None
+    finally:
+        report["qp_solve_seconds"] += perf_counter()-started
+    # Unexpected numerical exceptions propagate from the library. A normal
+    # result, including its declared inconsistent constraints, reaches this
+    # same request check before another query or trial can start.
+    if check_request is not None:
+        check_request()
+    return result
 # END the measured entrance is already fixed by the cubic coefficient map.
 
 
@@ -54,6 +96,15 @@ class CubicAffineMap(CubicBasis):
         if (self.start_q.shape != self.start_dq.shape
                 or not np.isfinite(self.start_q).all() or not np.isfinite(self.start_dq).all()):
             raise ValueError("Cubic entrance needs matching finite measured q0/dq0")
+        # BEGIN fixed physical rows belong to this q0/dq0 and knot-clock binding.
+        # q, dq and ddq use every original break; jerk uses each segment's
+        # midpoint so both sides of a jerk jump remain represented. Moving
+        # extrema add their own rows locally to each QP/LP invocation.
+        self.fixed_constraint_times = tuple(np.arange(self.intervals+1, dtype=float)
+            if order < 3 else np.arange(self.intervals, dtype=float)+.5 for order in range(4))
+        self.fixed_constraint_rows = tuple(self.query_knot_times(times, order)
+            for order, times in enumerate(self.fixed_constraint_times))
+        # END later iterations reuse these arrays without rebuilding their basis.
 
     def coefficients(self, actions):
         """Complete coefficients, computed relative to q0 before translation."""
@@ -122,68 +173,112 @@ class CubicAffineMap(CubicBasis):
         return times, values
         # END exact boundary states are preserved without a numerical tolerance.
 
+    # BEGIN only new analytic witness times generate new affine rows.
+    def _initial_constraint_rows(self, initial, bounds, joint, report):
+        """Combine bound-time rows with this starting curve's extra extrema."""
+        known, matrices, lower, upper = [], [], [], []
+        for order, (lo_bound, hi_bound) in enumerate(bounds):
+            started = perf_counter()
+            query, _ = self.extrema_times(initial, joint, order)
+            report["extrema_seconds"] += perf_counter()-started
+            started = perf_counter()
+            fixed_times = self.fixed_constraint_times[order]
+            weights, fixed = self.fixed_constraint_rows[order]
+            extra = np.setdiff1d(query, fixed_times)
+            times, offset = fixed_times, fixed[:, joint]
+            if len(extra):
+                new_weights, new_fixed = self.query_knot_times(extra, order)
+                times = np.r_[fixed_times, extra]
+                indices = np.argsort(times)
+                times = times[indices]
+                weights = np.concatenate((weights, new_weights))[indices]
+                offset = np.r_[offset, new_fixed[:, joint]][indices]
+            known.append(times)
+            matrices.append(weights)
+            lower.append(lo_bound-offset)
+            upper.append(hi_bound-offset)
+            report["assembly_seconds"] += perf_counter()-started
+        started = perf_counter()
+        result = known, np.concatenate(matrices), np.concatenate(lower), np.concatenate(upper)
+        report["assembly_seconds"] += perf_counter()-started
+        return result
+
+    def _violated_constraint_rows(self, controls, bounds, joint, known, report):
+        """Check the actual curve and assemble only previously absent bad extrema."""
+        violation, matrices, lower, upper = False, [], [], []
+        for order, (lo_bound, hi_bound) in enumerate(bounds):
+            started = perf_counter()
+            query, values = self.extrema_times(controls, joint, order)
+            report["extrema_seconds"] += perf_counter()-started
+            started = perf_counter()
+            bad = (values < lo_bound) | (values > hi_bound)
+            violation |= bool(np.any(bad))
+            extra = np.setdiff1d(query[bad], known[order])
+            if len(extra):
+                weights, fixed = self.query_knot_times(extra, order)
+                matrices.append(weights)
+                lower.append(lo_bound-fixed[:, joint])
+                upper.append(hi_bound-fixed[:, joint])
+                known[order] = np.r_[known[order], extra]
+            report["assembly_seconds"] += perf_counter()-started
+        started = perf_counter()
+        added = ((np.concatenate(matrices), np.concatenate(lower), np.concatenate(upper))
+                 if matrices else None)
+        report["assembly_seconds"] += perf_counter()-started
+        return violation, added
+    # END no tolerance changes the identity of an already assembled witness time.
+
     def solve_joint(self, hessian, linear, bounds, joint, *, origin,
-                    initial, native_dtype, step_limit=None, interior=False):
+                    initial, native_dtype, step_limit=None, check_request=None, work_report=None):
         """Exchange violated analytic extrema for linear QP rows, at most 24 times.
 
         The optimization variable is a coefficient increment from ``origin``.
-        For fitting, the origin is zero. For recovery it is the current legal
+        For fitting, the origin is zero. For descent it is the current legal
         action. Checking the rounded candidate, rather than the double QP
         answer, also exposes violations introduced by the actual action dtype.
         """
-        times = {derivative: self.extrema_times(initial, joint, derivative)[0]
-                 for derivative in range(4)}
-        # This small inward margin belongs only to construction of a
-        # representable fit anchor. Physical acceptance keeps the exact model
-        # limits, and optimizer recovery never activates this margin.
-        coordinate_scale = max(1., float(np.max(np.abs(bounds[0]))), float(np.max(np.abs(initial))))
-        roundoff = 32*np.finfo(native_dtype).eps*coordinate_scale if interior else 0.
-        report = {"rounds": 0, "constraint_count": 0}
+        # The caller owns this optional diagnostic dictionary so a completed
+        # native call remains visible when the following request check raises.
+        report = {} if work_report is None else work_report
+        report.update(program_work_report(), rounds=0, constraint_count=0)
+        known, rows, lo, hi = self._initial_constraint_rows(initial, bounds, joint, report)
+        started = perf_counter()
+        offset = rows@origin
+        lo, hi = lo-offset, hi-offset
+        if step_limit is not None:
+            rows = np.r_[rows, np.eye(self.knots)]
+            lo, hi = np.r_[lo, -step_limit], np.r_[hi, step_limit]
+        report["assembly_seconds"] += perf_counter()-started
         for iteration in range(24):
-            row_parts, lower_parts, upper_parts = [], [], []
-            for derivative, (lo_bound, hi_bound) in enumerate(bounds):
-                # BEGIN use the same exact entrance rows as tensor sampling.
-                weights, fixed = self.query_knot_times(times[derivative], derivative)
-                offset = fixed[:, joint]+weights@origin
-                # END numerical cancellation cannot fabricate an entrance QP row.
-                # BEGIN inward construction margins act only on free directions.
-                margin = roundoff*np.abs(weights).sum(-1)
-                # END the original physical acceptance bounds remain unchanged.
-                row_parts.append(weights)
-                lower_parts.append(lo_bound-offset+margin)
-                upper_parts.append(hi_bound-offset-margin)
-            rows, lo, hi = np.concatenate(row_parts), np.concatenate(lower_parts), np.concatenate(upper_parts)
-            if step_limit is not None:
-                rows = np.r_[rows, np.eye(self.knots)]
-                lo, hi = np.r_[lo, -step_limit], np.r_[hi, step_limit]
             report.update(rounds=iteration+1, constraint_count=int(2*len(rows)))
-            increment = _solve_qp(hessian, linear, rows, lo, hi)
+            increment = _solve_qp(hessian, linear, rows, lo, hi,
+                                 report=report, check_request=check_request)
             if increment is None:
                 return None, {**report, "reason": "finite_constraints_inconsistent"}
             # Match base + direction in the actual float dtype. In particular,
             # float32 addition is not the cast of a float64 coefficient sum.
             rounded = (origin.astype(native_dtype)+increment.astype(native_dtype)).astype(float)
-            violation, added = False, False
-            for derivative, (lo_bound, hi_bound) in enumerate(bounds):
-                query, values = self.extrema_times(rounded, joint, derivative)
-                bad = (values < lo_bound) | (values > hi_bound)
-                violation = violation or bool(np.any(bad))
-                extended = np.unique(np.r_[times[derivative], query[bad]])
-                added = added or len(extended) != len(times[derivative])
-                times[derivative] = extended
+            violation, added = self._violated_constraint_rows(rounded, bounds, joint, known, report)
             if not violation:
                 return increment, {**report, "reason": "analytic_extrema_passed"}
-            if not added:
+            if added is None:
                 # A repeated rounded boundary cannot yield a new cutting row.
                 # The caller must still restore native-dtype feasibility:
-                # shorten a recovery direction, or contract a fit toward its
+                # shorten a descent direction, or contract a fit toward its
                 # legal anchor, using the existing exact tensor limiter.
                 return increment, {**report, "reason": "rounded_boundary_repeated"}
+            started = perf_counter()
+            new_rows, new_lo, new_hi = added
+            offset = new_rows@origin
+            rows = np.concatenate((rows, new_rows))
+            lo, hi = np.r_[lo, new_lo-offset], np.r_[hi, new_hi-offset]
+            report["assembly_seconds"] += perf_counter()-started
         return increment, {**report, "reason": "extrema_exchange_limit"}
 
 
-def recover_position_step(domain, base, gradient, step_limits, scales, curve=None):
-    """Project a scaled negative gradient, retaining independent joint motion.
+def projected_descent_step(domain, base, gradient, step_limits, scales, curve=None, *,
+                           check_request=None, work_report=None):
+    """Project the complete negative gradient into the physical displacement set.
 
     Physical constraints are separable by joint, so the small diagonal QPs
     are solved serially. The original native step limits bound *increments*,
@@ -191,55 +286,70 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
     decrease before accepting any returned direction.
     """
     zero = torch.zeros_like(base)
-    report = {"success": False, "reason": "invalid_recovery_input", "rounds": 0,
-              "constraint_count": 0, "gradient_dot_step": 0., "limiter_scale": 0.,
-              "per_joint_limiter_scale": []}
+    report = {} if work_report is None else work_report
+    report.update(program_work_report(), success=False, reason="invalid_descent_input", rounds=0,
+                  constraint_count=0, gradient_dot_step=0., limiter_scale=0.,
+                  per_joint_limiter_scale=[])
     if base.ndim != 3 or base.shape[0] != 1 or gradient.shape != base.shape:
-        raise ValueError("Physical-domain recovery requires one matching action/gradient batch")
+        raise ValueError("Physical-domain descent requires one matching action/gradient batch")
     if not bool(domain.feasible(base).all()):
-        raise ValueError("Physical-domain recovery requires a legal current action")
+        raise ValueError("Physical-domain descent requires a legal current action")
     domain.validate_scales(scales)
-    x, g, limits = _numpy(base)[0], _numpy(gradient)[0], _numpy(step_limits)
+    x, g, limits = _numpy(base, report)[0], _numpy(gradient, report)[0], _numpy(step_limits, report)
     limits = np.broadcast_to(limits, x.shape)
     maximum = float(scales.max())
     if (not np.isfinite(g).all() or not np.isfinite(limits).all()
             or np.any(limits <= 0.) or maximum <= 0.):
         return zero, report
-    # Match the native direction normalization before applying its largest
-    # trial multiplier. Scaling one gradient preserves its descent sign.
-    normalization = max(1., float(np.max(np.abs(g)/limits)))
-    target = -g/normalization
+    # BEGIN the complete gradient defines the Euclidean projection metric.
+    # The farthest native trial is bounded by the existing displacement box.
+    # Dividing all coordinates by one large gradient component would change
+    # this subproblem and suppress legal motion in unrelated coordinates.
+    target = -g
+    # END physical bounds constrain the direction, not the gradient magnitude.
     increments = np.empty_like(x)
-    native_dtype = base.detach().cpu().numpy().dtype
+    native_dtype = torch.empty((), dtype=base.dtype).numpy().dtype
     if curve is None:
-        lower, upper = _numpy(domain.lower), _numpy(domain.upper)
+        lower, upper = _numpy(domain.lower, report), _numpy(domain.upper, report)
     else:
-        bounds = _numpy(domain.bounds)
+        bounds = _numpy(domain.bounds, report)
     hessian = np.eye(x.shape[0])
     for joint in range(x.shape[1]):
-        if curve is None:
-            rows = np.r_[hessian, hessian]
-            lo = np.r_[(lower[joint]-x[:, joint])/maximum, -limits[:, joint]/maximum]
-            hi = np.r_[(upper[joint]-x[:, joint])/maximum, limits[:, joint]/maximum]
-            increment = _solve_qp(hessian, -target[:, joint], rows, lo, hi)
-            detail = {"rounds": 1, "constraint_count": int(2*len(rows)),
-                      "reason": "finite_constraints_inconsistent" if increment is None else "position_qp_solved"}
-        else:
-            # Solve the furthest native trial as a displacement; convert back
-            # to a direction only after the continuous-curve checks.
-            increment, detail = curve.solve_joint(hessian, -maximum*target[:, joint],
-                bounds[:, :, joint], joint, origin=x[:, joint],
-                initial=x[:, joint], native_dtype=native_dtype,
-                step_limit=limits[:, joint])
-            if increment is not None:
-                increment = increment/maximum
-        report["rounds"] = max(report["rounds"], detail["rounds"])
-        report["constraint_count"] += detail["constraint_count"]
+        detail = {**program_work_report(), "rounds": 0, "constraint_count": 0}
+        try:
+            if curve is None:
+                detail["rounds"] = 1
+                started = perf_counter()
+                rows = np.r_[hessian, hessian]
+                lo = np.r_[(lower[joint]-x[:, joint])/maximum, -limits[:, joint]/maximum]
+                hi = np.r_[(upper[joint]-x[:, joint])/maximum, limits[:, joint]/maximum]
+                detail.update(constraint_count=int(2*len(rows)))
+                detail["assembly_seconds"] += perf_counter()-started
+                increment = _solve_qp(hessian, -target[:, joint], rows, lo, hi,
+                                     report=detail, check_request=check_request)
+                detail["reason"] = ("finite_constraints_inconsistent" if increment is None
+                                    else "position_qp_solved")
+            else:
+                # Solve the furthest native trial as a displacement; convert
+                # back only after the continuous-curve checks. The owned
+                # detail records calls even when a request check interrupts.
+                increment, outcome = curve.solve_joint(hessian, -maximum*target[:, joint],
+                    bounds[:, :, joint], joint, origin=x[:, joint],
+                    initial=x[:, joint], native_dtype=native_dtype,
+                    step_limit=limits[:, joint], check_request=check_request, work_report=detail)
+                detail.update(outcome)
+                if increment is not None:
+                    increment = increment/maximum
+        finally:
+            report["rounds"] = max(report["rounds"], detail["rounds"])
+            report["constraint_count"] += detail["constraint_count"]
+            for name in PROGRAM_WORK_FIELDS:
+                report[name] += detail[name]
         if increment is None:
-            return zero, {**report, "reason": "recovery_qp_not_constructed",
+            return zero, {**report, "reason": "direction_qp_not_constructed",
                           "joint_column": joint, "joint_qp_reason": detail["reason"]}
         increments[:, joint] = increment
-    proposed = torch.as_tensor(increments, dtype=base.dtype, device=base.device)[None]
+    proposed = _tensor(increments, dtype=base.dtype, device=base.device, report=report)[None]
     # Physical domains and these diagonal QPs are separable by joint. Correct
     # float-dtype rounding for each joint's *complete curve increment* before
     # combining them; a roundoff-sized outward component in one joint must
@@ -269,63 +379,123 @@ def recover_position_step(domain, base, gradient, step_limits, scales, curve=Non
     return direction, {**report, "success": True, "reason": "physical_descent_direction"}
 
 
-# BEGIN one algebraic QP anchor serves every complete-domain entry point.
-def construct_cubic_anchor(domain, curve, dtype, device):
-    """Construct a native-dtype feasible curve using the shared four-order QP.
+# BEGIN an original-domain linear program constructs the common physical anchor.
+def construct_cubic_anchor(domain, curve, dtype, device, *, check_request=None, report=None):
+    """Maximize coefficient-space room inside the original physical bounds.
 
-    This construction has no fit/initialize dependency. The position-valued
-    constant proposal supplies a finite objective centre; the measured q0,
-    dq0, stopped terminal interval and fixed clock remain in the affine map.
-    A construction margin accounts for coefficient rounding only. Every
-    returned action is checked against the original model bounds.
+    Each original row ``a @ C <= b`` becomes ``a @ C + ||a||_1*r <= b``
+    with a shared radius r >= 0 for one joint. Maximizing r selects a centre
+    that is less sensitive to coefficient rounding. The radius is an objective
+    variable, not a required margin: r=0 retains every original boundary
+    solution, including domains with no interior. The measured q0/dq0 and
+    terminal stop remain fixed by the cubic map. Violated analytic extrema
+    add rows, and actual action-dtype curves use the unchanged domain test.
     """
-    initial = np.broadcast_to(_numpy(domain._start_q), (domain.knots, len(domain.lower)))
+    if report is None:
+        report = program_work_report()
+    report.update(reason="anchor_not_constructed", joint_status=[], rounds=0,
+                  constraint_count=0, control_radius=[])
+    initial = np.broadcast_to(_numpy(domain._start_q, report), (domain.knots, len(domain.lower)))
     controls = np.empty_like(initial)
     native_dtype = torch.empty((), dtype=dtype).numpy().dtype
-    bounds = _numpy(domain.bounds)
-    report = {"reason": "anchor_not_constructed", "joint_qp_status": [], "rounds": 0,
-              "constraint_count": 0}
+    bounds = _numpy(domain.bounds, report)
     for joint in range(initial.shape[-1]):
-        candidate, detail = curve.solve_joint(np.eye(domain.knots), -initial[:, joint],
-            bounds[:, :, joint], joint, origin=np.zeros(domain.knots),
-            initial=initial[:, joint], native_dtype=native_dtype, interior=True)
-        report["rounds"] = max(report["rounds"], detail["rounds"])
-        report["constraint_count"] += detail["constraint_count"]
-        report["joint_qp_status"].append(detail["reason"])
-        if candidate is None:
-            return None, {**report, "reason": detail["reason"], "joint_column": joint}
-        controls[:, joint] = candidate
-    anchor = torch.as_tensor(controls, dtype=dtype, device=device)[None]
+        known, rows, lower, upper = curve._initial_constraint_rows(
+            initial[:, joint], bounds[:, :, joint], joint, report)
+        started = perf_counter()
+        norm = np.abs(rows).sum(axis=1, keepdims=True)
+        matrix = np.r_[np.c_[rows, norm], np.c_[-rows, norm]]
+        rhs = np.r_[upper, -lower]
+        objective = np.r_[np.zeros(domain.knots), -1.]
+        variable_bounds = [(None, None)]*domain.knots+[(0., None)]
+        report["assembly_seconds"] += perf_counter()-started
+        previous_constraints = report["constraint_count"]
+        reason = "extrema_exchange_limit"
+        for iteration in range(24):
+            report["rounds"] = max(report["rounds"], iteration+1)
+            report["constraint_count"] = previous_constraints+len(rhs)
+            if check_request is not None:
+                check_request()
+            started = perf_counter()
+            report["lp_calls"] += 1
+            try:
+                result = linprog(objective, A_ub=matrix, b_ub=rhs,
+                    bounds=variable_bounds, method="highs")
+            finally:
+                report["lp_solve_seconds"] += perf_counter()-started
+            if check_request is not None:
+                check_request()
+            if not result.success:
+                reason = ("finite_constraints_inconsistent" if result.status == 2
+                          else "anchor_linear_program_failed")
+                return None, {**report, "reason": reason, "joint_column": joint,
+                              "linear_program_status": int(result.status)}
+            rounded = result.x[:-1].astype(native_dtype)
+            # The native tensor predicate decides this joint's acceptance;
+            # other columns carry the declared shape without deciding it.
+            trial = initial.copy()
+            trial[:, joint] = rounded
+            action = _tensor(trial, dtype=dtype, device=device, report=report)[None]
+            started = perf_counter()
+            low, high = domain.all_extrema(action)
+            valid = bool(((low[0, :, joint] >= domain.bounds[:, 0, joint])
+                          & (high[0, :, joint] <= domain.bounds[:, 1, joint])).all())
+            report["extrema_seconds"] += perf_counter()-started
+            if valid:
+                reason = "analytic_extrema_passed"
+                break
+            _, added = curve._violated_constraint_rows(
+                rounded.astype(float), bounds[:, :, joint], joint, known, report)
+            if added is None:
+                reason = "rounded_anchor_outside_domain"
+                break
+            # Existing LP rows retain their numeric values. Only newly
+            # violated extrema acquire coefficient-radius columns here.
+            started = perf_counter()
+            new_rows, new_lower, new_upper = added
+            norm = np.abs(new_rows).sum(axis=1, keepdims=True)
+            matrix = np.r_[matrix, np.c_[new_rows, norm], np.c_[-new_rows, norm]]
+            rhs = np.r_[rhs, new_upper, -new_lower]
+            report["assembly_seconds"] += perf_counter()-started
+        report["joint_status"].append(reason)
+        report["control_radius"].append(float(result.x[-1]))
+        if reason != "analytic_extrema_passed":
+            return None, {**report, "reason": reason, "joint_column": joint}
+        controls[:, joint] = rounded
+    anchor = _tensor(controls, dtype=dtype, device=device, report=report)[None]
     if not bool(domain.feasible(anchor).all()):
-        reason = ("extrema_exchange_limit" if "extrema_exchange_limit" in report["joint_qp_status"]
-                  else "rounded_anchor_outside_domain")
-        return None, {**report, "reason": reason}
+        return None, {**report, "reason": "rounded_anchor_outside_domain"}
     return anchor, {**report, "reason": "physical_anchor_constructed"}
 # END anchor feasibility is the same predicate used by native optimization.
 
 
 # BEGIN reference samples remain soft under the single continuous physical domain.
-def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None):
+def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None, *, check_request=None):
     """Fit soft references while preserving the measured entrance and clock.
 
     The complete bound declaration belongs to ``domain``. Native-dtype
     contraction uses its ordinary line limiter, so fitting, initialization
-    and recovery cannot accept different derivative domains.
+    and descent cannot accept different derivative domains.
     """
     from .physical_joint_domain import JointDomainInitializationError
 
-    values = _numpy(targets)
+    report = {**program_work_report(), "success": False, "reason": "fit_initializer_not_constructed",
+        "rounds": 0, "constraint_count": 0, "joint_qp_status": [], "physical_derivative_orders": [0, 1, 2, 3]}
+    values = _numpy(targets, report)
+    started = perf_counter()
     weights, offset = curve.query(progress)
+    report["assembly_seconds"] += perf_counter()-started
     count, dof = domain.knots, len(domain.lower)
     if values.shape != offset.shape or not len(values) or not np.isfinite(values).all():
         raise ValueError("Cubic reference targets must be finite [query, joint] values")
-    prior = (np.zeros((count, dof)) if prior_controls is None else _numpy(prior_controls))
+    prior = (np.zeros((count, dof)) if prior_controls is None else _numpy(prior_controls, report))
     if prior.shape != (count, dof) or not np.isfinite(prior).all():
         raise ValueError("Cubic reference prior must match the finite free-control layout")
     source = prior_controls if isinstance(prior_controls, torch.Tensor) else targets
     dtype = source.dtype if isinstance(source, torch.Tensor) else torch.float32
     device = source.device if isinstance(source, torch.Tensor) else domain.lower.device
     native_dtype = torch.empty((), dtype=dtype).numpy().dtype
+    started = perf_counter()
     gram = weights.T@weights
     # A machine-precision-scaled ridge makes underdetermined observations
     # strictly convex. It is only a numerical tiebreaker, not another task cost.
@@ -333,22 +503,23 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None):
     hessian = gram+ridge*np.eye(count)
     linear = weights.T@(offset-values)-ridge*prior
     controls = np.empty((count, dof))
-    report = {"success": False, "reason": "fit_initializer_not_constructed", "rounds": 0,
-              "constraint_count": 0, "joint_qp_status": [], "physical_derivative_orders": [0, 1, 2, 3]}
+    report["assembly_seconds"] += perf_counter()-started
     if not bool(domain._entrance_valid):
         return None, {**report, "reason": "algebraic_entrance_invalid"}
-    bounds = _numpy(domain.bounds)
+    bounds = _numpy(domain.bounds, report)
     for joint in range(dof):
         candidate, detail = curve.solve_joint(hessian, linear[:, joint],
             bounds[:, :, joint], joint, origin=np.zeros(count),
-            initial=prior[:, joint], native_dtype=native_dtype)
+            initial=prior[:, joint], native_dtype=native_dtype, check_request=check_request)
         report["rounds"] = max(report["rounds"], detail["rounds"])
         report["constraint_count"] += detail["constraint_count"]
         report["joint_qp_status"].append(detail["reason"])
+        for name in PROGRAM_WORK_FIELDS:
+            report[name] += detail[name]
         if candidate is None:
             return None, {**report, "reason": detail["reason"], "joint_column": joint}
         controls[:, joint] = candidate
-    action = torch.as_tensor(controls, dtype=dtype, device=device)
+    action = _tensor(controls, dtype=dtype, device=device, report=report)
     report.update(fit_contraction_scale=1., maximum_bound_excess_before_contraction=[0.]*4,
                   fit_anchor_source="unneeded")
     if not bool(domain.feasible(action[None]).all()):
@@ -360,7 +531,13 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None):
         excess = torch.maximum(domain.bounds[:, 0]-low, high-domain.bounds[:, 1])
         try:
             if domain._anchor is None:
-                domain._anchor = domain._construct_anchor(dtype, device)
+                try:
+                    domain._anchor = domain._construct_anchor(dtype, device, check_request=check_request)
+                finally:
+                    # Charge a newly constructed anchor once. Reusing its
+                    # already valid coefficients performs no new LP solve.
+                    for name in PROGRAM_WORK_FIELDS:
+                        report[name] += domain.initialization_report[name]
             anchor = domain._anchor.to(dtype=dtype, device=device)
             domain.validate(anchor)
             delta = action[None]-anchor
@@ -375,13 +552,14 @@ def fit_cubic_reference(domain, curve, progress, targets, prior_controls=None):
             fit_contraction_scale=accepted_norm/proposed_norm if proposed_norm else 0.,
             fit_anchor_source="physical_domain_anchor")
         action = initialized[0]
-    residual = curve.evaluate(action, progress)-values
+    numeric_action = _numpy(action, report)
+    residual = curve.evaluate(numeric_action, progress)-values
     low, high = domain.all_extrema(action[None])
     return action, {**report, "success": True, "reason": "physical_reference_fit",
         "reference_rms_joint_units": float(np.sqrt(np.mean(residual**2))),
         "reference_max_error_joint_units": float(np.max(np.abs(residual))),
         "continuous_max_abs_derivatives": torch.maximum(low.abs(), high.abs())[0].cpu().tolist(),
-        "query_max_abs_velocity_joint_units_per_s": np.max(np.abs(curve.evaluate(action, progress, 1)), axis=0).tolist(),
+        "query_max_abs_velocity_joint_units_per_s": np.max(np.abs(curve.evaluate(numeric_action, progress, 1)), axis=0).tolist(),
         "continuous_max_abs_velocity_joint_units_per_s": torch.maximum(low.abs(), high.abs())[0, 1].cpu().tolist()}
 # END reference residuals describe the fitted curve in the model's joint units.
 # END the complete curve validator and rollout own final task/geometry acceptance.

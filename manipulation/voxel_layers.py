@@ -36,7 +36,7 @@ def _measured_spheres(spheres, margin):
         return spheres
     radius = spheres[..., 3:4]
     target = radius.detach().to(torch.float64)+margin
-    # BEGIN device-created scalars avoid repeated host transfers in capture.
+    # BEGIN device-created scalars avoid repeated host transfers in queries.
     target = torch.nextafter(target, torch.full((), torch.inf, dtype=target.dtype, device=target.device))
     rounded = target.to(radius.dtype)
     rounded = torch.where(rounded.to(torch.float64) < target,
@@ -136,7 +136,7 @@ class FineRegion:
             prefix = prefix.cumsum(axis=axis, dtype=np.int32)
         self._prefix = torch.from_numpy(prefix)
         self._device_prefix = {}
-        # BEGIN stable immutable layer constants shared with captured queries.
+        # BEGIN repeated layer queries share immutable device constants.
         self._device_constants = {}
         self._device_groups = {}
         # END no input state or layer decision is cached here.
@@ -167,7 +167,7 @@ class FineRegion:
                 torch.tensor(-torch.inf, dtype=torch.float64, device=device),
                 torch.tensor(torch.inf, dtype=torch.float64, device=device))
         return self._device_constants[device]
-    # END warmup creates constants before graph replay can use their addresses.
+    # END each device reuses its original layer constants across queries.
 
     # BEGIN Python advanced-index lists otherwise create a host index per call.
     def _group_indices(self, device, groups):
@@ -205,13 +205,10 @@ class FineRegion:
         """
         if envelope.shape[-2:] != (2, 3) or envelope.dtype != torch.float64:
             raise ValueError("Source-support envelopes require float64 [...,2,3] grid-local bounds")
-        # BEGIN keep unsafe integer indexing out of a deferred-failure block.
+        # BEGIN validate measured bounds before integer index construction.
         low, high = envelope[..., 0, :], envelope[..., 1, :]
-        valid = require_tensor(torch.isfinite(envelope).all() & ~(low > high).any(),
-                               "Source-support envelopes must be finite ordered boxes")
-        if valid is not None:
-            envelope = torch.where(valid, envelope, torch.zeros_like(envelope))
-            low, high = envelope[..., 0, :], envelope[..., 1, :]
+        require_tensor(torch.isfinite(envelope).all() & ~(low > high).any(),
+                       "Source-support envelopes must be finite ordered boxes")
         _, shape, _, negative, positive = self._constants(low.device)
         # END all valid FP64 bounds enter the identical outward-rounded formula.
         # Integer shape and half-integer offsets are represented exactly.
@@ -246,12 +243,10 @@ class FineRegion:
         if spheres.ndim != 4 or spheres.shape[-1] != 4:
             raise ValueError("Layer selection requires [B,H,S,4] complete body spheres")
         groups = validate_body_groups(groups, spheres.shape[-2])
-        # BEGIN record dynamic faults on-device inside an optimizer graph.
-        valid = require_tensor(torch.isfinite(spheres).all() & ~(spheres[..., 3] < 0).any(),
-                               "Layer selection cannot omit invalid or disabled body-cover spheres")
-        if valid is not None:
-            spheres = torch.where(valid, spheres, torch.zeros_like(spheres))
-        # END a failed block cannot export this placeholder selection.
+        # BEGIN validate the complete supplied cover before selecting a layer.
+        require_tensor(torch.isfinite(spheres).all() & ~(spheres[..., 3] < 0).any(),
+                       "Layer selection cannot omit invalid or disabled body-cover spheres")
+        # END every selected sphere belongs to the original valid input.
         # Selection is a discrete, shared model choice; collision gradients
         # continue through the original spheres in the selected native field.
         # The Mapper produces axis-aligned grids in each owner's local frame.

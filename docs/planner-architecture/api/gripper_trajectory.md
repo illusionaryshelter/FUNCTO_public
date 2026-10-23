@@ -1,6 +1,6 @@
 # `manipulation/gripper_trajectory.py` 实现契约
 
-代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。
+代码基线：`82a3d66；包含本次工作区已实现改动，待统一实现提交后更新`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_text`
@@ -840,8 +840,6 @@ torch.isfinite
 (times < 0.0).any
 (times > self.duration).any
 self.duration
-torch.where
-torch.zeros_like
 times.device
 times.dtype
 self._torch_cache
@@ -860,8 +858,6 @@ times.contiguous
 
 ```python
 message
-valid
-times
 key
 self._torch_cache[key]
 knots
@@ -884,8 +880,6 @@ torch.isfinite(times).all
 torch.isfinite
 (times < 0.0).any
 (times > self.duration).any
-torch.where
-torch.zeros_like
 torch.as_tensor
 self.times.copy
 self._curve.c.copy
@@ -897,7 +891,7 @@ len
 
 ## `FingerTrajectory.torch_storage_bytes`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L447)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L442)。
 
 输入签名：
 
@@ -935,7 +929,7 @@ self._curve
 
 ## `FingerTrajectory.describe`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L452)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L447)。
 
 输入签名：
 
@@ -999,7 +993,7 @@ deepcopy
 
 ## `FingerTrajectory.from_mapping`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L463)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L458)。
 
 输入签名：
 
@@ -1050,7 +1044,7 @@ result.describe
 
 ## `FingerTrajectory.validate_execution`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L473)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L468)。
 
 输入签名：
 
@@ -1119,7 +1113,7 @@ deepcopy
 
 ## `NominalFingerGeometry`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L505)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L500)。
 
 ```python
 class NominalFingerGeometry():
@@ -1151,7 +1145,7 @@ _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare
 
 ## `NominalFingerGeometry.__post_init__`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L525)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L520)。
 
 输入签名：
 
@@ -1221,7 +1215,7 @@ CubicHermiteSpline
 
 ## `NominalFingerGeometry.valid_mask`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L547)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L542)。
 
 输入签名：
 
@@ -1275,7 +1269,7 @@ ValueError
 
 ## `NominalFingerGeometry.valid_mask_torch`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L561)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L556)。
 
 输入签名：
 
@@ -1320,7 +1314,7 @@ admitted.all
 
 ## `NominalFingerGeometry.sample`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L571)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L566)。
 
 输入签名：
 
@@ -1352,7 +1346,7 @@ FingerTrajectory.sample
 
 ## `NominalFingerGeometry.sample_torch`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L574)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L569)。
 
 输入签名：
 
@@ -1384,7 +1378,7 @@ FingerTrajectory.sample_torch
 
 ## `NominalFingerGeometry.torch_storage_bytes`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L579)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L574)。
 
 输入签名：
 
@@ -1417,7 +1411,7 @@ FingerTrajectory.torch_storage_bytes.fget
 
 ## `NominalFingerGeometry.describe`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L582)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L577)。
 
 输入签名：
 
@@ -1461,7 +1455,7 @@ self.velocity.tolist
 
 ## `NominalFingerGeometry.from_reference`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L589)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L584)。
 
 输入签名：
 
@@ -1501,7 +1495,7 @@ cls
 
 ## `NominalFingerGeometry.from_mapping`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L595)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L590)。
 
 输入签名：
 
@@ -1548,7 +1542,7 @@ result.describe
 
 ## `bind_nominal_finger_geometry`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L605)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L600)。
 
 输入签名：
 

@@ -1,10 +1,14 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`82a3d66`；本文同时描述本次工作区内已实现、待统一提交的参考初始化与约束方向改动。实现提交后统一更新代码基线引用。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
-工具曲线初始化产出统一位置、速度、加速度和分段 jerk 连续域内的数值候选及实际采样证据。`reference_initialization` 各完整曲线快照中的 `seeds[*].sampled_scope_feasible` 表示同次任务、关节及 `robot` 几何条件；该几何范围包含共享官方机器人自身与名义手部。`continuous_domain/continuous_residuals` 表示实际保存多项式的四类关节范围；任务观测场状态单独为 `task_scene_constraints="not_evaluated"`。`evaluate_reference` 从返回动作建立原生结果，随后导出该实际曲线并进入本章正式评价。计算完成、当前范围采样合格和完整可执行资格分别记录。
+工具曲线初始化产出统一位置、速度、加速度和分段 jerk 域内的数值候选及实际采样证据。`reference_initialization.coarse/refined` 分别保存物理域内的数值初值和完整工具优化输出；各 `seeds[*].sampled_scope_feasible` 表示同次任务、关节及 `robot` 几何条件，该几何范围包含共享官方机器人自身与名义手部。`continuous_domain/continuous_residuals` 描述实际保存多项式的四类关节范围，任务观测场状态为 `task_scene_constraints="not_evaluated"`。
+
+`known_initialization_failures` 读取终态记录中的原始 `functional_inequalities`。它逐种子核对实际系数、关节名、入口 `q0/dq0`、原断点时刻、时长和进度映射；每个种子至少存在一个有限正值时，该记录表明所有返回初值已有具体功能违约。`plan_trajectory` 在没有调用者 `joint_reference` 的情况下省略这批初值的完整验收，直接进入主优化，并以 `reference_candidate.qualification="skipped_known_functional_failure"` 保存调度依据。混合、未知、缺失或不对应的记录，以及任何已提供原关节曲线，继续经过原完整验收路径。该调度记录不含完整验收的 `accepted` 字段。
+
+正式验收路径由 `evaluate_reference` 从实际返回动作建立原生结果，再由候选选择导出保存曲线并进入本章评价。主优化完成后的曲线同样进入完整验收。初始化完成、当前范围采样合格和完整交付资格分别记录。
 
 `_CuroboPlanner._candidate_metrics` 消费每条实际 `JointTrajectory` 和候选场景，沿保存多项式生成 `q/dq/ddq/jerk`，经原生 FK 计算任务、原关节指标及同一观测场景分项。`_candidate_sample_times` 保留各原多项式区间端点，并按 `interpolation_dt` 分割；确切任务锚点直接按该候选的进度映射和物理时钟求值。原生输出及调用者提供的曲线均经过这一入口，各自保留时长、节点和手指时钟。查询临时上下文在 `finally` 清理。
 
@@ -32,7 +36,7 @@
 
 `PlanningResult` 保存 `success`、`trajectory`、`diagnostics`、`execution_binding`、`request_ledger`。成功结果的 `trajectory` 为 `JointTrajectory`；其具名关节、时间、位置、速度、进度映射、原事件、条件、手指曲线及已满足依赖共同定义可执行内容。失败候选以 `diagnostics.diagnostic_trajectory` 保存，用于解释残差。
 
-`diagnostics.reference_initialization` 保存本次工具曲线初始化的实际迭代分配、粗系数和返回系数，以及各候选对应的普通成本、功能残差、连续域报告和标准轨迹快照。记录在请求 `finally` 中从已完成计算复制，参考 IK 查询、粗链与拟合报告按相同规则保存。细化中断时，其状态携带原因与异常类型，完整的 `coarse/refined` 项保留；尚未完成的阶段保持缺失。完整规划候选尚未产生时，最后完成初始化阶段的第一条曲线可成为诊断轨迹，其余候选继续保存在阶段快照中。
+`diagnostics.reference_initialization` 保存本次工具曲线初始化的实际迭代分配、数值初值 `coarse` 与优化输出 `refined`，以及各候选对应的普通成本、功能残差、连续域报告和标准轨迹快照。请求 `finally` 从已完成计算复制这些记录，并保留参考 IK 查询、数值链与种子来源。中断记录包含原因与异常类型，尚未完成的快照保持缺失。完整规划候选尚未产生时，最后完成初始化阶段的第一条曲线可成为诊断轨迹，其余候选保存在各阶段快照中。
 
 `execution_binding.bind_candidate` 接受实际候选、任务、场景、连续验收和正式采样报告，生成 `candidate_id`，保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 与同身份验收。参数及记录中沿用的 `native_report/validation.native` 名称指正式保存曲线经原生指标 API 得到的报告。`curve_snapshot` 保存原 Hermite 节点、实际系数、可执行终点和首个显式效果依赖边界；`plain` 将 NumPy 及公开 dataclass 字段转为普通记录，无界区间使用具名 JSON 表达。
 
@@ -98,7 +102,7 @@
 | `physical_domain_initializer_not_constructed` | 在固定入口和物理关节域内未构造出本次需要的初值 | 关节域、入口和构造错误 |
 | `planning_stage_failed` | 阶段输入、资源或数值调用产生其他异常 | `failed_stage`、`reason`、`error_type`、原异常栈 |
 
-`reference_initialization.status` 描述计算阶段，包括提议收集、曲线优化、完成、没有可分配初始化块以及中断。它与本表的请求结果、快照中的 `sampled_scope_feasible` 和完整验收结果具有不同职责。`enrichment` 单独保存优化前有限补查询、逐槽比较和实际选择。主请求在初始化之前或中途退出时，已有查询和完整快照用于定位实际停止位置；最终输出保留原请求的取消、期限或数值失败类别。
+`reference_initialization.status` 描述数值提议收集、工具曲线优化、完成、没有可分配初始化块以及中断。它与请求结果、快照中的 `sampled_scope_feasible` 和完整验收结论具有不同含义。`reference_candidate.qualification` 在省略初值完整扫描时记录明确功能违约的调度依据；已完成的普通完整验收继续保存实际候选报告。已有查询、完整快照、原始失败及缺失状态共同定位请求的实际停止阶段。
 
 状态说明所完成计算的结论。结果消费者通过具体残差、输入来源及失败阶段决定下一项研究或操作。场景支持范围、未知区域、接触表示范围和实体相交各有独立分项，详见[观测与碰撞](02-observation-and-collision.md)。
 

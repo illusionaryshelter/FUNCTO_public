@@ -4,13 +4,13 @@ The caller owns static task/geometry checks and the native IK budget. These
 CPU helpers neither create task goals nor certify connections or trajectories.
 """
 
-# BEGIN reference qualification and complete-chain continuity replace clearance-first greed.
+# BEGIN numerical reference and functional candidate policies retain separate evidence.
 from __future__ import annotations
 
 import numpy as np
 
 
-# BEGIN all proposal consumers use the same completed-query qualification.
+# BEGIN numerical reference selection is separate from functional qualification.
 def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, previous,
                                  *, reports):
     """Select one warm start from the original static and native IK evidence.
@@ -22,13 +22,15 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
     state, initially the measured entrance. ``reports[N]`` contains the same
     query's task/model components and original native pose-success flags.
 
-    The common qualification prefix precedes all numerical preferences.
-    Successful proposals within one prefix minimize Euclidean
-    joint displacement before using their pose energy as a tiebreaker.
+    Original native success precedes numerical preferences. Successful
+    proposals minimize Euclidean joint displacement before using their pose
+    energy as a tiebreaker.
     Failed proposals minimize pose energy before joint displacement. This
     preserves the failed solver's numerical progress without allowing tiny
-    differences between solved poses to select a distant posture. The
-    original candidate index breaks exact ties. The returned index names
+    differences between solved poses to select a distant posture.
+    Static task/model evidence breaks only equal numerical choices; an
+    unqueried failed pose cannot displace a solved numerical reference.
+    The original candidate index breaks exact ties. The returned index names
     at most one warm start. The native SeedManager fills the remaining fixed
     seed budget. An empty input index set has no tracking proposal.
     """
@@ -38,10 +40,11 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
     solved = np.asarray([row["native_pose_ik_success"] for row in reports], dtype=bool)
     prior = np.asarray(previous, dtype=float)[0]
     selected = min(candidate_indices, default=None,
-        key=lambda index: (*_qualification_prefix(reports[index], "reference"),
+        key=lambda index: (not solved[index],
                            0. if solved[index] else float(costs[index]),
                            float(np.linalg.norm(values[index]-prior)),
-                           float(costs[index]) if solved[index] else 0., int(index)))
+                           float(costs[index]) if solved[index] else 0.,
+                           *_static_qualification(reports[index]), int(index)))
     return None if selected is None else int(selected)
 # END one selected numerical state leaves the remaining native seed slots free.
 
@@ -75,8 +78,8 @@ def _quality(report):
 
 
 # BEGIN interpret original component semantics without another geometry query.
-def _qualification_prefix(report, query_kind):
-    """Return known task/model failures, native failure and unknown verdicts.
+def _static_qualification(report):
+    """Return known task/model failures and separate unestablished verdicts.
 
     ``planning._CuroboPlanner._rank_ik_candidates`` owns these reports. A
     completed task/native check provides finite positive violation values;
@@ -90,7 +93,9 @@ def _qualification_prefix(report, query_kind):
     A failure and an unestablished verdict are mutually exclusive ranking
     states. An explicit violation wins when the same report also contains
     unknown relations; the report itself retains both pieces of evidence.
-    Functional queries ignore convergence to the nominal pose centre.
+    Numerical reference consumers use these values only after their
+    numerical criteria. Functional consumers use this original allowed-set
+    evidence first and do not require convergence to a nominal pose centre.
     """
     evaluated = report.get("static_model_query") == "evaluated"
 
@@ -106,7 +111,6 @@ def _qualification_prefix(report, query_kind):
                if name.startswith(("collision/", "contact/", "initial_support/"))
                or name == "gripper/controller"))
     return (bool(task_failed), bool(model_failed),
-            not report["native_pose_ik_success"] if query_kind == "reference" else False,
             not task_failed and (not evaluated or not report["task_satisfied"]),
             not model_failed and (not evaluated or not report["model_valid"]))
 # END a stored False without its definite component remains unestablished.
@@ -115,14 +119,13 @@ def _qualification_prefix(report, query_kind):
 def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance, query_kind):
     """Return bounded distinct proposals, without assembling a trajectory.
 
-    The common prefix compares definite task failure, definite model failure,
-    native reference failure, then unestablished task/model verdicts.
-    ``query_kind='functional'`` does not use
-    that flag: the declared allowed set can pass despite failure to reach its
-    nominal centre. Both kinds retain finite recovery proposals, explicitly
+    Reference proposals compare original native success and numerical
+    continuity before static evidence. Functional proposals compare definite
+    task/model failures and unestablished verdicts before continuity, without
+    using nominal-centre convergence. Both kinds retain finite proposals, explicitly
     leaving their failed checks in the reports; they never reject a skill.
 
-    Within one tier, distance to the nearest supplied previous state precedes
+    Distance to the nearest supplied previous state precedes
     extra environment clearance, self clearance and joint-limit margin. These
     optional quality measurements cannot buy a large posture jump. Missing or
     nonfinite measurements lose their quality tiebreak against finite ones.
@@ -142,9 +145,11 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
     def key(index):
         report = reports[index]
-        return (*_qualification_prefix(report, query_kind),
-                float(np.linalg.norm(prior-values[index], axis=-1).min()),
-                *_quality(report), int(index))
+        continuity = float(np.linalg.norm(prior-values[index], axis=-1).min())
+        static = _static_qualification(report)
+        prefix = ((not report["native_pose_ik_success"], continuity, *static)
+                  if query_kind == "reference" else (*static, continuity))
+        return (*prefix, *_quality(report), int(index))
 
     selected = []
     for index in sorted(np.flatnonzero(np.isfinite(values).all(axis=-1)), key=key):
@@ -168,10 +173,10 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     bounds only normalize the polyline's continuity cost. Neither the nodes
     nor their connecting edges certify the later continuous trajectory.
 
-    Dynamic programming sums the common qualification prefix over nodes,
-    then compares failed-node pose energy, normalized joint velocity energy
-    and successful-node pose energy, in that order. Unqueried or unresolved
-    checks contribute only to unestablished-verdict counts. Each last node keeps
+    Dynamic programming first minimizes native-failure count, then failed-node
+    pose energy, normalized joint velocity energy and successful-node pose
+    energy. Summed static evidence only breaks equal numerical paths.
+    Unqueried or unresolved checks remain unestablished verdicts. Each last node keeps
     'count' histories. Samples with no finite legal proposal are filled
     between available nodes and measured q0, without inventing pose success.
     The resulting values initialize the common direct tool-space optimizer;
@@ -209,7 +214,8 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                  & (values <= positions_bounds[1]).all(-1))
         retained = []
         order = sorted(np.flatnonzero(legal), key=lambda index:
-            (*_qualification_prefix(rows[index], "reference"), energy[index], index))
+            (not rows[index]["native_pose_ik_success"], energy[index],
+             *_static_qualification(rows[index]), index))
         for index in order:
             if retained and np.any(np.max(np.abs(values[retained]-values[index]), axis=-1) <= joint_tolerance):
                 continue
@@ -222,7 +228,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     # BEGIN fixed node evidence and physical-time continuity define one ranking.
     # Pose energy and continuity remain separate lexicographic quantities; no
     # task-specific conversion weight or extra rejection threshold is added.
-    states = {None: [((0, 0, 0, 0, 0, 0., 0., 0.), ())]}
+    states = {None: [((0, 0., 0., 0., 0, 0, 0, 0), ())]}
     previous_time = 0.
     normalizer = times[-1]*start.shape[1]
     for layer, (query, indices) in enumerate(layers):
@@ -230,7 +236,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
         next_states = {}
         for index in indices:
             report = reports[query][index]
-            prefix = _qualification_prefix(report, "reference")
+            static = _static_qualification(report)
             options = []
             for preceding_index, paths in states.items():
                 preceding = start[0] if layer == 0 else pools[layers[layer-1][0]][preceding_index]
@@ -242,9 +248,9 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 for cost, path in paths:
                     solved = report["native_pose_ik_success"]
                     energy = float(costs[query][index])
-                    combined = (*(cost[item]+int(value) for item, value in enumerate(prefix)),
-                                cost[5]+(0. if solved else energy), cost[6]+edge,
-                                cost[7]+(energy if solved else 0.))
+                    combined = (cost[0]+int(not solved), cost[1]+(0. if solved else energy),
+                                cost[2]+edge, cost[3]+(energy if solved else 0.),
+                                *(cost[4+item]+int(value) for item, value in enumerate(static)))
                     options.append((combined, (*path, index)))
             next_states[index] = sorted(options)[:count]
         states = next_states
@@ -269,23 +275,21 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                      "SOLVED" if reports[query][index]["native_pose_ik_success"]
                      else "APPROXIMATE_PROPOSAL")
                     for query, index in enumerate(indices)]
-        # BEGIN successful native nodes alone supply joint fitting observations.
-        # The original input-pool index remains intact beside every status.
-        # Interpolation is a numerical path proposal, never a measured IK row.
-        observation_mask = [status == "SOLVED" for status in statuses]
+        # BEGIN every finite chain state is a coefficient proposal, not an observation.
+        # Native success and original pool indices retain the selection
+        # evidence. Complete tool-reference optimization uses all its times.
         result.append({"candidate_indices": indices, "joint_positions": positions.tolist(),
             "anchor_query_indices": anchor_queries, "query_statuses": statuses,
-            "observation_mask": observation_mask,
-            "selection_cost": {"static_task_failed_count": int(cost[0]),
-                "static_model_failed_count": int(cost[1]),
-                "nonconverged_candidate_count": int(cost[2]),
-                "static_task_not_established_count": int(cost[3]),
-                "static_model_not_established_count": int(cost[4]),
-                "failed_pose_energy": float(cost[5]), "normalized_velocity_energy": float(cost[6]),
-                "successful_pose_energy": float(cost[7])},
+            "selection_cost": {"static_task_failed_count": int(cost[4]),
+                "static_model_failed_count": int(cost[5]),
+                "nonconverged_candidate_count": int(cost[0]),
+                "static_task_not_established_count": int(cost[6]),
+                "static_model_not_established_count": int(cost[7]),
+                "failed_pose_energy": float(cost[1]), "normalized_velocity_energy": float(cost[2]),
+                "successful_pose_energy": float(cost[3])},
             "interpolated_queries": [query for query, index in enumerate(indices) if index is None],
-            "reference_success": all(observation_mask)})
-        # END evidence selects fitting rows without changing query identities.
+            "reference_success": all(status == "SOLVED" for status in statuses)})
+        # END the full task-space reference remains independent of proposal status.
         if len(result) == count:
             break
     return result

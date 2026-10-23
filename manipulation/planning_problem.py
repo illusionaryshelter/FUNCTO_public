@@ -672,15 +672,13 @@ class MechanismRequirement:
         # Rollout and exact-event queries can be concatenated out of order.
         # Physical time orders motion even when progress is on a plateau.
         # Progress is sufficient only for a local seed query with no clock.
-        # BEGIN finite-time validation stays on-device inside optimizer blocks.
+        # BEGIN physical times are validated before ordering coordinate history.
         if trajectory_time is not None:
             from .optimizer_device_checks import require_tensor
             message = "Coordinate history needs finite physical times aligned with its queries"
             if trajectory_time.shape != progress.shape:
                 raise ValueError(message)
-            valid = require_tensor(torch.isfinite(trajectory_time).all(), message)
-            if valid is not None:
-                trajectory_time = torch.where(valid, trajectory_time, torch.zeros_like(trajectory_time))
+            require_tensor(torch.isfinite(trajectory_time).all(), message)
         # END valid times retain the original stable sort and cumsum order.
         order = torch.argsort(progress if trajectory_time is None else trajectory_time, dim=-1, stable=True)
         sorted_angle = torch.gather(angle, -1, order)

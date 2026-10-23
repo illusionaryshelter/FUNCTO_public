@@ -127,7 +127,7 @@ def bind_analytic_ik_screening(planner, report_for=None):
     from manipulation.physical_joint_domain import JointPositionDomain
     planner.position_domain = JointPositionDomain(planner.physical_domain.lower, planner.physical_domain.upper)
     planner.reference_ik_pose_weights = (10000., 500.)
-    planner._refine_reference_seeds = Mock(side_effect=lambda seeds, *, enrichment=None: seeds.contiguous())
+    planner._refine_reference_seeds = Mock(side_effect=lambda seeds: seeds.contiguous())
     # END complete refinement uses the independent native-optimizer fixture.
 # END declared static evidence cannot substitute for source checking or complete trajectory acceptance.
 
@@ -206,7 +206,8 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     # END analytic nonconstant polynomials are supplied directly to qualification.
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.check_request = Mock()
-    planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
+    planner.physical_domain = SimpleNamespace(initialize=lambda values, *, check_request=None: values,
+        initialization_report={}, validate=lambda values: None)
     planner.problem = problem
     # The Cartesian test coordinates span metres; declare their metric sampling
     # resolution explicitly while individual spatial tests select finer values.
@@ -350,7 +351,8 @@ class PlannerCalculusTests(unittest.TestCase):
     def test_initializer_plateau_inverse_is_explicitly_earliest(self):
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.check_request = Mock()
-        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values, *, check_request=None: values,
+        initialization_report={}, validate=lambda values: None)
         planner.progress_map = _ProgressMap(np.array([0., .2, .4, 1.]), np.array([0., 1., 1., 2.]))
         self.assertEqual(planner._seed_u(1.), .2)
 
@@ -975,7 +977,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner.physical_domain.initialize = initialize
         # END the fixed domain supplies dq0 and all continuous derivative bounds.
         planner.reference_ik_pose_weights = (10000., 500.)
-        planner._refine_reference_seeds = Mock(side_effect=lambda seeds, *, enrichment=None: seeds.contiguous())
+        planner._refine_reference_seeds = Mock(side_effect=lambda seeds: seeds.contiguous())
         # END the real continuous refinement has independent objective/constraint tests.
         return planner, initialize, warm_starts
 
@@ -1012,7 +1014,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
                 np.testing.assert_array_equal(chain["joint_positions"][query], pools[query][index])
         self.assertEqual(success, [3]*6)
         self.assertEqual(planner.reference_ik_distinct_counts, [3]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"]*2)
+        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_control_polygon"]*2)
         initialize.assert_called_once()
         self.assertEqual(tuple(warm_starts[0].shape), (1, 1, 3))
         for index in range(1, 6):
@@ -1047,7 +1049,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertFalse(np.array_equal(chains[0]["joint_positions"], chains[1]["joint_positions"]))
         self.assertEqual(success, [2, 1, 2, 2, 1, 2])
         self.assertEqual(planner.reference_ik_distinct_counts, success)
-        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"]*2)
+        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_control_polygon"]*2)
         initialize.assert_called_once()
 
     def test_failed_control_pose_keeps_finite_approximate_nodes_and_original_flag(self):
@@ -1058,7 +1060,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertEqual(success, [3, 3, 0, 3, 3, 3])
         self.assertEqual(planner.reference_ik_distinct_counts, [3, 3, 0, 3, 3, 3])
         self.assertEqual(planner.initial_seed_strategies,
-                         ["successful_reference_ik_fit"]*2)
+                         ["reference_ik_control_polygon"]*2)
         self.assertEqual(planner.reference_ik_chains[0]["interpolated_queries"], [])
         self.assertTrue(bool(torch.isfinite(seeds).all()))
         self.assertGreater(float(seeds[0, 0].abs().max()), 0.)
@@ -1078,7 +1080,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         seeds, success = planner.reference_seeds()
         self.assertEqual(success, [2]*6)
         self.assertEqual(planner.reference_ik_distinct_counts, [1]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit", "physical_entry_curve"])
+        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_control_polygon", "physical_entry_curve"])
         np.testing.assert_array_equal(seeds.numpy()[0, 1], np.zeros((6, 3)))
         initialize.assert_called_once()
 
@@ -1089,7 +1091,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner, initialize, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
         seeds, _ = planner.reference_seeds()
         self.assertEqual(planner.reference_ik_distinct_counts, [2]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"]*2)
+        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_control_polygon"]*2)
         selected = np.asarray([row["joint_positions"] for row in planner.reference_ik_chains])
         self.assertGreater(float(np.max(np.abs(selected[1]-selected[0]))), tolerance)
         self.assertLessEqual(float(np.max(np.abs(selected[1]-selected[0]))), 4*tolerance+1e-14)
@@ -1101,13 +1103,15 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         seeds, success = planner.reference_seeds()
         self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
         np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
-        rebuilt = planner.physical_domain.evaluate(seeds[0, 0], (np.arange(6)+1.)/8.)
-        np.testing.assert_allclose(rebuilt, primary, atol=1e-5)
+        # BEGIN IK values propose coefficients without imposing interpolation.
+        np.testing.assert_array_equal(initialize.call_args.args[0][0, 0].numpy(), primary)
+        self.assertTrue(bool(planner.physical_domain.feasible(seeds).all()))
+        # END complete tool optimization receives the resulting physical curve.
         self.assertEqual(success, [3]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["successful_reference_ik_fit"])
+        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_control_polygon"])
         initialize.assert_called_once()
 
-    def test_reference_seed_chooses_a_complete_chain_before_fitting_coefficients(self):
+    def test_reference_seed_chooses_a_complete_chain_before_physical_initialization(self):
         pools = [np.array([[0., 0., 0.], [.4, 0., 0.]])]
         pools.extend(np.array([[.5, 0., 0.], [.5, 0., 0.]]) for _ in range(5))
         planner, initialize, warm_starts = self.planner_for(pools, [np.ones(2, bool)]*6, seed_count=1)
@@ -1120,24 +1124,24 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         # complete coarse graph selects after seeing later reference nodes.
         np.testing.assert_array_equal(warm_starts[1].numpy()[0, 0], [0., 0., 0.])
         self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
-        self.assertTrue(planner.reference_seed_fits[0]["success"])
+        np.testing.assert_array_equal(initialize.call_args.args[0][0, 0].numpy(),
+                                      planner.reference_ik_chains[0]["joint_positions"])
         initialize.assert_called_once()
 
-    def test_failed_optional_reference_fit_retains_evidence_and_measured_initializer(self):
+    # BEGIN a failed physical initializer is an explicit request failure.
+    def test_physical_initialization_failure_propagates_with_completed_ik_evidence(self):
+        from manipulation.physical_joint_domain import JointDomainInitializationError
+
         _, _, pools, flags = self.two_tracks()
         planner, initialize, _ = self.planner_for(pools, flags, seed_count=1)
-        with patch.object(planner.physical_domain, "fit_reference",
-                          return_value=(None, {"success": False, "reason": "declared_fit_failure"})):
-            seeds, success = planner.reference_seeds()
-        self.assertEqual(success, [3]*6)
+        initialize.side_effect = JointDomainInitializationError("declared domain failure")
+        with self.assertRaisesRegex(JointDomainInitializationError, "domain failure"):
+            planner.reference_seeds()
+        self.assertEqual(len(planner.reference_ik_queries), 6)
         self.assertTrue(planner.reference_ik_chains[0]["reference_success"])
-        np.testing.assert_array_equal(seeds.numpy()[0, 0], np.zeros((6, 3)))
-        self.assertEqual(planner.initial_seed_strategies, ["entry_curve_after_fit_failure"])
-        fit = planner.reference_seed_fits[0]
-        self.assertFalse(fit["success"])
-        self.assertEqual(fit["reason"], "declared_fit_failure")
-        self.assertEqual(fit["source"], "entry_curve_after_fit_failure")
         initialize.assert_called_once()
+        planner._refine_reference_seeds.assert_not_called()
+    # END no different proposal replaces an unexplained physical-domain failure.
 
     # BEGIN static evidence and direct refinement retain the original seed budget.
     def test_extra_clearance_does_not_override_qualified_whole_chain_continuity(self):
@@ -1173,20 +1177,21 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         self.assertEqual(tuple(warm_starts[1].shape), (1, 1, 3))
         cost = planner.reference_ik_chains[0]["selection_cost"]
         self.assertEqual((cost["static_task_not_established_count"], cost["static_model_not_established_count"]), (6, 6))
-        self.assertTrue(planner.reference_seed_fits[0]["success"])
+        np.testing.assert_array_equal(initialize.call_args.args[0][0, 0].numpy(),
+                                      planner.reference_ik_chains[0]["joint_positions"])
         torch.testing.assert_close(planner.start.position, before_q, rtol=0, atol=0)
         torch.testing.assert_close(planner.start.velocity, before_dq, rtol=0, atol=0)
         self.assertTrue(torch.isfinite(seeds).all())
         initialize.assert_called_once()
     # END static failure evidence stays separate from the measured entrance.
 
-    # BEGIN direct refinement owns the returned curve after coarse joint fitting.
+    # BEGIN direct refinement owns the returned curve after numerical initialization.
     def test_refinement_output_is_returned_without_a_later_event_joint_refit(self):
         _, _, pools, flags = self.two_tracks()
         planner, _, _ = self.planner_for(pools, flags)
         returned = []
 
-        def refine(coarse, *, enrichment=None):
+        def refine(coarse):
             result = coarse.clone()
             result[:, :, 2:] += .01
             returned.append(result)
@@ -1199,9 +1204,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
         planner._refine_reference_seeds.assert_called_once()
         self.assertIs(seeds, returned[0])
         self.assertEqual(success, [3]*6)
-        self.assertEqual(fitting.call_count, 2)
-        self.assertTrue(all("event_positions" not in call.kwargs and "event_progress" not in call.kwargs
-                            for call in fitting.call_args_list))
+        fitting.assert_not_called()
         planner._build_goal_ik_candidates.assert_not_called()
         self.assertGreater(float((seeds-planner._refine_reference_seeds.call_args.args[0]).abs().max()), 0.)
         np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0], [0.])[:, 0],
@@ -1220,7 +1223,7 @@ class ReferenceSeedDiversityTests(unittest.TestCase):
             planner.reference_seeds()
         self.assertIs(raised.exception, cancelled)
         self.assertEqual(len(planner.reference_ik_queries), 6)
-        self.assertEqual(len(planner.reference_seed_fits), 2)
+        self.assertEqual(len(planner.reference_ik_chains), 2)
         planner._refine_reference_seeds.assert_called_once()
         planner._build_goal_ik_candidates.assert_not_called()
     # END the caller receives the actual refinement result or its request stop.
@@ -1820,7 +1823,8 @@ class NativeCostManagerOwnershipTests(unittest.TestCase):
         metrics_template.self_collision_cfg = None
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.check_request = Mock()
-        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values, *, check_request=None: values,
+        initialization_report={}, validate=lambda values: None)
         planner.device_cfg = self.device_cfg
         planner.trajopt = SimpleNamespace(
             config=SimpleNamespace(metrics_rollout_config=SimpleNamespace(constraint_cfg=metrics_template)),
@@ -2178,7 +2182,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
         cuda = SimpleNamespace(mem_get_info=Mock(return_value=(6*1024**3, 8*1024**3)),
                                memory_reserved=Mock(return_value=400), memory_allocated=Mock(return_value=101))
         runtime = SimpleNamespace(cuda=cuda)
-        workspace = _PlanningWorkspace(0, 0, 200, 0, 600, False)
+        workspace = _PlanningWorkspace(0, 0, 200, 600)
         # Existing cached pages count in device-used but can satisfy future
         # tensors. One byte less reuse must fail the actual physical limit.
         # BEGIN shared allocation admission reports the whole-device boundary.
@@ -2213,7 +2217,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
 
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.check_request = Mock()
-        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values, *, check_request=None: values,
+        initialization_report={}, validate=lambda values: None)
         planner.ik, planner.trajopt = CyclicSolver("ik"), CyclicSolver("trajectory")
         references = (weakref.ref(planner.ik), weakref.ref(planner.trajopt))
         with patch("manipulation.planning.gc.collect", wraps=gc.collect) as collect:
@@ -2244,11 +2249,8 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             PlanningBudget(max_refinement_points=1)
 
     # BEGIN a large finite scene must fit by lifetime, without dropping queries.
-    def test_graph_admission_preserves_eager_budget_and_counts_shared_grids_once(self):
-        # BEGIN graph pools exclude CPU source validation, even in guidance rows.
-        # Distinct full-live/captured peaks catch accidentally duplicating CPU
-        # query/packing/dedup scratch in the two CUDA pools. Immutable grids
-        # remain shared across both graph pools and all independent scenes.
+    def test_scene_budget_counts_shared_grids_once_across_native_rollouts(self):
+        # BEGIN immutable grids are shared; each native rollout keeps query state.
         estimator = Mock(side_effect=lambda batch, horizon:
             {"gpu_retained": 5, "gpu_live": 150,
              "cpu_shared": 17, "cpu_live": 31, "gpu_shared": 23,
@@ -2257,23 +2259,19 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
                                 estimated_workspace_allocation=estimator)
         metadata = self.robot_metadata()
         eager_bytes = 13*5+150+23
-        graph_bytes = eager_bytes+2*60
-        # END the ordinary eager bound still includes the complete 150-byte peak.
-        for capacity, expected_bytes, expected_graph in (
-                (eager_bytes, eager_bytes, False),
-                (graph_bytes-1, eager_bytes, False),
-                (graph_bytes, eager_bytes, False)):
+        # END the live bound includes the complete serial 150-byte query peak.
+        for capacity in (eager_bytes, eager_bytes+119, eager_bytes+120):
             with self.subTest(capacity=capacity):
                 estimator.reset_mock()
                 actual = _planning_workspace_bytes(scene, metadata,
                     PlanningBudget(max_scene_gpu_workspace_bytes=capacity), 1)
-                self.assertEqual((actual.gpu_bytes, actual.trajectory_graph), (expected_bytes, expected_graph))
+                self.assertEqual(actual.gpu_bytes, eager_bytes)
                 self.assertEqual(actual.cpu_bytes, 17+31)
                 self.assertEqual(estimator.call_count, 5)
         scene.contacts = (object(),)
         actual = _planning_workspace_bytes(scene, metadata,
-            PlanningBudget(max_scene_gpu_workspace_bytes=graph_bytes), 1)
-        self.assertEqual((actual.gpu_bytes, actual.trajectory_graph), (eager_bytes, False))
+            PlanningBudget(max_scene_gpu_workspace_bytes=eager_bytes), 1)
+        self.assertEqual(actual.gpu_bytes, eager_bytes)
         with self.assertRaisesRegex(ValueError, "required .* allowed"):
             _planning_workspace_bytes(scene, metadata,
                 PlanningBudget(max_scene_gpu_workspace_bytes=eager_bytes-1), 1)
@@ -2318,7 +2316,7 @@ class RequiredAnchorAllocationTests(unittest.TestCase):
             replace(budget, max_validation_points=32768), 22))
         with self.assertRaisesRegex(ValueError, "required .* allowed"):
             _planning_workspace_bytes(world, metadata,
-                replace(budget, max_scene_gpu_workspace_bytes=expanded.gpu_eager_bytes-1), 22)
+                replace(budget, max_scene_gpu_workspace_bytes=expanded.gpu_bytes-1), 22)
         self.assertEqual(torch.cuda.is_initialized(), initialized)
         # END per-rollout copies do not multiply immutable CPU field storage.
 
@@ -2800,7 +2798,8 @@ class InitialStatePreflightTests(unittest.TestCase):
             phases=(MotionPhase("free", constant_path()),))
         planner = _CuroboPlanner.__new__(_CuroboPlanner)
         planner.check_request = Mock()
-        planner.physical_domain = SimpleNamespace(initialize=lambda values: values, validate=lambda values: None)
+        planner.physical_domain = SimpleNamespace(initialize=lambda values, *, check_request=None: values,
+        initialization_report={}, validate=lambda values: None)
         planner.problem, planner.joint_names = problem, problem.joint_names
         # BEGIN entrance source checks receive the same explicit progress/time mapping.
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))

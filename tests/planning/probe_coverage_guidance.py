@@ -69,7 +69,6 @@ def run(args):
         "grid_shape": list(coverage.known_free.shape), "static_owner_count": args.static_owners,
         "hand_pair_count": args.hand_pairs, "scene_workspace_bytes": workspace.total_bytes,
         "scene_cpu_workspace_bytes": workspace.cpu_bytes, "scene_gpu_workspace_bytes": workspace.gpu_bytes,
-        "trajectory_optimizer_graph_admitted": workspace.trajectory_graph,
         "scene_workspace_mib": workspace.total_bytes/1024**2, "anchor_fk_bytes": workspace.anchor_fk_bytes,
         "scene_gpu_limit_bytes": budget.max_scene_gpu_workspace_bytes, "methods": {}}
     if not args.cpu_only:

@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`82a3d66`。本次仅文档提交引用该实现提交，组件代码与该基线一致。
+代码基线：`82a3d66；包含本次工作区已实现改动，待统一实现提交后更新`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `select_ik_tracking_candidate`
@@ -24,13 +24,15 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
 > state, initially the measured entrance. ``reports[N]`` contains the same
 > query's task/model components and original native pose-success flags.
 >
-> The common qualification prefix precedes all numerical preferences.
-> Successful proposals within one prefix minimize Euclidean
-> joint displacement before using their pose energy as a tiebreaker.
+> Original native success precedes numerical preferences. Successful
+> proposals minimize Euclidean joint displacement before using their pose
+> energy as a tiebreaker.
 > Failed proposals minimize pose energy before joint displacement. This
 > preserves the failed solver's numerical progress without allowing tiny
-> differences between solved poses to select a distant posture. The
-> original candidate index breaks exact ties. The returned index names
+> differences between solved poses to select a distant posture.
+> Static task/model evidence breaks only equal numerical choices; an
+> unqueried failed pose cannot displace a solved numerical reference.
+> The original candidate index breaks exact ties. The returned index names
 > at most one warm start. The native SeedManager fills the remaining fixed
 > seed budget. An empty input index set has no tracking proposal.
 
@@ -66,15 +68,15 @@ np.asarray
 _validate_reports
 len
 min
-_qualification_prefix
 float
 np.linalg.norm
+_static_qualification
 int
 ```
 
 ## `_validate_reports`
 
-[定义位置](../../../manipulation/planning_ik.py#L49)。
+[定义位置](../../../manipulation/planning_ik.py#L52)。
 
 输入签名：
 
@@ -116,7 +118,7 @@ report.get
 
 ## `_measurement`
 
-[定义位置](../../../manipulation/planning_ik.py#L59)。
+[定义位置](../../../manipulation/planning_ik.py#L62)。
 
 输入签名：
 
@@ -159,7 +161,7 @@ np.isfinite
 
 ## `_quality`
 
-[定义位置](../../../manipulation/planning_ik.py#L68)。
+[定义位置](../../../manipulation/planning_ik.py#L71)。
 
 输入签名：
 
@@ -200,19 +202,19 @@ values.extend
 tuple
 ```
 
-## `_qualification_prefix`
+## `_static_qualification`
 
-[定义位置](../../../manipulation/planning_ik.py#L78)。
+[定义位置](../../../manipulation/planning_ik.py#L81)。
 
 输入签名：
 
 ```python
-def _qualification_prefix(report, query_kind):
+def _static_qualification(report):
 ```
 
 实现说明：
 
-> Return known task/model failures, native failure and unknown verdicts.
+> Return known task/model failures and separate unestablished verdicts.
 >
 > ``planning._CuroboPlanner._rank_ik_candidates`` owns these reports. A
 > completed task/native check provides finite positive violation values;
@@ -226,12 +228,14 @@ def _qualification_prefix(report, query_kind):
 > A failure and an unestablished verdict are mutually exclusive ranking
 > states. An explicit violation wins when the same report also contains
 > unknown relations; the report itself retains both pieces of evidence.
-> Functional queries ignore convergence to the nominal pose centre.
+> Numerical reference consumers use these values only after their
+> numerical criteria. Functional consumers use this original allowed-set
+> evidence first and do not require convergence to a nominal pose centre.
 
 显式输出分支：
 
 ```python
-(bool(task_failed), bool(model_failed), not report['native_pose_ik_success'] if query_kind == 'reference' else False, not task_failed and (not evaluated or not report['task_satisfied']), not model_failed and (not evaluated or not report['model_valid']))
+(bool(task_failed), bool(model_failed), not task_failed and (not evaluated or not report['task_satisfied']), not model_failed and (not evaluated or not report['model_valid']))
 ```
 
 读取的对象属性：
@@ -268,9 +272,9 @@ name.startswith
 bool
 ```
 
-## `_qualification_prefix.positive`
+## `_static_qualification.positive`
 
-[定义位置](../../../manipulation/planning_ik.py#L97)。
+[定义位置](../../../manipulation/planning_ik.py#L102)。
 
 输入签名：
 
@@ -302,7 +306,7 @@ np.isfinite
 
 ## `rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning_ik.py#L115)。
+[定义位置](../../../manipulation/planning_ik.py#L119)。
 
 输入签名：
 
@@ -314,14 +318,13 @@ def rank_ik_candidates(candidates, reports, previous, *, count, joint_tolerance,
 
 > Return bounded distinct proposals, without assembling a trajectory.
 >
-> The common prefix compares definite task failure, definite model failure,
-> native reference failure, then unestablished task/model verdicts.
-> ``query_kind='functional'`` does not use
-> that flag: the declared allowed set can pass despite failure to reach its
-> nominal centre. Both kinds retain finite recovery proposals, explicitly
+> Reference proposals compare original native success and numerical
+> continuity before static evidence. Functional proposals compare definite
+> task/model failures and unestablished verdicts before continuity, without
+> using nominal-centre convergence. Both kinds retain finite proposals, explicitly
 > leaving their failed checks in the reports; they never reject a skill.
 >
-> Within one tier, distance to the nearest supplied previous state precedes
+> Distance to the nearest supplied previous state precedes
 > extra environment clearance, self clearance and joint-limit margin. These
 > optional quality measurements cannot buy a large posture jump. Missing or
 > nonfinite measurements lose their quality tiebreak against finite ones.
@@ -384,7 +387,7 @@ int
 
 ## `rank_ik_candidates.key`
 
-[定义位置](../../../manipulation/planning_ik.py#L143)。
+[定义位置](../../../manipulation/planning_ik.py#L146)。
 
 输入签名：
 
@@ -395,7 +398,7 @@ def key(index):
 显式输出分支：
 
 ```python
-(*_qualification_prefix(report, query_kind), float(np.linalg.norm(prior - values[index], axis=-1).min()), *_quality(report), int(index))
+(*prefix, *_quality(report), int(index))
 ```
 
 读取的对象属性：
@@ -410,22 +413,25 @@ np.linalg
 
 ```python
 report
+continuity
+static
+prefix
 ```
 
 直接调用符号：
 
 ```python
-_qualification_prefix
 float
 np.linalg.norm(prior - values[index], axis=-1).min
 np.linalg.norm
+_static_qualification
 _quality
 int
 ```
 
 ## `select_ik_chains`
 
-[定义位置](../../../manipulation/planning_ik.py#L159)。
+[定义位置](../../../manipulation/planning_ik.py#L164)。
 
 输入签名：
 
@@ -444,10 +450,10 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 > bounds only normalize the polyline's continuity cost. Neither the nodes
 > nor their connecting edges certify the later continuous trajectory.
 >
-> Dynamic programming sums the common qualification prefix over nodes,
-> then compares failed-node pose energy, normalized joint velocity energy
-> and successful-node pose energy, in that order. Unqueried or unresolved
-> checks contribute only to unestablished-verdict counts. Each last node keeps
+> Dynamic programming first minimizes native-failure count, then failed-node
+> pose energy, normalized joint velocity energy and successful-node pose
+> energy. Summed static evidence only breaks equal numerical paths.
+> Unqueried or unresolved checks remain unestablished verdicts. Each last node keeps
 > 'count' histories. Samples with no finite legal proposal are filled
 > between available nodes and measured q0, without inventing pose success.
 > The resulting values initialize the common direct tool-space optimizer;
@@ -531,7 +537,7 @@ indices
 dt
 next_states
 report
-prefix
+static
 options
 preceding_index
 paths
@@ -556,7 +562,6 @@ joint
 prior
 indices[query]
 statuses
-observation_mask
 status
 ```
 
@@ -586,7 +591,7 @@ np.isfinite(values).all
 (values <= positions_bounds[1]).all
 sorted
 np.flatnonzero
-_qualification_prefix
+_static_qualification
 retained.append
 int
 layers.append

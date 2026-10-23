@@ -1,4 +1,4 @@
-"""Complete curve initialization through real CPU cubic and native L-BFGS code.
+"""Complete curve initialization through real CPU cubic and constrained gradient code.
 
 The two-coordinate Cartesian FK is declared analytically. Original task managers,
 continuous joint-domain checks and native optimizer state are production code;
@@ -88,12 +88,13 @@ def make_planner(fixture, count=2, iterations=8):
         config=SimpleNamespace(use_cuda_graph=False), optimizers=[stage],
         goal_registry_manager=GoalManager(device)))
     bind_solver_components(shell, domain)
+    stage = shell.core.optimizers[0]
     stage.update_num_problems(count)
     optimizer = MultiStageOptimizer([stage])
     planner = _CuroboPlanner.__new__(_CuroboPlanner)
     planner.torch, planner.JointState, planner.start = torch, JointState, start
     planner.check_request = Mock()
-    stage._core.request_guard = planner.check_request
+    stage.request_guard = planner.check_request
     planner.problem = fixture.problem
     planner.joint_names = fixture.problem.joint_names
     planner.physical_domain, planner._manager_type = domain, fixture.configuration
@@ -252,8 +253,8 @@ def test_initialization_rebinds_goal_clock_after_native_graph_reset(manager_fixt
         regular.reset_shape = MethodType(RobotRollout.reset_shape, regular)
         regular.reset_cuda_graph = MethodType(RobotRollout.reset_cuda_graph, regular)
         regular.update_params = MethodType(RobotRollout.update_params, regular)
-        stage._core.rollout_fn = regular
-        stage._core._rollout_list = [regular, initial]
+        stage.rollout_fn = regular
+        stage._rollout_list = [regular, initial]
         planner.trajopt.optimizer_rollouts = [regular, initial]
         checked_clocks = []
 

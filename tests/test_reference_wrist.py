@@ -1,4 +1,4 @@
-"""Actual ZYZ tool motion through bounded enrichment and native refinement.
+"""Actual ZYZ tool motion through complete-reference constrained optimization.
 
 The mechanism is Rz(q1) Ry(q2) Rz(q3), with a fixed tool offset. The declared
 IK fixture returns mathematically equivalent configurations; SciPy independently
@@ -107,11 +107,10 @@ def wrist_planner():
     calls = []
 
     def solve(goal, **kwargs):
-        # Original observations reproduce the published branch-switch example.
-        # Additional calls solve the same pose using their supplied exact IK
-        # warm start, so their outcome follows a numerical input, not time/name.
+        # The fixed query sequence declares equivalent IK branches. The
+        # production initializer receives each selected state exactly once.
         assert np.float32(goal) == np.float32(float(planner.seed_parameter.item())*planner.formal_clock["duration"])
-        value = pools[len(calls)][0] if len(calls) < 18 else kwargs["seed_config"][0, 0].numpy()
+        value = pools[len(calls)][0]
         calls.append(float(planner.seed_parameter.item()))
         return SimpleNamespace(js_solution=SimpleNamespace(position=torch.from_numpy(value.copy())[None, None]),
             success=torch.ones((1, 1), dtype=torch.bool), position_error=torch.zeros((1, 1)),
@@ -126,6 +125,7 @@ def wrist_planner():
     shell = SimpleNamespace(core=SimpleNamespace(device_cfg=device,
         config=SimpleNamespace(use_cuda_graph=False), optimizers=[stage], goal_registry_manager=GoalManager(device)))
     bind_solver_components(shell, planner.physical_domain)
+    stage = shell.core.optimizers[0]
     stage.update_num_problems(1)
     planner.trajopt = SimpleNamespace(optimizer=MultiStageOptimizer([stage]), optimizer_rollouts=[rollout],
         core=SimpleNamespace(optimizers=[stage]), action_horizon=18, action_dim=3,
@@ -159,13 +159,12 @@ def test_equivalent_ik_switch_is_evaluated_and_refined_in_actual_tool_space():
     record = planner.reference_initialization
     coarse = torch.tensor(record["coarse"]["seeds"][0]["controls"])
     before, after = independent_error(planner, coarse, qa), independent_error(planner, result[0, 0], qa)
-    print({"coarse": before, "refined": after, "additional_times": calls[18:],
-           "selection": record["enrichment"]["selected_sources"]})
+    print({"coarse": before, "refined": after, "reference_query_count": len(calls)})
     assert before["maximum_rotation_rad"] > 3.13
     assert after["mean_energy"] < before["mean_energy"]
     assert after["maximum_rotation_rad"] < before["maximum_rotation_rad"]
     assert after["maximum_position_m"] < before["maximum_position_m"]
-    assert len(calls) <= 20 and success == [1]*len(calls)
+    assert len(calls) == 18 and success == [1]*18
     planner.physical_domain.validate(result)
     np.testing.assert_allclose(planner.physical_domain.evaluate(result[0, 0], [0.])[0], qa, atol=0, rtol=0)
     np.testing.assert_allclose(planner.physical_domain.evaluate(result[0, 0], [0.], derivative=1), 0., atol=0, rtol=0)
