@@ -127,14 +127,14 @@
 | `time_mean_weights/motion_cost` | 普通物理网格、原STATE配置、物理导数和原界 | 时间平均运动成本；优化和固定评分 |
 | `solver_storage_bytes` | 自由变量数及任务/物理约束行数 | 原SLSQP工作区及共享数值数组字节；分配前准入 |
 | `task_jacobian` | 原任务值及自由系数的计算图、期限检查、主机准入回调 | 在独立权向量的反向图中逐列计算完整一阶任务导数；SLSQP任务约束 |
-| `solve_trajectory` | 一条初始系数、完整计算对象、迭代额度、期限检查、场景待分配材料与单次几何临时字节 `pending_geometry_bytes` | 独立 `ConstrainedSolution(controls,report)`；联合内存准入与候选选择 |
+| `solve_trajectory` | 一条初始系数、完整计算对象、迭代额度、期限检查、场景待分配材料与单次几何临时字节 `pending_geometry_bytes`、调用者持有的必填 `report_out` 字典 | 正常返回 `ConstrainedSolution(controls,report_out)`；中断时同一字典保存开始/完成计数、耗时、已确定的目标尺度及三个有界试算/迭代快照，原异常继续传播；候选选择与失败诊断 |
 | `_ik_manager_type` | 原生IK配置及可选事件允许集合 | 参考位姿或同刻声明允许集合的代价/指标管理器；原生IK |
 | `rank_ik_candidates/select_ik_tracking_candidate/select_ik_chains` | 原候选、原成功与模型证据、真实时间、前态和界 | 成功及连续性优先的有限状态与完整链；参考样本 |
 | `_reference_entrance` | 原具名q/dq、官方模型、手部入口与标定 | 参考系TCP位姿与线/角速度；BoundToolReference |
 | `_ConstrainedPlanner.reference_seeds` | 完整参考或原关节曲线、固定时钟和IK预算 | CPU系数 `[1,K,M,J]`、查询成功数与拟合记录；初值评价和主求解 |
 | `_ConstrainedPlanner._reference_ik_query/_select_reference_chains` | 实际时刻、明确seed来源及有限候选池 | 原查询节点、选择链和生产者身份；参考种子 |
 | `_ConstrainedPlanner._build_goal_ik_candidates/ompl_seed` | 原功能允许集合、场景、固定时钟和搜索预算 | 事件候选及有限路径拟合系数；预算内恢复 |
-| `_ConstrainedPlanner.evaluate_reference/optimize` | CPU系数及可选迭代数 | 直接初值记录或串行SLSQP结果列表；候选选择 |
+| `_ConstrainedPlanner.evaluate_reference/optimize` | CPU系数及可选迭代数 | 直接初值记录或串行SLSQP结果列表；每次调用前登记 `last_optimizer_runtime`，中断时另存实际系数的诊断曲线与来源，导出失败单独记录且保留原求解异常；候选选择及失败报告 |
 | `_ConstrainedPlanner._controls_curve` | `[M,J]`系数、入口、原时钟、事件与手指曲线 | `JointTrajectory`；验收、归档和执行 |
 | `_ConstrainedPlanner._candidate_objective` | 实际保存曲线及其场景 | 固定网格运动成本和声明任务质量；跨候选排序 |
 | `_ConstrainedPlanner._candidate_metrics/_candidate_domain_validation` | 保存曲线、场景和记账接口、原关节界 | 原任务及场景采样报告、连续关节极值和入口残差；统一验收 |
@@ -143,6 +143,8 @@
 | `check_interval_geometry` | 原曲线、运动界、几何查询回调和预算 | 已证明、交叠、未决及实际查询时刻；候选报告 |
 | `_ConstrainedPlanner.select_candidate/evaluate_candidate/export` | 独立结果、同一候选评分及原模型验收 | 选中结果、曲线和报告；export交付已评价对象 |
 | `plan_trajectory.record_validation_work/qualify_candidate/qualify_native/deliver_incumbent` | 已开始的验证与完成查询、已合格曲线和固定评分 | 即时工作账本与独立最佳绑定；请求返回 |
+
+中断报告的 `latest_trial/latest_complete_trial` 以自由系数和递增 `trial_index` 标识实际计算，`completed_components` 指明哪些值及导数已完成；其中 `geometry_objective` 与同一系数的目标计算绑定。`last_callback_iterate` 以 `callback_index` 记录库迭代，并在系数相同的条件下记录对应试算编号。`reference_candidate.curve` 保存已检查参考种子的多项式快照，原 `accepted` 与几何验收证据继续属于该曲线。`diagnostic_optimizer_provenance` 保存所导出试算的身份及已有计算证据，`diagnostic_candidate_source` 指明 `diagnostic_optimizer_trial/last_solver_iterate/validated_reference_seed/validated_optimizer_candidate`，`diagnostic_validation_status` 明确完整验收是否完成。完整验收的失败出口另以 `diagnostic_candidate_report` 保存实际该曲线的原 `attempt`，来源由实际曲线身份决定。归档入口 `tests/planning/recorded_task_planning.plan_and_record` 将来源与状态写入候选记录，诊断曲线保留 `rejected_diagnostic_not_executable` 分类。
 
 ## 5. 验收与设备执行
 

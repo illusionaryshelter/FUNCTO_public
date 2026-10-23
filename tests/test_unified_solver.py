@@ -150,7 +150,7 @@ def test_control_column_jacobian_handles_only_constant_task_rows(fixed_entry):
     values = torch.cat((eq[bound.variable_equality_rows], iq))
     jacobian = task_jacobian(values, controls, check_request=lambda: None, admit_work=lambda: None)
     assert jacobian.shape == (values.numel(), controls.numel()) and not jacobian.any()
-    result = solve_trajectory(bound, initial, iterations=1,
+    result = solve_trajectory(bound, initial, report_out={}, iterations=1,
         check_request=lambda: None, pending_geometry_bytes=0)
     assert result.report["solver_called"] and result.report["solver_task_equalities"] == 0
     if fixed_entry:
@@ -174,13 +174,90 @@ def test_full_objective_gradient_and_event_grid_keep_physical_motion_weights():
             (values,), eps=1e-6, atol=3e-6, rtol=3e-6)
 
 
+# BEGIN interrupted real SLSQP retains actual same-control computation evidence.
+def test_budget_interrupt_preserves_evaluated_trial_counts_and_geometry_identity():
+    from manipulation.planning import PlanningWorkExhausted
+    bound, initial = computation()
+    report, actual = {}, dict(objective=0, task=0, physical=0)
+    original_objective, original_task = bound.objective_components, bound.task
+    original_physical = bound.domain.signed_constraints
+
+    def objective(controls):
+        actual["objective"] += 1
+        values = original_objective(controls)
+        # This provenance marker labels the real objective evaluation. The
+        # fixture has no scene entities and makes no collision assertion.
+        bound.geometry_report.update(evaluated_controls=controls.detach().tolist())
+        return values
+
+    def task(controls):
+        actual["task"] += 1
+        return original_task(controls)
+
+    def physical(controls):
+        actual["physical"] += 1
+        return original_physical(controls)
+
+    bound.objective_components, bound.task, bound.domain.signed_constraints = objective, task, physical
+    error = PlanningWorkExhausted("Existing request budget ended at an actual SLSQP iterate")
+
+    def check():
+        snapshot = report.get("latest_complete_trial")
+        if (report.get("callback_iterations", 0) and snapshot is not None
+                and not np.array_equal(snapshot["controls"], initial)):
+            raise error
+
+    with pytest.raises(PlanningWorkExhausted) as raised:
+        solve_trajectory(bound, initial, iterations=160, check_request=check,
+                         pending_geometry_bytes=0, report_out=report)
+    assert raised.value is error
+    assert report["state"] == "interrupted" and report["solver_called"]
+    assert report["completed_evaluations"] == actual
+    assert {kind: report[kind + "_evaluations"] for kind in actual} == actual
+    assert report["objective_scale"] >= 1. and report["elapsed_seconds"] > 0
+    trial = report["latest_complete_trial"]
+    assert not np.array_equal(trial["controls"], initial)
+    assert set(trial["completed_components"]) == {"objective", "task", "physical"}
+    np.testing.assert_array_equal(trial["controls"], trial["geometry_objective"]["evaluated_controls"])
+    np.testing.assert_array_equal(trial["controls"], report["last_callback_iterate"]["controls"])
+    bound.geometry_report["evaluated_controls"] = initial.tolist()
+    assert trial["geometry_objective"]["evaluated_controls"] != initial.tolist()
+
+
+def test_interrupted_objective_keeps_partial_trial_without_borrowing_previous_geometry():
+    from manipulation.planning import PlanningWorkExhausted
+    bound, initial = computation()
+    report = {}
+    original = bound.objective_components
+    error = PlanningWorkExhausted("Budget ended inside an objective evaluation")
+    calls = 0
+
+    def objective(controls):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise error
+        return original(controls)
+
+    bound.objective_components = objective
+    with pytest.raises(PlanningWorkExhausted) as raised:
+        solve_trajectory(bound, initial, iterations=160, check_request=lambda: None,
+                         pending_geometry_bytes=0, report_out=report)
+    assert raised.value is error
+    assert report["objective_evaluations"] == 2 and report["completed_evaluations"]["objective"] == 1
+    assert not np.array_equal(report["latest_trial"]["controls"], initial)
+    assert "objective" not in report["latest_trial"]["completed_components"]
+    assert "geometry_objective" not in report["latest_trial"]
+# END unfinished evaluation and completed evidence retain distinct identities.
+
+
 @pytest.mark.parametrize("production_weights", [False, True])
 def test_slsqp_from_task_infeasible_seed_preserves_entry_and_exports_original_polynomial(production_weights):
     bound, initial = computation(production_weights=production_weights)
     eq_initial, iq_initial = bound.task(torch.tensor(initial))
     assert eq_initial.abs().max() > .1 and iq_initial.max() > .1
     requests = []
-    result = solve_trajectory(bound, initial, iterations=160, check_request=lambda: requests.append(None), pending_geometry_bytes=0)
+    result = solve_trajectory(bound, initial, report_out={}, iterations=160, check_request=lambda: requests.append(None), pending_geometry_bytes=0)
     assert result.report["success"], result.report
     assert result.report["maximum_control_update"] > .05
     assert result.report["objective_evaluations"] > 1 and requests
@@ -241,7 +318,7 @@ def test_host_capacity_is_checked_before_any_dense_task_jacobian(monkeypatch):
         raise AssertionError("Task derivatives must follow host-memory admission")
     monkeypatch.setattr(torch.autograd, "grad", forbidden_derivative)
     with pytest.raises(ResourceLimitError, match="host_process_rss"):
-        solve_trajectory(bound, initial, iterations=1, check_request=lambda: None, pending_geometry_bytes=0)
+        solve_trajectory(bound, initial, report_out={}, iterations=1, check_request=lambda: None, pending_geometry_bytes=0)
 
 
 # BEGIN independent capacity checks cannot admit a jointly excessive peak.
@@ -250,7 +327,7 @@ def test_scene_and_solver_storage_are_admitted_as_one_live_host_peak(monkeypatch
     import manipulation.resource_admission as admission
 
     bound, initial = computation()
-    baseline = solve_trajectory(bound, initial, iterations=1,
+    baseline = solve_trajectory(bound, initial, report_out={}, iterations=1,
         check_request=lambda: None, pending_geometry_bytes=0)
     solver_bytes = sum(baseline.report["solver_storage_bytes"].values())
     pending_scene = solver_bytes
@@ -268,7 +345,7 @@ def test_scene_and_solver_storage_are_admitted_as_one_live_host_peak(monkeypatch
         raise AssertionError("A jointly excessive scene/solver peak must precede derivatives")
     monkeypatch.setattr(torch.autograd, "grad", forbidden_derivative)
     with pytest.raises(ResourceLimitError, match="host_process_rss") as caught:
-        solve_trajectory(bound, initial, iterations=1, check_request=lambda: None,
+        solve_trajectory(bound, initial, report_out={}, iterations=1, check_request=lambda: None,
                          pending_geometry_bytes=pending_scene)
     assert caught.value.required_bytes == resident + solver_bytes + pending_scene
 # END no large buffer is allocated to verify the shared eight-GiB boundary.
@@ -280,7 +357,7 @@ def test_repeated_task_admission_counts_resident_solver_and_scene_storage_once(m
     import manipulation.resource_admission as admission
 
     bound, initial = computation()
-    baseline = solve_trajectory(bound, initial, iterations=1,
+    baseline = solve_trajectory(bound, initial, report_out={}, iterations=1,
         check_request=lambda: None, pending_geometry_bytes=0)
     solver_bytes = sum(baseline.report["solver_storage_bytes"].values())
     pending_scene = solver_bytes
@@ -303,7 +380,7 @@ def test_repeated_task_admission_counts_resident_solver_and_scene_storage_once(m
     monkeypatch.setattr(psutil, "Process", lambda: process)
     monkeypatch.setattr(psutil, "virtual_memory", lambda: SimpleNamespace(available=16*1024**3))
     monkeypatch.setattr("manipulation.unified_solver.require_host_memory", admitted_increment)
-    result = solve_trajectory(bound, initial, iterations=2,
+    result = solve_trajectory(bound, initial, report_out={}, iterations=2,
         check_request=lambda: None, pending_geometry_bytes=pending_scene)
     assert result.report["solver_called"] and len(requests) >= 3
     assert requests[0] == initial_peak and all(value < solver_bytes//2 for value in requests[1:])
@@ -319,7 +396,7 @@ def test_fixed_entry_equalities_are_verified_then_eliminated_by_curve_structure(
     original = bound.task(torch.tensor(initial))[0]
     perturbed = bound.task(torch.tensor(initial+.2))[0]
     assert original[0] == perturbed[0] == 0.
-    result = solve_trajectory(bound, initial, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
+    result = solve_trajectory(bound, initial, report_out={}, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
     assert result.report["success"], result.report
     assert result.report["fixed_entry_equalities"] == {"function_pose:0:yaw": 0.}
     assert result.report["solver_task_equalities"] == int(terminal_yaw_tolerance == 0.)
@@ -334,7 +411,7 @@ def test_fixed_entry_equalities_are_verified_then_eliminated_by_curve_structure(
 
 def test_production_weights_reach_original_strict_acceptance_with_calibration_and_finite_yaw():
     bound, initial = computation(terminal_yaw_tolerance=.02, production_weights=True)
-    result = solve_trajectory(bound, initial, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
+    result = solve_trajectory(bound, initial, report_out={}, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
     assert result.report["success"], result.report
     controls = torch.tensor(result.controls)
     equality, inequality = bound.task(controls)
@@ -354,7 +431,7 @@ def test_violated_fixed_entry_equality_is_retained_and_prevents_the_library_call
     def forbidden_solve(*args, **kwargs):
         raise AssertionError("A fixed violated entry equation cannot be optimized")
     monkeypatch.setattr(solver, "minimize", forbidden_solve)
-    result = solve_trajectory(bound, initial, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
+    result = solve_trajectory(bound, initial, report_out={}, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
     assert not result.report["success"] and not result.report["solver_called"]
     assert result.report["iterations"] == 0
     assert result.report["fixed_entry_equalities"]["function_pose:0:yaw"] == pytest.approx(-.01)
@@ -390,7 +467,7 @@ def test_one_positive_objective_divisor_preserves_values_derivatives_and_order(m
         return SimpleNamespace(x=x0.copy(), fun=recorded[0][2], success=True,
                                status=0, message="objective interface checked", nit=0)
     monkeypatch.setattr(solver, "minimize", inspect_objective)
-    result = solve_trajectory(bound, initial, iterations=1, check_request=lambda: None, pending_geometry_bytes=0)
+    result = solve_trajectory(bound, initial, report_out={}, iterations=1, check_request=lambda: None, pending_geometry_bytes=0)
     divisor = result.report["objective_scale"]
     assert divisor > 1e9
     for raw, gradient, value, derivative in recorded:

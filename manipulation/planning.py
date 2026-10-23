@@ -2587,6 +2587,9 @@ class _ConstrainedPlanner:
         self.goal_ik_candidates = {}
         self.last_optimizer_diagnostics, self.last_optimizer_runtime = [], []
         self.delivery_candidate = self.initialization_candidate = None
+        # BEGIN solver diagnostics own their curve separately from validated proposals.
+        self.diagnostic_optimizer_candidate = self.diagnostic_optimizer_provenance = None
+        # END an interrupted solver cannot replace a candidate's completed verdict.
         self.reference_initialization = {'status': 'not_started'}
         self.reference_ik_queries, self.reference_ik_chains, self.initial_seed_strategies = [], [], []
         self.route = 'unified_constrained'
@@ -2696,6 +2699,9 @@ class _ConstrainedPlanner:
         self.last_validation, self.last_optimizer_diagnostics, self.goal_ik_candidates = None, [], {}
         self.last_optimizer_runtime = []
         self.delivery_candidate = self.initialization_candidate = None
+        # BEGIN each request owns its diagnostic controls and provenance.
+        self.diagnostic_optimizer_candidate = self.diagnostic_optimizer_provenance = None
+        # END no trial survives a request rebind.
         self.reference_initialization = {'status': 'not_started'}
         self.reference_ik_queries, self.reference_ik_chains, self.initial_seed_strategies = [], [], []
         self.ik.reset_seed()
@@ -3727,22 +3733,54 @@ class _ConstrainedPlanner:
         from .unified_solver import solve_trajectory
         results = []
         self.last_optimizer_diagnostics, self.last_optimizer_runtime = [], []
-        for row in seed[0]:
+        # BEGIN retain one diagnostic curve from the actual serial solve.
+        self.diagnostic_optimizer_candidate = self.diagnostic_optimizer_provenance = None
+        for seed_index, row in enumerate(seed[0]):
             # BEGIN admit scene/Pin work simultaneously with each solver's buffers.
             # Earlier scoring or another serial seed may have materialized
             # fixed samples. Recompute their pending/resident split before
             # the solver combines this amount with its actual dense row count.
             workspace = _planning_workspace_bytes(self.computation.scene, self.robot_metadata,
                                                   self.budget, self.anchor_capacity)
-            result = solve_trajectory(self.computation, row.detach().cpu().numpy(),
-                iterations=self.budget.trajectory_iterations if iterations is None else iterations,
-                check_request=self.check_request, pending_geometry_bytes=workspace.pending_cpu_bytes)
+            runtime = {"seed_index": seed_index}
+            self.last_optimizer_runtime.append(runtime)
+            try:
+                result = solve_trajectory(self.computation, row.detach().cpu().numpy(),
+                    iterations=self.budget.trajectory_iterations if iterations is None else iterations,
+                    check_request=self.check_request, pending_geometry_bytes=workspace.pending_cpu_bytes,
+                    report_out=runtime)
+            except BaseException:
+                # Export only already evaluated controls or the library's last
+                # iterate. This conversion performs no objective/geometry query
+                # and leaves delivery_candidate and last_validation untouched.
+                snapshot = runtime.get("latest_complete_trial")
+                source = "diagnostic_optimizer_trial"
+                if snapshot is None:
+                    snapshot = runtime.get("last_callback_iterate")
+                    source = "last_solver_iterate"
+                if snapshot is None:
+                    snapshot = runtime.get("latest_trial")
+                    source = "diagnostic_optimizer_trial"
+                if snapshot is not None and np.isfinite(snapshot["controls"]).all():
+                    try:
+                        diagnostic = self._controls_curve(np.asarray(snapshot["controls"]))
+                        provenance = {"source": source, "seed_index": seed_index,
+                            "validation_status": "not_completed", **deepcopy(snapshot)}
+                        self.diagnostic_optimizer_candidate = diagnostic
+                        self.diagnostic_optimizer_provenance = provenance
+                    except Exception as export_error:
+                        # Finite trial coefficients may overflow Hermite rates.
+                        # Preserve that export failure beside the original solver
+                        # exception, which still decides the request outcome.
+                        runtime["diagnostic_curve_export_error"] = {
+                            "error_type": type(export_error).__name__, "reason": str(export_error)}
+                raise
             # END RSS retains already allocated fields, samples and earlier results.
             results.append(result)
             # Each completed solve owns its report even when a later seed
             # reaches the shared request deadline before returning a result.
             self.last_optimizer_diagnostics.append(result.report)
-            self.last_optimizer_runtime.append(deepcopy(result.report))
+        # END report_out survives the original exception without qualifying a curve.
         return results
 
     def select_candidate(self, results, *, record_work):
@@ -3972,6 +4010,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
     from .planning_problem import TimeBindingError
     started = time.monotonic()
     prior = planner = ledger = trajectory = None
+    # BEGIN reference provenance follows the exact selected curve identity.
+    reference_trajectory = None
+    # END a later candidate may be selected during the same main_solve stage.
     incumbent = None
     initial_seconds = 0.
     motion_ready, motion_baseline = False, {}
@@ -4336,7 +4377,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
 
         reference_result = planner.evaluate_reference(seeds)
         native_result, trajectory, attempt = select_candidate(reference_result)
-        diagnostics['reference_candidate'] = deepcopy(attempt)
+        # BEGIN checked seed evidence remains bound to its own saved polynomial.
+        from .execution_binding import curve_snapshot
+        reference_trajectory = trajectory
+        diagnostics['reference_candidate'] = {
+            **deepcopy(attempt), "source": "validated_reference_seed", "validation_status": "completed",
+            "curve": curve_snapshot(trajectory)}
+        # END later numerical trials have separate geometry and validation status.
         qualify_native(native_result, attempt)
         observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == 'needs_observation'
         recovery = None
@@ -4348,7 +4395,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             stage = "main_solve"
             native_result, trajectory, attempt = select_candidate(planner.optimize(
                 seeds, iterations=planner.main_trajectory_iterations))
-            # END the first slot owns both allocated parts; recovery keeps its quota.
+            # END the main constrained solve consumes its declared iteration budget.
             diagnostics["attempts"].append(deepcopy(attempt))
             qualify_native(native_result, attempt)
             check()
@@ -4376,22 +4423,27 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     else:
                         recovery = "ompl_failed"
                 # END no new observations, permissions or request time are granted.
-                # BEGIN functional AL updates consume only the main solve's native blocks.
+                # BEGIN a completed OMPL proposal uses the remaining constrained-solve slot.
                 if recovery == "ompl":
-                    # END no extra full solve is authorized by task residuals alone.
                     check("trajectory_solves")
                     consumed["trajectory_solves"] += 1
                     native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
                     diagnostics["attempts"].append(deepcopy(attempt))
                     qualify_native(native_result, attempt)
                     check()
+                # END the recovery candidate uses the same declared problem and checks.
         # END mixed failures retain ordinary optimization and recovery.
         diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})
         if incumbent is not None:
             return deliver_incumbent()
         # BEGIN completed finite search reports its selected failure evidence.
+        candidate_source = ("validated_reference_seed" if trajectory is reference_trajectory
+                            else "validated_optimizer_candidate")
         diagnostics.update(failure=(_unknown_policy_failure(attempt, scene.unknown_policy)
             or "no_feasible_solution_found"), diagnostic_trajectory=trajectory,
+            diagnostic_candidate_source=candidate_source, diagnostic_validation_status="completed",
+            diagnostic_candidate_report={**deepcopy(attempt), "source": candidate_source,
+                                         "validation_status": "completed"},
             failure_scope="The selected candidate failed the declared requirements or unknown-space policy; "
                 "its component evidence does not establish that every route to the fixed target fails")
         return outcome
@@ -4412,13 +4464,30 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             else "planning_stage_failed"), failed_stage=stage, reason=str(error), error_type=type(error).__name__,
             failure_traceback=traceback.format_exc())
         # END stage context and native API failures remain directly diagnosable.
-        candidate = (getattr(planner, "delivery_candidate", None) if planner is not None else None)
+        # BEGIN interruption diagnostics identify the curve that produced each record.
+        candidate = getattr(planner, "diagnostic_optimizer_candidate", None)
+        provenance = getattr(planner, "diagnostic_optimizer_provenance", None)
+        if candidate is not None:
+            diagnostics.update(diagnostic_candidate_source=provenance["source"],
+                diagnostic_validation_status="not_completed", diagnostic_optimizer_provenance=deepcopy(provenance))
+        else:
+            candidate = getattr(planner, "delivery_candidate", None)
+            if candidate is not None and reference_trajectory is not None:
+                diagnostics.update(diagnostic_candidate_source=("validated_reference_seed"
+                    if candidate is reference_trajectory else "validated_optimizer_candidate"
+                    if candidate is trajectory else "diagnostic_optimizer_trial"),
+                    diagnostic_validation_status="completed" if candidate is trajectory else "not_completed")
+                if candidate is trajectory:
+                    diagnostics["diagnostic_candidate_report"] = {
+                        **deepcopy(attempt), "source": diagnostics["diagnostic_candidate_source"],
+                        "validation_status": "completed"}
         candidate = trajectory if candidate is None else candidate
         if candidate is None:
             candidate = getattr(planner, "initialization_candidate", None)
         if isinstance(candidate, JointTrajectory):
             diagnostics["diagnostic_trajectory"] = candidate
             diagnostics["diagnostic_candidate_scope"] = "joint curve retained for failure diagnostics; qualification not implied"
+        # END no diagnostic candidate enters the execution binding.
         outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
         return outcome
     finally:

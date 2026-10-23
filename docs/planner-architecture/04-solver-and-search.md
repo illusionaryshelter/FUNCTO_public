@@ -46,7 +46,11 @@
 
 Pinocchio 临时增量为 `8[S(6FNᵣ+12F+Nᵣ)+2]` 字节，其中 `S` 是任务物理时间查询数，`F` 是完整机器人计算帧数，`Nᵣ` 是含名义手指的机器人关节数。对应同时存活的数据为一份 `[S,F,6,Nᵣ]` 乘积、两份 `[S,F,6]` 空间权向量、一份 `[S,Nᵣ]` 关节累积量及两个标量；每个元素为 float64。该数量计入当前求导新增工作区，原生运动学导数与第一次反向图由 RSS 计入。
 
-多个种子串行调用同一求解函数，每次完成即保存独立报告。求解内在实际回调及任务导数列间检查请求期限。SLSQP 终止只表明数值算法状态，候选交付继续经过原条件验收。
+多个种子串行调用同一求解函数。`_ConstrainedPlanner.optimize` 在调用前把该种子的独立 `report_out` 字典登记到 `last_optimizer_runtime`，正常返回的 `ConstrainedSolution.report` 也引用这份记录。求解内在实际回调及任务导数列间检查请求期限；退出时记录实际墙钟耗时与各类开始求值次数，`completed_evaluations` 另记已返回值与导数的次数，其中任务初始行数查询计为一次任务求值。异常记录保留原类型和原因，并继续向请求调用方传播。初始目标归一化完成后，正比例尺度和原目标数值立即写入同一记录。
+
+报告只保留三个有界状态：`latest_trial` 保存最近实际开始计算的系数、递增试算编号和已完成分项；`latest_complete_trial` 保存目标、连续关节和所需任务值及导数均已完成的最近系数；`last_callback_iterate` 保存 SLSQP 回调给出的最近迭代系数及其与已计算试算的对应编号。目标值及其 `geometry_objective` 在同一次目标和梯度计算完成时一起复制到所属试算，几何记录的含义仍为有限优化目标的计算范围。回调保存已有系数，不增加求值。正常返回的顶层几何记录仅引用与返回系数一致的试算。
+
+预算中断时，`optimize` 依次选取最近完整求值、库回调迭代、最近已开始试算，使用 `_controls_curve` 导出独立的 `diagnostic_optimizer_candidate`。`diagnostic_optimizer_provenance` 保存系数、种子和试算身份、完成分项以及已有目标证据，其 `validation_status` 为 `not_completed`。若有限系数在 Hermite 速度导出中溢出，`diagnostic_curve_export_error` 保存导出错误，原求解异常仍向调用方传播。`plan_trajectory` 单独保存已完成参考验收的 `reference_candidate`，其中 `curve` 是原多项式快照、`source` 为 `validated_reference_seed`、`accepted` 保留原判定。失败结果通过 `diagnostic_candidate_source` 区分 `diagnostic_optimizer_trial`、`last_solver_iterate`、`validated_reference_seed` 和 `validated_optimizer_candidate`。后两者的完整验收结果与曲线身份对应，保存在 `diagnostic_candidate_report`；`accepted` 保留原判定。归档消费者保留该来源与验收状态。SLSQP 终止描述数值算法状态，候选交付继续经过原条件验收。
 
 ## 6. 搜索、验收与预算
 

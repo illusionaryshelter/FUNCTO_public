@@ -8,6 +8,7 @@ original entity queries independently decide whether a candidate is usable.
 """
 
 # BEGIN fixed-clock constrained trajectory search with explicit model semantics.
+from copy import deepcopy
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -255,7 +256,7 @@ def solver_storage_bytes(*, variables, task_equalities, task_inequalities, physi
 # END no output-space standard basis is allocated for task derivatives.
 
 
-def solve_trajectory(computation, initial, *, iterations, check_request, pending_geometry_bytes):
+def solve_trajectory(computation, initial, *, iterations, check_request, pending_geometry_bytes, report_out):
     """Submit one full problem to SciPy SLSQP, with exact first derivatives.
 
     SLSQP may evaluate infeasible trials and starts; the original constraints
@@ -267,6 +268,10 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
     storage plus one live geometry/FK evaluation. Existing field/model arrays
     and previously constructed material samples already belong to measured
     RSS. The caller recomputes this quantity before each serial seed solve.
+
+    ``report_out`` is caller-owned and remains available when a request check
+    raises. Its bounded snapshots describe actual evaluated controls and the
+    last SLSQP callback iterate; none is a candidate-acceptance certificate.
     """
     initial = np.asarray(initial, dtype=float)
     shape = initial.shape
@@ -274,128 +279,182 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
     cache_x = None
     counts = {"objective_evaluations": 0, "task_evaluations": 0, "physical_evaluations": 0}
     started = perf_counter()
+    # BEGIN retain bounded, same-control evidence across a native interruption.
+    report = report_out
+    report.update(backend="scipy.optimize.SLSQP", state="running", solver_called=False,
+                  task_query_count=len(computation.parameters), completed_evaluations={
+                      "objective": 0, "task": 0, "physical": 0}, callback_iterations=0,
+                  latest_trial=None, latest_complete_trial=None, last_callback_iterate=None)
+    trial_index = 0
 
-    # Establish fixed row counts with ordinary FK before allocating any dense
-    # Jacobian or SLSQP workspace. Continuous cubic rows comprise two position,
-    # two velocity, four acceleration-endpoint and two jerk rows per segment
-    # and joint. Every task declaration retains its own original signed rows.
-    check_request()
-    initial_controls = torch.tensor(initial, dtype=torch.float64, requires_grad=True)
-    initial_task = computation.task(initial_controls)
-    counts["task_evaluations"] += 1
-    full_eq_count, inequality_count = tuple(value.numel() for value in initial_task)
-    fixed_values = initial_task[0][computation.fixed_equality_rows].detach().numpy()
-    fixed_report = {computation.equality_keys[index]: float(value)
-        for index, value in zip(computation.fixed_equality_rows, fixed_values)}
-    report = {"backend": "scipy.optimize.SLSQP", "task_query_count": len(computation.parameters),
-              "complete_task_equalities": full_eq_count, "fixed_entry_equalities": fixed_report,
-              "solver_task_equalities": len(computation.variable_equality_rows)}
-    # An immutable violated equality makes this original request infeasible.
-    # Verify its original zero-width set before removing its constant solver
-    # row. No angular allowance or numerical-Jacobian rank rule is introduced.
-    if not np.all(np.isfinite(fixed_values) & (fixed_values == 0.)):
-        report.update(success=False, status=None, message="Fixed entry task equalities are infeasible",
-            solver_called=False, iterations=0, objective=None, elapsed_seconds=perf_counter()-started,
-            maximum_control_update=0., unchanged_from_seed=True, **counts)
-        return ConstrainedSolution(initial.copy(), report)
-    eq_count = len(computation.variable_equality_rows)
-    physical_count = 10*computation.domain.intervals*shape[1]
-    memory = solver_storage_bytes(variables=initial.size, task_equalities=eq_count,
-        task_inequalities=inequality_count, physical_inequalities=physical_count)
-    # The scalar Pin bridge retains one [time,frame,6,joint] product,
-    # two [time,frame,6] spatial covectors, one [time,joint] accumulation
-    # and two scalar reductions at its largest reverse allocation. Existing
-    # native derivative arrays and the first reverse graph belong to RSS.
-    samples = len(computation.parameters)
-    frames = len(computation.kinematics.frames)
-    joints = len(computation.kinematics.joint_names)
-    memory["physical_sampling_rows"] = 8*8*computation.domain.intervals*shape[1]*shape[0]
-    memory["pinocchio_reverse_buffers"] = 8*(samples*(6*frames*joints+12*frames+joints)+2)
-    # BEGIN geometry and constrained-solver buffers coexist in each trial.
-    # Material samples may still be lazy at the first objective evaluation.
-    # Admit that storage and the live pair/FK graph with the dense solver;
-    # separate admissible increments do not bound their simultaneous peak.
-    memory["pending_geometry_bytes"] = pending_geometry_bytes
-    require_host_memory(sum(memory.values()), pending_existing_bytes=0,
-                        max_rss_bytes=computation.max_host_rss_bytes)
+    def snapshot_for(x):
+        for name in ("latest_trial", "latest_complete_trial"):
+            snapshot = report[name]
+            if snapshot is not None and np.array_equal(np.asarray(snapshot["controls"]).ravel(), x):
+                return snapshot
+        return None
 
-    def admit_task_derivatives():
-        # The task values, independent covector and first reverse graph now
-        # belong to measured RSS. Later callbacks also retain the allocated
-        # SLSQP workspace and constructed scene samples. Only the new dense
-        # matrix, one returned column and Pin reverse temporaries are pending.
-        rows = eq_count + inequality_count
-        increment = 8*rows*(initial.size+1) + memory["pinocchio_reverse_buffers"]
-        require_host_memory(increment, pending_existing_bytes=0,
+    def callback(x):
+        report["callback_iterations"] += 1
+        matched = snapshot_for(x)
+        report["last_callback_iterate"] = {
+            "callback_index": report["callback_iterations"], "controls": x.reshape(shape).tolist(),
+            "trial_index": None if matched is None else matched["trial_index"],
+            "completed_components": [] if matched is None else list(matched["completed_components"])}
+        check_request()
+    # END callbacks record the library's iterate without another computation.
+
+    try:
+        # Establish fixed row counts with ordinary FK before allocating any dense
+        # Jacobian or SLSQP workspace. Continuous cubic rows comprise two position,
+        # two velocity, four acceleration-endpoint and two jerk rows per segment
+        # and joint. Every task declaration retains its own original signed rows.
+        check_request()
+        initial_controls = torch.tensor(initial, dtype=torch.float64, requires_grad=True)
+        counts["task_evaluations"] += 1
+        initial_task = computation.task(initial_controls)
+        report["completed_evaluations"]["task"] += 1
+        full_eq_count, inequality_count = tuple(value.numel() for value in initial_task)
+        fixed_values = initial_task[0][computation.fixed_equality_rows].detach().numpy()
+        fixed_report = {computation.equality_keys[index]: float(value)
+            for index, value in zip(computation.fixed_equality_rows, fixed_values)}
+        report.update(complete_task_equalities=full_eq_count, fixed_entry_equalities=fixed_report,
+                      solver_task_equalities=len(computation.variable_equality_rows))
+        # An immutable violated equality makes this original request infeasible.
+        # Verify its original zero-width set before removing its constant solver
+        # row. No angular allowance or numerical-Jacobian rank rule is introduced.
+        if not np.all(np.isfinite(fixed_values) & (fixed_values == 0.)):
+            report.update(state="completed", success=False, status=None, message="Fixed entry task equalities are infeasible",
+                solver_called=False, iterations=0, objective=None, elapsed_seconds=perf_counter()-started,
+                maximum_control_update=0., unchanged_from_seed=True, **counts)
+            return ConstrainedSolution(initial.copy(), report)
+        eq_count = len(computation.variable_equality_rows)
+        physical_count = 10*computation.domain.intervals*shape[1]
+        memory = solver_storage_bytes(variables=initial.size, task_equalities=eq_count,
+            task_inequalities=inequality_count, physical_inequalities=physical_count)
+        # The scalar Pin bridge retains one [time,frame,6,joint] product,
+        # two [time,frame,6] spatial covectors, one [time,joint] accumulation
+        # and two scalar reductions at its largest reverse allocation. Existing
+        # native derivative arrays and the first reverse graph belong to RSS.
+        samples = len(computation.parameters)
+        frames = len(computation.kinematics.frames)
+        joints = len(computation.kinematics.joint_names)
+        memory["physical_sampling_rows"] = 8*8*computation.domain.intervals*shape[1]*shape[0]
+        memory["pinocchio_reverse_buffers"] = 8*(samples*(6*frames*joints+12*frames+joints)+2)
+        # BEGIN geometry and constrained-solver buffers coexist in each trial.
+        # Material samples may still be lazy at the first objective evaluation.
+        # Admit that storage and the live pair/FK graph with the dense solver;
+        # separate admissible increments do not bound their simultaneous peak.
+        memory["pending_geometry_bytes"] = pending_geometry_bytes
+        report.update(solver_storage_bytes=memory,
+            task_jacobian_method="scalar_control_columns_from_covector_reverse_graph")
+        require_host_memory(sum(memory.values()), pending_existing_bytes=0,
                             max_rss_bytes=computation.max_host_rss_bytes)
-    # END resident source geometry is counted by RSS, never added again here.
-    del initial_task, initial_controls
 
-    def evaluate(kind, x):
-        nonlocal cache_x
-        check_request()
-        if cache_x is None or not np.array_equal(x, cache_x):
-            cache.clear()
-            cache_x = x.copy()
-        if kind in cache:
-            return cache[kind]
-        counts[kind + "_evaluations"] += 1
-        if kind == "physical":
-            output = computation.domain.signed_constraints(x.reshape(shape))
-        else:
-            controls = torch.tensor(x.reshape(shape), dtype=torch.float64, requires_grad=True)
-            if kind == "objective":
-                components = computation.objective_components(controls)
-                value = sum(components.values())
-                gradient, = torch.autograd.grad(value, controls)
-                output = (float(value.detach()), gradient.detach().numpy().ravel())
+        def admit_task_derivatives():
+            # The task values, independent covector and first reverse graph now
+            # belong to measured RSS. Later callbacks also retain the allocated
+            # SLSQP workspace and constructed scene samples. Only the new dense
+            # matrix, one returned column and Pin reverse temporaries are pending.
+            rows = eq_count + inequality_count
+            increment = 8*rows*(initial.size+1) + memory["pinocchio_reverse_buffers"]
+            require_host_memory(increment, pending_existing_bytes=0,
+                                max_rss_bytes=computation.max_host_rss_bytes)
+        # END resident source geometry is counted by RSS, never added again here.
+        del initial_task, initial_controls
+
+        def evaluate(kind, x):
+            nonlocal cache_x, trial_index
+            check_request()
+            if cache_x is None or not np.array_equal(x, cache_x):
+                cache.clear()
+                cache_x = x.copy()
+                trial_index += 1
+                report["latest_trial"] = {"trial_index": trial_index,
+                    "controls": x.reshape(shape).tolist(), "completed_components": []}
+            if kind in cache:
+                return cache[kind]
+            counts[kind + "_evaluations"] += 1
+            if kind == "physical":
+                output = computation.domain.signed_constraints(x.reshape(shape))
             else:
-                eq, inequality = computation.task(controls)
-                eq = eq[computation.variable_equality_rows]
-                sizes = (eq.numel(), inequality.numel())
-                values = torch.cat((eq, inequality))
-                jacobian = task_jacobian(values, controls, check_request=check_request,
-                                         admit_work=admit_task_derivatives)
-                output = (values.detach().numpy(), jacobian, sizes)
-        cache[kind] = output
-        check_request()
-        return output
+                controls = torch.tensor(x.reshape(shape), dtype=torch.float64, requires_grad=True)
+                if kind == "objective":
+                    components = computation.objective_components(controls)
+                    value = sum(components.values())
+                    gradient, = torch.autograd.grad(value, controls)
+                    output = (float(value.detach()), gradient.detach().numpy().ravel())
+                else:
+                    eq, inequality = computation.task(controls)
+                    eq = eq[computation.variable_equality_rows]
+                    sizes = (eq.numel(), inequality.numel())
+                    values = torch.cat((eq, inequality))
+                    jacobian = task_jacobian(values, controls, check_request=check_request,
+                                             admit_work=admit_task_derivatives)
+                    output = (values.detach().numpy(), jacobian, sizes)
+            cache[kind] = output
+            # BEGIN completion and geometry evidence belong to this exact x only.
+            report["completed_evaluations"][kind] += 1
+            snapshot = report["latest_trial"]
+            snapshot["completed_components"].append(kind)
+            if kind == "objective":
+                snapshot.update(objective=output[0], geometry_objective=deepcopy(computation.geometry_report))
+            required = {"objective", "physical"} | ({"task"} if eq_count + inequality_count else set())
+            if required.issubset(snapshot["completed_components"]):
+                report["latest_complete_trial"] = deepcopy(snapshot)
+            # END a later partial evaluation cannot overwrite completed evidence.
+            check_request()
+            return output
 
-    x0 = initial.ravel().copy()
-    # BEGIN one positive constant changes numerical units, not objective order.
-    # Production task weights can make the initial gradient O(1e10), which
-    # destabilizes SLSQP's first quadratic subproblem. Fix this divisor once;
-    # every trial value and derivative use the same factor, while reporting
-    # and candidate ranking retain the original physical objective.
-    initial_value, initial_gradient = evaluate("objective", x0)
-    objective_scale = max(1., abs(initial_value), float(np.abs(initial_gradient).max()))
+        x0 = initial.ravel().copy()
+        # BEGIN one positive constant changes numerical units, not objective order.
+        # Production task weights can make the initial gradient O(1e10), which
+        # destabilizes SLSQP's first quadratic subproblem. Fix this divisor once;
+        # every trial value and derivative use the same factor, while reporting
+        # and candidate ranking retain the original physical objective.
+        initial_value, initial_gradient = evaluate("objective", x0)
+        objective_scale = max(1., abs(initial_value), float(np.abs(initial_gradient).max()))
+        report.update(objective_scale=objective_scale, initial_objective=initial_value,
+                      initial_gradient_linf=float(np.abs(initial_gradient).max()))
 
-    def scaled_objective(x):
-        value, gradient = evaluate("objective", x)
-        return value/objective_scale, gradient/objective_scale
-    # END argmin f and argmin f/positive_constant have exactly the same set.
-    constraints = [{"type": "ineq", "fun": lambda x: -evaluate("physical", x)[0],
-                    "jac": lambda x: -evaluate("physical", x)[1]}]
-    if eq_count:
-        constraints.append({"type": "eq", "fun": lambda x: evaluate("task", x)[0][:eq_count],
-                            "jac": lambda x: evaluate("task", x)[1][:eq_count]})
-    if inequality_count:
-        constraints.append({"type": "ineq", "fun": lambda x: -evaluate("task", x)[0][eq_count:],
-                            "jac": lambda x: -evaluate("task", x)[1][eq_count:]})
-    result = minimize(scaled_objective, x0, jac=True, method="SLSQP",
-        constraints=constraints, callback=lambda _: check_request(),
-        options={"maxiter": int(iterations), "ftol": 1e-9, "disp": False})
-    report.update({"success": bool(result.success), "solver_called": True,
-              "status": int(result.status), "message": str(result.message),
-              "iterations": int(result.nit), "objective": float(result.fun)*objective_scale,
-              "objective_scale": objective_scale, "normalized_objective": float(result.fun),
-              "initial_objective": initial_value,
-              "initial_gradient_linf": float(np.abs(initial_gradient).max()),
-              "elapsed_seconds": perf_counter() - started, **counts,
-              "maximum_control_update": float(np.max(np.abs(result.x - x0))),
-              "unchanged_from_seed": bool(np.array_equal(result.x, x0)),
-              "solver_storage_bytes": memory,
-              "task_jacobian_method": "scalar_control_columns_from_covector_reverse_graph",
-              "geometry_objective": computation.geometry_report.copy()})
-    return ConstrainedSolution(result.x.reshape(shape).copy(), report)
+        def scaled_objective(x):
+            value, gradient = evaluate("objective", x)
+            return value/objective_scale, gradient/objective_scale
+        # END argmin f and argmin f/positive_constant have exactly the same set.
+        constraints = [{"type": "ineq", "fun": lambda x: -evaluate("physical", x)[0],
+                        "jac": lambda x: -evaluate("physical", x)[1]}]
+        if eq_count:
+            constraints.append({"type": "eq", "fun": lambda x: evaluate("task", x)[0][:eq_count],
+                                "jac": lambda x: evaluate("task", x)[1][:eq_count]})
+        if inequality_count:
+            constraints.append({"type": "ineq", "fun": lambda x: -evaluate("task", x)[0][eq_count:],
+                                "jac": lambda x: -evaluate("task", x)[1][eq_count:]})
+        report["solver_called"] = True
+        result = minimize(scaled_objective, x0, jac=True, method="SLSQP",
+            constraints=constraints, callback=callback,
+            options={"maxiter": int(iterations), "ftol": 1e-9, "disp": False})
+        matched = snapshot_for(result.x)
+        report.update({"state": "completed", "success": bool(result.success), "solver_called": True,
+                  "status": int(result.status), "message": str(result.message),
+                  "iterations": int(result.nit), "objective": float(result.fun)*objective_scale,
+                  "objective_scale": objective_scale, "normalized_objective": float(result.fun),
+                  "initial_objective": initial_value,
+                  "initial_gradient_linf": float(np.abs(initial_gradient).max()),
+                  "elapsed_seconds": perf_counter() - started, **counts,
+                  "maximum_control_update": float(np.max(np.abs(result.x - x0))),
+                  "unchanged_from_seed": bool(np.array_equal(result.x, x0)),
+                  "solver_storage_bytes": memory,
+                  "task_jacobian_method": "scalar_control_columns_from_covector_reverse_graph",
+                  "geometry_objective": ({} if matched is None else deepcopy(matched.get("geometry_objective", {}))),
+                  "geometry_trial_index": None if matched is None else matched["trial_index"]})
+        return ConstrainedSolution(result.x.reshape(shape).copy(), report)
+    except BaseException as error:
+        # The caller receives this original exception and the completed report
+        # fields; recording never changes budget, cancellation or error policy.
+        report.update(state="interrupted", interrupted=True,
+                      error_type=type(error).__name__, reason=str(error))
+        raise
+    finally:
+        report.update(elapsed_seconds=perf_counter()-started, **counts)
+
 # END all numerical search belongs to the maintained solver, not a custom loop.

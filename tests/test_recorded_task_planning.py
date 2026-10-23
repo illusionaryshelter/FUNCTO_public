@@ -49,7 +49,10 @@ def test_curve_record_keeps_classification_and_separates_full_curve_from_barrier
         np.testing.assert_array_equal(arrays["velocity"], curve.velocity)
 
 
-def test_passive_failure_recorder_calls_planner_once_and_keeps_first_cause(tmp_path, monkeypatch):
+# BEGIN archive provenance distinguishes an unchecked trial and a checked rejected seed.
+@pytest.mark.parametrize("source,status", [("diagnostic_optimizer_trial", "not_completed"),
+                                           ("validated_reference_seed", "completed")])
+def test_passive_failure_recorder_calls_planner_once_and_keeps_first_cause(tmp_path, monkeypatch, source, status):
     from manipulation import planning
     @dataclass
     class Budget:
@@ -58,7 +61,8 @@ def test_passive_failure_recorder_calls_planner_once_and_keeps_first_cause(tmp_p
         np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {"collision": .1})
     curve.satisfied_dependencies = ("verified prefix",)
     result = planning.PlanningResult(False, None,
-        {"failure": "no_solution_within_budget", "diagnostic_trajectory": curve},
+        {"failure": "no_solution_within_budget", "diagnostic_trajectory": curve,
+         "diagnostic_candidate_source": source, "diagnostic_validation_status": status},
         request_ledger={"spent_solves": 2})
     calls = []
     backend = object()
@@ -78,17 +82,22 @@ def test_passive_failure_recorder_calls_planner_once_and_keeps_first_cause(tmp_p
     metadata = json.loads((output / "diagnostic-trajectory.json").read_text())
     assert metadata["execution_binding"] is None
     assert metadata["satisfied_dependencies"] == ["verified prefix"]
-    assert metadata["validation_status"] == "not_completed"
+    assert metadata["validation_status"] == status and metadata["source"] == source
+    entry, = report["candidates"]
+    assert entry["source"] == source and entry["validation_status"] == status
+    assert entry["classification"] == metadata["classification"] == "rejected_diagnostic_not_executable"
+# END provenance changes neither original failure nor execution classification.
 # END the archived diagnostic never receives formal execution authorization.
 
 # BEGIN the real formal binding consumes and preserves the online scene record.
-def test_real_binding_and_cpu_scene_roundtrip_keep_candidate_and_consumed_dependency():
+def test_real_binding_and_observed_field_roundtrip_keep_candidate_and_consumed_dependency(tmp_path):
     from manipulation.execution_binding import bind_candidate, check_result
     from manipulation.planning import JointTrajectory, PlanningResult
-    from manipulation.online_geometry import OnlinePlanningScene
-    from test_online_geometry import scene
+    # BEGIN use the current registered-robot/observed-field serialization contract.
+    from manipulation.observed_mapping import FrozenObservedField
+    from test_native_scene_contract import make_scene
     from test_motion_backend_contract import problem
-    original = scene(conditional=True)
+    original = make_scene(tmp_path)
     curve = JointTrajectory(("q",), np.array([0., 1.]), np.zeros((2, 1)), np.zeros((2, 1)),
         np.array([0., 1.]), np.array([0., 1.]),
         ({"event_id": "observed", "skill_id": "s", "time": 0., "progress": 0., "requires_evidence": "held"},), (), {},
@@ -99,9 +108,12 @@ def test_real_binding_and_cpu_scene_roundtrip_keep_candidate_and_consumed_depend
     checked = check_result(result)
     assert checked["curve"]["satisfied_dependencies"] == ["held"]
     assert checked["curve"]["next_verification"] is None
-    restored = OnlinePlanningScene.from_binding(checked["scene"])
-    sphere = np.array([[0., 0., 0., .01]])
-    assert restored.query_state(sphere, np.eye(4), .5) == original.query_state(sphere, np.eye(4), .5)
+    restored = FrozenObservedField.from_record(checked["scene"]["background"])
+    assert checked["scene"] == json.loads(json.dumps(original.to_execution_binding()))
+    np.testing.assert_array_equal(restored.values, original.background.values)
+    np.testing.assert_array_equal(restored.observed, original.background.observed)
+    np.testing.assert_array_equal(restored.weights, original.background.weights)
+    # END archive verification consumes the same fields as the production binding.
     curve.satisfied_dependencies = ()
     with pytest.raises(ValueError, match="(?i)curve|trajectory|candidate"):
         check_result(result)

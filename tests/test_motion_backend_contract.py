@@ -197,6 +197,9 @@ def test_recovery_failure_returns_no_execution_binding_or_export():
     assert not result.success and result.execution_binding is None
     assert result.diagnostics["failure"] == "no_feasible_solution_found"
     assert result.diagnostics["diagnostic_trajectory"] is native.curve
+    # BEGIN completed rejection preserves the selected candidate's evidence status.
+    assert result.diagnostics["diagnostic_validation_status"] == "completed"
+    # END result authorization remains absent regardless of completed validation.
     assert native.calls.count("solve") == 2 and "export" not in native.calls
     backend.close()
 
@@ -581,3 +584,147 @@ def test_nonbudget_improvement_errors_retain_failure_semantics(error):
     finally:
         backend.close()
 # END budget exhaustion cannot promote an unfinished or cancelled computation.
+
+
+# BEGIN real interrupted numerical controls remain separate from seed validation.
+@pytest.mark.parametrize("interruption", ["budget", "deadline"])
+def test_interrupted_solver_exports_unvalidated_trial_and_keeps_seed_evidence(interruption):
+    from manipulation.planning import PlanningWorkExhausted
+    from manipulation.unified_solver import solve_trajectory
+    from test_unified_solver import computation
+
+    bound, initial = computation()
+    native = Native([False])
+    native.torch = torch
+    native.computation, native.physical_domain = bound, bound.domain
+    native.problem = SimpleNamespace(events=(), conditions=())
+    native.robot_metadata, native.finger_trajectory = {}, None
+    native.joint_names, native.action_horizon = bound.joint_names, initial.shape[0]
+    native.formal_clock = {"knot_dt": bound.domain._curve_map.knot_dt, "duration": bound.duration}
+    native._controls_curve = _ConstrainedPlanner._controls_curve.__get__(native)
+    native.curve = native._controls_curve(initial)
+    seed_position = native.curve.position.copy()
+    native.reference_seeds = lambda joint_reference=None: (torch.tensor(initial)[None, None], [])
+    native.optimize = _ConstrainedPlanner.optimize.__get__(native)
+    select = native.select_candidate
+
+    def select_reference(value, *, record_work):
+        result, curve, report = select(value, record_work=record_work)
+        # The deterministic validation fixture labels this seed only. Real
+        # geometry accuracy is exercised in the native scene contract tests.
+        report["geometry_witness_provenance"] = {"position": curve.position.tolist()}
+        native.delivery_candidate = curve
+        return result, curve, report
+
+    native.select_candidate = select_reference
+    error = (PlanningWorkExhausted("Interrupted real numerical trial") if interruption == "budget"
+             else MotionPlanningError("deadline_exceeded", "Interrupted real numerical trial"))
+
+    def budgeted_solve(computation, initial, **kwargs):
+        check_request, runtime = kwargs["check_request"], kwargs["report_out"]
+
+        def check():
+            check_request()
+            complete = runtime.get("latest_complete_trial")
+            if (runtime.get("callback_iterations", 0) and complete is not None
+                    and not np.array_equal(complete["controls"], initial)):
+                raise error
+
+        return solve_trajectory(computation, initial, **{**kwargs, "check_request": check})
+
+    with patch("manipulation.unified_solver.solve_trajectory", side_effect=budgeted_solve), \
+         patch("manipulation.planning._planning_workspace_bytes", return_value=SimpleNamespace(pending_cpu_bytes=0)):
+        result, backend = run(native)
+    try:
+        assert not result.success and result.trajectory is None and result.execution_binding is None
+        assert result.diagnostics["failure"] == (
+            "cumulative_planning_budget_exhausted" if interruption == "budget" else "deadline_exceeded")
+        assert result.diagnostics["failed_stage"] == "main_solve"
+        assert result.diagnostics["diagnostic_candidate_source"] == "diagnostic_optimizer_trial"
+        assert result.diagnostics["diagnostic_validation_status"] == "not_completed"
+        diagnostic = result.diagnostics["diagnostic_trajectory"]
+        assert not np.array_equal(diagnostic.position, seed_position)
+        np.testing.assert_array_equal(native.delivery_candidate.position, seed_position)
+        reference = result.diagnostics["reference_candidate"]
+        assert reference["source"] == "validated_reference_seed" and not reference["accepted"]
+        assert reference["validation_status"] == "completed"
+        np.testing.assert_array_equal(reference["curve"]["position"], seed_position)
+        assert reference["geometry_witness_provenance"]["position"] == reference["curve"]["position"]
+        trial = result.diagnostics["diagnostic_optimizer_provenance"]
+        assert "geometry_witness_provenance" not in trial
+        np.testing.assert_array_equal(native._controls_curve(np.asarray(trial["controls"])).position,
+                                      diagnostic.position)
+        runtime, = result.diagnostics["last_optimizer_runtime"]
+        assert runtime["state"] == "interrupted" and runtime["objective_evaluations"] > 1
+        assert runtime["latest_complete_trial"]["trial_index"] == trial["trial_index"]
+    finally:
+        backend.close()
+# END public failures preserve the original type and never authorize the trial.
+
+
+# BEGIN same-stage cancellation uses the actual selected curve, not the stage name.
+def test_cancel_after_main_selection_does_not_label_optimized_curve_as_reference_seed():
+    native = Native([False, False])
+    select = native.select_candidate
+    state = {"selections": 0, "main_selected": False}
+
+    def selected(value, *, record_work):
+        state["selections"] += 1
+        if state["selections"] == 2:
+            native.curve = deepcopy(native.curve)
+            native.curve.position[-1, 0] = .2
+        result, curve, report = select(value, record_work=record_work)
+        native.delivery_candidate = curve
+        state["main_selected"] = state["selections"] == 2
+        return result, curve, report
+
+    native.select_candidate = selected
+    result, backend = run(native, cancelled=lambda: state["main_selected"])
+    try:
+        assert not result.success and result.diagnostics["failure"] == "cancelled"
+        assert result.diagnostics["failed_stage"] == "main_solve"
+        assert result.diagnostics["diagnostic_candidate_source"] == "validated_optimizer_candidate"
+        assert result.diagnostics["diagnostic_validation_status"] == "completed"
+        report = result.diagnostics["diagnostic_candidate_report"]
+        assert report["source"] == "validated_optimizer_candidate" and not report["accepted"]
+        assert report["validation_status"] == "completed"
+        assert result.diagnostics["reference_candidate"]["curve"]["position"][-1] == [0.]
+        assert result.diagnostics["diagnostic_trajectory"].position[-1, 0] == .2
+    finally:
+        backend.close()
+# END completed selection and numerical interruption retain separate statuses.
+
+
+# BEGIN real diagnostic Hermite overflow cannot replace a budget exception.
+def test_diagnostic_curve_export_error_preserves_original_solver_exception():
+    from manipulation.planning import PlanningWorkExhausted
+    from test_unified_solver import computation
+    bound, initial = computation()
+    native = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
+    native.torch, native.computation, native.physical_domain = torch, bound, bound.domain
+    native.problem = SimpleNamespace(events=(), conditions=())
+    native.robot_metadata, native.finger_trajectory, native.anchor_capacity = {}, None, 256
+    native.joint_names, native.action_horizon = bound.joint_names, initial.shape[0]
+    native.formal_clock = {"knot_dt": .001, "duration": (initial.shape[0]-1)*.001}
+    native.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+    native.budget, native.check_request = PlanningBudget(), lambda: None
+    error = PlanningWorkExhausted("Original numerical budget interruption")
+    controls = np.full_like(initial, np.finfo(float).max/2)
+    controls[::2] *= -1
+
+    def interrupted(*args, report_out, **kwargs):
+        report_out["latest_trial"] = {"trial_index": 2, "controls": controls.tolist(),
+                                       "completed_components": []}
+        raise error
+
+    with patch("manipulation.unified_solver.solve_trajectory", side_effect=interrupted), \
+         patch("manipulation.planning._planning_workspace_bytes", return_value=SimpleNamespace(pending_cpu_bytes=0)), \
+         np.errstate(over="ignore", invalid="ignore"):
+        with pytest.raises(PlanningWorkExhausted) as raised:
+            native.optimize(torch.tensor(initial)[None, None])
+    assert raised.value is error
+    runtime, = native.last_optimizer_runtime
+    assert runtime["latest_trial"]["controls"] == controls.tolist()
+    assert runtime["diagnostic_curve_export_error"]["error_type"] == "ValueError"
+    assert native.diagnostic_optimizer_candidate is native.diagnostic_optimizer_provenance is None
+# END diagnostic export failure remains evidence, not a new planner outcome.

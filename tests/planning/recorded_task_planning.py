@@ -61,7 +61,7 @@ def _write_diagnostic_json(path, document):
 
 
 def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status="completed",
-               joint_limits=None, planning_result=None):
+               joint_limits=None, planning_result=None, source=None):
     """Preserve the exact exported cubic, event identities and optional FK.
 
     ``fk`` contains independently evaluated native FK of this same exported
@@ -117,6 +117,9 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
     # allocating a second encoded copy of this potentially large document.
     rendered = json.dumps(
         {"classification": classification, "validation_status": validation_status,
+         # BEGIN source names the candidate that owns this archive's polynomial.
+         "source": source,
+         # END qualification remains in the independent execution binding.
          "execution_binding": binding,
          "execution_limits": deepcopy(execution_limits),
          "finger_trajectory": None if fingers is None else fingers.describe(),
@@ -173,13 +176,17 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
                 joint_limits=bounds, planning_result=result)
         elif diagnostic is not None:
             entry = {"path": "diagnostic-trajectory.npz", "classification": "rejected_diagnostic_not_executable",
-                     "validation_status": "not_completed", "curve_saved": False,
+                     # BEGIN archive the production curve's actual evidence status.
+                     "validation_status": result.diagnostics.get("diagnostic_validation_status", "not_completed"),
+                     "source": result.diagnostics.get("diagnostic_candidate_source"), "curve_saved": False,
+                     # END a checked rejected seed remains distinct from an optimizer trial.
                      "attempt": {"failure": result.diagnostics.get("failure"),
                                  "residuals": diagnostic.residuals}}
             report["candidates"].append(entry)
             try:
                 save_curve(output / entry["path"], diagnostic, classification=entry["classification"],
-                    execution_limits=execution_limits, validation_status=entry["validation_status"])
+                    execution_limits=execution_limits, validation_status=entry["validation_status"],
+                    source=entry["source"])
                 entry["curve_saved"] = True
             except Exception as error:
                 entry["diagnostic_error"] = f"{type(error).__name__}: {error}"
