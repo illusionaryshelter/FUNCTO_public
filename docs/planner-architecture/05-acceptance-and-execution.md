@@ -1,6 +1,6 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`2498027`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`2498027`；本文同时描述工作区已实现的中断状态记录与分项调用计数，待对应实现提交后更新引用。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
 
 ## 1. 候选的完整验收
 
@@ -36,7 +36,7 @@
 
 `PlanningResult` 保存 `success`、`trajectory`、`diagnostics`、`execution_binding`、`request_ledger`。成功结果的 `trajectory` 为 `JointTrajectory`；其具名关节、时间、位置、速度、进度映射、原事件、条件、手指曲线及已满足依赖共同定义可执行内容。失败候选以 `diagnostics.diagnostic_trajectory` 保存，用于解释残差。
 
-`diagnostics.reference_initialization` 保存本次工具曲线初始化的实际迭代分配、数值初值 `coarse` 与优化输出 `refined`，以及各候选对应的普通成本、功能残差、连续域报告和标准轨迹快照。请求 `finally` 从已完成计算复制这些记录，并保留参考 IK 查询、数值链与种子来源。中断记录包含原因与异常类型，尚未完成的快照保持缺失。完整规划候选尚未产生时，最后完成初始化阶段的第一条曲线可成为诊断轨迹，其余候选保存在各阶段快照中。
+`diagnostics.reference_initialization` 保存本次工具曲线初始化的实际迭代分配、数值初值 `coarse` 与优化输出 `refined`，以及各候选对应的普通成本、功能残差、连续域报告和标准轨迹快照。请求 `finally` 从已完成计算复制这些记录，并保留参考 IK 查询、数值链与种子来源。初始化中断时，`interrupted_snapshot` 另行保存优化器在下一方向构造前已选定的实际系数与完整曲线，种子字段 `qualification_status="not_evaluated_after_interruption"` 表达该状态的验收范围。记录路径仅序列化已有动作；功能残差和完整几何判定按实际已有记录保存。完整规划候选尚未产生时，第一条中断曲线成为诊断轨迹，其余候选保存在该快照中。尚无已完成优化状态时，诊断仍使用最近已保存的初始化曲线。
 
 `execution_binding.bind_candidate` 接受实际候选、任务、场景、连续验收和正式采样报告，生成 `candidate_id`，保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 与同身份验收。参数及记录中沿用的 `native_report/validation.native` 名称指正式保存曲线经原生指标 API 得到的报告。`curve_snapshot` 保存原 Hermite 节点、实际系数、可执行终点和首个显式效果依赖边界；`plain` 将 NumPy 及公开 dataclass 字段转为普通记录，无界区间使用具名 JSON 表达。
 

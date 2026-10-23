@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`2498027`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`2498027`；本文同时描述工作区已实现的中断状态记录与分项调用计数，待对应实现提交后更新引用。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
 
 ## 1. 技能表示与运行环境状态
 
@@ -90,6 +90,8 @@
 `reference_initialization.iteration_allocation` 保存总更新数、原生内迭代块长度以及初始化/主求解分配；`geometry_scope="robot"` 表示共享官方机器人自身与名义手部计算，`task_scene_constraints="not_evaluated"` 表示任务观测场的计算范围。`coarse` 是物理域初始化后的数值初值，`refined` 是完整工具目标优化的实际输出。两者的 `seeds` 按 `seed_index` 保存自由系数、标准 `trajectory` 快照、同次采样资格、固定普通目标、完整优化目标、原生约束、完整任务有符号不等式，以及连续位置/速度/加速度/分段 jerk 报告。`reference_times_s/reference_point_costs` 保留普通原生网格上的时间和已加权参考贡献。
 
 快照保留具名关节、物理时刻、位置/速度、多项式系数、进度映射、事件、条件与手指时钟；`executable_until/next_verification` 描述事件依赖定义的条件区间，完整执行资格由候选验收与绑定提供。`refined` 对应实际返回并交给完整主求解的系数。查询日志按执行顺序追加，数值链同时保存时间顺序与生产节点身份。中断后保留已完成记录，失败与缺失随对应阶段保存。
+
+初始化中断时的 `interrupted_snapshot` 以 `source="last_completed_optimizer_action"` 标明数值来源，外层保留 `geometry_scope="robot"` 与任务场计算范围。其每个种子保存 `seed_index/controls/trajectory` 和 `qualification_status="not_evaluated_after_interruption"`。这些曲线来自下一方向构造前已经选定的探索动作，只经标准多项式导出与序列化；验收字段按其实际缺失状态展示。第一条中断曲线可成为 `diagnostic-trajectory.*`，其身份与保存初值、完成优化输出分别保留。
 
 `reference_initialization.optimizer_runtime` 和 `last_optimizer_runtime` 分别记录初始化与最后一次主求解的各 optimizer 诊断，包含实际方向、线搜索和 QP/LP 调用数及相应时段。方向工作按种子保存；同一个 optimizer 各种子重复保存的 `shared_batch_work` 表示同一批量前向、反向、局部几何捕获、基点证据与设备等待，汇总时取一次。主机时段与后续显式流等待分别测量，报告保留其实际墙钟含义。物理域的 `initialization_report` 另记录构造初始锚点的 LP 工作。
 

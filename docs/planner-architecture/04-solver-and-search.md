@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`2498027`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
+代码基线：`2498027`；本文同时描述工作区已实现的中断状态记录与分项调用计数，待对应实现提交后更新引用。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
 
 ## 1. 请求生命周期与资源分配
 
@@ -140,7 +140,7 @@ subject to   c + α_max d ∈ D,
 
 一次缩半属于同一迭代内的目标评价，原生最佳状态在该次搜索结束后更新一次。`_opt_step` 记录迭代、有效位移下降、线搜索批次数与缩半次数；`solve_diagnostics` 按种子保存方向调用数、实际 `qp_calls/lp_calls`、极值计算、约束装配、原生 QP/LP 和数组传输时段，以及最后方向报告。每个原生 QP/LP 调用前后检查同一请求，调用次数和求解时段通过调用者持有的记录保留，随后期限检查中止时仍可读取已经执行的工作。有限方向构造或线搜索结果描述本次数值计算，完整任务资格仍由原候选验收确定。每次完成的前向计算继续维护采样合格候选，未被选为探索点的试探也可凭同次原硬证据更新候选槽。
 
-每个种子记录中的 `shared_batch_work` 是同一个 optimizer 的共享批量计算，汇总时每个 optimizer 取一次。其 `cost_gradient_calls/geometry_capture_calls/base_evidence_calls` 分别计数代价与梯度、局部几何捕获和基点硬证据计算；相应主机时段与后续显式设备流等待时段分别记录。主机调用时段包含调用内部已经发生的同步工作，显式等待只测量调用返回后的等待，两者不重叠；这些时段表示实际调用的墙钟时间。初始化在 `reference_initialization.optimizer_runtime` 保存各核心记录，主求解在 `last_optimizer_runtime` 保存最后一次调用记录；两者均在 `finally` 读取已完成工作。
+每个种子记录中的 `shared_batch_work` 是同一个 optimizer 的共享批量计算，汇总时每个 optimizer 取一次。`completed_forward_calls` 与 `completed_backward_calls` 分别计数已完成的前向与反向；前向完成后若请求已耗尽，可在反向开始前停止。`geometry_capture_calls/base_evidence_calls` 分别计数局部几何捕获和基点硬证据计算。前向、反向的主机时段在各自 `finally` 中累计，包含中途抛出异常前已发生的工作；后续显式设备流等待时段另存。主机调用时段包含调用内部已经发生的同步工作，显式等待只测量调用返回后的等待，两者不重叠；这些时段表示实际调用的墙钟时间。初始化在 `reference_initialization.optimizer_runtime` 保存各核心记录，主求解在 `last_optimizer_runtime` 保存最后一次调用记录；两者均在 `finally` 读取已完成工作。
 
 `_retain_sampled_candidate` 为每个种子维护一个候选槽。动作与排序目标为有限数且本阶段的 `feasible=True` 时，按 `fixed_objective` 选择较小值。由于该值独立于块内局部几何和功能乘子，来自同一阶段不同块的候选可以直接比较。未保留到这类候选的种子返回原生优化结果，其残差由实际输出报告说明。完整主求解重新建立候选槽；普通与密集轨迹指标、连续关节域及最终候选验收继续决定交付。
 
@@ -162,7 +162,9 @@ subject to   c + α_max d ∈ D,
 
 `_trajectory_candidate` 通过原生 gather 取得指定 seed 的动作、状态、时钟及有限恢复见证，单 seed 与多 seed 均拥有独立必要张量。完整状态可含锁定关节，动作系数仅含活动关节，二者分别按自身具名布局保存。`select_candidate` 在任何保存曲线评分或指标调用之前，先取得全部原生候选与诊断，使后续复用常驻缓冲时这些输入保持完整。
 
-`_native_curve` 读取所选结果的实际 `solution`，交给 `_controls_curve`；后者调用 `CubicBasis.hermite_nodes`，以原断点 binary64 节点构造 `JointTrajectory`，复制进度、事件、条件、手指曲线和已满足依赖。`_initialization_snapshot` 从每个种子的实际动作进入同一导出函数。`reference_initialization.coarse/refined` 分别记录物理域内的数值初值与完整工具优化输出的系数、多项式及同次证据；初始化几何范围为 `robot`，任务场状态为 `not_evaluated`。中断时保留已完成记录；完整候选尚未产生时，最后完成初始化阶段的第一条曲线可成为诊断轨迹。
+`_native_curve` 读取所选结果的实际 `solution`，交给 `_controls_curve`；后者调用 `CubicBasis.hermite_nodes`，以原断点 binary64 节点构造 `JointTrajectory`，复制进度、事件、条件、手指曲线和已满足依赖。`_initialization_snapshot` 从每个种子的实际动作进入同一导出函数。`reference_initialization.coarse/refined` 分别记录物理域内的数值初值与完整工具优化输出的系数、多项式及同次证据；初始化几何范围为 `robot`，任务场状态为 `not_evaluated`。
+
+`PhysicalGradientCore._physical_step_direction` 在开始下一次方向构造前复制已经完成选择的探索动作，保存在当前求解的 `last_completed_action`；求解重置与初始化阶段入口清空该字段，其存储计入工作区。初始化异常时，`_refine_reference_seeds` 将这些实际系数经 `_controls_curve/curve_snapshot` 序列化为 `interrupted_snapshot`。每个种子保存控制量、完整曲线和 `qualification_status="not_evaluated_after_interruption"`；该路径只导出既有数据。完整候选尚未产生时，第一条中断曲线进入诊断归档。其已完成数值更新与后续尚未取得的功能、几何验收分别记录。
 
 `_candidate_objective` 在请求固定的 `(knots+4)×interpolation_steps+1` 个归一化节点上计算普通成本。每条曲线使用自身时长、进度映射、工具标定及物理导数，`fixed_objective/objective_components` 因而具有共同排名定义。有限原生曲线按该评分和稳定索引排列，已完成的评分直接传入正式评价。
 

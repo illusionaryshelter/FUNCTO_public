@@ -148,8 +148,9 @@ class PhysicalGradientCore(GradientOptCore):
 
         cuRobo's two cost callbacks have no before-backward hook. This owned
         implementation retains their detach, reshape, reduction, backward
-        vector and return tensors. The only added operation is the same
-        request check before forward, before backward and after backward.
+        vector and return tensors. It records each host call's elapsed time
+        and completion, with request checks before forward, before backward
+        and after backward.
         """
         from curobo._src.util.logging import log_and_raise
         self._check_request()
@@ -157,10 +158,13 @@ class PhysicalGradientCore(GradientOptCore):
         x_in = x_n.view(self.config.num_problems * self.config.num_particles,
                        self.action_horizon, self.action_dim)
         started = perf_counter()
-        trajectories = rollout.evaluate_action(x_in, use_cuda_graph=False)
-        costs = trajectories.costs_and_constraints.get_sum_cost_and_constraint(sum_horizon=True)
-        self._batch_work["forward_host_seconds"] += perf_counter()-started
-        self._batch_work["cost_gradient_calls"] += 1
+        # BEGIN interrupted calls retain their elapsed work and separate completion.
+        try:
+            trajectories = rollout.evaluate_action(x_in, use_cuda_graph=False)
+            costs = trajectories.costs_and_constraints.get_sum_cost_and_constraint(sum_horizon=True)
+        finally:
+            self._batch_work["forward_host_seconds"] += perf_counter()-started
+        self._batch_work["completed_forward_calls"] += 1
         if costs.shape != (self.config.num_problems * self.config.num_particles,):
             log_and_raise(f"costs.shape != (num_problems*num_particles,): {costs.shape}")
         cost = costs.view(self.config.num_problems, self.config.num_particles, 1)
@@ -168,8 +172,12 @@ class PhysicalGradientCore(GradientOptCore):
         # another expensive backward pass or publish its partial candidate.
         self._check_request(wait_for_device=True)
         started = perf_counter()
-        cost.backward(gradient=self._l_vec, retain_graph=False)
-        self._batch_work["backward_host_seconds"] += perf_counter()-started
+        try:
+            cost.backward(gradient=self._l_vec, retain_graph=False)
+        finally:
+            self._batch_work["backward_host_seconds"] += perf_counter()-started
+        self._batch_work["completed_backward_calls"] += 1
+        # END a completed forward does not imply its backward was performed.
         self._check_request(wait_for_device=True)
         g_x = x_n.grad.detach()
         # BEGIN retain graded candidate evidence from this exact completed query.
@@ -344,6 +352,13 @@ class PhysicalGradientCore(GradientOptCore):
     def _physical_step_direction(self, state, selected=None):
         """Use the full current gradient at first, ordinary and restarted steps."""
         base = state.exploration_action.detach()
+        # BEGIN preserve the completed selection before its next direction solve.
+        # The native step selects an evaluated action before calling this hook.
+        # A deadline in the following QP must leave that actual curve available
+        # for result recording. This detached snapshot is diagnostic only; it
+        # supplies neither candidate qualification nor another planning seed.
+        self.last_completed_action = base.clone()
+        # END serialization after interruption requires no new objective query.
         gradient = state.exploration_gradient.detach()
         limits = self.action_horizon_step_max.reshape(self.action_horizon, self.action_dim)
         scales = self._line_search_context.line_search_scale
@@ -424,6 +439,9 @@ class PhysicalGradientCore(GradientOptCore):
     # END completed direction reports preserve their original numerical scope.
 
     def _reset_progress(self):
+        # BEGIN a new solve cannot expose the preceding solve's diagnostic curve.
+        self.last_completed_action = None
+        # END the first completed objective selection creates this snapshot.
         for name in self._progress_buffers:
             getattr(self, name).zero_()
         self._direction_reports = [{} for _ in range(self.config.num_problems)]
@@ -431,7 +449,7 @@ class PhysicalGradientCore(GradientOptCore):
         self._direction_work = [dict.fromkeys(self._direction_work_fields, 0)
                                 for _ in range(self.config.num_problems)]
         # BEGIN batch calls share work across seeds and must be counted once.
-        self._batch_work = dict.fromkeys(("cost_gradient_calls", "geometry_capture_calls",
+        self._batch_work = dict.fromkeys(("completed_forward_calls", "completed_backward_calls", "geometry_capture_calls",
             "forward_host_seconds", "backward_host_seconds", "geometry_capture_host_seconds",
             "base_evidence_calls", "base_evidence_host_seconds", "device_wait_seconds"), 0)
         # END host call times and explicit stream waits are disjoint intervals.
@@ -518,6 +536,10 @@ class PhysicalGradientCore(GradientOptCore):
     @property
     def extra_workspace_bytes(self):
         tensors = [getattr(self, name) for name in self._progress_buffers+self._candidate_buffers]
+        # BEGIN account for the one retained diagnostic action when present.
+        if self.last_completed_action is not None:
+            tensors.append(self.last_completed_action)
+        # END the snapshot has the same bounded shape as one native action batch.
         if self._functional_constraints is not None:
             owner = self._functional_constraints
             tensors.extend(value for value in (owner._multiplier_buffer, owner._penalty_buffer,

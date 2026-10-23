@@ -22,7 +22,7 @@ from curobo.types import DeviceCfg, JointState
 from manipulation.cubic_trajectory import CubicTrajectoryStep
 from manipulation.curobo_solver_components import bind_solver_components
 from manipulation.physical_joint_domain import CubicJointDomain, JointDomainInitializationError
-from manipulation.planning import _CuroboPlanner, _ProgressMap, PlanningBudget
+from manipulation.planning import _CuroboPlanner, _ProgressMap, MotionPlanningError, PlanningBudget
 from test_event_allowed_set_ik import event_problem
 from test_scene_query_performance import manager_fixture
 
@@ -171,13 +171,83 @@ def test_single_native_block_is_reserved_for_main_solve(manager_fixture):
 def test_interruption_preserves_completed_coarse_curve_and_restores_original_scope(manager_fixture):
     with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
         planner, seed, _, stage = make_planner(fixture)
+        # An earlier solve's action must not become this phase's diagnostic.
+        stage.last_completed_action = seed[0].clone()+.1
         with patch.object(planner.trajopt.optimizer, "optimize", side_effect=TimeoutError("declared deadline")), \
              patch("curobo._src.runtime.cuda_event_timers", False):
             with pytest.raises(TimeoutError, match="declared deadline"):
                 planner._refine_reference_seeds(seed)
         record = planner.reference_initialization
         assert record["status"] == "interrupted" and "coarse" in record and "refined" not in record
+        for index, row in enumerate(record["interrupted_snapshot"]["seeds"]):
+            np.testing.assert_array_equal(row["controls"], seed[0, index].numpy())
         assert planner.initialization_candidate is not None
+        assert stage.config.num_iters == 8 and fixture.manager.local_geometry_models is not None
+
+
+def test_interruption_before_first_evaluation_does_not_archive_an_earlier_solve(manager_fixture):
+    with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
+        planner, seed, rollout, stage = make_planner(fixture, count=1)
+        stage.last_completed_action = seed[0].clone()+.1
+        planner.check_request.side_effect = TimeoutError("before first evaluation")
+        with pytest.raises(TimeoutError, match="before first evaluation"):
+            planner._refine_reference_seeds(seed)
+        assert planner.reference_initialization["status"] == "interrupted"
+        assert "coarse" not in planner.reference_initialization
+        assert "interrupted_snapshot" not in planner.reference_initialization
+        assert planner.initialization_candidate is None
+        assert not rollout.evaluations and not fixture.scene.queries
+        assert stage.config.num_iters == 8
+
+
+@pytest.mark.parametrize("error", [TimeoutError("declared deadline"),
+    MotionPlanningError("cancelled", "declared cancellation"),
+    MotionPlanningError("deadline_exceeded", "declared request deadline")])
+def test_interruption_archives_actual_selected_curve_without_new_evaluation(manager_fixture, error):
+    with manager_fixture("trajectory_optimizer", required=(.5,), capacity=4, task=event_problem()) as fixture:
+        planner, seed, rollout, stage = make_planner(fixture, count=1)
+        native_direction = planner.physical_domain.descent_step
+        completed = {}
+
+        def interrupt_next_direction(base, *args, **kwargs):
+            # The first physical direction runs normally. The real Armijo
+            # selection then changes the base before its next direction.
+            if not torch.equal(base, seed[0]):
+                completed.update(action=base.detach().clone(), rollouts=len(rollout.evaluations),
+                                 scene_queries=len(fixture.scene.queries), evidence_calls=evidence.call_count)
+                raise error
+            return native_direction(base, *args, **kwargs)
+
+        with patch.object(planner.physical_domain, "descent_step", side_effect=interrupt_next_direction), \
+             patch.object(planner, "_initialization_snapshot", wraps=planner._initialization_snapshot) as snapshots, \
+             patch.object(planner, "_candidate_domain_validation", wraps=planner._candidate_domain_validation) as domain_checks, \
+             patch.object(fixture.manager, "optimizer_evidence", wraps=fixture.manager.optimizer_evidence) as evidence, \
+             patch("curobo._src.runtime.cuda_event_timers", False):
+            with pytest.raises(type(error)) as raised:
+                planner._refine_reference_seeds(seed)
+            assert raised.value is error
+            assert snapshots.call_count == 1 and domain_checks.call_count == 1
+            assert evidence.call_count == completed["evidence_calls"]
+        assert completed and not torch.equal(completed["action"], seed[0])
+        assert len(rollout.evaluations) == completed["rollouts"]
+        assert len(fixture.scene.queries) == completed["scene_queries"]
+        record = planner.reference_initialization
+        assert record["status"] == "interrupted" and "refined" not in record
+        interrupted = record["interrupted_snapshot"]
+        assert interrupted["geometry_scope"] == "robot"
+        assert interrupted["task_scene_constraints"] == "not_evaluated"
+        assert interrupted["source"] == "last_completed_optimizer_action"
+        row, = interrupted["seeds"]
+        assert row["qualification_status"] == "not_evaluated_after_interruption"
+        assert set(row) == {"seed_index", "controls", "trajectory", "qualification_status"}
+        np.testing.assert_array_equal(row["controls"], completed["action"][0].numpy())
+        expected = planner._controls_curve(completed["action"][0])
+        np.testing.assert_array_equal(row["trajectory"]["position"], expected.position)
+        np.testing.assert_array_equal(row["trajectory"]["velocity"], expected.velocity)
+        np.testing.assert_array_equal(planner.initialization_candidate.position, expected.position)
+        assert row["trajectory"]["joint_names"] == list(planner.joint_names)
+        assert row["trajectory"]["times"] == list(np.arange(17)*.125)
+        assert planner.known_initialization_failures(completed["action"][None]) is None
         assert stage.config.num_iters == 8 and fixture.manager.local_geometry_models is not None
 
 

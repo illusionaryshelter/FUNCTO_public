@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`2498027`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
+代码基线：`2498027`；本文同时描述工作区已实现的中断状态记录与分项调用计数，待对应实现提交后更新引用。本目录按运行阶段组织接口的作用、必要输入、输出和调用者。完整签名、dataclass 字段、返回表达式和内部调用符号见[逐符号实现索引](07-implementation-index.md)。同一对象的方法共享其构造时绑定的数据；表中省略的 `self` 指向该已构造实例。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -138,7 +138,7 @@
 | `PhysicalLineSearch.search/_prepare_search_points` | 以同目标、同 AL 参数及同局部几何完成一次 Armijo 搜索 | 探索点、物理域方向与原生倍率 → 通过的动作及匹配 cost/gradient；未找到下降的种子逐次缩半，正步在原 dtype 中等于基点时结束 |
 | `PhysicalGradientCore._refresh_local_geometry` | 在当前实际基准动作上同时捕获局部几何与原硬证据 | seed 动作、常规 rollout、共享 LocalGeometryModels → `(changed, trajectories)`；块边界读取同次残差和固定目标，初始与常规梯度入口共用模型 |
 | `PhysicalGradientCore._retain_sampled_candidate` | 在每个种子的固定槽中保留当前计算范围内采样硬条件合格候选 | 当前动作、同次 feasible 与固定排序目标 → 按目标较小值更新动作；初始化为任务、关节及 robot 几何范围，完整求解为 full 范围，目标切换重置候选槽 |
-| `PhysicalGradientCore._physical_step_direction/_run_initial_evaluation/_restart_changed_objective` | 为首次、普通及目标更新后的迭代生成同一物理约束方向 | 实际探索动作、同目标完整梯度、原步长范围与倍率 → 分种子方向及 QP 报告；原生 GradientOptCore 生命周期 |
+| `PhysicalGradientCore._physical_step_direction/_run_initial_evaluation/_restart_changed_objective` | 为首次、普通及目标更新后的迭代生成同一物理约束方向 | 实际探索动作、同目标完整梯度、原步长范围与倍率 → 分种子方向及 QP 报告；构造前复制 last_completed_action 供异常数值导出；原生 GradientOptCore 生命周期 |
 | `PhysicalGradientCore.solve_diagnostics/extra_workspace_bytes` | 导出本次数值更新、线搜索、方向计算和存储量 | 当前核心 → 更新、方向、实际 QP/LP、线搜索计数及存储字节；按 seed 的方向时段与每个 optimizer 仅计一次的 shared_batch_work；请求诊断/资源准入 |
 | `ProcessCostManager.compute_costs` | 按配置分别计算普通参考成本或当前范围的任务/场景约束 | reference_objective 返回同一时间权重下的关节项与 continuous_reference；trajectory_optimizer 消费有序有效样本/确切锚点并按 scope 计算场景，trajectory_metrics 始终计算完整原硬证据 |
 | `ProcessCostManager.optimizer_evidence` | 核对同次 AL/几何张量并合并原 cspace 及其他硬约束 | trajectories → `(feasible,signed,fixed_objective)`；几何证据采用本次 robot/full 范围，固定目标仅汇总普通成本；候选槽与初始化快照 |
@@ -161,7 +161,7 @@
 | `_CuroboPlanner.reference_seeds` | 一次构造自由系数，再优化完整工具参考 | 完整参考或可选原关节曲线、测得入口、模型/时钟与预算 → `[B,K,M,D]` 实际返回系数和原查询成功数；Greville 参数处的数值状态提出系数，同一物理域初始化后直接进入完整工具优化 |
 | `_CuroboPlanner._reference_ik_query` | 执行带明确时刻与 seed 来源的参考查询 | u、`[1,1,D]` 前态、warm_start_source → 原候选/报告/能量/跟踪状态；追加实际查询记录，共享 _solve_ik 账本 |
 | `_CuroboPlanner._select_reference_chains` | 从按时间组织的原候选池构造完整数值链 | 归一化物理时间到候选层的映射 → 原选择器的链、query_parameters 和生产者 query/candidate 索引；自由系数提议 |
-| `_CuroboPlanner._refine_reference_seeds` | 在首次额度中完成 robot 范围的完整工具优化并恢复 full 范围 | 原域数值初值、原生优化器、完整任务与固定时钟 → 实际返回系数、迭代分配与完成/中断记录；仅一次 reinitialize→optimize 生命周期 |
+| `_CuroboPlanner._refine_reference_seeds` | 在首次额度中完成 robot 范围的完整工具优化并恢复 full 范围 | 原域数值初值、原生优化器、完整任务与固定时钟 → 实际返回系数、迭代分配与完成记录；异常时把 last_completed_action 序列化为 interrupted_snapshot，保留验收缺失状态；一次 reinitialize→optimize 生命周期 |
 | `_CuroboPlanner._initialization_snapshot` | 保存实际动作的同次任务/关节/robot 证据和连续多项式 | `[K,M,D]` 动作、optimizer rollout、原关节限制 → 同次原始功能不等式、采样资格、普通/完整目标、参考贡献，以及系数、多项式和连续域报告；数值初值 coarse 与优化输出 refined |
 | `_CuroboPlanner.known_initialization_failures` | 读取全部返回初值的同终态明确功能违约 | `[1,K,M,D]` 返回系数与已有 refined 记录 → 每 seed 的有限正原始功能不等式，或证据不满足条件时 None；plan_trajectory 仅在 joint_reference 为空时据此省略一次完整扫描 |
 | `_CuroboPlanner._build_goal_ik_candidates` | 为搜索求同刻原功能允许集合的有限关节提议 | 原要求/时钟、参考系数、IK 预算及 check_search → 原事件池及任务/场景报告；ompl_seed |

@@ -463,6 +463,41 @@ class NativeComponentTest(unittest.TestCase):
         self.assertEqual(core.config.inner_iters, 2)
         self.assertEqual(int(core._iterations[0]), 1)
 
+    # BEGIN interruption retains the action actually selected by native Armijo.
+    def test_next_direction_timeout_preserves_completed_selection_without_another_rollout(self):
+        domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
+        solver, _, rollouts = self.make_solver(domain, 1)
+        bind_solver_components(solver, domain)
+        optimizer = solver.core.optimizers[0]
+        seed = torch.zeros((1, 1, 2))
+        original = domain.descent_step
+        selected, evaluations = [], []
+
+        def interrupt_after_selection(base, *args, **kwargs):
+            if selected:
+                selected.append(base.detach().clone())
+                evaluations.append(sum(len(rollout.evaluations) for rollout in rollouts))
+                raise TimeoutError("next direction exhausted the request")
+            selected.append(base.detach().clone())
+            return original(base, *args, **kwargs)
+
+        with patch("curobo._src.runtime.cuda_event_timers", False), \
+             patch.object(domain, "descent_step", side_effect=interrupt_after_selection):
+            with self.assertRaisesRegex(TimeoutError, "next direction exhausted"):
+                optimizer.optimize(seed)
+        self.assertEqual(len(selected), 2)
+        self.assertTrue(bool((selected[-1] > seed).all()))
+        torch.testing.assert_close(optimizer.last_completed_action, selected[-1], rtol=0, atol=0)
+        self.assertEqual(sum(len(rollout.evaluations) for rollout in rollouts), evaluations[-1])
+        # Iterations count completed next-direction construction; the saved
+        # action also covers the selected step whose following QP was interrupted.
+        self.assertEqual(int(optimizer._iterations[0]), 0)
+        selected[-1].zero_()
+        self.assertTrue(bool((optimizer.last_completed_action > 0).all()))
+        optimizer._reset_progress()
+        self.assertIsNone(optimizer.last_completed_action)
+    # END the snapshot has no authorization or rollout side effect.
+
 
     def test_expired_forward_never_starts_backward_for_either_native_callback(self):
         domain = JointPositionDomain(-torch.ones(2), torch.ones(2))
@@ -472,6 +507,7 @@ class NativeComponentTest(unittest.TestCase):
         core = optimizer
         for initial in (False, True):
             with self.subTest(initial=initial):
+                core._reset_progress()
                 expired, backward = [False], []
                 rollout = rollouts[int(initial)]
                 original = rollout.evaluate_action
@@ -492,6 +528,9 @@ class NativeComponentTest(unittest.TestCase):
                     with self.assertRaisesRegex(TimeoutError, "forward consumed deadline"):
                         callback(x)
                 self.assertEqual(backward, [])
+                self.assertEqual(core._batch_work["completed_forward_calls"], 1)
+                self.assertEqual(core._batch_work["completed_backward_calls"], 0)
+                self.assertGreater(core._batch_work["forward_host_seconds"], 0.)
 
 
     def test_completed_cuda_boundary_waits_only_current_stream_before_guard(self):

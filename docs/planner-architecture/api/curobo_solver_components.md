@@ -1,6 +1,6 @@
 # `manipulation/curobo_solver_components.py` 实现契约
 
-代码基线：`2498027`。
+代码基线：`2498027；包含已实现的中断状态记录改动，待对应实现提交更新`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `PhysicalLineSearch`
@@ -481,8 +481,9 @@ def _cost_and_gradient_with_guard(self, x, rollout):
 >
 > cuRobo's two cost callbacks have no before-backward hook. This owned
 > implementation retains their detach, reshape, reduction, backward
-> vector and return tensors. The only added operation is the same
-> request check before forward, before backward and after backward.
+> vector and return tensors. It records each host call's elapsed time
+> and completion, with request checks before forward, before backward
+> and after backward.
 
 显式输出分支：
 
@@ -527,9 +528,10 @@ started
 trajectories
 costs
 self._batch_work['forward_host_seconds']
-self._batch_work['cost_gradient_calls']
+self._batch_work['completed_forward_calls']
 cost
 self._batch_work['backward_host_seconds']
+self._batch_work['completed_backward_calls']
 g_x
 feasible
 signed
@@ -557,7 +559,7 @@ self._retain_sampled_candidate
 
 ## `PhysicalGradientCore._compute_cost_constraint_and_gradient`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L184)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L192)。
 
 输入签名：
 
@@ -590,7 +592,7 @@ self._cost_and_gradient_with_guard
 
 ## `PhysicalGradientCore._compute_cost_constraint_and_gradient_initial`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L188)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L196)。
 
 输入签名：
 
@@ -626,7 +628,7 @@ self._cost_and_gradient_with_guard
 
 ## `PhysicalGradientCore._begin_functional_solve`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L193)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L201)。
 
 输入签名：
 
@@ -699,7 +701,7 @@ self._refresh_local_geometry
 
 ## `PhysicalGradientCore._refresh_local_geometry`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L219)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L227)。
 
 输入签名：
 
@@ -788,7 +790,7 @@ torch.as_tensor
 
 ## `PhysicalGradientCore._retain_sampled_candidate`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L257)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L265)。
 
 输入签名：
 
@@ -881,7 +883,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._finish_functional_block`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L281)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L289)。
 
 输入签名：
 
@@ -1021,7 +1023,7 @@ self._restart_changed_objective
 
 ## `PhysicalGradientCore._physical_step_direction`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L344)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L352)。
 
 输入签名：
 
@@ -1044,6 +1046,7 @@ direction
 ```python
 state.exploration_action.detach
 state.exploration_action
+base.clone
 state.exploration_gradient.detach
 state.exploration_gradient
 self.action_horizon_step_max.reshape
@@ -1073,6 +1076,7 @@ torch.no_grad
 
 ```python
 base
+self.last_completed_action
 gradient
 limits
 scales
@@ -1092,6 +1096,7 @@ self._direction_work[index][name]
 
 ```python
 state.exploration_action.detach
+base.clone
 state.exploration_gradient.detach
 self.action_horizon_step_max.reshape
 torch.zeros_like
@@ -1110,7 +1115,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._restart_changed_objective`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L375)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L390)。
 
 输入签名：
 
@@ -1170,7 +1175,7 @@ torch.no_grad
 
 ## `PhysicalGradientCore._restart_changed_objective.copy_rows`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L377)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L392)。
 
 输入签名：
 
@@ -1209,7 +1214,7 @@ value.reshape_as
 
 ## `PhysicalGradientCore._opt_step`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L397)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L412)。
 
 输入签名：
 
@@ -1291,7 +1296,7 @@ self._line_backtracks.add_
 
 ## `PhysicalGradientCore._create_initial_iteration_state`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L411)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L426)。
 
 输入签名：
 
@@ -1332,7 +1337,7 @@ action.clone
 
 ## `PhysicalGradientCore._reset_progress`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L426)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L441)。
 
 输入签名：
 
@@ -1358,6 +1363,7 @@ self._direction_work_fields
 写入目标：
 
 ```python
+self.last_completed_action
 name
 self._direction_reports
 _
@@ -1377,7 +1383,7 @@ dict.fromkeys
 
 ## `PhysicalGradientCore.update_num_problems`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L439)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L457)。
 
 输入签名：
 
@@ -1437,7 +1443,7 @@ float
 
 ## `PhysicalGradientCore._prepare_solve`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L453)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L471)。
 
 输入签名：
 
@@ -1482,7 +1488,7 @@ self.domain.validate_scales
 
 ## `PhysicalGradientCore.reinitialize`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L459)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L477)。
 
 输入签名：
 
@@ -1521,7 +1527,7 @@ super
 
 ## `PhysicalGradientCore.optimize`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L466)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L484)。
 
 输入签名：
 
@@ -1573,7 +1579,7 @@ torch.where
 
 ## `PhysicalGradientCore._dispatch`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L483)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L501)。
 
 输入签名：
 
@@ -1612,7 +1618,7 @@ self._finish_functional_block
 
 ## `PhysicalGradientCore.solve_diagnostics`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L489)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L507)。
 
 输入签名：
 
@@ -1697,7 +1703,7 @@ report.update
 
 ## `PhysicalGradientCore.extra_workspace_bytes`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L519)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L537)。
 
 输入签名：
 
@@ -1716,6 +1722,8 @@ sum((value.numel() * value.element_size() for value in tensors))
 ```python
 self._progress_buffers
 self._candidate_buffers
+self.last_completed_action
+tensors.append
 self._functional_constraints
 tensors.extend
 owner._multiplier_buffer
@@ -1740,6 +1748,7 @@ value
 
 ```python
 getattr
+tensors.append
 tensors.extend
 sum
 value.numel
@@ -1748,7 +1757,7 @@ value.element_size
 
 ## `PhysicalGradientCore.bind_domain`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L527)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L549)。
 
 输入签名：
 
@@ -1785,7 +1794,7 @@ self._reset_progress
 
 ## `LayoutGoalManager`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L535)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L557)。
 
 ```python
 class LayoutGoalManager(GoalManager):
@@ -1801,7 +1810,7 @@ class LayoutGoalManager(GoalManager):
 
 ## `LayoutGoalManager._get_padded_goalset_for_links`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L538)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L560)。
 
 输入签名：
 
@@ -1837,7 +1846,7 @@ super
 
 ## `bind_solver_components`
 
-[定义位置](../../../manipulation/curobo_solver_components.py#L546)。
+[定义位置](../../../manipulation/curobo_solver_components.py#L568)。
 
 输入签名：
 

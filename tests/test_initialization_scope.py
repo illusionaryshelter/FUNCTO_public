@@ -11,7 +11,8 @@ import torch
 
 from curobo._src.rollout.metrics import CostCollection, CostsAndConstraints
 
-from manipulation.planning import PlanningBudget
+from manipulation.execution_binding import curve_snapshot
+from manipulation.planning import MotionPlanningError, PlanningBudget
 from manipulation.planning_problem import JointCoupling
 from test_event_allowed_set_ik import event_problem, state_at
 from test_motion_backend_contract import Native, run as run_native
@@ -114,26 +115,38 @@ def test_robot_scope_retains_self_controller_and_unresolved_evidence(manager_fix
 # END task legality cannot erase a definite robot component or invent one from uncertainty.
 
 
-def test_interrupted_initialization_consumes_first_solve_and_retains_completed_records():
+@pytest.mark.parametrize("error, failure", [
+    (TimeoutError("Declared initializer deadline"), "planning_stage_failed"),
+    (MotionPlanningError("cancelled", "Declared cancellation"), "cancelled"),
+    (MotionPlanningError("deadline_exceeded", "Declared request deadline"), "deadline_exceeded")])
+def test_interrupted_initialization_consumes_first_solve_and_retains_completed_records(error, failure):
     """The real public ledger accounts work before an initializer can return."""
     native = Native([])
     completed = {"stage": "coarse", "seeds": [{"seed_index": 0, "controls": [[0.]]}]}
+    interrupted = {"geometry_scope": "robot", "task_scene_constraints": "not_evaluated",
+        "source": "last_completed_optimizer_action", "seeds": [{"seed_index": 0,
+            "controls": np.zeros((8, 1)).tolist(), "trajectory": curve_snapshot(native.curve),
+            "qualification_status": "not_evaluated_after_interruption"}]}
 
     def interrupted_reference(joint_reference=None):
         native.calls.append("seed")
         native.reference_initialization = {"status": "interrupted", "coarse": completed,
-            "geometry_scope": "robot", "task_scene_constraints": "not_evaluated"}
+            "geometry_scope": "robot", "task_scene_constraints": "not_evaluated",
+            "interrupted_snapshot": interrupted}
         native.initialization_candidate = native.curve
-        raise TimeoutError("Declared initializer deadline")
+        raise error
 
     native.reference_seeds = interrupted_reference
     result, backend = run_native(native, budget=PlanningBudget(maximum_trajectory_solves=1))
     try:
-        assert not result.success and result.execution_binding is None
+        assert not result.success and result.trajectory is None and result.execution_binding is None
+        assert result.diagnostics["failure"] == failure
         assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
         assert result.diagnostics["failed_stage"] == "reference_initialization"
         assert result.diagnostics["reference_initialization"]["coarse"] == completed
+        assert result.diagnostics["reference_initialization"]["interrupted_snapshot"] == interrupted
         assert result.diagnostics["diagnostic_trajectory"] is native.curve
+        assert native.known_initialization_failures(torch.zeros(1, 1, 8, 1)) is None
         assert native.calls == ["seed"]
     finally:
         backend.close()

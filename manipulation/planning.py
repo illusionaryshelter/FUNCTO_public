@@ -4232,6 +4232,9 @@ class _CuroboPlanner:
         # measured entrance, explicit clock and free-terminal declaration.
         for stage in optimizer.optimizers:
             stage.reset_cuda_graph()
+            # This phase owns its diagnostic action even if it ends before
+            # reinitialize; an earlier solve cannot supply its snapshot.
+            stage.last_completed_action = None
         state, goal = self._native_request(seeds)
         endpoint = self.JointState.from_position(seeds[:, :, -1].contiguous())
         endpoint.dt = self.torch.full((1, seeds.shape[1]), self.budget.maximum_trajectory_dt,
@@ -4265,16 +4268,35 @@ class _CuroboPlanner:
             # END no supplemental IK query or independent q-fit follows the update.
         except Exception as error:
             record.update(status="interrupted", reason=str(error), error_type=type(error).__name__)
+            # BEGIN archive the last completed selection without another evaluation.
+            # The optimizer copies this action after objective/gradient
+            # selection and before constructing its next physical direction.
+            # Curve serialization preserves the same entrance and clock; it
+            # supplies no new task, geometry or candidate qualification.
+            completed = optimizer.optimizers[-1].last_completed_action
+            if completed is not None:
+                from .execution_binding import curve_snapshot
+                interrupted = {"geometry_scope": "robot", "task_scene_constraints": "not_evaluated",
+                    "source": "last_completed_optimizer_action", "seeds": []}
+                for index, action in enumerate(completed):
+                    curve = self._controls_curve(action)
+                    interrupted["seeds"].append({"seed_index": index,
+                        "controls": action.detach().cpu().tolist(), "trajectory": curve_snapshot(curve),
+                        "qualification_status": "not_evaluated_after_interruption"})
+                    if index == 0:
+                        self.initialization_candidate = curve
+                record["interrupted_snapshot"] = interrupted
+            # END the public exception path records this curve only as diagnostics.
             raise
         finally:
             # BEGIN retain actual completed optimizer work even when its budget ends.
             record["optimizer_runtime"] = [stage.solve_diagnostics for stage in optimizer.optimizers]
-            # END these counters neither qualify nor reconstruct a partial curve.
+            # END runtime counters remain distinct from serialized curve data.
             self._manager_type.set_geometry_scope("full")
             optimizer.update_niters(total)
             for stage in optimizer.optimizers:
                 stage.reset_cuda_graph()
-    # END only completed coefficient snapshots are retained across interruptions.
+    # END interrupted actions retain their explicit unevaluated qualification status.
 
     # BEGIN an existing terminal task violation can bypass redundant qualification.
     def known_initialization_failures(self, seeds):
@@ -5981,7 +6003,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             candidate = getattr(planner, "initialization_candidate", None)
         if isinstance(candidate, JointTrajectory):
             diagnostics["diagnostic_trajectory"] = candidate
-            diagnostics["diagnostic_candidate_scope"] = "last completed native candidate; no execution authorization"
+            diagnostics["diagnostic_candidate_scope"] = "joint curve retained for failure diagnostics; qualification not implied"
         outcome.success, outcome.trajectory, outcome.execution_binding = False, None, None
         return outcome
     finally:
