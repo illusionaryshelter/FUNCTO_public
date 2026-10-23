@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`01a6609`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：`1526e60` 为修改前检查点；本次已实现交互区域坐标构造，提交后以实际实现提交号同步本标记。阶段实验与计划对照位于项目外 `sim-version-plans`。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -59,6 +59,18 @@
 | `goal_requirements_at/goal_residual` | 选择并计算原目标身份对应允许集合 | 进度、目标身份、候选及可选 normalized → 目标集合/超差正部；事件 IK 的归一化目标与搜索终点 |
 | `bound_motion_block` | 根据已满足独立依赖划分可执行运动块 | 原任务、目标身份、已满足依赖 → 复制问题与区间记录；请求绑定 |
 | `requirement_consumption/verification_issues/remaining_obligations` | 解释要求的消费与剩余范围 | 原要求、查询进度、已执行身份 → 消费/缺项/剩余义务记录；绑定、报告与续规划 |
+
+## 接受区域与功能坐标 API
+
+| API | 前置输入与计算 | 输出及实际调用关系 |
+|---|---|---|
+| `prepare_inputs` | 单源记录、两个已选实体视图、同状态依据；核对观测与特征索引 | 数值计算输入和特征对；`run_region_transfer` 调用 |
+| `select_reference_transform` | 原区域接受结果、primary 支持候选及既有分数 | 所选候选变换和源/目标配对身份；参考方向初始化 |
+| `run_region_transfer` | 源、视图、必填的 `representation.kind`、同状态依据，可选当前所属刚体 | 区域状态/证据和功能坐标；正式入口 `config.ground_skill` 调用，grasp 与 manipulation 仅选择各自坐标构造 |
+| `propagate_region_frame` | 源图像时刻功能坐标和所选 Sim(3) | 原 grasp 语义的源原点/完整朝向传播 |
+| `construct_interaction_region_frame` | 接受的 primary.center、声明区域几何、源功能方向及所选旋转 | manipulation 交互区域 F；平面使用观测法向与投影功能 x，surface 使用源方向对应 |
+| `_region_frame_record` | 源/目标功能坐标、候选身份、可选当前所属刚体及同状态依据 | 共用坐标/来源记录，可选实体局部 F；两个构造器调用 |
+| `frame_from_deformation` | 粗对齐源点、同索引变形点、源区域索引和粗功能坐标 | Open3D 局部刚体拟合修正及 RMS；保持其独立点变形接口 |
 
 ## 2. RGB-D 与已有实体模型
 

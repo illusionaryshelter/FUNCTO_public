@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`01a6609`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：`1526e60` 为修改前检查点；本次已实现交互区域坐标构造，提交后以实际实现提交号同步本标记。阶段实验与计划对照位于项目外 `sim-version-plans`。
 
 ## 1. 输入的来源与相互依赖
 
@@ -61,7 +61,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `generate_reference` 在字段的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
 
-`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer` 获得 `T_world_region`，再传给 `generate_reference`。它将数组写入 `reference.npz`，将旋转选择依据写入 `report.json.reference_rotation_transfer`，将连续工具路径与边界传给 `reference_phase`，最后调用参考网页输出。这个报告字段是上述参考运算的可追溯结果，其坐标与计算入口与路径对象一致。
+`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer(..., skill_kind=representation["kind"])` 获得 `T_world_region`，再传给 `generate_reference`。它将数组写入 `reference.npz`，将旋转选择依据写入 `report.json.reference_rotation_transfer`，将连续工具路径与边界传给 `reference_phase`，最后调用参考网页输出。这个报告字段是上述参考运算的可追溯结果，其坐标与计算入口与路径对象一致。
 
 输出包括 `object_path/eef_path`、对应时间和名义位姿数组、`object_boundaries/eef_boundaries`、`boundary_checks`、`summaries`、`missing` 与 `status`。受控路径的终点为源释放时间与显式持物终点中的较早者；`bound_*` 另保存原名义绑定诊断。每份边界声明包含 `initial_pose`、带局部进度/位姿/来源的 `goals` 以及声明来源；`boundary_checks` 记录 `declared_for_physical_time_binding`。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
 
@@ -212,3 +212,16 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 `grounding.py` 中 `infer_task` 从指令与源/当前图像产生结构化语义任务，`select_roles` 从检测候选选择对象角色，`propose_query_regions` 提出可在图像中核对的区域查询，`match_points` 在指定 masks 内计算对应像素。`selection.select_grounding_candidates` 将已有源语义、当前指令和明确视图候选交给选择器，返回所选候选或未决状态。它们为所选技能与几何绑定提供输入；数值规划从已经确定的任务与场景开始。各接口完整输入和直接返回记录见[实现索引](07-implementation-index.md)。
 
 已有实体模型通过 `observed_owners` 直接进入场景；新实体可以由 mask 和深度建立。事件前表示坐标 C 与事件工具位姿 E_g 确定固定关系 A=E_g⁻¹C_pre，之后工具 FK 给出 C(t)=E(t)A。源任务坐标至 C 的变换 M_D 同时用于任务点重表达，参考生成消费 J=M_D⁻¹。
+
+
+## 交互区域的目标功能坐标构造
+
+研究对象是已接受观测区域与源技能功能坐标之间的对应。`manipulation/region_transfer.py` 接收一份源区域记录、两份已选择实体的 RGB-D 观测及空间特征。`prepare_inputs` 保留源点索引、图像像素、采集标定与同状态声明；`run_region_transfer` 调用已有双视角数值计算，将区域结果和全部证据交给 `select_reference_transform`。后者在接受的 primary 区域所支持的候选中按既有分数、原候选编号选取一个方向对应。区域是否接受、候选竞争和质量警告均由该数值结果提供。
+
+`run_region_transfer` 的必填 `skill_kind` 直接取技能表示中的 `kind`。`grasp` 消费 `propagate_region_frame`：在源图像时刻组合源本体位姿与 `L_body_region`，再用所选 Sim(3) 变换其原点、仅用旋转变换单位轴。该分支保留完整源功能方向及原点传播。
+
+`manipulation` 消费 `construct_interaction_region_frame`。令 W 为当前标定世界坐标，F 为当前交互区域功能坐标；`primary.center` 是接受区域在 W 中的观测种子点，作为 F 原点。它是区域构造所使用的中心，区域内点的算术质心是另一计算量。已声明 `region_geometry=planar` 时，以 `primary.normal` 的有符号单位方向 n 为 z；源功能 x 轴经所选候选旋转得到 a，取 x=(a−n(nᵀa))/‖a−n(nᵀa)‖，y=n×x。a 在切平面中的投影须非零，这是完整坐标构造的几何输入条件。已有 `function_frame` 构造正交右手坐标。已声明 `region_geometry=surface` 时，该区域没有单一平面法向，完整朝向由源功能旋转的对应给出，原点仍由接受中心给出。
+
+两个构造器通过 `_region_frame_record` 输出 `T_world_region`、原源功能坐标、源所属实体与采集时间、支持候选身份。显式提供当前区域所属刚体位姿时，记录同状态依据，并计算 `L_body_region = inverse(T_world_body) @ T_world_region`；世界坐标和实体局部坐标指向同一 F。交互区域结果另有 `construction`，记录中心和方向的实际来源。源区域、源功能坐标、完整示教运动和交互/释放事件仍是技能表示；本步骤只构造其当前参考坐标。
+
+`config.ground_skill` 将该 F 交给 `generate_reference`，后者继续使用原 H_m、J、A、当前机器人反馈及已声明的初始相对旋转规则构造名义物体和工具路径。`reference_phase` 将路径及事件边界连接到规划问题；`BoundToolReference` 再用机器人 FK 入口和请求时钟绑定物理时间。`frame_from_deformation` 是已有的同索引点变形输出局部刚体拟合接口，输入为粗对齐源点、变形后的同索引点、源区域索引和粗功能坐标，输出局部刚体修正与拟合残差；本次双视角区域路径不调用它。

@@ -13,7 +13,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from manipulation.region_transfer import (frame_from_deformation,
-    prepare_inputs, propagate_region_frame, run_region_transfer, select_reference_transform)
+    prepare_inputs, propagate_region_frame, run_region_transfer, select_reference_transform,
+    construct_interaction_region_frame)
 from transfer.segmentation import prepare_selected_observation
 
 
@@ -98,7 +99,8 @@ class RegionTransferTests(unittest.TestCase):
         return dict(accepted=accepted, status="accepted_observed_region" if accepted else "rejected_ambiguous_region",
             reasons=[] if accepted else ["competing_regions"], finite_candidate_unique=False,
             sim3_scale=None, sim3_rotation=None, sim3_translation=None,
-            modes=[dict(type="primary", hypothesis_indices=[9, 2], sample_indices=np.array([2, 4]))]
+            modes=[dict(type="primary", hypothesis_indices=[9, 2], sample_indices=np.array([2, 4]),
+                        center=np.array([.6, -.4, 1.2]), normal=np.array([0., 0., 1.]))]
                 if accepted else [],
             diagnostics=dict(hypotheses=[first, second], quality_warnings=["tied_estimates_common_region_only"]))
 
@@ -119,7 +121,7 @@ class RegionTransferTests(unittest.TestCase):
         result = self.inference_result()
         outputs = dict(result=result, surface=dict(xyz=np.zeros((5, 3))), source={"fixture": "prepared_queries"})
         with patch("transfer.dual_view.pipeline.run", return_value=outputs) as numerical:
-            returned = run_region_transfer(self.source, self.views, same_state_source=self.state_source,
+            returned = run_region_transfer(self.source, self.views, skill_kind="grasp", same_state_source=self.state_source,
                                            current_region_owner=self.owner)
         numerical.assert_called_once()
         self.assertIs(returned["outputs"], outputs)
@@ -153,15 +155,69 @@ class RegionTransferTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(frame["T_world_region"][:3, 3] -
             (selected["scale"] * selected["rotation"] @ later[:3, 3] + selected["translation"])), .1)
 
+    # BEGIN observed interaction-frame semantics and grasp isolation.
+    def test_manipulation_uses_primary_while_grasp_keeps_source_sim3(self):
+        result = self.inference_result()
+        outputs = dict(result=result, surface=dict(xyz=np.zeros((5, 3))))
+        selected = select_reference_transform(result)
+        expected_grasp = propagate_region_frame(self.source, selected,
+            current_region_owner=self.owner, same_state_source=self.state_source)
+        with patch("transfer.dual_view.pipeline.run", return_value=outputs):
+            grasp = run_region_transfer(self.source, self.views, skill_kind="grasp",
+                same_state_source=self.state_source, current_region_owner=self.owner)
+            manipulation = run_region_transfer(self.source, self.views, skill_kind="manipulation",
+                same_state_source=self.state_source, current_region_owner=self.owner)
+        for field in ("T_world_region", "T_source_world_region", "L_body_region"):
+            np.testing.assert_array_equal(grasp["reference_frame"][field], expected_grasp[field])
+        self.assertNotIn("construction", grasp["reference_frame"])
+        frame = manipulation["reference_frame"]
+        np.testing.assert_array_equal(frame["T_world_region"][:3, 3], result["modes"][0]["center"])
+        np.testing.assert_allclose(frame["T_world_region"][:3, 2], result["modes"][0]["normal"], atol=1e-14)
+        np.testing.assert_allclose(self.owner["T_world_body"] @ frame["L_body_region"],
+            frame["T_world_region"], atol=1e-14)
+        self.assertIs(grasp["outputs"], manipulation["outputs"])
+        self.assertEqual(result["diagnostics"]["quality_warnings"], ["tied_estimates_common_region_only"])
+
+    def test_interaction_frame_preserves_signed_normal_and_world_covariance(self):
+        primary = self.inference_result()["modes"][0]
+        primary = dict(primary, normal=Rotation.from_euler("xy", [.15, -.2]).as_matrix()[:, 2])
+        selected = select_reference_transform(self.inference_result())
+        source_original = self.source["L_body_region"].copy()
+        frame = construct_interaction_region_frame(self.source, selected, primary)["T_world_region"]
+        np.testing.assert_allclose(frame[:3, :3].T @ frame[:3, :3], np.eye(3), atol=1e-14)
+        self.assertAlmostEqual(np.linalg.det(frame[:3, :3]), 1.)
+        np.testing.assert_allclose(frame[:3, 2], primary["normal"], atol=1e-14)
+        # Changing a candidate's scale/translation cannot move an accepted center.
+        changed = dict(selected, scale=9., translation=np.array([9., -8., 7.]))
+        np.testing.assert_array_equal(construct_interaction_region_frame(self.source, changed, primary)["T_world_region"], frame)
+        world = pose((.4, -.2, .5), (.7, -.3, .2))
+        R, p = world[:3, :3], world[:3, 3]
+        source = dict(self.source, T_world_body_at_image=world @ self.source["T_world_body_at_image"])
+        candidate = dict(selected, rotation=R @ selected["rotation"] @ R.T)
+        observed = dict(primary, center=R @ primary["center"]+p, normal=R @ primary["normal"])
+        moved = construct_interaction_region_frame(source, candidate, observed)["T_world_region"]
+        np.testing.assert_allclose(moved, world @ frame, atol=1e-14)
+        np.testing.assert_array_equal(self.source["L_body_region"], source_original)
+
+    def test_surface_interaction_center_retains_declared_functional_rotation(self):
+        primary = dict(self.inference_result()["modes"][0], normal=None)
+        selected = select_reference_transform(self.inference_result())
+        source = dict(self.source, region_geometry="surface")
+        actual = construct_interaction_region_frame(source, selected, primary)["T_world_region"]
+        original = propagate_region_frame(source, selected)["T_world_region"]
+        np.testing.assert_array_equal(actual[:3, 3], primary["center"])
+        np.testing.assert_array_equal(actual[:3, :3], original[:3, :3])
+    # END the same accepted evidence produces each declared frame contract.
+
     def test_rejected_and_missing_evidence_do_not_create_a_reference_frame(self):
         rejected = dict(result=self.inference_result(False), surface={}, source={})
         with patch("transfer.dual_view.pipeline.run", return_value=rejected):
-            returned = run_region_transfer(self.source, self.views, same_state_source=self.state_source)
+            returned = run_region_transfer(self.source, self.views, skill_kind="grasp", same_state_source=self.state_source)
         self.assertIsNone(returned["reference_frame"])
         self.assertEqual(returned["reasons"], ["competing_regions"])
         del self.source["feature"]
         with patch("transfer.dual_view.pipeline.run") as numerical:
-            returned = run_region_transfer(self.source, self.views, same_state_source=self.state_source)
+            returned = run_region_transfer(self.source, self.views, skill_kind="grasp", same_state_source=self.state_source)
         numerical.assert_not_called()
         self.assertEqual(returned["status"], "missing")
         self.assertIn("missing_source_feature", returned["reasons"])

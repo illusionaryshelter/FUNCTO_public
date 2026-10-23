@@ -1,13 +1,14 @@
 # 实现符号索引
 
-代码基线：`01a6609`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。 本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：`1526e60` 为修改前检查点；本次已实现交互区域坐标构造，提交后以实际实现提交号同步本标记。阶段实验与计划对照位于项目外 `sim-version-plans`。 本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **58 个文件、932 个定义**。
+覆盖 **59 个文件、945 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
+| [manipulation/region_transfer.py](api/region_transfer.md) | 13 | [01](01-inputs-and-task-model.md) |
 | [manipulation/representation.py](api/representation.md) | 22 | [01](01-inputs-and-task-model.md) |
 | [manipulation/program.py](api/program.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/motion.py](api/motion.md) | 21 | [01](01-inputs-and-task-model.md) |

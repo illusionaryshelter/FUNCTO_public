@@ -111,12 +111,14 @@ def test_successful_entry_exports_nominal_path_and_declared_tool_boundaries(tmp_
     monkeypatch.setattr("local_models.gemini.Gemini.chat_json", Mock(return_value=selection))
     monkeypatch.setattr("local_models.marco.extract_image", Mock(return_value=np.ones((1, 3, 4, 4))))
     monkeypatch.setattr("transfer.dual_view.pipeline.prepare", Mock(return_value={"scope": "CPU fixture"}))
-    monkeypatch.setattr("config.ground_skill.run_region_transfer", Mock(return_value={
+    region_call = Mock(return_value={
         "status": "accepted_observed_region", "reasons": [],
-        "reference_frame": {"T_world_region": function}, "outputs": None}))
+        "reference_frame": {"T_world_region": function}, "outputs": None})
+    monkeypatch.setattr("config.ground_skill.run_region_transfer", region_call)
     output = tmp_path / "success"
     report = ground_skill(package, scene, output, instruction="Use the observed container")
     assert report["status"] == "completed" and report["reference_status"] == "reference"
+    assert region_call.call_args.kwargs["skill_kind"] == "grasp"
     with np.load(output / "reference.npz", allow_pickle=False) as saved:
         nominal_start = saved["eef_poses"][0].copy()
         assert np.linalg.norm(nominal_start - actual) > .1

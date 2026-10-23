@@ -10,6 +10,7 @@ candidate below only supplies a frame for reference-motion initialization.
 import numpy as np
 
 from .motion import _inverse, _pose_array
+from .regions import function_frame
 from transfer.experiment import feature_observation
 from transfer.joint_features import source_queries
 from transfer.multiview_experiment import _check_observation
@@ -225,12 +226,25 @@ def propagate_region_frame(source, transform, *, current_region_owner=None, same
     current[:3, 3] = apply_sim3(frame[None, :3, 3], transform["scale"], rotation,
                                  transform["translation"])[0]
     current = _pose_array(current, "Current world region frame")
+    return _region_frame_record(source, frame, current, transform["hypothesis_id"],
+        "selected-candidate reference frame; not a unique-pose certificate",
+        current_region_owner, same_state_source)
+
+
+# BEGIN manipulation interaction regions use the accepted observed center.
+def _region_frame_record(source, frame, current, hypothesis_id, scope,
+                         current_region_owner, same_state_source):
+    """Store world/source frames and bind an explicitly supplied current owner.
+
+    Both frame constructors use this same SE(3) bookkeeping. The owner pose
+    and its acquisition provenance have the same contract as before.
+    """
     result = {"T_world_region": current, "T_source_world_region": frame,
               "source_owner_id": source["owner_id"],
               "source_timestamp_s": source["timestamp_s"],
-              "hypothesis_id": transform["hypothesis_id"],
+              "hypothesis_id": hypothesis_id,
               "L_body_region": None, "current_owner_id": None,
-              "scope": "selected-candidate reference frame; not a unique-pose certificate"}
+              "scope": scope}
     if current_region_owner is not None:
         state_source = _text(same_state_source, "Region/owner same-state evidence")
         owner_id = _text(current_region_owner.get("owner_id"), "Current region owner ID")
@@ -243,9 +257,57 @@ def propagate_region_frame(source, transform, *, current_region_owner=None, same
     return result
 
 
-def run_region_transfer(source, views, *, same_state_source, current_region_owner=None):
+
+def construct_interaction_region_frame(source, transform, primary, *,
+                                       current_region_owner=None, same_state_source=None):
+    """Construct a manipulation interaction frame from an accepted region.
+
+    W denotes the current calibrated world. The origin is primary.center in W,
+    the observed seed used by the accepted region (not its mask centroid).
+    For declared planar geometry, z is the signed observed normal and x is
+    the transferred source functional x projected into that tangent plane;
+    y=z cross x. For declared surface geometry there is no single region
+    normal: the source functional rotation is transferred unchanged.
+    Source functional frames and represented motion are never rewritten.
+
+    The accepted primary and its supporting transform are supplied together
+    by run_region_transfer. This API changes reference construction only;
+    region acceptance and candidate evidence retain their original values.
+    """
+    source_frame = (_pose_array(source["T_world_body_at_image"], "Source body at region image time")
+                    @ _pose_array(source["L_body_region"], "Source body-local region frame"))
+    rotated = np.asarray(transform["rotation"]) @ source_frame[:3, :3]
+    geometry = source["region_geometry"]
+    if geometry == "planar":
+        normal = np.asarray(primary["normal"], dtype=float)
+        normal = normal / np.linalg.norm(normal)
+        tangent = rotated[:, 0] - normal * (normal @ rotated[:, 0])
+        current = function_frame(primary["center"], tangent, normal)
+        axes_source = "observed_normal_and_projected_transferred_functional_x"
+    elif geometry == "surface":
+        current = np.eye(4)
+        current[:3, :3], current[:3, 3] = rotated, primary["center"]
+        axes_source = "transferred_source_functional_rotation"
+    else:
+        raise ValueError("source.region_geometry must explicitly be planar or surface")
+    result = _region_frame_record(source, source_frame,
+        _pose_array(current, "Observed interaction region frame"), transform["hypothesis_id"],
+        "accepted observed interaction-region reference; not a unique-pose certificate",
+        current_region_owner, same_state_source)
+    result["construction"] = dict(origin_source="accepted_primary.center",
+        center_meaning="observed region seed, not mask centroid", axes_source=axes_source,
+        region_geometry=geometry)
+    return result
+# END grasp source-frame propagation retains its original Sim(3) computation.
+
+
+def run_region_transfer(source, views, *, skill_kind, same_state_source, current_region_owner=None):
     """Call the existing resident dual-view pipeline once and bind its frame.
 
+    ``skill_kind`` is the existing representation.kind declaration. Grasp
+    retains source-frame Sim(3) propagation. Manipulation constructs its
+    interaction frame from the accepted primary center and declared geometry.
+    The numerical region pipeline is identical for both declarations.
     The caller first runs dual_view.pipeline.prepare in its serial supervised
     GPU process. Missing inputs and an unsupported source plane retain explicit
     states; other malformed-input/runtime errors propagate. Returned loaded
@@ -256,6 +318,8 @@ def run_region_transfer(source, views, *, same_state_source, current_region_owne
     """
     from transfer.dual_view import pipeline
 
+    if skill_kind not in ("grasp", "manipulation"):
+        raise ValueError("skill_kind must be grasp or manipulation")
     try:
         loaded, features = prepare_inputs(source, views, same_state_source=same_state_source)
     except RegionInputMissing as error:
@@ -277,8 +341,15 @@ def run_region_transfer(source, views, *, same_state_source, current_region_owne
                 or np.any(target_ids < 0) or np.any(target_ids >= len(outputs["surface"]["xyz"]))):
             raise ValueError("Selected candidate pairing lost its source/target index domains")
         selected["source_point_indices"] = loaded["query_indices"][rows]
-        frame = propagate_region_frame(source, selected, current_region_owner=current_region_owner,
-                                       same_state_source=same_state_source)
+        # BEGIN select the frame contract from the declared representation kind.
+        if skill_kind == "manipulation":
+            primary = next(mode for mode in result["modes"] if mode["type"] == "primary")
+            frame = construct_interaction_region_frame(source, selected, primary,
+                current_region_owner=current_region_owner, same_state_source=same_state_source)
+        else:
+            frame = propagate_region_frame(source, selected, current_region_owner=current_region_owner,
+                                           same_state_source=same_state_source)
+        # END grasp retains the exact existing source origin and full rotation.
         frame["target_entity_id"] = loaded["target_entity_id"]
     return {"status": result["status"], "reasons": list(result["reasons"]),
             "reference_frame": frame, "selected_transform": selected,

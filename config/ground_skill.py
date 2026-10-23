@@ -147,7 +147,10 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
         # END surface no longer compiles unused planar CUDA proposal kernels.
         same_state = ("Both RGB-D views and robot feedback were exported from one frozen scene "
                       f"at simulation time {layout['sim_time_s']}; scene preparation took zero physics steps.")
-        transfer = run_region_transfer(skill["source"], views, same_state_source=same_state)
+        # BEGIN declare the existing skill class at the shared region API.
+        transfer = run_region_transfer(skill["source"], views,
+            skill_kind=skill["representation"]["kind"], same_state_source=same_state)
+        # END only manipulation changes the interaction-frame constructor.
         record.update(region_status=transfer["status"], region_reasons=transfer["reasons"])
         outputs = transfer.get("outputs")
         if outputs is not None:

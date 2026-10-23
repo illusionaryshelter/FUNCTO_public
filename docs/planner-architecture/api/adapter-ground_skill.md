@@ -1,6 +1,6 @@
 # `config/ground_skill.py` 实现契约
 
-代码基线：`01a6609`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：`1526e60`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -276,7 +276,7 @@ np.asarray
 
 ## `main`
 
-[定义位置](../../../config/ground_skill.py#L214)。
+[定义位置](../../../config/ground_skill.py#L217)。
 
 输入签名：
 
