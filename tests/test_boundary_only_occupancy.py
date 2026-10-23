@@ -48,7 +48,8 @@ def test_boundary_only_cell_remains_unresolved_and_available_to_contact_queries(
     contact = query_region_intersection(field, np.eye(4),
         np.vstack((np.eye(3), -np.eye(3))), np.ones(6))
     assert contact["status"] == "contact"
-    assert field.local_zero(np.full(3, .01)) is not None
+    from manipulation.sampled_geometry_objective import MaterialSamples
+    assert len(MaterialSamples(field).zero_points) > 0
 
 
 def test_constant_zero_cell_keeps_its_volume():

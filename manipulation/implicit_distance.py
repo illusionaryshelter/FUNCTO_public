@@ -14,7 +14,6 @@ from itertools import count
 import math
 
 import numpy as np
-from scipy.optimize import minimize
 from scipy.spatial import cKDTree
 
 
@@ -184,10 +183,7 @@ class ObservedField:
                              if len(self.cells) else np.empty((0, 8)))
         centers = self.cell_origins + self.voxel_size / 2
         self.tree = cKDTree(centers) if len(centers) else None
-        # BEGIN local surface directions index supported zero-bearing cells.
-        # Occupied interior cells remain in the collision tree. They cannot
-        # displace a more distant observed zero from the direction query's
-        # finite candidate list. A constant-zero cell has no surface normal.
+        # BEGIN original sign structure distinguishes volume from zero boundaries.
         minimum = self._cell_values.min(axis=1) if len(self.cells) else np.empty(0)
         maximum = self._cell_values.max(axis=1) if len(self.cells) else np.empty(0)
         # A nonconstant nonnegative trilinear cell is strictly positive at
@@ -195,10 +191,7 @@ class ObservedField:
         # Its occupied zero subset has no volume interior. Keep that subset
         # for surface tasks and report its possible contact as unresolved.
         self._boundary_only_cells = (minimum == 0) & (maximum > 0)
-        self._zero_cell_ids = np.flatnonzero((minimum <= 0) & (maximum >= 0)
-                                           & (minimum < maximum))
-        self._zero_tree = cKDTree(centers[self._zero_cell_ids]) if len(self._zero_cell_ids) else None
-        # END this additional index never changes occupied cells or their tree.
+        # END no local surface optimizer or additional field index is needed.
         self.nodes = []
         # BEGIN batch the same initial slab bounds without changing tree order.
         # A small batch bounds temporary interpolation storage independently
@@ -227,21 +220,18 @@ class ObservedField:
             return identity
 
         self.root = build(self.tree.tree) if self.tree is not None else None
-        # BEGIN both immutable indices account for their own retained arrays.
+        # BEGIN the immutable occupied index accounts for its retained arrays.
         for array in (self.values, self.observed, self.origin, self.valid_cells,
-                      self.cells, self.cell_origins, self._cell_values, self._zero_cell_ids,
+                      self.cells, self.cell_origins, self._cell_values,
                       self._boundary_only_cells):
             array.flags.writeable = False
         self.storage_nbytes = sum(a.nbytes for a in (
             self.values, self.observed, self.valid_cells, self.cells,
-            self.cell_origins, self._cell_values, self._zero_cell_ids,
+            self.cell_origins, self._cell_values,
             self._boundary_only_cells)) + 256 * len(self.nodes)
         # BEGIN each point array and its ndarray header remain scene-owned.
         self.storage_nbytes += sum(points.nbytes + 128 for points in leaf_points)
         # END this storage participates in the existing request admission.
-        if self._zero_tree is not None:
-            self._zero_tree.data.flags.writeable = False
-            self.storage_nbytes += self._zero_tree.data.nbytes + self._zero_tree.indices.nbytes
         # END the occupied representation retains its existing storage account.
 
     # BEGIN vectorized initial bounds retain scalar tighten arithmetic.
@@ -361,8 +351,20 @@ class ObservedField:
         error = error + np.sum(coordinate_error * slope, axis=-1)
         return value, gradient / self.voxel_size, error
 
-    def sample(self, points):
-        """Evaluate only fully supported cells, retaining an explicit valid mask."""
+    def sample(self, points, *, excluded_cells=()):
+        """Evaluate supported cells, optionally removing declared cell material.
+
+        ``excluded_cells`` contains original occupied-cell identities from a
+        finite initial-support permission. Adjacent supported cells retain
+        their own identity. The returned mask describes this query domain;
+        unobserved locations retain their original unknown status.
+        """
+        # BEGIN finite material exclusions use the same interpolation lookup.
+        valid_cells = self.valid_cells
+        if excluded_cells:
+            valid_cells = self.valid_cells.copy()
+            valid_cells[tuple(self.cells[np.asarray(tuple(excluded_cells), dtype=np.int64)].T)] = False
+        # END no sample value or represented occupancy is modified.
         points = np.asarray(points, dtype=float)
         layout = points.shape[:-1]
         flat = points.reshape(-1, 3)
@@ -372,7 +374,7 @@ class ObservedField:
         indices = np.minimum(indices, self.cell_shape - 1)
         inside = ((grid >= 0) & (grid <= self.shape - 1)).all(-1)
         clipped = np.clip(indices, 0, self.cell_shape - 1)
-        valid = inside & self.valid_cells[tuple(clipped.T)]
+        valid = inside & valid_cells[tuple(clipped.T)]
         # A supported cell is closed. At an internal lattice plane either
         # adjacent cell may supply the same interpolated value; prefer the
         # floor cell, then inspect the other incident cells when necessary.
@@ -383,7 +385,7 @@ class ObservedField:
                         & ((candidate >= 0) & (candidate < self.cell_shape)).all(-1))
             selected = np.flatnonzero(eligible)
             if len(selected):
-                selected = selected[self.valid_cells[tuple(candidate[selected].T)]]
+                selected = selected[valid_cells[tuple(candidate[selected].T)]]
                 clipped[selected] = candidate[selected]
                 valid[selected] = True
         value, gradient, error = (np.full(len(flat), np.nan), np.zeros_like(flat),
@@ -491,44 +493,6 @@ class ObservedField:
             if float(np.min(values - errors)) <= 0:
                 result.append(self.tighten(child))
         return tuple(result)
-
-    def local_zero(self, point):
-        """Find a local zero-section point solely for an optimization direction."""
-        # BEGIN query the surface candidate index, retaining original cell IDs.
-        if self._zero_tree is None:
-            return None
-        _, indices = self._zero_tree.query(np.asarray(point), k=min(8, len(self._zero_cell_ids)))
-        best = None
-        for candidate in np.atleast_1d(indices):
-            identity = int(self._zero_cell_ids[candidate])
-            values = self._cell_values[identity]
-            # END all candidates contain a supported nonconstant zero section.
-            lower = self.cell_origins[identity]
-            seeds = []
-            for a, b in _EDGES:
-                if values[a] * values[b] <= 0 and values[a] != values[b]:
-                    seeds.append(CORNERS[a] + values[a] / (values[a] - values[b])
-                                 * (CORNERS[b] - CORNERS[a]))
-            if not seeds:
-                continue
-            target = (np.asarray(point) - lower) / self.voxel_size
-            initial = min(seeds, key=lambda p: float(np.sum((p - target) ** 2)))
-            result = minimize(lambda u: float(np.sum((u - target) ** 2)), initial,
-                jac=lambda u: 2 * (u - target), bounds=[(0., 1.)] * 3, method="SLSQP",
-                constraints={"type": "eq", "fun": lambda u: trilinear(values, u)[0],
-                             "jac": lambda u: trilinear(values, u)[1]},
-                options={"maxiter": 24, "ftol": 1e-12})
-            if not result.success:
-                continue
-            zero = lower + result.x * self.voxel_size
-            _, gradient, _ = self.cell_value(identity, zero)
-            norm = float(np.linalg.norm(gradient))
-            if not norm > 0:
-                continue
-            distance = float(np.linalg.norm(zero - point))
-            if best is None or distance < best[0]:
-                best = distance, zero, gradient / norm
-        return best
 
 
 def query_distance(first, first_pose, second, second_pose, *,

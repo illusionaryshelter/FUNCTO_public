@@ -1,6 +1,6 @@
 # `manipulation/planning_problem.py` 实现契约
 
-代码基线：`d7bcafc`。
+代码基线：`774e121-plus-unified-workspace`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_tensor`
@@ -2269,23 +2269,25 @@ torch.finfo
 torch.cat
 ```
 
-## `MechanismRequirement.direction_residuals`
+## `MechanismRequirement.direction_inequalities`
 
-[定义位置](../../../manipulation/planning_problem.py#L757)。
+[定义位置](../../../manipulation/planning_problem.py#L758)。
 
 输入签名：
 
 ```python
-def direction_residuals(self, position, quaternion, progress, *, trajectory_time, tool_linear_velocity=None, tool_angular_velocity=None, mode='trajectory', use_tolerance=True):
+def direction_inequalities(self, position, quaternion, progress, *, trajectory_time, tool_linear_velocity=None, tool_angular_velocity=None, mode='trajectory', use_tolerance=True):
 ```
 
 实现说明：
 
-> Check finite ordered queries; only final curves use instantaneous rates.
+> Signed values <= 0 at finite ordered physical-time queries.
 >
 > A geometric OMPL path uses physical-time secants solely to screen a
 > seed. Its downstream cubic must still pass true J(q) dq rate checks.
 > Single-state seed membership deliberately proves no path direction.
+> Inactive queries have zero values and derivatives. This preserves the
+> query layout while exposing feasible slack to a constrained solver.
 
 显式输出分支：
 
@@ -2324,7 +2326,6 @@ torch.flip
 direction.origin_coordinate
 values.gather
 direction.sign
-torch.relu
 direction.minimum
 at_end.any
 at_start.any
@@ -2391,7 +2392,6 @@ torch.flip(at_end, [-1]).to(torch.int64).argmax
 torch.flip(at_end, [-1]).to
 torch.flip
 values.gather
-torch.relu
 at_end.any
 at_start.any
 torch.ones_like
@@ -2404,9 +2404,52 @@ torch.finfo
 torch.cat
 ```
 
+## `MechanismRequirement.direction_residuals`
+
+[定义位置](../../../manipulation/planning_problem.py#L823)。
+
+输入签名：
+
+```python
+def direction_residuals(self, position, quaternion, progress, *, trajectory_time, tool_linear_velocity=None, tool_angular_velocity=None, mode='trajectory', use_tolerance=True):
+```
+
+实现说明：
+
+> Positive violations of the same signed direction inequalities.
+
+显式输出分支：
+
+```python
+{name: torch.relu(value) for (name, value) in self.direction_inequalities(position, quaternion, progress, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity, tool_angular_velocity=tool_angular_velocity, mode=mode, use_tolerance=use_tolerance).items()}
+```
+
+读取的对象属性：
+
+```python
+torch.relu
+self.direction_inequalities(position, quaternion, progress, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity, tool_angular_velocity=tool_angular_velocity, mode=mode, use_tolerance=use_tolerance).items
+self.direction_inequalities
+```
+
+写入目标：
+
+```python
+name
+value
+```
+
+直接调用符号：
+
+```python
+torch.relu
+self.direction_inequalities(position, quaternion, progress, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity, tool_angular_velocity=tool_angular_velocity, mode=mode, use_tolerance=use_tolerance).items
+self.direction_inequalities
+```
+
 ## `SupportRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L824)。
+[定义位置](../../../manipulation/planning_problem.py#L838)。
 
 ```python
 class SupportRequirement():
@@ -2434,7 +2477,7 @@ hard_components: tuple[str, ...] = ('body', 'footprint')
 
 ## `SupportRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L842)。
+[定义位置](../../../manipulation/planning_problem.py#L856)。
 
 输入签名：
 
@@ -2485,28 +2528,29 @@ len
 set
 ```
 
-## `SupportRequirement.raw_inequalities`
+## `SupportRequirement.inequality_components`
 
-[定义位置](../../../manipulation/planning_problem.py#L860)。
+[定义位置](../../../manipulation/planning_problem.py#L874)。
 
 输入签名：
 
 ```python
-def raw_inequalities(self, position, quaternion, numerical):
+def inequality_components(self, position, quaternion, numerical):
 ```
 
 实现说明：
 
-> Return four signed per-pose requirements, each satisfied at <= 0.
+> Return signed <= 0 rows before reducing points or support planes.
 >
 > Lengths remain in metres and the normal error remains a chord length.
-> Keeping feasible-side values lets AL multipliers decrease without
-> inventing a tangent location or yaw target inside this finite support.
+> Gap rows are the two sides of each contact-point height. Body rows
+> bound each material point above the support. Footprint rows retain
+> every body-point/polygon-edge pair. The normal is one chord bound.
 
 显式输出分支：
 
 ```python
-{'gap': gaps.abs().amax(-1) - self.gap_tolerance, 'body': -height.amin(-1) - numerical.position_m, 'footprint': footprint + self.margin - numerical.position_m, 'normal': chord - angular_bound}
+{'gap': torch.stack((gaps, -gaps), -1) - self.gap_tolerance, 'body': -height - numerical.position_m, 'footprint': footprint + self.margin - numerical.position_m, 'normal': chord - angular_bound}
 ```
 
 读取的对象属性：
@@ -2526,7 +2570,6 @@ self.surface.normal
 self.surface.basis
 self.surface._hull.equations
 self.surface._hull
-(xy @ equations[:, :2].T + equations[:, 2]).amax
 equations[:, :2].T
 _tensor(self.outward_normal, q).expand
 self.outward_normal
@@ -2535,10 +2578,8 @@ torch.linalg.vector_norm
 torch.linalg
 np.sin
 self.normal_tolerance
-gaps.abs().amax
-gaps.abs
+torch.stack
 self.gap_tolerance
-height.amin
 numerical.position_m
 self.margin
 ```
@@ -2570,18 +2611,59 @@ quaternion_rotate
 _tensor(self.body_points, p).expand
 _tensor
 _tensor(self.contact_points, p).expand
-(xy @ equations[:, :2].T + equations[:, 2]).amax
 _tensor(self.outward_normal, q).expand
 torch.linalg.vector_norm
 np.sin
-gaps.abs().amax
-gaps.abs
-height.amin
+torch.stack
+```
+
+## `SupportRequirement.raw_inequalities`
+
+[定义位置](../../../manipulation/planning_problem.py#L902)。
+
+输入签名：
+
+```python
+def raw_inequalities(self, position, quaternion, numerical):
+```
+
+实现说明：
+
+> Return the four original per-pose maxima of signed support rows.
+
+显式输出分支：
+
+```python
+{'gap': components['gap'].amax(dim=(-1, -2)), 'body': components['body'].amax(-1), 'footprint': components['footprint'].amax(dim=(-1, -2)), 'normal': components['normal']}
+```
+
+读取的对象属性：
+
+```python
+self.inequality_components
+components['gap'].amax
+components['body'].amax
+components['footprint'].amax
+```
+
+写入目标：
+
+```python
+components
+```
+
+直接调用符号：
+
+```python
+self.inequality_components
+components['gap'].amax
+components['body'].amax
+components['footprint'].amax
 ```
 
 ## `SupportRequirement.normalized_inequalities`
 
-[定义位置](../../../manipulation/planning_problem.py#L887)。
+[定义位置](../../../manipulation/planning_problem.py#L911)。
 
 输入签名：
 
@@ -2591,7 +2673,7 @@ def normalized_inequalities(self, position, quaternion, numerical):
 
 实现说明：
 
-> Scale units for AL without changing any acceptance right-hand side.
+> Scale support preferences while retaining each physical threshold.
 >
 > The three length requirements share the declared gap scale, bounded
 > below by numerical precision. In particular, a tight boundary rounding
@@ -2638,7 +2720,7 @@ self.raw_inequalities
 
 ## `SupportRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L904)。
+[定义位置](../../../manipulation/planning_problem.py#L928)。
 
 输入签名：
 
@@ -2681,7 +2763,7 @@ torch.relu
 
 ## `PoseEventRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L915)。
+[定义位置](../../../manipulation/planning_problem.py#L939)。
 
 ```python
 class PoseEventRequirement():
@@ -2719,7 +2801,7 @@ yaw_tolerance_rad: float | None = None
 
 ## `PoseEventRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L947)。
+[定义位置](../../../manipulation/planning_problem.py#L971)。
 
 输入签名：
 
@@ -2786,7 +2868,7 @@ condition.strip
 
 ## `PoseEventRequirement.component_tolerances`
 
-[定义位置](../../../manipulation/planning_problem.py#L991)。
+[定义位置](../../../manipulation/planning_problem.py#L1015)。
 
 输入签名：
 
@@ -2827,7 +2909,7 @@ result['yaw']
 
 ## `PoseEventRequirement.error_components`
 
-[定义位置](../../../manipulation/planning_problem.py#L998)。
+[定义位置](../../../manipulation/planning_problem.py#L1022)。
 
 输入签名：
 
@@ -2900,7 +2982,7 @@ angle.abs
 
 ## `PoseEventRequirement.errors`
 
-[定义位置](../../../manipulation/planning_problem.py#L1022)。
+[定义位置](../../../manipulation/planning_problem.py#L1046)。
 
 输入签名：
 
@@ -2938,7 +3020,7 @@ self.error_components
 
 ## `PoseEventRequirement.errors_numpy`
 
-[定义位置](../../../manipulation/planning_problem.py#L1027)。
+[定义位置](../../../manipulation/planning_problem.py#L1051)。
 
 输入签名：
 
@@ -2992,7 +3074,7 @@ _quaternion
 
 ## `PoseEventRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1035)。
+[定义位置](../../../manipulation/planning_problem.py#L1059)。
 
 输入签名：
 
@@ -3034,7 +3116,7 @@ self.component_tolerances.items
 
 ## `CoordinateEventRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L1044)。
+[定义位置](../../../manipulation/planning_problem.py#L1068)。
 
 ```python
 class CoordinateEventRequirement():
@@ -3058,7 +3140,7 @@ coordinate_origin: float | None = None
 
 ## `CoordinateEventRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L1054)。
+[定义位置](../../../manipulation/planning_problem.py#L1078)。
 
 输入签名：
 
@@ -3101,7 +3183,7 @@ ValueError
 
 ## `CoordinateEventRequirement.absolute_target`
 
-[定义位置](../../../manipulation/planning_problem.py#L1066)。
+[定义位置](../../../manipulation/planning_problem.py#L1090)。
 
 输入签名：
 
@@ -3133,7 +3215,7 @@ self.coordinate_origin
 
 ## `CoordinateEventRequirement.kind`
 
-[定义位置](../../../manipulation/planning_problem.py#L1070)。
+[定义位置](../../../manipulation/planning_problem.py#L1094)。
 
 输入签名：
 
@@ -3163,20 +3245,20 @@ self.mechanism
 
 无显式条目。
 
-## `CoordinateEventRequirement.error`
+## `CoordinateEventRequirement.signed_error`
 
-[定义位置](../../../manipulation/planning_problem.py#L1073)。
+[定义位置](../../../manipulation/planning_problem.py#L1098)。
 
 输入签名：
 
 ```python
-def error(self, position, quaternion, progress, *, trajectory_time=None):
+def signed_error(self, position, quaternion, progress, *, trajectory_time=None):
 ```
 
 显式输出分支：
 
 ```python
-difference.abs()
+difference
 ```
 
 读取的对象属性：
@@ -3191,7 +3273,6 @@ torch.sin
 torch.cos
 torch.where
 self.mechanism.history_complete
-difference.abs
 ```
 
 写入目标：
@@ -3211,12 +3292,45 @@ torch.sin
 torch.cos
 torch.where
 self.mechanism.history_complete
-difference.abs
+```
+
+## `CoordinateEventRequirement.error`
+
+[定义位置](../../../manipulation/planning_problem.py#L1107)。
+
+输入签名：
+
+```python
+def error(self, position, quaternion, progress, *, trajectory_time=None):
+```
+
+显式输出分支：
+
+```python
+self.signed_error(position, quaternion, progress, trajectory_time=trajectory_time).abs()
+```
+
+读取的对象属性：
+
+```python
+self.signed_error(position, quaternion, progress, trajectory_time=trajectory_time).abs
+self.signed_error
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+self.signed_error(position, quaternion, progress, trajectory_time=trajectory_time).abs
+self.signed_error
 ```
 
 ## `CoordinateEventRequirement.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1082)。
+[定义位置](../../../manipulation/planning_problem.py#L1111)。
 
 输入签名：
 
@@ -3251,7 +3365,7 @@ self.error
 
 ## `InteriorRequirement`
 
-[定义位置](../../../manipulation/planning_problem.py#L1089)。
+[定义位置](../../../manipulation/planning_problem.py#L1118)。
 
 ```python
 class InteriorRequirement():
@@ -3275,7 +3389,7 @@ source: object
 
 ## `InteriorRequirement.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L1099)。
+[定义位置](../../../manipulation/planning_problem.py#L1128)。
 
 输入签名：
 
@@ -3320,20 +3434,20 @@ np.isfinite
 ValueError
 ```
 
-## `InteriorRequirement.evaluate`
+## `InteriorRequirement.raw_inequalities`
 
-[定义位置](../../../manipulation/planning_problem.py#L1107)。
+[定义位置](../../../manipulation/planning_problem.py#L1137)。
 
 输入签名：
 
 ```python
-def evaluate(self, position, quaternion, numerical):
+def raw_inequalities(self, position, quaternion, numerical):
 ```
 
 显式输出分支：
 
 ```python
-torch.relu(error - numerical.position_m)
+points @ h[:, :3].T + h[:, 3] + self.margin - numerical.position_m
 ```
 
 读取的对象属性：
@@ -3345,10 +3459,8 @@ self.body_points
 p.shape
 self.body_points.shape
 self.halfspaces
-(points @ h[:, :3].T + h[:, 3] + self.margin).amax
 h[:, :3].T
 self.margin
-torch.relu
 numerical.position_m
 ```
 
@@ -3359,7 +3471,6 @@ p
 q
 points
 h
-error
 ```
 
 直接调用符号：
@@ -3369,13 +3480,47 @@ _compose
 quaternion_rotate
 _tensor(self.body_points, p).expand
 _tensor
-(points @ h[:, :3].T + h[:, 3] + self.margin).amax
+```
+
+## `InteriorRequirement.evaluate`
+
+[定义位置](../../../manipulation/planning_problem.py#L1143)。
+
+输入签名：
+
+```python
+def evaluate(self, position, quaternion, numerical):
+```
+
+显式输出分支：
+
+```python
+torch.relu(self.raw_inequalities(position, quaternion, numerical).amax(dim=(-1, -2)))
+```
+
+读取的对象属性：
+
+```python
 torch.relu
+self.raw_inequalities(position, quaternion, numerical).amax
+self.raw_inequalities
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+torch.relu
+self.raw_inequalities(position, quaternion, numerical).amax
+self.raw_inequalities
 ```
 
 ## `PlanningProblem`
 
-[定义位置](../../../manipulation/planning_problem.py#L1118)。
+[定义位置](../../../manipulation/planning_problem.py#L1151)。
 
 ```python
 class PlanningProblem():
@@ -3419,7 +3564,7 @@ end_progress: float | None = None
 
 ## `PlanningProblem.__post_init__`
 
-[定义位置](../../../manipulation/planning_problem.py#L1151)。
+[定义位置](../../../manipulation/planning_problem.py#L1184)。
 
 输入签名：
 
@@ -3541,7 +3686,7 @@ np.diff
 
 ## `PlanningProblem.phase_count`
 
-[定义位置](../../../manipulation/planning_problem.py#L1206)。
+[定义位置](../../../manipulation/planning_problem.py#L1239)。
 
 输入签名：
 
@@ -3573,7 +3718,7 @@ len
 
 ## `PlanningProblem.bound_motion_block`
 
-[定义位置](../../../manipulation/planning_problem.py#L1210)。
+[定义位置](../../../manipulation/planning_problem.py#L1243)。
 
 输入签名：
 
@@ -3675,7 +3820,7 @@ asdict
 
 ## `PlanningProblem.requirement_consumption`
 
-[定义位置](../../../manipulation/planning_problem.py#L1269)。
+[定义位置](../../../manipulation/planning_problem.py#L1302)。
 
 输入签名：
 
@@ -3770,7 +3915,7 @@ event_occurrence_key
 
 ## `PlanningProblem.requirement_consumption.add`
 
-[定义位置](../../../manipulation/planning_problem.py#L1280)。
+[定义位置](../../../manipulation/planning_problem.py#L1313)。
 
 输入签名：
 
@@ -3801,7 +3946,7 @@ deepcopy
 
 ## `PlanningProblem.source_time_map`
 
-[定义位置](../../../manipulation/planning_problem.py#L1360)。
+[定义位置](../../../manipulation/planning_problem.py#L1401)。
 
 输入签名：
 
@@ -3842,7 +3987,7 @@ self.source_progress.copy
 
 ## `PlanningProblem.source_time_to_progress`
 
-[定义位置](../../../manipulation/planning_problem.py#L1366)。
+[定义位置](../../../manipulation/planning_problem.py#L1407)。
 
 输入签名：
 
@@ -3877,7 +4022,7 @@ np.interp
 
 ## `PlanningProblem.progress_to_source_time`
 
-[定义位置](../../../manipulation/planning_problem.py#L1370)。
+[定义位置](../../../manipulation/planning_problem.py#L1411)。
 
 输入签名：
 
@@ -3912,7 +4057,7 @@ np.interp
 
 ## `PlanningProblem.terminal_pose_target`
 
-[定义位置](../../../manipulation/planning_problem.py#L1375)。
+[定义位置](../../../manipulation/planning_problem.py#L1416)。
 
 输入签名：
 
@@ -3952,7 +4097,7 @@ next
 
 ## `PlanningProblem.anchors`
 
-[定义位置](../../../manipulation/planning_problem.py#L1380)。
+[定义位置](../../../manipulation/planning_problem.py#L1421)。
 
 输入签名：
 
@@ -4013,7 +4158,7 @@ float
 
 ## `PlanningProblem.stop_progress`
 
-[定义位置](../../../manipulation/planning_problem.py#L1394)。
+[定义位置](../../../manipulation/planning_problem.py#L1435)。
 
 输入签名：
 
@@ -4051,7 +4196,7 @@ np.array
 
 ## `PlanningProblem.sample_reference`
 
-[定义位置](../../../manipulation/planning_problem.py#L1397)。
+[定义位置](../../../manipulation/planning_problem.py#L1438)。
 
 输入签名：
 
@@ -4103,7 +4248,7 @@ torch.where
 
 ## `PlanningProblem.transform_tool_pose`
 
-[定义位置](../../../manipulation/planning_problem.py#L1406)。
+[定义位置](../../../manipulation/planning_problem.py#L1447)。
 
 输入签名：
 
@@ -4146,7 +4291,7 @@ _tensor(self.tool_transform[:3, 3], position).expand_as
 
 ## `PlanningProblem.reference_to_link_pose`
 
-[定义位置](../../../manipulation/planning_problem.py#L1413)。
+[定义位置](../../../manipulation/planning_problem.py#L1454)。
 
 输入签名：
 
@@ -4191,7 +4336,7 @@ _quaternion
 
 ## `PlanningProblem.transform_robot_spheres`
 
-[定义位置](../../../manipulation/planning_problem.py#L1421)。
+[定义位置](../../../manipulation/planning_problem.py#L1462)。
 
 输入签名：
 
@@ -4229,7 +4374,7 @@ torch.cat
 
 ## `PlanningProblem.transform_tool_velocity`
 
-[定义位置](../../../manipulation/planning_problem.py#L1427)。
+[定义位置](../../../manipulation/planning_problem.py#L1468)。
 
 输入签名：
 
@@ -4280,7 +4425,7 @@ torch.linalg.cross
 
 ## `PlanningProblem.residuals`
 
-[定义位置](../../../manipulation/planning_problem.py#L1437)。
+[定义位置](../../../manipulation/planning_problem.py#L1478)。
 
 输入签名：
 
@@ -4458,7 +4603,7 @@ joint_velocity.abs
 
 ## `PlanningProblem.residuals.event_mask`
 
-[定义位置](../../../manipulation/planning_problem.py#L1446)。
+[定义位置](../../../manipulation/planning_problem.py#L1487)。
 
 输入签名：
 
@@ -4491,9 +4636,298 @@ _first_event_query
 torch.zeros_like
 ```
 
+## `PlanningProblem.constraint_components`
+
+[定义位置](../../../manipulation/planning_problem.py#L1574)。
+
+输入签名：
+
+```python
+def constraint_components(self, position, quaternion, progress, joint_position=None, joint_names=None, joint_velocity=None, *, trajectory_time, tool_linear_velocity=None, tool_angular_velocity=None):
+```
+
+实现说明：
+
+> Return ``(equalities, inequalities)`` with EQ=0 and INEQ<=0.
+>
+> Inputs are the actual candidate tool pose, joint state and tool twist
+> at one fixed complete physical-time query layout. Poses use the task
+> reference frame and wxyz quaternions; twist uses that same reference
+> frame and seconds. The caller validates ``verification_issues`` once
+> when binding the layout, including all exact anchors and the start of
+> angular history. Local-rate declarations require the actual J(q) dq
+> twist. These are full-trajectory inputs, not local membership queries.
+>
+> Dictionary insertion order and row shapes depend only on declarations
+> and that fixed layout. Each tensor may be flattened and concatenated;
+> Torch autograd differentiates the same signed values. Values retain
+> physical units and the existing declared/numerical allowances. No
+> positive-part penalty or maximum hides feasible-side derivatives.
+> Zero-width yaw is an equality of its signed principal angle. Other
+> tolerated requirements keep their existing inequalities, including
+> numerical joint-coupling and stop allowances.
+>
+> Point events use one earliest actual query. Process rows certify only
+> the supplied finite queries; coordinate monotonicity compares adjacent
+> ordered queries, and local rates use instantaneous twist at those
+> queries. This method supplies no continuous-interval certificate.
+> Scene relations and event clock windows are bound by their existing
+> scene/clock consumers before this task computation.
+
+显式输出分支：
+
+```python
+(equalities, inequalities)
+```
+
+读取的对象属性：
+
+```python
+self.start_progress
+self.end_progress
+self.numerical.position_m
+self.numerical
+self.numerical.rotation_rad
+self.pose_relations
+requirement.error
+requirement.start
+requirement.end
+np.flatnonzero
+np.isfinite
+requirement.pose_bounds
+self.mechanisms
+requirement.errors
+requirement.model.position_tolerance
+requirement.model
+requirement.model.rotation_tolerance
+requirement.coordinate_limits
+requirement.coordinates
+requirement.direction_inequalities(position, quaternion, progress, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity, tool_angular_velocity=tool_angular_velocity).items
+requirement.direction_inequalities
+self.supports
+requirement.progress
+requirement.inequality_components
+requirement.hard_components
+self.interiors
+requirement.raw_inequalities
+self.pose_events
+requirement.error_components
+requirement.component_tolerances.items
+requirement.component_tolerances
+self.coordinate_events
+requirement.mechanism.coordinates
+requirement.mechanism
+requirement.absolute_target
+requirement.tolerance
+self.couplings
+tuple(joint_names).index
+coupling.joint_names
+coupling.matrix.T
+coupling.matrix
+coupling.target
+self.numerical.joint
+self.events
+event.stop
+event.progress
+self.numerical.velocity
+```
+
+写入目标：
+
+```python
+equalities
+inequalities
+inequalities['progress:lower']
+inequalities['progress:upper']
+pose_allowance
+index
+requirement
+error
+mask
+side
+sign
+columns
+bound
+value
+inequalities[f"pose_relation:{index}:{('lower' if side == 0 else 'upper')}"]
+position_error
+rotation_error
+inequalities[f'mechanism:{index}:position']
+inequalities[f'mechanism:{index}:rotation']
+coordinates
+bounds
+inequalities[f'mechanism_limits:{index}:lower']
+inequalities[f'mechanism_limits:{index}:upper']
+name
+inequalities[f'mechanism:{index}:{name}']
+values
+inequalities[f'support:{index}:{name}']
+inequalities[f'interior:{index}']
+errors
+key
+equalities[key]
+inequalities[key]
+difference
+inequalities[f'function_coordinate:{index}:lower']
+inequalities[f'function_coordinate:{index}:upper']
+coupling
+inequalities[f'coupling:{index}:lower']
+inequalities[f'coupling:{index}:upper']
+event
+velocity
+inequalities[f'stop:{index}:lower']
+inequalities[f'stop:{index}:upper']
+```
+
+直接调用符号：
+
+```python
+_tensor
+enumerate
+requirement.error
+np.flatnonzero
+np.isfinite
+len
+scoped
+requirement.errors
+requirement.coordinates
+requirement.direction_inequalities(position, quaternion, progress, trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity, tool_angular_velocity=tool_angular_velocity).items
+requirement.direction_inequalities
+active_event
+_first_event_query
+requirement.inequality_components
+at_event
+requirement.raw_inequalities
+requirement.error_components
+requirement.component_tolerances.items
+requirement.mechanism.coordinates
+tuple(joint_names).index
+tuple
+```
+
+## `PlanningProblem.constraint_components.scoped`
+
+[定义位置](../../../manipulation/planning_problem.py#L1606)。
+
+输入签名：
+
+```python
+def scoped(value, mask):
+```
+
+实现说明：
+
+> Retain the fixed query/point layout with inactive zero rows.
+
+显式输出分支：
+
+```python
+torch.where(expanded, value, 0.0)
+```
+
+读取的对象属性：
+
+```python
+value.ndim
+mask.ndim
+torch.where
+```
+
+写入目标：
+
+```python
+expanded
+```
+
+直接调用符号：
+
+```python
+torch.where
+```
+
+## `PlanningProblem.constraint_components.at_event`
+
+[定义位置](../../../manipulation/planning_problem.py#L1611)。
+
+输入签名：
+
+```python
+def at_event(value, mask):
+```
+
+实现说明：
+
+> Gather one physical arrival while retaining any component axes.
+
+显式输出分支：
+
+```python
+torch.where(present, selected, float('nan'))
+```
+
+读取的对象属性：
+
+```python
+scoped(value, mask).sum
+progress.ndim
+mask.any
+selected.ndim
+present.ndim
+torch.where
+```
+
+写入目标：
+
+```python
+selected
+present
+```
+
+直接调用符号：
+
+```python
+scoped(value, mask).sum
+scoped
+mask.any
+torch.where
+float
+```
+
+## `PlanningProblem.constraint_components.active_event`
+
+[定义位置](../../../manipulation/planning_problem.py#L1618)。
+
+输入签名：
+
+```python
+def active_event(requirement):
+```
+
+显式输出分支：
+
+```python
+self.start_progress <= requirement.progress <= self.end_progress
+```
+
+读取的对象属性：
+
+```python
+self.start_progress
+requirement.progress
+self.end_progress
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+无显式条目。
+
 ## `PlanningProblem.evaluate`
 
-[定义位置](../../../manipulation/planning_problem.py#L1532)。
+[定义位置](../../../manipulation/planning_problem.py#L1706)。
 
 输入签名：
 
@@ -4526,212 +4960,9 @@ self.residuals(position, quaternion, progress, joint_position, joint_names, join
 self.residuals
 ```
 
-## `PlanningProblem.functional_constraint_keys`
-
-[定义位置](../../../manipulation/planning_problem.py#L1542)。
-
-输入签名：
-
-```python
-def functional_constraint_keys(self):
-```
-
-实现说明：
-
-> Stable event/component identities for the current request suffix.
-
-显式输出分支：
-
-```python
-tuple([f'function_pose:{index}:{component}' for (index, requirement) in enumerate(self.pose_events) if requirement.progress >= self.start_progress for component in requirement.component_tolerances] + [f'function_coordinate:{index}' for (index, requirement) in enumerate(self.coordinate_events) if requirement.progress >= self.start_progress] + [f'support:{index}:{component}' for (index, requirement) in enumerate(self.supports) if requirement.progress >= self.start_progress for component in requirement.hard_components])
-```
-
-读取的对象属性：
-
-```python
-self.pose_events
-requirement.progress
-self.start_progress
-requirement.component_tolerances
-self.coordinate_events
-self.supports
-requirement.hard_components
-```
-
-写入目标：
-
-```python
-index
-requirement
-component
-```
-
-直接调用符号：
-
-```python
-tuple
-enumerate
-```
-
-## `PlanningProblem.functional_inequalities`
-
-[定义位置](../../../manipulation/planning_problem.py#L1559)。
-
-输入签名：
-
-```python
-def functional_inequalities(self, position, quaternion, progress, *, trajectory_time=None):
-```
-
-实现说明：
-
-> Return signed event residuals and their single physical query masks.
->
-> For input progress ``[batch, horizon]``, residual values have shape
-> ``[batch]`` and Boolean masks have shape ``[batch, horizon]``. A pose
-> event supplies position and orientation inequalities, plus a yaw row
-> when a declared axis has yaw_tolerance_rad < pi. Orientation means
-> full SO(3) angle without an axis and remaining swing with an axis;
-> a coordinate event uses its existing signed/unwrapped history before
-> taking the absolute error. Those values are
-> ``error/original_tolerance-1`` for positive bounds. Exact zero yaw uses
-> ``error/numerical.rotation_rad``; this scale preserves the zero-width
-> allowed set. A support event supplies its declared hard physical
-> inequalities divided by positive scales; their zero sets remain the
-> original finite-support requirements.
->
-> The first actual event instant is used even when progress pauses or an
-> exact anchor duplicates a regular sample. A missing required event is
-> NaN, not a falsely feasible zero. Events before a continued request's
-> start are absent from both dictionaries and retain their original IDs.
-
-显式输出分支：
-
-```python
-(signed, masks)
-```
-
-读取的对象属性：
-
-```python
-position.shape
-progress.shape
-quaternion.shape
-self.pose_events
-requirement.progress
-self.start_progress
-requirement.error_components
-requirement.component_tolerances.items
-requirement.component_tolerances
-self.coordinate_events
-requirement.error
-requirement.tolerance
-self.supports
-mask.to(torch.int64).argmax
-mask.to
-torch.int64
-position.gather
-selected[..., None].expand
-selected.shape
-quaternion.gather
-requirement.normalized_inequalities
-self.numerical
-requirement.hard_components
-torch.where
-mask.any
-value.squeeze
-```
-
-写入目标：
-
-```python
-signed
-masks
-index
-requirement
-mask
-errors
-name
-bound
-error
-selected
-event_position
-event_quaternion
-components
-component
-value
-key
-signed[key]
-masks[key]
-```
-
-直接调用符号：
-
-```python
-ValueError
-enumerate
-_first_event_query
-requirement.error_components
-requirement.component_tolerances.items
-add
-requirement.error
-mask.to(torch.int64).argmax
-mask.to
-position.gather
-selected[..., None].expand
-quaternion.gather
-requirement.normalized_inequalities
-torch.where
-mask.any
-value.squeeze
-float
-```
-
-## `PlanningProblem.functional_inequalities.add`
-
-[定义位置](../../../manipulation/planning_problem.py#L1585)。
-
-输入签名：
-
-```python
-def add(key, error, tolerance, mask):
-```
-
-显式输出分支：
-
-无显式条目。
-
-读取的对象属性：
-
-```python
-self.numerical.rotation_rad
-self.numerical
-torch.where(mask, (error - tolerance) / scale, 0.0).sum
-torch.where
-mask.any
-```
-
-写入目标：
-
-```python
-scale
-value
-signed[key]
-masks[key]
-```
-
-直接调用符号：
-
-```python
-torch.where(mask, (error - tolerance) / scale, 0.0).sum
-torch.where
-mask.any
-float
-```
-
 ## `PlanningProblem.optimizer_preferences`
 
-[定义位置](../../../manipulation/planning_problem.py#L1627)。
+[定义位置](../../../manipulation/planning_problem.py#L1715)。
 
 输入签名：
 
@@ -4743,8 +4974,7 @@ def optimizer_preferences(self, position, quaternion, progress, *, trajectory_ti
 
 > Guide process relations and optional quality-stage goal centering.
 >
-> Functional feasibility is supplied only by the signed inequality AL
-> terms. ``quality`` additionally evaluates soft support components and
+> Functional feasibility is supplied by constraint_components. ``quality`` additionally evaluates soft support components and
 > prefers the original goal center inside the same enforced tolerance.
 > Process equations and directional commands
 > retain their existing semantics in both phases; this method never
@@ -4889,7 +5119,7 @@ torch.finfo
 
 ## `PlanningProblem.measurements`
 
-[定义位置](../../../manipulation/planning_problem.py#L1711)。
+[定义位置](../../../manipulation/planning_problem.py#L1798)。
 
 输入签名：
 
@@ -4982,7 +5212,7 @@ requirement.error
 
 ## `PlanningProblem.verification_issues`
 
-[定义位置](../../../manipulation/planning_problem.py#L1742)。
+[定义位置](../../../manipulation/planning_problem.py#L1829)。
 
 输入签名：
 
@@ -5043,7 +5273,7 @@ requirement.history_complete
 
 ## `PlanningProblem.remaining_obligations`
 
-[定义位置](../../../manipulation/planning_problem.py#L1760)。
+[定义位置](../../../manipulation/planning_problem.py#L1847)。
 
 输入签名：
 
@@ -5135,7 +5365,7 @@ phase.metadata.get
 
 ## `PlanningProblem.projection_requirements`
 
-[定义位置](../../../manipulation/planning_problem.py#L1814)。
+[定义位置](../../../manipulation/planning_problem.py#L1901)。
 
 输入签名：
 
@@ -5193,7 +5423,7 @@ len
 
 ## `PlanningProblem.goal_requirements_at`
 
-[定义位置](../../../manipulation/planning_problem.py#L1831)。
+[定义位置](../../../manipulation/planning_problem.py#L1918)。
 
 输入签名：
 
@@ -5236,7 +5466,7 @@ abs
 
 ## `PlanningProblem.goal_residual`
 
-[定义位置](../../../manipulation/planning_problem.py#L1836)。
+[定义位置](../../../manipulation/planning_problem.py#L1923)。
 
 输入签名：
 
@@ -5308,7 +5538,7 @@ torch.cat
 
 ## `PlanningProblem.project_residual`
 
-[定义位置](../../../manipulation/planning_problem.py#L1868)。
+[定义位置](../../../manipulation/planning_problem.py#L1955)。
 
 输入签名：
 
@@ -5393,7 +5623,7 @@ torch.cat
 
 ## `_path_from_rows`
 
-[定义位置](../../../manipulation/planning_problem.py#L1912)。
+[定义位置](../../../manipulation/planning_problem.py#L1999)。
 
 输入签名：
 
@@ -5444,7 +5674,7 @@ np.eye
 
 ## `_model_from_diagnostics`
 
-[定义位置](../../../manipulation/planning_problem.py#L1922)。
+[定义位置](../../../manipulation/planning_problem.py#L2009)。
 
 输入签名：
 
@@ -5478,7 +5708,7 @@ np.asarray
 
 ## `_validate_skill_requirements`
 
-[定义位置](../../../manipulation/planning_problem.py#L1934)。
+[定义位置](../../../manipulation/planning_problem.py#L2021)。
 
 输入签名：
 
@@ -5555,7 +5785,7 @@ event['kind'].strip
 
 ## `_validate_skill_requirements.fields`
 
-[定义位置](../../../manipulation/planning_problem.py#L1941)。
+[定义位置](../../../manipulation/planning_problem.py#L2028)。
 
 输入签名：
 
@@ -5588,7 +5818,7 @@ sorted
 
 ## `build_planning_problem`
 
-[定义位置](../../../manipulation/planning_problem.py#L2030)。
+[定义位置](../../../manipulation/planning_problem.py#L2117)。
 
 输入签名：
 
@@ -5781,7 +6011,7 @@ getattr
 
 ## `build_planning_problem.append_interval`
 
-[定义位置](../../../manipulation/planning_problem.py#L2088)。
+[定义位置](../../../manipulation/planning_problem.py#L2175)。
 
 输入签名：
 

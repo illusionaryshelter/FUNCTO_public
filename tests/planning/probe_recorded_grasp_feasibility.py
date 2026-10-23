@@ -307,12 +307,13 @@ def probe(args, prepared, targets, report):
     problem, scene, budget = prepared["problem"], prepared["scene"], prepared["budget"]
     robot, metadata = _bounded_robot_configuration(prepared["robot"], problem, scene, budget)
     # BEGIN the standalone single-state query has the same CPU/GPU ownership.
-    allocation = scene.estimated_workspace_allocation(args.ik_seeds, 1, robot_coverage_horizon=1)
-    workspace = _PlanningWorkspace(allocation["cpu_shared"], allocation["cpu_live"],
-        sum(allocation[name] for name in ("gpu_retained", "gpu_live", "gpu_shared")), 0, 0, False)
+    allocation = scene.estimated_workspace_allocation(args.ik_seeds, 1)
+    workspace = _PlanningWorkspace(allocation["cpu_resident"], allocation["cpu_pending_shared"],
+        allocation["cpu_live"], sum(allocation[name] for name in ("gpu_retained", "gpu_live", "gpu_shared")), 0)
     if workspace.gpu_bytes > args.scene_gpu_workspace_mib*1024**2:
         raise ValueError("Actual single-state GPU scene queries exceed the declared workspace budget")
-    _require_planning_host_memory(workspace, max_host_rss_bytes=budget.max_host_rss_bytes)
+    _require_planning_host_memory(workspace.pending_cpu_bytes, encoded_record_bytes_upper=0,
+                                  max_host_rss_bytes=budget.max_host_rss_bytes)
     # END source geometry is never passed to the CUDA preflight as device bytes.
     device = DeviceCfg("cuda:0")
     report["resources"].update(estimated_scene_query_bytes=workspace.total_bytes,

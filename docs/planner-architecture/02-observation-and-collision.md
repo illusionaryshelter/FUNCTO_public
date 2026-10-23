@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`d7bcafc`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。
+代码基线：`774e121`；本文所述本轮新增有限几何目标已实现于工作区，最终实现提交由本轮统一提交标注。
 
 ## 1. 两种实体来源
 
@@ -32,7 +32,7 @@
 
 原始叶节点的局部点集由 `_initial_occupied_points` 在建树时按 1024 格分批计算，包含原角点、格内样本及边上的零点，并保持 `occupied_points` 的原顺序和算术。`_Node.points` 保存这份只读数组；后续刚体查询把同一局部点变换到相应实体姿态。动态细分节点继续按其当前范围计算点集。`storage_nbytes` 同时计入这些数组及其数组头，供场景资源准入使用。
 
-同一场维护占据单元与局部零面候选两套索引。占据树保留全部可能包含非正值的完整支持单元；`_zero_tree` 使用现有 SciPy `cKDTree` 索引满足 `min≤0≤max` 且 `min<max` 的单元中心。`local_zero` 在最近的最多八个此类单元中，以原三线性零面为等式、单元为范围，求局部零点及非零梯度方向。全负内部格和常值零格继续参与占据计算，局部方向查询只由具有零面方向的原单元提供。返回的是有限局部候选中的方向记录。
+占据树保留全部可能包含非正值的完整支持单元，包括全负内部格和常值零格。优化目标的材料点直接来自这些原叶；接触偏好的固定零点来自原顶点零值及符号变化边上的解析零根。三线性值和空间梯度均由本次试探位置所在的原支持单元计算。
 
 体积交叠见证须严格位于双方原始支持单元的开内部，包含坐标变换误差后的范围也不能触及原格边界。在每一侧，该范围上的插值值须可靠地严格为负，或原单元八角点全部非正。后一条件使整个单元属于 `φ≤0` 占据，包括插值恒为零的满格。由此确认共同占据的开邻域，而非仅有一个公共边界点。这里的原格边界不是搜索时产生的子框边界。
 
@@ -52,11 +52,15 @@
 
 `pair_residual` 为 `intersection` 返回分类残差 1，为 `clear` 和 `unresolved` 返回零碰撞残差，并独立返回原查询证据。分类量的导数为零；其单位是状态标记。未决身份保留在报告中。场景调用通过 `zero` 复用当前样本的可导零值，独立成对调用由两个位置张量构造该值。
 
-优化块开始时，`pair_local_model` 从实际基准状态的交叠证据取得一个材料点，并在另一个原观测场中求局部零点与法向。令点 `x` 属于实体 A，零点 `z` 和单位法向 `n` 属于实体 B；两个实体当前位姿为 `(R_A,p_A)`、`(R_B,p_B)`。`LocalPairModel.value` 计算 `d=(R_Ax+p_A−R_Bz−p_B)·R_Bn` 和 `f=ℓ·softplus(−d/ℓ)`，其中 `ℓ>0` 是提供零面的场的样本间距，`softplus(a)=log(1+exp(a))`。材料点、零点、局部法向和尺度在该块内固定，所有试探位姿都对这个相同标量求导，包含法向随 B 旋转的导数。无法取得局部零面时，硬证据照常保留，记录方向不可用。
+统一约束求解器通过 `OnlinePlanningScene.optimization_objective` 调用[固定材料点目标](api/sampled_geometry_objective.md)。求解首次调用固定各原场叶材料点及原单元身份；官方机器人形状使用已有可行点构造得到固定材料坐标。此后每个试探在原三线性支持域内读取实际场值和空间梯度；反向将原场点查询到官方机器人原生形状，包含关系由原生有符号点距离给出。两个方向的负值平方按原观测间距归一化，再取均值。原生自身配对保留 Coal 有符号距离及其当前见证导数。
 
-`LocalGeometryModels` 按种子、物理时刻、实体关系进度和接触许可进度保存上述记录。一个种子的全部线搜索粒子共享模型。试探时重新计算实际硬证据，局部模型在下一个实际基准状态才刷新；已分离试探仍可具有正 softplus 值，新出现的交叠仍具有原硬分类。`LocalContactModel` 另把一个固定目标零点相对声明有限区域的半空间超差范数作为 required contact 的连续目标。原 `query_region_intersection` 以支持零表面判断接触成立、缺失或未决。
+`MaterialSamples.point_bounds` 包围固定源材料坐标，`negative_bounds` 包围目标函数可能取负值的坐标。观测场的后一范围来自原占据树根所包含的完整支持单元：支持单元的三线性插值由非负权重组成，取负值要求至少一个原角点非正，因此这些完整单元覆盖全部可能负值位置。该范围计入原场格点查询的浮点运算误差。官方原生实体沿用已有支持投影范围。`_pair_separated` 用 `world_bounds` 和 `_local_interval` 将源材料范围变到目标坐标，并保留正变换及逆变换的数值区间；仅当两个方向均严格分离时返回零目标与两实体十四个位姿分量的零导数。许可只删除贡献，所以同一结论适用于原有限区域和原单元排除。相交或接触的范围继续调用完整目标。`zero_contribution_separated_pair_count` 记录此类零贡献配对；`sample_count_scope='material_points_actually_queried'` 明确支持、未知和活动点计数只统计实际调用的材料点。固定点集、分母和原实体验收均保持原定义。
 
-模型捕获和 `repeated_base_evaluation()` 作用域中的输入按种子复制同一个实际基准状态。场景在单次调用内以查询列、`(seed,time,relation_progress,permission_progress)` 及实体对、接触或覆盖身份保存数值查询记录；重复粒子读取相同记录，分别通过自身位姿和关节张量构造可微标量。不同查询列保留独立身份。普通线搜索试探各自完成原几何查询。`PhysicalGradientCore._refresh_local_geometry` 返回本次捕获的轨迹计算与模型变化标记，块边界从这份计算读取硬证据、固定排名目标和功能残差；目标改变后重新计算该基准状态的梯度。报告中的 `pair_queries` 统计逻辑实体对证据数量，数值查询复用不改变该计数的含义。
+有限点优化目标具有明确计算范围。原支持域和许可边界定义分段分支，最近特征切换处可能不可微；常值零场和常值负场内部的原空间梯度为零；有限点之间的交叠可能未进入目标。`report_out` 保存这些范围及实际查询计数。原实体体积交叠、required contact、覆盖及连续时间区间仍由各自原查询给出证据。
+
+`sample(excluded_cells=...)` 在目标查询时移除初始支撑声明的原第二实体单元；反向点集按同一单元 ID 删除对应材料。共享边界仍可由未删除邻格提供原值。有限接触仍由原 `_permission` 的实际半空间定义，两个重叠点端点分别测试。required contact 的偏好取固定原零点相对声明区域的最小超差；实际接触状态仍由 `query_region_intersection` 提供。
+
+每个实体对的临时点梯度先归约到两实体十四个位姿分量，再连回调用者的 FK 和三次轨迹变量。轨迹图按实体对及状态保存位姿导数，不按材料点数量保存整段点图。`estimated_workspace_allocation` 将 CPU 需求分为三项：`cpu_resident` 记录已驻留的原场、已匹配的原生配对缓存及已构造材料数组；`cpu_pending_shared` 记录尚未构造的固定材料上界及尚未匹配的原生配对缓存；`cpu_live` 记录一次实体对计算的临时数据与保留的位姿图。材料对象按身份去重，构造后其实际数组字节转入驻留项；每个材料对象的两个三维上下界数组最多占 96 字节，同时进入构造前上界和构造后实际计数。原场和已分配样本由 RSS 统计，新增准入使用后两项；GPU 项仅计点查询中具名关节、连杆位姿及其梯度的张量传送缓存。该目标是一阶接口，供同一 SLSQP 内核计算目标与雅可比。
 
 ## 4. 已知机器人与原任务场的组合
 
@@ -70,7 +74,7 @@
 
 `RobotStateValidator.required_pairs` 是原配对策略中所有 `required` 记录组成的元组。`OnlinePlanningScene._robot_self_components` 将该元组直接传给 `RobotGeometryChecker.query`，取得当前自碰撞条件需要的实体对证据；完整 `robot_pairs` 继续用于模型描述与快照保存。实体身份、几何形状和必检配对集合由原机器人配置确定。
 
-`DifferentiableRobotKinematics` 用 cuRobo 完整关节树求连杆位姿，包括本时刻名义手指坐标。场景对解析实体乘固定局部变换；凸顶点已在连杆坐标中，局部变换为单位阵。机器人模型与状态验证器共享同一个检查器。
+`DifferentiableRobotKinematics` 直接接收共享检查器现有的 Pinocchio 完整模型，包括本时刻名义手指坐标。`poses` 将输入显式传送为 CPU float64，调用同一 `PinKinematics`，再把位姿传回输入设备和精度；该传送保留梯度链。场景对解析实体乘固定局部变换；凸顶点已在连杆坐标中，局部变换为单位阵。`bind_online_robot` 只接收验证器和期限回调，模型与基座标定来自原验证器。
 
 `components(..., geometry_scope="robot")` 和 `geometry_scope="full"` 先运行同一手指状态、完整具名关节 FK、机器人实体放置和 `_robot_self_components`。共享函数输出 `collision/robot/self` 与 `unresolved/robot/self`；确定穿透使用原生有符号距离及其见证导数，数值边界保留独立未决分项。缺少名义手指几何时，对依赖相应关节的原配对记录 `unmodelled_motion`。手指控制残差与 conditional 手部状态也由同次手部计算保留。`robot` 范围完成这些项后返回；`full` 范围继续构造任务实体位姿并查询接触、观测场、支撑和覆盖。初始化与完整场景由此共享同一官方机器人实体、配对和数值分类。
 
@@ -80,13 +84,13 @@
 
 `query_native_field(..., native_bounds=(local,world))` 可直接消费同一原生实体的局部与世界投影范围。场景构造时保存不可变形状的局部范围；`components` 在本次调用内按实体和状态计算一次世界范围，供不同场配对复用。空场无需构造对应世界范围。required contact 使用的作用实体矩阵也在整批转换一次，然后按状态读取。这些范围和矩阵只复用相同几何计算，实体查询仍使用原形状和原任务场。
 
-完整范围的 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。完整场景优化另外提供 `local_models`，由 `objectives_out` 返回固定局部模型和其他连续场景项；机器人范围使用同次原生距离见证计算连续项。`evaluate` 在 acceptance 模式汇总硬分项，在 optimization 模式汇总优化项；两者均保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留 `geometry_scope`、分类计数和有限见证；场配对的未决只进入该报告。原生自身的 `numerical_boundary`、required contact、初始支撑高度与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
+完整范围的 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。主约束求解器通过独立 `optimization_objective` 取得固定有限目标，通过 `components` 与连续区间接口取得原实体证据，具体输入和作用见[场景接口](api/online_geometry.md)。`evaluate` 汇总所有非 conditional 原分项并保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留 `geometry_scope`、分类计数和有限见证；`nonclear_pairs` 按硬分项各选取物理时间最早与配对残差最大的记录，若两者相同则合并为一条。每条记录同时保留 `state_index`、`time_s`、任务 `progress`、接触许可 `permission_progress` 和选择原因。残差最大只在同一分项内部比较：机器人自身配对使用原生穿透距离，实体场配对使用原有交叠分类值。该显示选择直接消费已有查询证据；连续区间验收的完整 `geometry_evidence_out` 仍覆盖每个状态的每个要求配对。场配对的未决只进入查询报告。原生自身的 `numerical_boundary`、required contact、初始支撑高度与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
 
 区间几何调用显式提供 `geometry_evidence_out`，接收每个状态的完整实体对记录，包含原实体 ID、硬状态、距离范围、许可种类、内部组合体和未建模运动；该记录不受显示报告的有限条数限制。`first/second` 保存显示名称，`geometry_entity_key` 的两个同名字段分别保存 `robot/<geometry ID>`、`owner/<owner ID>` 或 `background`。带类别的实体键连接距离证据、运动界、配对缓存和交叠去重，也用于筛选依赖未建模手指运动的机器人实体；同名机器人组件与任务实体保留独立身份。
 
 原生机器人实体对的分离下界由 `native_pair_lower_bound` 对完整形状作支持投影，并保留数值范围。Coal 查询法向只提供投影方向，原生求解容差不被解释为距离误差界。区间检查如何将端点状态的几何证据与运动界结合，见[验收组件](05-acceptance-and-execution.md)。
 
-每次 `components` 调用从完整关节张量和各实体位置张量构造一次形状与进度一致的零值张量。条件未知跳过项、组合体内部跳过项及分类残差复用其中对应样本的标量。机器人自碰撞保留原生 signed distance 及刚体见证导数，初始支撑保留最小高度区间及其见证；这两个有量纲计算与固定局部零面模型分别提供连续优化项。
+每次 `components` 调用从完整关节张量和各实体位置张量构造一次形状与进度一致的零值张量。条件未知跳过项、组合体内部跳过项及分类残差复用其中对应样本的标量。机器人自碰撞保留原生 signed distance 及刚体见证导数，初始支撑保留最小高度区间及其见证；这两个有量纲计算保持其原数值语义；新的有限优化接口另对原值与长度尺度构造确定的平方目标。
 
 在每个实际进度样本，场景先以 `Attachment.active(progress)` 确定当前附着实体，再从任务场配对中排除两类内部对：`tool_geometry_names` 中任一工具实体与当前附着实体，以及同一 TCP 上两个当前附着实体。内部对不调用几何查询，`internal_assembly_pair_count` 记录排除的配对样本数。所有成员保留自己的原形状、位姿和观测支持，继续参与对背景、组合体外实体和其余机器人部件的查询。机器人自身仍由原生配对策略处理。有限接触的 `contact_permission_progress` 仅决定任务许可，不改变附着生效时刻。
 
@@ -100,6 +104,6 @@
 
 ## 6. 保存与调用关系
 
-`build_scene_from_rgbd → integrate_entity → freeze_mapper` 建立本次新任务场；已有场直接进入 `OnlinePlanningScene`。已知机器人由 `RobotGeometryChecker` 注册，规划器绑定完整 FK 后，在 IK、轨迹求解及验收中调用同一场景。
+`build_scene_from_rgbd → integrate_entity → freeze_mapper` 建立本次新任务场；已有场直接进入 `OnlinePlanningScene`。已知机器人由 `RobotGeometryChecker` 注册，规划器绑定完整 FK 后，在原状态检查和验收中调用同一场景；统一约束求解器向有限目标显式传入相同标定的 `robot_link_poses`，由场景乘固定组件变换并预测所有者关系。
 
-`to_execution_binding` 输出 `native_robot_observed_scene_v1`，保存机器人原形状、基座、标定、完整配对、固定角色、`tool_geometry_names` 和运动学配置，同时保存任务场样本、运动关系、有限任务接触与自由格。任务单场通过 `FrozenObservedField.from_record` 恢复；场景快照用于输入来源和身份交接，执行曲线恢复不等于重新构造可查询场景。
+`to_execution_binding` 输出 `native_robot_observed_scene_v1`，保存机器人原形状、基座、标定、完整配对、固定角色、`tool_geometry_names` ，同时保存任务场样本、运动关系、有限任务接触与自由格。任务单场通过 `FrozenObservedField.from_record` 恢复；场景快照用于输入来源和身份交接，执行曲线恢复不等于重新构造可查询场景。

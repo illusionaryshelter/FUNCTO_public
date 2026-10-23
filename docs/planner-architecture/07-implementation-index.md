@@ -1,10 +1,10 @@
 # 实现符号索引
 
-代码基线：`d7bcafc`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：`774e121-plus-unified-workspace`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **59 个文件、1032 个定义**。
+覆盖 **57 个文件、922 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -15,7 +15,7 @@
 | [manipulation/goals.py](api/goals.md) | 14 | [01](01-inputs-and-task-model.md) |
 | [manipulation/grasp.py](api/grasp.md) | 8 | [01](01-inputs-and-task-model.md) |
 | [manipulation/skill.py](api/skill.md) | 13 | [01](01-inputs-and-task-model.md) |
-| [manipulation/planning_problem.py](api/planning_problem.md) | 105 | [01](01-inputs-and-task-model.md) |
+| [manipulation/planning_problem.py](api/planning_problem.md) | 110 | [01](01-inputs-and-task-model.md) |
 | [manipulation/regions.py](api/regions.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/support_grounding.py](api/support_grounding.md) | 4 | [01](01-inputs-and-task-model.md) |
 | [manipulation/pipeline.py](api/pipeline.md) | 10 | [01](01-inputs-and-task-model.md) |
@@ -23,7 +23,7 @@
 | [manipulation/selection.py](api/selection.md) | 7 | [01](01-inputs-and-task-model.md) |
 | [manipulation/planning_observation.py](api/planning_observation.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/robot_self_filter.py](api/robot_self_filter.md) | 6 | [02](02-observation-and-collision.md) |
-| [manipulation/online_geometry.py](api/online_geometry.md) | 21 | [02](02-observation-and-collision.md) |
+| [manipulation/online_geometry.py](api/online_geometry.md) | 23 | [02](02-observation-and-collision.md) |
 | [manipulation/planning_scene.py](api/planning_scene.md) | 26 | [02](02-observation-and-collision.md) |
 | [manipulation/collision_records.py](api/collision_records.md) | 4 | [02](02-observation-and-collision.md) |
 | [manipulation/observations.py](api/observations.md) | 16 | [02](02-observation-and-collision.md) |
@@ -31,13 +31,10 @@
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/planning.py](api/planning.md) | 197 | [04](04-solver-and-search.md) |
+| [manipulation/planning.py](api/planning.md) | 161 | [04](04-solver-and-search.md) |
 | [manipulation/planning_ik.py](api/planning_ik.md) | 9 | [04](04-solver-and-search.md) |
-| [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 20 | [04](04-solver-and-search.md) |
-| [manipulation/physical_joint_domain.py](api/physical_joint_domain.md) | 22 | [04](04-solver-and-search.md) |
-| [manipulation/physical_joint_qp.py](api/physical_joint_qp.md) | 18 | [04](04-solver-and-search.md) |
-| [manipulation/curobo_solver_components.py](api/curobo_solver_components.md) | 34 | [04](04-solver-and-search.md) |
-| [manipulation/functional_augmented_lagrangian.py](api/functional_augmented_lagrangian.md) | 9 | [04](04-solver-and-search.md) |
+| [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 6 | [04](04-solver-and-search.md) |
+| [manipulation/physical_joint_domain.py](api/physical_joint_domain.md) | 10 | [04](04-solver-and-search.md) |
 | [manipulation/optimizer_device_checks.py](api/optimizer_device_checks.md) | 2 | [04](04-solver-and-search.md) |
 | [manipulation/resource_admission.py](api/resource_admission.md) | 5 | [04](04-solver-and-search.md) |
 | [manipulation/tensor_cpu_snapshot.py](api/tensor_cpu_snapshot.md) | 1 | [04](04-solver-and-search.md) |
@@ -47,13 +44,12 @@
 | [manipulation/robot_validation.py](api/robot_validation.md) | 11 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 15 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 26 | [05](05-acceptance-and-execution.md) |
-| [manipulation/planning_diagnostics.py](api/planning_diagnostics.md) | 15 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 5 | [05](05-acceptance-and-execution.md) |
-| [manipulation/implicit_distance.py](api/implicit_distance.md) | 29 | [02](02-observation-and-collision.md) |
+| [manipulation/implicit_distance.py](api/implicit_distance.md) | 28 | [02](02-observation-and-collision.md) |
 | [manipulation/observed_mapping.py](api/observed_mapping.md) | 10 | [02](02-observation-and-collision.md) |
 | [manipulation/observed_robot.py](api/observed_robot.md) | 4 | [02](02-observation-and-collision.md) |
-| [manipulation/observed_collision.py](api/observed_collision.md) | 6 | [02](02-observation-and-collision.md) |
+| [manipulation/observed_collision.py](api/observed_collision.md) | 5 | [02](02-observation-and-collision.md) |
 | [manipulation/observed_coverage.py](api/observed_coverage.md) | 4 | [02](02-observation-and-collision.md) |
 | [tests/planning/observed_robot_fixture.py](api/adapter-observed_robot_fixture.md) | 2 | [05](05-acceptance-and-execution.md) |
 | [manipulation/grasp_region.py](api/grasp_region.md) | 4 | [03](03-attachment-contact-and-hand.md) |
@@ -61,9 +57,11 @@
 | [manipulation/tool_geometry.py](api/tool_geometry.md) | 11 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_fixture.py](api/adapter-robot_fixture.md) | 31 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 6 | [02](02-observation-and-collision.md) |
-| [manipulation/local_geometry_model.py](api/local_geometry_model.md) | 15 | [02](02-observation-and-collision.md) |
+| [manipulation/sampled_geometry_objective.py](api/sampled_geometry_objective.md) | 13 | [02](02-observation-and-collision.md) |
 | [manipulation/geometry_motion_bound.py](api/geometry_motion_bound.md) | 14 | [05](05-acceptance-and-execution.md) |
 | [manipulation/interval_geometry.py](api/interval_geometry.md) | 12 | [05](05-acceptance-and-execution.md) |
-| [manipulation/reference_tracking.py](api/reference_tracking.md) | 15 | [04](04-solver-and-search.md) |
 | [manipulation/timed_reference.py](api/timed_reference.md) | 11 | [01](01-inputs-and-task-model.md) |
 | [manipulation/reference_visualization.py](api/reference_visualization.md) | 3 | [01](01-inputs-and-task-model.md) |
+| [manipulation/unified_solver.py](api/unified_solver.md) | 16 | [04](04-solver-and-search.md) |
+| [manipulation/cubic_constraints.py](api/cubic_constraints.md) | 11 | [04](04-solver-and-search.md) |
+| [manipulation/pin_kinematics.py](api/pin_kinematics.md) | 13 | [04](04-solver-and-search.md) |

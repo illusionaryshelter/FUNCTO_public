@@ -467,7 +467,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         scene = SimpleNamespace(gripper=None, required_progress_anchors=(), bind_robot_validator=Mock())
         scene.clone_for_rollout = lambda: deepcopy(scene)
         before = plain(request)
-        with patch("manipulation.planning._CuroboPlanner", side_effect=ValueError("native initialization gap")):
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=ValueError("native initialization gap")):
             result = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator, continuation=history)
         self.assertFalse(result.success)
         self.assertIn("native initialization gap", result.diagnostics["reason"])
@@ -519,7 +519,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
             private_scene.gripper.clock = {"bound": True}
             private_scene.gripper.commands = ()
             raise ValueError("native allocation failed after clock binding")
-        with patch("manipulation.planning._CuroboPlanner", side_effect=partially_initialize):
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=partially_initialize):
             result = plan_trajectory(request, scene, {}, robot_validator=self.robot_validator)
         self.assertFalse(result.success)
         self.assertIn("native allocation failed", result.diagnostics["reason"])
@@ -536,7 +536,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
         clock = {"time": 0.}
         planner.close = lambda: clock.update(time=2.)
         with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]), \
-                patch("manipulation.planning._CuroboPlanner", return_value=planner), \
+                patch("manipulation.planning._ConstrainedPlanner", return_value=planner), \
                 patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
             result = plan_trajectory(problem(), Scene(), {}, robot_validator=self.robot_validator,
                                      budget=PlanningBudget(planning_seconds=1.))
@@ -553,7 +553,7 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
             clock["time"] = 2.
             return {"candidate_id": "too-late"}
         with patch("manipulation.planning.time.monotonic", side_effect=lambda: clock["time"]), \
-                patch("manipulation.planning._CuroboPlanner", return_value=planner), \
+                patch("manipulation.planning._ConstrainedPlanner", return_value=planner), \
                 patch("manipulation.execution_binding.bind_candidate", side_effect=expensive_binding):
             result = plan_trajectory(problem(), Scene(), {}, robot_validator=self.robot_validator,
                                      budget=PlanningBudget(planning_seconds=1.))

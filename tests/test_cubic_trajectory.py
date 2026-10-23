@@ -1,158 +1,122 @@
-"""Independent CPU curve/gradient checks of the actual native tensor adapter."""
+"""Independent polynomial checks for the fixed-clock, free-terminal cubic."""
 
-# BEGIN no GPU context or robot assets are needed to test spline integration.
-from types import SimpleNamespace
+# BEGIN the mathematical basis is verified without an optimizer adapter.
 import unittest
 
 import numpy as np
 from scipy.interpolate import BSpline, CubicHermiteSpline
-import torch
 
-from manipulation.cubic_trajectory import CubicBasis, CubicTrajectoryStep, cubic_transition_config_type
-
-
-def output_state(batch, horizon, dof):
-    return SimpleNamespace(position=torch.zeros(batch, horizon, dof))
+from manipulation.cubic_trajectory import CubicBasis
 
 
-def independent_curve(q, dq, h, action):
-    """Direct complete-coefficient construction, independent of production rows."""
-    coefficients = np.r_[[(action[0]-2*h*dq)],
-                         [(1.5*q+.5*h*dq-.5*action[0])],
-                         action, np.repeat(action[-1:], 3, axis=0)]
-    return BSpline(np.arange(-3., len(action)+6.), coefficients, 3)
+def independent_curve(q, dq, clock, controls):
+    """Construct complete coefficients directly from the two entrance equalities."""
+    coefficients = np.concatenate(((controls[0]-2*clock*dq)[None],
+        (1.5*q+.5*clock*dq-.5*controls[0])[None], controls))
+    return BSpline(np.arange(-3., len(controls)+3.), coefficients, 3, extrapolate=False)
 
 
-class CubicTrajectoryTests(unittest.TestCase):
-    # BEGIN original-break export must retain derivatives as metric density changes.
-    def test_hermite_export_preserves_original_curve_and_avoids_dense_roundoff(self):
-        q = torch.tensor([[1.5, -.75, .2]])
-        dq = torch.tensor([[1e-5, -.02, .01]])
-        actions = q[:, None] + .025 * torch.sin(
-            torch.arange(54, dtype=torch.float32).reshape(1, 18, 3) * .37)
-        start = SimpleNamespace(position=q, velocity=dq)
-        for native_dt in (.125, .13005000352859497):
-            with self.subTest(native_dt=native_dt):
-                step = CubicTrajectoryStep(18, 4, native_dt, device="cpu")
-                times, positions, velocities = step.curve.hermite_nodes(
-                    actions[0].numpy(), q[0].numpy(), dq[0].numpy())
-                exported = CubicHermiteSpline(times, positions, velocities)
-                original = independent_curve(q[0].double().numpy(), dq[0].double().numpy(),
-                    step.knot_dt, actions[0].double().numpy())
-                query = (np.arange(1280) + .375) * (times[-1] / 1280)
+def evaluate(basis, controls, q, dq, progress, derivative):
+    weights, velocity = basis.weights(progress, derivative)
+    values = weights@(controls-q)+velocity[:, None]*dq
+    return values+q if derivative == 0 else values
+
+
+class CubicBasisTests(unittest.TestCase):
+    def test_all_physical_derivatives_match_independent_complete_coefficients(self):
+        rng = np.random.default_rng(19)
+        for count in (2, 8, 18):
+            for clock in (.125, .68):
+                basis = CubicBasis(count, clock)
+                q, dq = np.array([1.4, -.7]), np.array([-.13, .2])
+                controls = rng.normal(size=(count, 2))
+                progress = np.r_[0., rng.uniform(size=23), 1.]
+                oracle = independent_curve(q, dq, clock, controls)
                 for derivative in range(4):
-                    np.testing.assert_allclose(exported(query, derivative),
-                        original(query / step.knot_dt, derivative) / step.knot_dt**derivative,
-                        rtol=0, atol=2e-12)
-                self.assertEqual(len(times), 21)
-                np.testing.assert_array_equal(positions[0], q[0].numpy())
-                np.testing.assert_array_equal(velocities[0], dq[0].numpy())
-                np.testing.assert_array_equal(exported(query[query >= times[-2]], 1),
-                                               np.zeros((64, 3)))
-                for count in (641, 1281):
-                    output = step.sample(actions, start, torch.zeros(1, dtype=torch.int32),
-                        output_state(1, count, 3), valid_count=count, dense=True,
-                        output_dt=times[-1]/(count-1))
-                    dense_times = np.linspace(0., times[-1], count)
-                    rounded = CubicHermiteSpline(dense_times, output.position[0].numpy(),
-                                                output.velocity[0].numpy())
-                    self.assertGreater(np.max(np.abs(rounded(query, 3)-exported(query, 3))), .01)
-                    repeated = step.curve.hermite_nodes(actions[0].numpy(), q[0].numpy(), dq[0].numpy())
-                    for actual, expected in zip(repeated, (times, positions, velocities)):
-                        np.testing.assert_array_equal(actual, expected)
-    # END independent complete-coefficient B-spline supplies the comparison polynomial.
+                    actual = evaluate(basis, controls, q, dq, progress, derivative)
+                    np.testing.assert_allclose(actual,
+                        oracle(progress*(count-1), derivative)/clock**derivative,
+                        rtol=3e-13, atol=2e-12)
+                np.testing.assert_array_equal(evaluate(basis, controls, q, dq, [0.], 0), q[None])
+                np.testing.assert_array_equal(evaluate(basis, controls, q, dq, [0.], 1), dq[None])
 
-    def test_regular_dense_and_scipy_match_with_two_measured_entrances(self):
-        step = CubicTrajectoryStep(10, 4, .125, device="cpu")
-        q = torch.tensor([[1.4, -.7], [.2, 1.1]])
-        dq = torch.tensor([[1e-5, -2e-5], [-.13, .2]])
-        start = SimpleNamespace(position=q, velocity=dq)
-        indices = torch.tensor([0, 1, 1, 0], dtype=torch.int32)
-        action = torch.linspace(-.2, .6, 80).reshape(4, 10, 2)
-        goal = SimpleNamespace(dt=torch.full((4,), .125))
-        regular = step.forward(start, action, output_state(4, 49, 2), indices,
-            goal, torch.arange(4, dtype=torch.int32), torch.zeros(4, dtype=torch.uint8))
-        dense = step.sample(action, start, indices, output_state(4, 101, 2),
-                            valid_count=97, dense=True, output_dt=.0625)
-        before = torch.cuda.is_initialized()
-        for index in range(4):
-            curve = independent_curve(q[indices[index]].double().numpy(),
-                dq[indices[index]].double().numpy(), .5, action[index].double().numpy())
-            for derivative, name in enumerate(("position", "velocity", "acceleration", "jerk")):
-                expected = curve(np.arange(49)/4, derivative)/(.5**derivative)
-                np.testing.assert_allclose(getattr(regular, name)[index].numpy(), expected,
-                                           rtol=2e-7, atol=2e-7)
-                torch.testing.assert_close(getattr(regular, name)[index],
-                    getattr(dense, name)[index, :97:2], rtol=0, atol=0)
-            torch.testing.assert_close(regular.position[index, 0], q[indices[index]], rtol=0, atol=0)
-            torch.testing.assert_close(regular.velocity[index, 0], dq[indices[index]], rtol=0, atol=0)
-        torch.testing.assert_close(dense.position[:, 96:], action[:, -1:, :].expand(-1, 5, -1), rtol=0, atol=0)
-        self.assertEqual(torch.cuda.is_initialized(), before)
+    def test_polynomial_rows_match_the_same_curve_on_every_segment(self):
+        basis = CubicBasis(8, .3)
+        q, dq = np.array([.73, -.2]), np.array([.13, -.4])
+        controls = np.random.default_rng(3).normal(size=(8, 2))
+        coefficients = np.einsum("ksn,nj->ksj", basis.polynomial_weights, controls-q)
+        coefficients += basis.polynomial_velocity[:, :, None]*dq
+        for segment in range(basis.intervals):
+            local = np.linspace(0., 1., 9)
+            progress = (segment+local)/basis.intervals
+            for derivative in range(3):
+                expected = evaluate(basis, controls, q, dq, progress, derivative)
+                for joint in range(2):
+                    actual = np.poly1d(coefficients[:, segment, joint]).deriv(derivative)(local)
+                    actual = actual/basis.knot_dt**derivative+(q[joint] if derivative == 0 else 0.)
+                    np.testing.assert_allclose(actual, expected[:, joint], rtol=2e-13, atol=1e-12)
 
-    def test_first_two_controls_change_independent_entrance_derivatives_and_have_true_gradients(self):
-        step = CubicTrajectoryStep(8, 4, .125, device="cpu", dtype=torch.float64)
-        start = SimpleNamespace(position=torch.tensor([[.73]], dtype=torch.float64),
-                                velocity=torch.tensor([[-2.1e-5]], dtype=torch.float64))
-        index = torch.zeros(1, dtype=torch.int32)
-        action = torch.full((1, 8, 1), .73, dtype=torch.float64, requires_grad=True)
-        result = step.sample(action, start, index, output_state(1, 41, 1), valid_count=41)
-        rows = []
-        for value in (result.acceleration[0, 0, 0], result.jerk[0, 0, 0]):
-            rows.append(torch.autograd.grad(value, action, retain_graph=True)[0][0, :2, 0])
-        torch.testing.assert_close(torch.stack(rows), torch.tensor([[12., 0.], [-44., 8.]], dtype=torch.float64))
-        first_sample_gradient = torch.autograd.grad(result.position[0, 1, 0], action)[0][0, :2, 0]
-        self.assertTrue(bool((first_sample_gradient != 0).all()))
+    def test_original_hermite_breaks_reconstruct_every_cubic_segment(self):
+        basis = CubicBasis(18, .68)
+        q, dq = np.array([.73, -1.8]), np.array([1e-7, -.2])
+        controls = q+np.random.default_rng(6).normal(size=(18, 2))*.02
+        times, position, velocity = basis.hermite_nodes(controls, q, dq)
+        reconstructed = CubicHermiteSpline(times, position, velocity)
+        # Interior physical times distinguish polynomial preservation from
+        # matching only the exported position and velocity samples.
+        physical = (np.arange(basis.intervals)[:, None]+np.array([.17, .5, .83])).ravel()*.68
+        for derivative in range(4):
+            expected = evaluate(basis, controls, q, dq, physical/times[-1], derivative)
+            np.testing.assert_allclose(reconstructed(physical, derivative), expected, rtol=3e-12, atol=8e-13)
+        np.testing.assert_array_equal(position[0], q)
+        np.testing.assert_array_equal(velocity[0], dq)
+        self.assertEqual(len(times), basis.intervals+1)
 
-        def sampled(values):
-            state = step.sample(values, start, index, output_state(1, 41, 1), valid_count=41)
-            return torch.stack((state.position, state.velocity, state.acceleration, state.jerk))
+    def test_entrance_acceleration_and_jerk_are_independent_free_directions(self):
+        basis = CubicBasis(8, .5)
+        rows = np.stack([basis.weights([0.], derivative)[0][0, :2] for derivative in (2, 3)])
+        np.testing.assert_array_equal(rows, [[12., 0.], [-44., 8.]])
+        self.assertEqual(np.linalg.matrix_rank(rows), 2)
+        self.assertTrue(np.all(basis.weights([.01])[0][0, :2] != 0.))
 
-        self.assertTrue(torch.autograd.gradcheck(sampled, (action,), eps=1e-6, atol=1e-8, rtol=1e-7))
-
-    def test_original_curve_family_and_existing_terminal_interval_survive(self):
+    def test_free_terminal_state_can_continue_measured_velocity_without_stopping(self):
         basis = CubicBasis(10, .68)
-        q, dq = .73, -2.1e-5
-        original = np.linspace(-.2, .4, 8)
-        embedded = np.r_[q+.68*dq, q+2*.68*dq, original]
-        old = BSpline(basis.knot_vector,
-            np.r_[q+np.arange(-1, 3)*.68*dq, original, np.repeat(original[-1], 3)], 3)
+        q, dq = np.array([.73]), np.array([.2])
+        controls = q+(np.arange(10)+1)[:, None]*.68*dq
         progress = np.linspace(0, 1, 301)
         for derivative in range(4):
-            weights, velocity = basis.weights(progress, derivative)
-            actual = weights@(embedded-q)+velocity*dq+(q if derivative == 0 else 0.)
-            np.testing.assert_allclose(actual, old(progress*12, derivative)/(.68**derivative),
-                                       atol=2e-14, rtol=0)
-        weights, velocity = basis.weights(np.linspace(11/12, 1, 11))
-        np.testing.assert_array_equal(weights[:, -1], np.ones(11))
-        np.testing.assert_array_equal(velocity, np.zeros(11))
+            actual = evaluate(basis, controls, q, dq, progress, derivative)
+            expected = (q+progress[:, None]*9*.68*dq if derivative == 0 else
+                        np.full_like(actual, dq[0] if derivative == 1 else 0.))
+            np.testing.assert_allclose(actual, expected, atol=2e-14, rtol=0)
+        terminal_rows = np.stack([basis.weights([1.], order)[0][0] for order in range(3)])
+        self.assertEqual(np.linalg.matrix_rank(terminal_rows), 3)
 
-    def test_native_clock_and_hidden_goal_are_rejected_before_sampling(self):
-        step = CubicTrajectoryStep(8, 4, .125, device="cpu")
-        start = SimpleNamespace(position=torch.zeros(1, 1), velocity=torch.zeros(1, 1))
-        indices = torch.zeros(1, dtype=torch.int32)
-        args = (start, torch.zeros(1, 8, 1), output_state(1, 41, 1), indices)
-        with self.assertRaisesRegex(ValueError, "fixed request-wide"):
-            step.forward(*args, SimpleNamespace(dt=torch.tensor([.25])), indices, torch.zeros(1))
-        with self.assertRaisesRegex(ValueError, "hidden terminal"):
-            step.forward(*args, SimpleNamespace(dt=torch.tensor([.125])), indices, torch.ones(1))
+    # BEGIN the free terminal interval has independent position observations.
+    def test_reference_queries_remain_well_conditioned_as_control_count_grows(self):
+        for count in range(2, 30):
+            basis = CubicBasis(count, .3)
+            progress = basis.reference_parameters
+            self.assertEqual(len(progress), count)
+            self.assertGreater(progress[0], 0.)
+            self.assertEqual(progress[-1], 1.)
+            self.assertTrue(np.all(np.diff(progress) > 0.))
+            weights, _ = basis.weights(progress)
+            self.assertEqual(np.linalg.matrix_rank(weights), count)
+            # This is a regression bound on the sampling design, not a
+            # runtime condition-number gate or a constraint on the seed.
+            self.assertLess(np.linalg.cond(weights), 21.)
+    # END no initial observation duplicates the exactly eliminated measured q0.
 
-    def test_rebind_replaces_clock_and_keeps_new_actual_entrance(self):
-        step = CubicTrajectoryStep(8, 4, .125, device="cpu")
-        indices = torch.zeros(1, dtype=torch.int32)
-        action = torch.zeros(1, 8, 1)
-        start = SimpleNamespace(position=torch.zeros(1, 1), velocity=torch.zeros(1, 1))
-        step.sample(action, start, indices, output_state(1, 41, 1), valid_count=41)
-        old = step._regular_weights
-        step.bind_clock(.0625)
-        start.position.fill_(.4)
-        start.velocity.fill_(-.2)
-        result = step.sample(action, start, indices, output_state(1, 41, 1), valid_count=41)
-        self.assertIsNot(step._regular_weights, old)
-        torch.testing.assert_close(result.position[:, 0], start.position, rtol=0, atol=0)
-        torch.testing.assert_close(result.velocity[:, 0], start.velocity, rtol=0, atol=0)
-        self.assertEqual(step.knot_dt, .25)
+    def test_physical_clock_rescales_derivatives_of_a_zero_velocity_entry(self):
+        slow, fast = CubicBasis(8, .4), CubicBasis(8, .2)
+        progress = np.array([0., .12, .51, 1.])
+        for derivative in range(4):
+            np.testing.assert_allclose(fast.weights(progress, derivative)[0],
+                                       slow.weights(progress, derivative)[0]*2**derivative,
+                                       rtol=0, atol=0)
 
 
 if __name__ == "__main__":
     unittest.main()
-# END these tests validate the actual adapter, not robot collision feasibility.
+# END endpoint state, physical derivatives and export retain one polynomial.

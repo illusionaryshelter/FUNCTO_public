@@ -118,7 +118,7 @@ def run(output, knots=8, *, fixture_path):
                                          knots=knots, interpolation_buffer_size=768,
                                          trajectory_iterations=150, maximum_trajectory_solves=2, search_seconds=3.)
         report["knots"] = knots
-        original = planning._CuroboPlanner.optimize
+        original = planning._ConstrainedPlanner.optimize
         report["generation_attempts"] = []
 
         def measured(planner, seed):
@@ -140,7 +140,7 @@ def run(output, knots=8, *, fixture_path):
         # BEGIN restore collision diagnostics after every planner invocation.
         # The same imported helper may be reused after a native or diagnostic
         # exception; neither path may leave its observer on the shared class.
-        with patch.object(planning._CuroboPlanner, "optimize", new=measured):
+        with patch.object(planning._ConstrainedPlanner, "optimize", new=measured):
             result = planning.plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
         # END scoped collision diagnostics.
         report.update(status="completed", success=result.success, diagnostics=result.diagnostics)

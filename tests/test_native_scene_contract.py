@@ -52,50 +52,39 @@ def make_scene(tmp_path, *, gap=.001, fixed=(), occupied_background=False, polic
     return scene
 
 
-def evaluate(scene, role="acceptance"):
-    from manipulation.local_geometry_model import LocalGeometryModels
+def evaluate(scene):
+    """Run the same original entity conditions for every scene consumer."""
     q = torch.tensor([[[.04, -.02]]], dtype=torch.float64, requires_grad=True)
-    arguments = (None, torch.zeros((1, 1, 3), dtype=torch.float64),
+    return scene.components(None, torch.zeros((1, 1, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64),
-        torch.zeros((1, 1), dtype=torch.float64), q, ("left_slide", "right_slide"))
-    options = dict(trajectory_time=torch.zeros((1, 1)), query_role=role)
-    # BEGIN optimization tests explicitly capture the same actual base state.
-    if role == "optimization":
-        models = LocalGeometryModels()
-        models.begin_capture(1, 1)
-        options["local_models"] = models
-        scene.components(*arguments, **options)
-        models.finish_capture()
-    # END query role never silently creates a candidate-dependent objective.
-    return scene.components(*arguments, **options)
+        torch.zeros((1, 1), dtype=torch.float64), q, ("left_slide", "right_slide"),
+        trajectory_time=torch.zeros((1, 1)))
 
 
 def test_native_structure_gap_is_independent_of_task_acceptance_margin(tmp_path):
     scene = make_scene(tmp_path)
-    for role in ("optimization", "acceptance"):
-        costs = evaluate(scene, role)
-        assert costs["collision/robot/self"].item() == 0
-        assert costs["unresolved/robot/self"].item() == 0
-        assert scene.last_query_report["status_counts"]["separated"] == 1
-        assert not any("coverage" in key or "unknown" in key for key in costs)
+    costs = evaluate(scene)
+    assert costs["collision/robot/self"].item() == 0
+    assert costs["unresolved/robot/self"].item() == 0
+    assert scene.last_query_report["status_counts"]["separated"] == 1
+    assert not any("coverage" in key or "unknown" in key for key in costs)
 
 
-# BEGIN optimization and acceptance share task-field nonpenetration semantics.
+# BEGIN original task-field queries retain nonpenetration semantics.
 @pytest.mark.parametrize("gap,status", [(1e-3, "clear"), (1e-7, "clear"),
                                       (0., "unresolved"), (-1e-3, "intersection")])
-def test_task_field_gap_and_boundary_have_the_same_meaning_in_both_roles(tmp_path, gap, status):
+def test_task_field_gap_and_boundary_retain_original_nonpenetration_meaning(tmp_path, gap, status):
     from manipulation.implicit_distance import ObservedField
     scene = make_scene(tmp_path)
     scene.background = ObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
                                      origin=[-.005, .01 + gap, -.005], voxel_size=.01)
-    for role in ("optimization", "acceptance"):
-        costs = evaluate(scene, role)
-        assert (sum(costs.values()).item() > 0) == (status == "intersection")
-        assert scene.last_query_report["status_counts"].get(status, 0) > 0
-        assert scene.last_query_report["collision_rule"] == "nonpenetration"
-        if status == "unresolved":
-            assert any(row["status"] == "unresolved"
-                       for row in scene.last_query_report["nonclear_pairs"])
+    costs = evaluate(scene)
+    assert (sum(costs.values()).item() > 0) == (status == "intersection")
+    assert scene.last_query_report["status_counts"].get(status, 0) > 0
+    assert scene.last_query_report["collision_rule"] == "nonpenetration"
+    if status == "unresolved":
+        assert any(row["status"] == "unresolved"
+                   for row in scene.last_query_report["nonclear_pairs"])
 # END numerical uncertainty is visible without creating a clearance gate.
 
 
@@ -128,6 +117,55 @@ def test_scene_record_retains_model_policy_and_calibration(tmp_path):
     assert saved["robot_model"]["pairs"][0]["policy"] == "required"
     assert saved["robot_model"]["geometries"][1]["T_frame_geometry"][0][3] == .021
     assert "robot_bodies" not in saved
+
+
+# BEGIN displayed collision locations retain each component's actual query clock.
+def test_nonclear_diagnostics_keep_first_and_maximum_per_component(tmp_path):
+    scene = make_scene(tmp_path, occupied_background=True)
+    local = np.eye(4)
+    local[:3, 3] = [-.04, -.2, 0.]
+    checker = RobotGeometryChecker(tmp_path / "robot.urdf", base_frame="base", geometries=(
+        NativePrimitive("first", "base", "box", (.02, .02, .02), np.eye(4), "source"),
+        NativePrimitive("second", "left", "box", (.02, .02, .02), local, "source")))
+    scene.robot_model = scene.robot_validator.checker = checker
+
+    def poses(q, names):
+        zero = q[..., :1] * 0
+        quaternion = torch.cat((zero + 1, zero.expand(*q.shape[:-1], 3)), -1)
+        return {"base": (zero.expand(*q.shape[:-1], 3), quaternion),
+                "left": (torch.cat((q[..., :1], zero + .2, zero), -1), quaternion)}
+
+    scene.kinematics = SimpleNamespace(poses=poses)
+    q = torch.tensor([[[.059, -.02]] * 39 + [[.045, -.02]]], dtype=torch.float64)
+    progress = torch.linspace(.1, .9, 40, dtype=torch.float64)[None]
+    permission = progress + .05
+    times = torch.linspace(2., 6., 40, dtype=torch.float64)[None]
+    position, quaternion = poses(q, ())['base']
+    complete_evidence = []
+    costs = scene.components(None, position, quaternion, progress, q,
+        ("left_slide", "right_slide"), trajectory_time=times,
+        contact_permission_progress=permission, geometry_evidence_out=complete_evidence)
+    report = scene.last_query_report
+    assert report['pair_queries'] == len(complete_evidence) == 120
+    rows = report['nonclear_pairs']
+    assert {row['component'] for row in rows} == {
+        'collision/robot/self', 'collision/robot/background'}
+    self_rows = [row for row in rows if row['component'] == 'collision/robot/self']
+    assert len(self_rows) == 2
+    first, maximum = self_rows
+    assert first['selection'] == ['first'] and first['state_index'] == [0, 0]
+    assert maximum['selection'] == ['maximum_pair_residual']
+    assert maximum['state_index'] == [0, 39]
+    assert maximum['pair_residual_value'] == pytest.approx(costs['collision/robot/self'][0, 39])
+    for row in rows:
+        index = tuple(row['state_index'])
+        assert row['time_s'] == times[index].item()
+        assert row['progress'] == progress[index].item()
+        assert row['permission_progress'] == permission[index].item()
+    field_rows = [row for row in rows if row['component'] == 'collision/robot/background']
+    assert len(field_rows) == 1
+    assert field_rows[0]['selection'] == ['first', 'maximum_pair_residual']
+# END native self collisions cannot consume the observed-field display capacity.
 
 
 def test_primitive_fixed_rotation_and_translation_are_applied_once(tmp_path, monkeypatch):

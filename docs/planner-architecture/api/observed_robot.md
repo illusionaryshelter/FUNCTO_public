@@ -1,11 +1,11 @@
 # `manipulation/observed_robot.py` 实现契约
 
-代码基线：`d7bcafc`。
+代码基线：`774e121-plus-unified-workspace`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pure_kinematics`
 
-[定义位置](../../../manipulation/observed_robot.py#L13)。
+[定义位置](../../../manipulation/observed_robot.py#L11)。
 
 输入签名：
 
@@ -48,7 +48,7 @@ ValueError
 
 ## `DifferentiableRobotKinematics`
 
-[定义位置](../../../manipulation/observed_robot.py#L27)。
+[定义位置](../../../manipulation/observed_robot.py#L26)。
 
 ```python
 class DifferentiableRobotKinematics():
@@ -60,21 +60,27 @@ class DifferentiableRobotKinematics():
 
 实现说明：
 
-> Use all named joints, including nominal fingers, for native link poses.
+> Place native entities with the already registered Pinocchio model.
 >
 > The planning solver may optimize only the arm. The scene appends the
 > already selected measured/nominal finger coordinates before invoking this
-> complete tree. No future finger pose is obtained from the solver's locked
-> entrance configuration.
+> complete model. Every call uses the same CPU float64 Pinocchio algorithm.
+> Tensor copies connect CUDA/float32 proposal inputs to that algorithm and
+> restore its output to the input device/dtype while retaining autograd.
+>
+> The official robot and fixed end-effector configuration are reusable
+> across tasks because their shape and component relationships remain
+> fixed. This adapter receives the validator's existing kinematic model;
+> its poses come from named joints and the same base calibration.
 
 ## `DifferentiableRobotKinematics.__init__`
 
-[定义位置](../../../manipulation/observed_robot.py#L36)。
+[定义位置](../../../manipulation/observed_robot.py#L42)。
 
 输入签名：
 
 ```python
-def __init__(self, configuration, *, frames, T_reference_base, device):
+def __init__(self, model, *, frames, T_reference_base):
 ```
 
 显式输出分支：
@@ -84,46 +90,29 @@ def __init__(self, configuration, *, frames, T_reference_base, device):
 读取的对象属性：
 
 ```python
-KinematicsCfg.from_basic_urdf
-self.model.joint_names
-self.model
-np.asarray
-base[:3, 3].copy
-Rotation.from_matrix(base[:3, :3]).as_quat
-Rotation.from_matrix
+self._bridge.joint_names
+self._bridge
+self._bridge.frames
 ```
 
 写入目标：
 
 ```python
-kinematics
-native
 self.model
+self._bridge
 self.joint_names
-base
-self.position
-self.quaternion
+self.frames
 ```
 
 直接调用符号：
 
 ```python
-pure_kinematics
-KinematicsCfg.from_basic_urdf
-list
-DeviceCfg
-str
-Kinematics
-tuple
-np.asarray
-base[:3, 3].copy
-Rotation.from_matrix(base[:3, :3]).as_quat
-Rotation.from_matrix
+PinKinematics
 ```
 
 ## `DifferentiableRobotKinematics.poses`
 
-[定义位置](../../../manipulation/observed_robot.py#L53)。
+[定义位置](../../../manipulation/observed_robot.py#L48)。
 
 输入签名：
 
@@ -131,63 +120,45 @@ Rotation.from_matrix
 def poses(self, position, joint_names):
 ```
 
+实现说明：
+
+> Return original-device link poses with the same named-joint VJP.
+
 显式输出分支：
 
 ```python
-result
+{frame: tuple((value.to(device=position.device, dtype=position.dtype) for value in pose)) for (frame, pose) in poses.items()}
 ```
 
 读取的对象属性：
 
 ```python
-self.joint_names
-position[..., [names.index(name) for name in self.joint_names]].contiguous
-names.index
-self.model.compute_kinematics
-self.model
-JointState.from_position
-torch.as_tensor
-self.position
-position.dtype
+position.to
+torch.float64
+self._bridge.poses
+self._bridge
+value.to
 position.device
-self.quaternion
-state.tool_poses
-tools.tool_frames
-tools.quaternion
-tools.position
+position.dtype
+poses.items
 ```
 
 写入目标：
 
 ```python
-names
-ordered
-name
-state
-base_p
-base_q
-tools
-result
-index
+cpu_position
+poses
+value
 frame
-q
-p
-result[frame]
+pose
 ```
 
 直接调用符号：
 
 ```python
+position.to
+self._bridge.poses
 tuple
-set
-ValueError
-position[..., [names.index(name) for name in self.joint_names]].contiguous
-names.index
-self.model.compute_kinematics
-JointState.from_position
-list
-torch.as_tensor
-enumerate
-quaternion_rotate
-quaternion_multiply
+value.to
+poses.items
 ```

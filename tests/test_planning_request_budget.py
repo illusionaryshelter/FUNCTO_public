@@ -25,7 +25,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         # END these accounting tests never claim physical geometry validation.
 
     def test_failed_native_initializations_share_a_finite_request_budget(self):
-        with patch("manipulation.planning._CuroboPlanner", side_effect=TypeError("declared native API failure")) as native:
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=TypeError("declared native API failure")) as native:
             first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             saved = deepcopy(first.request_ledger)
             second = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=first.request_ledger)
@@ -61,7 +61,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         # END exhausted retries append their own mode without rewriting history.
 
     def test_rejected_budget_change_retains_prior_work_and_source_evidence(self):
-        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=RuntimeError("initialization failed")) as native:
             first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             first.request_ledger["effects"]["already_observed"] = {
                 "value": "T", "source": "earlier actual feedback", "timestamp_s": 3.}
@@ -81,7 +81,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
                                 saved["consumed_planning"]["planning_seconds"])
 
     def test_rejected_execution_record_still_accounts_against_supplied_request(self):
-        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=RuntimeError("initialization failed")) as native:
             first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             # BEGIN a requested actual continuation keeps its distinct mode.
             continuation_attempt = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, request_ledger=first.request_ledger,
@@ -107,7 +107,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         original = self.budget
         changed = replace(original, max_host_rss_bytes=12*1024**3,
             max_device_used_bytes=8*1024**3, max_scene_gpu_workspace_bytes=3*1024**3)
-        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("native allocation refused")) as native:
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=RuntimeError("native allocation refused")) as native:
             first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=original)
             saved = deepcopy(first.request_ledger)
             second = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator,
@@ -131,7 +131,7 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         self.assertEqual(changes[0]["consumed_planning"]["initializations"], 1)
 
     def test_resource_change_does_not_authorize_a_work_budget_change(self):
-        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("initialization failed")) as native:
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=RuntimeError("initialization failed")) as native:
             first = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator, budget=self.budget)
             rejected = plan_trajectory(self.problem, self.scene, {}, robot_validator=self.robot_validator,
                 request_ledger=first.request_ledger,

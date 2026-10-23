@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from manipulation.planning import _CuroboPlanner, plan_trajectory
+from manipulation.planning import _ConstrainedPlanner, plan_trajectory
 
 
 class PlanningPrecisionTests(unittest.TestCase):
@@ -51,9 +51,9 @@ class PlanningPrecisionTests(unittest.TestCase):
                     planner.ik.destroy.side_effect = lambda: self.assertFalse(
                         torch.backends.cuda.matmul.allow_tf32)
 
-                with patch.object(_CuroboPlanner, "_initialize", autospec=True,
+                with patch.object(_ConstrainedPlanner, "_initialize", autospec=True,
                                   side_effect=initialize):
-                    planner = _CuroboPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
+                    planner = _ConstrainedPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
                 planner.close()
                 self.assertEqual(self.flags(), (enabled, not enabled))
                 torch.backends.cuda.matmul.allow_tf32 = not enabled
@@ -71,16 +71,16 @@ class PlanningPrecisionTests(unittest.TestCase):
             torch.backends.cudnn.allow_tf32 = True
             raise ValueError("native initialization failed")
 
-        with patch.object(_CuroboPlanner, "_initialize", side_effect=failing_initialize):
+        with patch.object(_ConstrainedPlanner, "_initialize", side_effect=failing_initialize):
             with self.assertRaisesRegex(ValueError, "native initialization failed"):
-                _CuroboPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
+                _ConstrainedPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
         self.assertEqual(self.flags(), (False, False))
 
     def test_native_destroy_failure_still_restores_precision(self):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = False
-        with patch.object(_CuroboPlanner, "_initialize"):
-            planner = _CuroboPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
+        with patch.object(_ConstrainedPlanner, "_initialize"):
+            planner = _ConstrainedPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
         planner.ik = SimpleNamespace(destroy=Mock(side_effect=RuntimeError("destroy failed")))
         with self.assertRaisesRegex(RuntimeError, "destroy failed"):
             planner.close()
@@ -103,9 +103,10 @@ class PlanningPrecisionTests(unittest.TestCase):
             planner.scene_cpu_workspace_bytes = planner.scene_gpu_workspace_bytes = 0
             planner.anchor_fk_workspace_bytes = 0
             planner.anchor_capacity = 0
+            planner.goal_ik_candidates = {}
         # END fixtures retain the production initialization contract.
 
-        with patch.object(_CuroboPlanner, "_initialize", autospec=True, side_effect=initialize):
+        with patch.object(_ConstrainedPlanner, "_initialize", autospec=True, side_effect=initialize):
             # BEGIN failed requests retain accounting and restore caller precision.
             from manipulation.planning_problem import PlanningProblem, MotionPhase, PosePath
             path = PosePath(np.array([0., 1.]), np.stack([np.eye(4), np.eye(4)]), "reference")

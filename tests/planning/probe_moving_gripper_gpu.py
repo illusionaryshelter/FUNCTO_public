@@ -225,7 +225,7 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
         report["budget"] = asdict(budget)
         report["reference_tool_translation_m"] = float(np.linalg.norm(reference_position[-1]-reference_position[0]))
         report["commanded_width_m"] = ((reference_q[[0, -1]][:, finger_columns]-closed) @ np.sign(span)).tolist()
-        original_export = planner_module._CuroboPlanner.export
+        original_export = planner_module._ConstrainedPlanner.export
         report["candidate_scene_components"] = []
 
         def measured_export(planner, native_result):
@@ -251,11 +251,11 @@ def run(output, *, fixture_path, native_knots=8, interpolation_buffer_size=512):
                 })
             return curve, count
 
-        planner_module._CuroboPlanner.export = measured_export
+        planner_module._ConstrainedPlanner.export = measured_export
         try:
             result = plan_trajectory(problem, scene, robot, budget=budget, robot_validator=validator)
         finally:
-            planner_module._CuroboPlanner.export = original_export
+            planner_module._ConstrainedPlanner.export = original_export
         report.update(status="completed", success=result.success, diagnostics=result.diagnostics)
         if result.trajectory is not None:
             trajectory = result.trajectory

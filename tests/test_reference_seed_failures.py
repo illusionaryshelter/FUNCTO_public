@@ -1,7 +1,7 @@
 """CPU regressions for numerical IK proposals and independent success evidence.
 
 The analytic planner fixture supplies native-shaped positions and residuals;
-the production physical initializer preserves the measured entrance and bound clock.
+the production sample fit preserves the measured entrance and bound clock.
 These tests exercise proposal construction, not robot reachability or final
 task/scene qualification.
 """
@@ -52,10 +52,10 @@ def test_domain_invalid_native_states_do_not_change_tracking_or_coarse_branches(
         for query in invalid_queries:
             pools[query] = np.full_like(pools[query], invalid_value)
             flags[query] = np.zeros_like(flags[query])
-        planner, initialize, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+        planner, fitting, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
         seeds, _ = planner.reference_seeds()
         outcomes.append((seeds, warm_starts))
-        initialize.assert_called_once()
+        assert fitting.call_count == planner.budget.trajectory_seeds
         assert len(planner.reference_ik_chains) == 2
         for query, last_proposal in enumerate((None, None, 1, 1, 3, 4)):
             warm = warm_starts[query].numpy()
@@ -79,23 +79,19 @@ def test_domain_invalid_native_states_do_not_change_tracking_or_coarse_branches(
         torch.testing.assert_close(first, second, rtol=0., atol=0.)
 
 
-def test_legal_nonconverged_outputs_supply_tracking_and_control_proposals():
+def test_legal_nonconverged_outputs_supply_tracking_and_sample_proposals():
     """Finite failed states retain their status while proposing free coefficients."""
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
     flags = [np.zeros_like(row) for row in flags]
-    planner, initialize, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
-    with patch.object(planner.physical_domain, "fit_reference",
-                      wraps=planner.physical_domain.fit_reference) as fit:
-        seeds, counts = planner.reference_seeds()
-    fit.assert_not_called()
+    planner, fitting, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+    seeds, counts = planner.reference_seeds()
     assert counts == [0]*6
-    initialize.assert_called_once()
+    assert fitting.call_count == planner.budget.trajectory_seeds
     assert len(planner.reference_ik_chains) == 2
     assert bool(torch.isfinite(seeds).all())
-    np.testing.assert_array_equal(initialize.call_args.args[0][0].numpy(),
+    np.testing.assert_array_equal([call.args[1] for call in fitting.call_args_list],
         [chain["joint_positions"] for chain in planner.reference_ik_chains])
-    assert planner.initial_seed_strategies == ["reference_ik_control_polygon"]*2
-    planner._refine_reference_seeds.assert_called_once()
+    assert planner.initial_seed_strategies == ["reference_ik_samples"]*2
     for query, record in enumerate(planner.reference_ik_queries):
         assert record["warm_start_from_query"] == (None if query == 0 else query-1)
         assert all(not row["report"]["native_pose_ik_success"] for row in record["candidates"])
@@ -115,13 +111,13 @@ def test_legal_nonconverged_outputs_supply_tracking_and_control_proposals():
 def test_native_success_and_unestablished_static_verdicts_remain_separate(failed_check):
     """Stored False values without a violation do not fabricate measured failures."""
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
-    planner, initialize, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(
+    planner, fitting, warm_starts = fixtures.ReferenceSeedDiversityTests.planner_for(
         pools, flags, report_for=lambda row, success, parameter: {failed_check: False})
     seeds, counts = planner.reference_seeds()
     assert counts == [3]*6
     assert planner.reference_ik_distinct_counts == [3]*6
     assert len(planner.reference_ik_chains) == 2
-    initialize.assert_called_once()
+    assert fitting.call_count == planner.budget.trajectory_seeds
     assert bool(torch.isfinite(seeds).all())
     for query, record in enumerate(planner.reference_ik_queries):
         assert record["reference_status"] == "SOLVED"
@@ -158,31 +154,30 @@ def test_broken_native_values_keep_json_safe_failure_and_convergence_evidence():
 # END native success, numerical usability and continuous task acceptance remain distinct.
 
 
-# BEGIN complete numerical chains enter one physical initialization independently of success.
+# BEGIN complete numerical chains enter sample fitting independently of success.
 @pytest.mark.parametrize("solved", [(), (2,), (0, 1), (0, 2, 4), tuple(range(6))])
-def test_every_legal_proposal_enters_control_polygon_with_fixed_clock_and_entry(solved):
+def test_every_legal_proposal_enters_sample_fit_with_fixed_clock_and_entry(solved):
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
     for index in range(len(flags)):
         if index not in solved:
             flags[index] = np.zeros_like(flags[index])
-    planner, initialize, _ = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+    planner, fitting, _ = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
     domain = planner.physical_domain
     original_map, original_clock = domain._curve_map, dict(planner.formal_clock)
     q0, dq0 = planner.start.position.clone(), planner.start.velocity.clone()
-    with patch.object(domain, "fit_reference", wraps=domain.fit_reference) as fit:
-        seeds, _ = planner.reference_seeds()
+    seeds, _ = planner.reference_seeds()
     assert domain._curve_map is original_map and planner.formal_clock == original_clock
     assert seeds.shape == (1, 2, 6, 3)
-    assert bool(domain.feasible(seeds).all())
+    parameters = domain._curve_map.reference_parameters
+    for index, chain in enumerate(planner.reference_ik_chains):
+        np.testing.assert_allclose(domain.evaluate(seeds[0,index], parameters), chain['joint_positions'], atol=2e-14)
     np.testing.assert_array_equal(domain.evaluate(seeds[0], [0.])[:, 0], q0.expand(2, -1).numpy())
     np.testing.assert_allclose(domain.evaluate(seeds[0], [0.], 1)[:, 0],
                                dq0.expand(2, -1).numpy(), rtol=0, atol=1e-14)
-    initialize.assert_called_once()
-    np.testing.assert_array_equal(initialize.call_args.args[0][0].numpy(),
+    assert fitting.call_count == planner.budget.trajectory_seeds
+    np.testing.assert_array_equal([call.args[1] for call in fitting.call_args_list],
         [chain["joint_positions"] for chain in planner.reference_ik_chains])
     assert planner.request_work["ik_queries"] == 6*planner.budget.ik_seeds
-    planner._refine_reference_seeds.assert_called_once()
-    fit.assert_not_called()
     for chain in planner.reference_ik_chains:
         expected = ["SOLVED" if index in solved else "APPROXIMATE_PROPOSAL" for index in range(6)]
         assert chain["query_statuses"] == expected
@@ -195,14 +190,14 @@ def test_changed_legal_failed_states_change_numerical_proposals_without_claiming
         flags = [np.array([index in (0, 2, 4)]) for index in range(6)]
         for index in (1, 3, 5):
             pools[index] = np.full((1, 3), failed_value)
-        planner, initialize, warm = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags, seed_count=1)
+        planner, fitting, warm = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags, seed_count=1)
         planner.reference_seeds()
-        proposals.append(initialize.call_args.args[0].clone())
+        proposals.append(fitting.call_args_list[0].args[1].copy())
         tracking.append(warm)
         assert planner.reference_ik_chains[0]["query_statuses"] == [
             "SOLVED", "APPROXIMATE_PROPOSAL", "SOLVED", "APPROXIMATE_PROPOSAL", "SOLVED", "APPROXIMATE_PROPOSAL"]
-    assert not torch.equal(proposals[0], proposals[1])
-    torch.testing.assert_close(proposals[0][:, :, [0, 2, 4]], proposals[1][:, :, [0, 2, 4]], rtol=0, atol=0)
+    assert not np.array_equal(proposals[0], proposals[1])
+    np.testing.assert_array_equal(proposals[0][[0, 2, 4]], proposals[1][[0, 2, 4]])
     assert not torch.equal(tracking[0][2], tracking[1][2])
 # END proposal values and native convergence evidence remain separate inputs.
 
@@ -235,27 +230,21 @@ def test_failed_native_submission_retains_the_consumed_candidate_count():
 def test_joint_reference_is_sampled_once_in_active_order_before_complete_optimization():
     from manipulation.planning import JointTrajectory
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
-    planner, initialize, calls = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
-    planner.source_progress_map = planner.progress_map
-    planner.reference_time_map = None
+    planner, fitting, calls = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
     times = np.array([0., .4, 1.2, 2.])
     source_q = np.stack((.1*times**2, -.02*times**2, .03*times**2), -1)
     source_dq = np.stack((.2*times, -.04*times, .06*times), -1)
     source = JointTrajectory(tuple(reversed(planner.joint_names)), times, source_q, source_dq,
         np.array([0., 1.]), np.array([0., 1.]), (), (), {})
     originals = [value.copy() for value in (source.times, source.position, source.velocity)]
-    with patch.object(planner.physical_domain, "fit_reference", wraps=planner.physical_domain.fit_reference) as fit:
-        seeds, success = planner.reference_seeds(joint_reference=source)
+    seeds, success = planner.reference_seeds(joint_reference=source)
     expected_times = planner.physical_domain._curve_map.reference_parameters*source.duration
     expected_controls = source.sample(expected_times)[0][:, ::-1]
-    initialize.assert_called_once()
-    np.testing.assert_allclose(initialize.call_args.args[0][0].numpy(),
+    assert fitting.call_count == planner.budget.trajectory_seeds
+    np.testing.assert_allclose([call.args[1] for call in fitting.call_args_list],
         np.broadcast_to(expected_controls, (2, *expected_controls.shape)), atol=1e-14)
-    fit.assert_not_called()
-    planner._refine_reference_seeds.assert_called_once()
     assert success == [] and calls == [] and planner.request_work["ik_queries"] == 0
-    assert planner.initial_seed_strategies == ["recorded_joint_control_polygon"]*2
-    assert bool(planner.physical_domain.feasible(seeds).all())
+    assert planner.initial_seed_strategies == ["recorded_joint_samples"]*2
     for actual, original in zip((source.times, source.position, source.velocity), originals):
         np.testing.assert_array_equal(actual, original)
 
@@ -263,10 +252,7 @@ def test_joint_reference_is_sampled_once_in_active_order_before_complete_optimiz
 def test_joint_reference_sampling_preserves_bound_clock_and_motion_inside_a_pause():
     from manipulation.planning import JointTrajectory, _ProgressMap
     _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
-    planner, initialize, calls = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
-    planner.source_progress_map = _ProgressMap(np.array([0., .25, .5, 1.]),
-                                               np.array([0., .5, .5, 1.]))
-    planner.reference_time_map = _ProgressMap(np.array([0., .4, 1.]), np.array([0., .8, 1.]))
+    planner, fitting, calls = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
     planner.progress_map = _ProgressMap(np.array([0., .125, .25, .4, 1.]),
                                         np.array([0., .5, .5, .8, 1.]))
     # Only endpoint Hermite breaks are needed for this exact quadratic. Its
@@ -278,10 +264,53 @@ def test_joint_reference_sampling_preserves_bound_clock_and_motion_inside_a_paus
         np.array([0., .2, .8, 1.]), np.array([0., .5, .5, 1.]), (), (), {})
     planner.reference_seeds(joint_reference=source)
     native_u = planner.physical_domain._curve_map.reference_parameters
-    original_u = np.interp(native_u, [0., .4, 1.], [0., .8, 1.])
-    expected_source_u = np.interp(original_u, [0., .25, .5, 1.], [0., .2, .8, 1.])
+    expected_source_u = np.interp(native_u, [0., .125, .25, .4, 1.], [0., .2, .8, .92, 1.])
     expected = .1*(2.*expected_source_u)**2
-    np.testing.assert_allclose(initialize.call_args.args[0][0, 0].numpy(),
+    np.testing.assert_allclose(fitting.call_args_list[0].args[1],
         np.broadcast_to(expected[:, None], (6, 3)), atol=1e-14)
     assert calls == []
 # END the supplied candidate remains distinct from its new numerical proposal.
+
+
+# BEGIN an added reference terminal interval retains source-curve parameterization.
+def test_joint_reference_uses_original_pause_phase_before_added_terminal_interval():
+    from manipulation.planning import JointTrajectory, _ProgressMap, reference_progress_clock
+    _, _, pools, flags = fixtures.ReferenceSeedDiversityTests.two_tracks()
+    planner, fitting, calls = fixtures.ReferenceSeedDiversityTests.planner_for(pools, flags)
+    source_map = _ProgressMap(np.array([0., .2, .8, 1.]), np.array([0., .5, .5, 1.]))
+    planner.source_progress_map = source_map
+    planner.progress_map, planner.reference_time_map = reference_progress_clock(
+        source_map, planner.budget.knots, stop_progress=(), anchors=source_map.s)
+    # The source quadratic continues moving during its own progress pause.
+    # It has no terminal pause; the scheduling prior contributes that interval.
+    times = np.array([0., 2.])
+    source = JointTrajectory(planner.joint_names, times,
+        np.broadcast_to((.1*times**2)[:, None], (2, 3)).copy(),
+        np.broadcast_to((.2*times)[:, None], (2, 3)).copy(),
+        source_map.u, source_map.s, (), (), {})
+    planner.reference_seeds(joint_reference=source)
+    parameters = planner.physical_domain._curve_map.reference_parameters
+    expected_time = 2*np.interp(parameters, planner.reference_time_map.u,
+                               planner.reference_time_map.s)
+    expected = np.broadcast_to((.1*expected_time**2)[:, None], (6, 3))
+    np.testing.assert_allclose(fitting.call_args_list[0].args[1], expected, atol=1e-14)
+    assert len(planner.progress_map.anchor_parameters([1.])) == 2
+    assert fitting.call_count == planner.budget.trajectory_seeds
+    assert calls == []
+# END the complete source polynomial supplies one initial coefficient fit.
+
+
+# BEGIN cancellation preserves already completed native-query evidence.
+def test_reference_query_cancellation_retains_completed_work_and_stops_before_fit():
+    from manipulation.planning import MotionPlanningError
+    _,_,pools,flags=fixtures.ReferenceSeedDiversityTests.two_tracks()
+    planner,fitting,calls=fixtures.ReferenceSeedDiversityTests.planner_for(pools,flags)
+    cancelled=MotionPlanningError('cancelled','declared cancellation')
+    planner.check_request.side_effect=[None,cancelled]
+    with pytest.raises(MotionPlanningError) as raised:
+        planner.reference_seeds()
+    assert raised.value is cancelled
+    assert len(calls)==len(planner.reference_ik_queries)==1
+    assert planner.request_work['ik_queries']==planner.budget.ik_seeds
+    fitting.assert_not_called()
+# END request interruption cannot reset submitted native work.

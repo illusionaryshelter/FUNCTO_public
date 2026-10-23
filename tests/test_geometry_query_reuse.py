@@ -51,8 +51,14 @@ def test_missing_required_contact_converts_each_actor_batch_once(tmp_path, monke
 
     monkeypatch.setattr(online, "_matrices", counted)
     result = evaluate(scene, count)
-    assert batches == [count] * 5
-    assert sum(batches) == 5 * count
+    # BEGIN original contact intersection reuses registered entity transforms.
+    # The retired local-contact surrogate converted an additional TCP actor
+    # matrix. Original finite-region intersection only needs the target's
+    # already converted matrix, in addition to the scene collision entities.
+    entities = len(scene.robot_model.geometry_names) + len(scene.owners) + 1
+    assert batches == [count] * entities
+    assert sum(batches) == entities * count
+    # END one transform per registered entity is independent of batch length.
     torch.testing.assert_close(result["contact/required_feature"], torch.ones((1, count), dtype=torch.float64))
 
 

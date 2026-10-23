@@ -754,14 +754,17 @@ class MechanismRequirement:
         angular = numerator/(w.square()+along.square()).clamp_min(torch.finfo(w.dtype).eps**2)
         return angular if self.model.kind == "revolute" else torch.cat((planar, angular), -1)
 
-    def direction_residuals(self, position, quaternion, progress, *, trajectory_time,
+    # BEGIN expose the original feasible side of each direction requirement.
+    def direction_inequalities(self, position, quaternion, progress, *, trajectory_time,
                             tool_linear_velocity=None, tool_angular_velocity=None, mode="trajectory",
                             use_tolerance=True):
-        """Check finite ordered queries; only final curves use instantaneous rates.
+        """Signed values <= 0 at finite ordered physical-time queries.
 
         A geometric OMPL path uses physical-time secants solely to screen a
         seed. Its downstream cubic must still pass true J(q) dq rate checks.
         Single-state seed membership deliberately proves no path direction.
+        Inactive queries have zero values and derivatives. This preserves the
+        query layout while exposing feasible slack to a constrained solver.
         """
         import torch
         if mode not in {"trajectory", "path", "point"}:
@@ -795,7 +798,7 @@ class MechanismRequirement:
                 last = progress.shape[-1]-1-torch.flip(at_end, [-1]).to(torch.int64).argmax(-1, keepdim=True)
                 origin = values.gather(-1, first) if direction.origin_coordinate is None else direction.origin_coordinate
                 change = direction.sign*(values.gather(-1, last)-origin)
-                error = torch.relu(direction.minimum-change-tolerance)
+                error = direction.minimum-change-tolerance
                 complete = at_end.any(-1, keepdim=True) & (at_start.any(-1, keepdim=True)
                     if direction.origin_coordinate is None else torch.ones_like(at_start[..., :1]))
                 error = torch.where(complete, error, float("inf"))
@@ -804,18 +807,29 @@ class MechanismRequirement:
                 error = torch.where(scoped_progress.amin(-1, keepdim=True) > direction.end+1e-7, 0., error)
                 violation = violation.scatter(-1, last, error)
             elif direction.kind == "local_rate" and rates is not None:
-                violation = torch.where(active, torch.relu(direction.minimum-
-                    direction.sign*rates[..., direction.coordinate_index]-tolerance), 0.)
+                violation = torch.where(active, direction.minimum-
+                    direction.sign*rates[..., direction.coordinate_index]-tolerance, 0.)
             else:
                 elapsed = times[..., 1:]-times[..., :-1]
                 pair = active[..., 1:] & active[..., :-1] & (elapsed > 0)
                 signed = direction.sign*(values[..., 1:]-values[..., :-1])
                 if direction.kind == "local_rate":
                     signed = signed/elapsed.clamp_min(torch.finfo(elapsed.dtype).tiny)
-                error = torch.relu(direction.minimum-signed-tolerance)
+                error = direction.minimum-signed-tolerance
                 violation = torch.cat((violation[..., :1], torch.where(pair, error, 0.)), -1)
             result[f"direction:{index}:{direction.kind}"] = torch.gather(violation, -1, restore)
         return result
+
+    def direction_residuals(self, position, quaternion, progress, *, trajectory_time,
+                            tool_linear_velocity=None, tool_angular_velocity=None, mode="trajectory",
+                            use_tolerance=True):
+        """Positive violations of the same signed direction inequalities."""
+        import torch
+        return {name: torch.relu(value) for name, value in self.direction_inequalities(
+            position, quaternion, progress, trajectory_time=trajectory_time,
+            tool_linear_velocity=tool_linear_velocity, tool_angular_velocity=tool_angular_velocity,
+            mode=mode, use_tolerance=use_tolerance).items()}
+    # END optimization and diagnostic direction checks share one computation.
     # END true coordinate rates and path-dependent direction obligations.
 # END independently scoped current mechanism and lifted coordinate checks.
 
@@ -856,13 +870,14 @@ class SupportRequirement:
             raise ValueError("Support hard components must be distinct declared geometry components")
         # END an empty hard set explicitly makes the complete support a preference.
 
-    # BEGIN retain all source-declared support inequalities for optimization.
-    def raw_inequalities(self, position, quaternion, numerical):
-        """Return four signed per-pose requirements, each satisfied at <= 0.
+    # BEGIN preserve every material-point/support-plane inequality separately.
+    def inequality_components(self, position, quaternion, numerical):
+        """Return signed <= 0 rows before reducing points or support planes.
 
         Lengths remain in metres and the normal error remains a chord length.
-        Keeping feasible-side values lets AL multipliers decrease without
-        inventing a tangent location or yaw target inside this finite support.
+        Gap rows are the two sides of each contact-point height. Body rows
+        bound each material point above the support. Footprint rows retain
+        every body-point/polygon-edge pair. The normal is one chord bound.
         """
         import torch
         p, q = _compose(position, quaternion, self.tool_from_carrier)
@@ -873,19 +888,28 @@ class SupportRequirement:
         height = (body-origin) @ normal
         xy = (body-origin) @ _tensor(self.surface.basis, p)
         equations = _tensor(self.surface._hull.equations, p)
-        footprint = (xy @ equations[:, :2].T+equations[:, 2]).amax(dim=(-1, -2))
+        footprint = xy @ equations[:, :2].T+equations[:, 2]
         outward = quaternion_rotate(q, _tensor(self.outward_normal, q).expand(*q.shape[:-1], 3))
         # Chord distance is monotone in angle on [0, pi] and avoids acos's
         # infinite derivative when a correctly aligned face has dot == 1.
         chord = torch.linalg.vector_norm(outward+normal, dim=-1)
         angular_bound = 2*np.sin(self.normal_tolerance/2)
-        return {"gap": gaps.abs().amax(-1)-self.gap_tolerance,
-                "body": -height.amin(-1)-numerical.position_m,
+        return {"gap": torch.stack((gaps, -gaps), -1)-self.gap_tolerance,
+                "body": -height-numerical.position_m,
                 "footprint": footprint+self.margin-numerical.position_m,
                 "normal": chord-angular_bound}
 
+    def raw_inequalities(self, position, quaternion, numerical):
+        """Return the four original per-pose maxima of signed support rows."""
+        components = self.inequality_components(position, quaternion, numerical)
+        return {"gap": components["gap"].amax(dim=(-1, -2)),
+                "body": components["body"].amax(-1),
+                "footprint": components["footprint"].amax(dim=(-1, -2)),
+                "normal": components["normal"]}
+    # END hard rows, quality preferences and measurements share the geometry.
+
     def normalized_inequalities(self, position, quaternion, numerical):
-        """Scale units for AL without changing any acceptance right-hand side.
+        """Scale support preferences while retaining each physical threshold.
 
         The three length requirements share the declared gap scale, bounded
         below by numerical precision. In particular, a tight boundary rounding
@@ -1070,14 +1094,19 @@ class CoordinateEventRequirement:
     def kind(self):
         return self.mechanism.model.kind
 
-    def error(self, position, quaternion, progress, *, trajectory_time=None):
+    # BEGIN signed native event errors retain the actual lifted coordinate.
+    def signed_error(self, position, quaternion, progress, *, trajectory_time=None):
         import torch
         coordinate = self.mechanism.coordinates(position, quaternion, progress, trajectory_time=trajectory_time)[..., 0]
         difference = coordinate-self.absolute_target
         if self.kind == "revolute":
             local = torch.atan2(torch.sin(difference), torch.cos(difference))
             difference = torch.where(self.mechanism.history_complete(progress)[..., None], difference, local)
-        return difference.abs()
+        return difference
+
+    def error(self, position, quaternion, progress, *, trajectory_time=None):
+        return self.signed_error(position, quaternion, progress, trajectory_time=trajectory_time).abs()
+    # END the two event bounds and the existing absolute-error report agree.
 
     def evaluate(self, position, quaternion, progress, *, trajectory_time=None):
         import torch
@@ -1104,13 +1133,17 @@ class InteriorRequirement:
         if not self.source or not 0 <= self.start <= self.end or not np.isfinite(self.margin) or self.margin < 0:
             raise ValueError("Interior requirements need a bounded interval, margin, and evidence")
 
-    def evaluate(self, position, quaternion, numerical):
-        import torch
+    # BEGIN expose each original body-point/interior-halfspace inequality.
+    def raw_inequalities(self, position, quaternion, numerical):
         p, q = _compose(position, quaternion, self.tool_from_carrier)
         points = p[..., None, :]+quaternion_rotate(q, _tensor(self.body_points, p).expand(*p.shape[:-1], *self.body_points.shape))
         h = _tensor(self.halfspaces, p)
-        error = (points @ h[:, :3].T+h[:, 3]+self.margin).amax(dim=(-1, -2))
-        return torch.relu(error-numerical.position_m)
+        return points @ h[:, :3].T+h[:, 3]+self.margin-numerical.position_m
+
+    def evaluate(self, position, quaternion, numerical):
+        import torch
+        return torch.relu(self.raw_inequalities(position, quaternion, numerical).amax(dim=(-1, -2)))
+    # END positive maximum reports retain the same finite convex interior.
 
 
 # BEGIN one current skill with separate goals, process relations and references.
@@ -1295,8 +1328,12 @@ class PlanningProblem:
                          (requirement.start, requirement.end) if hasattr(requirement, "start")
                          else (self.start_progress, float(self.phase_count)))
                 # BEGIN geometric accuracy is posthoc, never an online gate.
-                consumers = (("PlanningProblem.residuals", "simulation_posthoc_pose_evaluation")
-                             if name in {"pose_events", "supports", "coordinate_events"} else ("PlanningProblem.residuals",))
+                # BEGIN the complete signed interface consumes each task declaration.
+                consumers = (("PlanningProblem.constraint_components", "PlanningProblem.residuals",
+                              "simulation_posthoc_pose_evaluation")
+                             if name in {"pose_events", "supports", "coordinate_events"}
+                             else ("PlanningProblem.constraint_components", "PlanningProblem.residuals"))
+                # END posthoc geometry remains a separate consumer from planning.
                 categories = ((category, "simulation_posthoc_obligation")
                               if name in {"pose_events", "supports", "coordinate_events"} else (category,))
                 # END nominal optimization retains its original allowed set.
@@ -1305,10 +1342,11 @@ class PlanningProblem:
                 if name == "mechanisms":
                     if requirement.coordinate_limits is not None:
                         add((name, index, "coordinate_limits"), ("process_requirement",),
-                            ("PlanningProblem.residuals",), scope, requirement.source)
+                            ("PlanningProblem.constraint_components", "PlanningProblem.residuals"),
+                            scope, requirement.source)
                     for direction_index, direction in enumerate(requirement.directions):
                         add((name, index, "directions", direction_index), ("process_requirement",),
-                            ("MechanismRequirement.direction_residuals",),
+                            ("MechanismRequirement.direction_inequalities", "MechanismRequirement.direction_residuals"),
                             (direction.start, direction.end), direction.source)
         for index, condition in enumerate(self.conditions):
             kind = condition.get("kind")
@@ -1342,7 +1380,10 @@ class PlanningProblem:
                     or event.requires_evidence or event.stop or event.timing):
                 consumers.append("TrajectoryExecutor.execute")
             if event.stop:
-                consumers.append("planning._verification_stop_preference")
+                # BEGIN stops have explicit signed joint-velocity rows.
+                consumers.append("PlanningProblem.constraint_components")
+                # END the event occurrence and original clock remain unchanged.
+                consumers.append("PlanningProblem.residuals")
             if event.timing:
                 consumers.extend(("planning._validate_bound_event_times", "execution._timing_checks"))
             categories = (("actual_evidence_obligation",) if event.kind == "effect" else
@@ -1529,6 +1570,139 @@ class PlanningProblem:
                     torch.relu(joint_velocity.abs()-self.numerical.velocity).sum(-1), 0.)
         return result
 
+    # BEGIN complete signed task rows for the single constrained trajectory solve.
+    def constraint_components(self, position, quaternion, progress, joint_position=None,
+                              joint_names=None, joint_velocity=None, *, trajectory_time,
+                              tool_linear_velocity=None, tool_angular_velocity=None):
+        """Return ``(equalities, inequalities)`` with EQ=0 and INEQ<=0.
+
+        Inputs are the actual candidate tool pose, joint state and tool twist
+        at one fixed complete physical-time query layout. Poses use the task
+        reference frame and wxyz quaternions; twist uses that same reference
+        frame and seconds. The caller validates ``verification_issues`` once
+        when binding the layout, including all exact anchors and the start of
+        angular history. Local-rate declarations require the actual J(q) dq
+        twist. These are full-trajectory inputs, not local membership queries.
+
+        Dictionary insertion order and row shapes depend only on declarations
+        and that fixed layout. Each tensor may be flattened and concatenated;
+        Torch autograd differentiates the same signed values. Values retain
+        physical units and the existing declared/numerical allowances. No
+        positive-part penalty or maximum hides feasible-side derivatives.
+        Zero-width yaw is an equality of its signed principal angle. Other
+        tolerated requirements keep their existing inequalities, including
+        numerical joint-coupling and stop allowances.
+
+        Point events use one earliest actual query. Process rows certify only
+        the supplied finite queries; coordinate monotonicity compares adjacent
+        ordered queries, and local rates use instantaneous twist at those
+        queries. This method supplies no continuous-interval certificate.
+        Scene relations and event clock windows are bound by their existing
+        scene/clock consumers before this task computation.
+        """
+        import torch
+        equalities, inequalities = {}, {}
+
+        def scoped(value, mask):
+            """Retain the fixed query/point layout with inactive zero rows."""
+            expanded = mask[(...,)+(None,)*(value.ndim-mask.ndim)]
+            return torch.where(expanded, value, 0.)
+
+        def at_event(value, mask):
+            """Gather one physical arrival while retaining any component axes."""
+            selected = scoped(value, mask).sum(progress.ndim-1)
+            present = mask.any(-1)
+            present = present[(...,)+(None,)*(selected.ndim-present.ndim)]
+            return torch.where(present, selected, float("nan"))
+
+        def active_event(requirement):
+            return self.start_progress <= requirement.progress <= self.end_progress
+
+        inequalities["progress:lower"] = self.start_progress-progress
+        inequalities["progress:upper"] = progress-self.end_progress
+        pose_allowance = _tensor([self.numerical.position_m]*3+
+                                 [self.numerical.rotation_rad]*3, position)
+        for index, requirement in enumerate(self.pose_relations):
+            error = requirement.error(position, quaternion, progress)
+            mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+            for side, sign in ((0, -1), (1, 1)):
+                columns = np.flatnonzero(np.isfinite(requirement.pose_bounds[:, side]))
+                if len(columns):
+                    bound = _tensor(requirement.pose_bounds[columns, side], position)
+                    value = sign*(error[..., columns]-bound)-pose_allowance[columns]
+                    inequalities[f"pose_relation:{index}:{'lower' if side == 0 else 'upper'}"] = scoped(value, mask)
+
+        for index, requirement in enumerate(self.mechanisms):
+            mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+            position_error, rotation_error = requirement.errors(position, quaternion)
+            inequalities[f"mechanism:{index}:position"] = scoped(
+                position_error-requirement.model.position_tolerance-1e-10, mask)
+            inequalities[f"mechanism:{index}:rotation"] = scoped(
+                rotation_error-requirement.model.rotation_tolerance-1e-10, mask)
+            if requirement.coordinate_limits is not None:
+                coordinates = requirement.coordinates(position, quaternion, progress,
+                                                       trajectory_time=trajectory_time)
+                bounds = _tensor(requirement.coordinate_limits, position)
+                inequalities[f"mechanism_limits:{index}:lower"] = scoped(bounds[:, 0]-coordinates, mask)
+                inequalities[f"mechanism_limits:{index}:upper"] = scoped(coordinates-bounds[:, 1], mask)
+            for name, value in requirement.direction_inequalities(position, quaternion, progress,
+                    trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity,
+                    tool_angular_velocity=tool_angular_velocity).items():
+                inequalities[f"mechanism:{index}:{name}"] = value
+
+        for index, requirement in enumerate(self.supports):
+            if not active_event(requirement):
+                continue
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            values = requirement.inequality_components(at_event(position, mask),
+                                                       at_event(quaternion, mask), self.numerical)
+            for name in requirement.hard_components:
+                inequalities[f"support:{index}:{name}"] = values[name]
+
+        for index, requirement in enumerate(self.interiors):
+            mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
+            inequalities[f"interior:{index}"] = scoped(
+                requirement.raw_inequalities(position, quaternion, self.numerical), mask)
+
+        for index, requirement in enumerate(self.pose_events):
+            if not active_event(requirement):
+                continue
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            errors = requirement.error_components(at_event(position, mask), at_event(quaternion, mask))
+            for name, bound in requirement.component_tolerances.items():
+                key = f"function_pose:{index}:{name}"
+                if name == "yaw" and bound == 0:
+                    equalities[key] = errors["signed_yaw"]
+                else:
+                    inequalities[key] = errors[name]-bound
+
+        for index, requirement in enumerate(self.coordinate_events):
+            if not active_event(requirement):
+                continue
+            mask = _first_event_query(progress, requirement.progress, trajectory_time)
+            # Complete history is a layout precondition: use the lifted actual
+            # coordinate directly, with no principal-angle local screening.
+            coordinates = requirement.mechanism.coordinates(position, quaternion, progress,
+                                                             trajectory_time=trajectory_time)[..., 0]
+            difference = at_event(coordinates, mask)-requirement.absolute_target
+            inequalities[f"function_coordinate:{index}:lower"] = -difference-requirement.tolerance
+            inequalities[f"function_coordinate:{index}:upper"] = difference-requirement.tolerance
+
+        for index, coupling in enumerate(self.couplings):
+            columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
+            error = (joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)
+                     -_tensor(coupling.target, joint_position))
+            inequalities[f"coupling:{index}:lower"] = -error-self.numerical.joint
+            inequalities[f"coupling:{index}:upper"] = error-self.numerical.joint
+        for index, event in enumerate(self.events):
+            if event.stop and active_event(event):
+                mask = _first_event_query(progress, event.progress, trajectory_time)
+                velocity = at_event(joint_velocity, mask)
+                inequalities[f"stop:{index}:lower"] = -velocity-self.numerical.velocity
+                inequalities[f"stop:{index}:upper"] = velocity-self.numerical.velocity
+        return equalities, inequalities
+    # END task constraints retain source semantics and differentiable feasible slack.
+
     def evaluate(self, position, quaternion, progress, joint_position=None,
                  joint_names=None, joint_velocity=None, *, trajectory_time=None, point_goal_ids=None,
                  tool_linear_velocity=None, tool_angular_velocity=None, direction_mode="trajectory"):
@@ -1537,99 +1711,12 @@ class PlanningProblem:
                                   point_goal_ids=point_goal_ids, tool_linear_velocity=tool_linear_velocity,
                                   tool_angular_velocity=tool_angular_velocity, direction_mode=direction_mode).values())
 
-    # BEGIN exact signed point inequalities for the functional AL objective.
-    @property
-    def functional_constraint_keys(self):
-        """Stable event/component identities for the current request suffix."""
-        return tuple(
-            [f"function_pose:{index}:{component}"
-             for index, requirement in enumerate(self.pose_events)
-             if requirement.progress >= self.start_progress
-             # BEGIN only explicitly constrained orientation components get AL rows.
-             for component in requirement.component_tolerances]
-             # END a full-turn yaw interval has no hidden optimization target.
-            + [f"function_coordinate:{index}"
-               for index, requirement in enumerate(self.coordinate_events)
-               if requirement.progress >= self.start_progress]
-            + [f"support:{index}:{component}"
-               for index, requirement in enumerate(self.supports)
-               if requirement.progress >= self.start_progress
-               for component in requirement.hard_components])
-
-    def functional_inequalities(self, position, quaternion, progress, *, trajectory_time=None):
-        """Return signed event residuals and their single physical query masks.
-
-        For input progress ``[batch, horizon]``, residual values have shape
-        ``[batch]`` and Boolean masks have shape ``[batch, horizon]``. A pose
-        event supplies position and orientation inequalities, plus a yaw row
-        when a declared axis has yaw_tolerance_rad < pi. Orientation means
-        full SO(3) angle without an axis and remaining swing with an axis;
-        a coordinate event uses its existing signed/unwrapped history before
-        taking the absolute error. Those values are
-        ``error/original_tolerance-1`` for positive bounds. Exact zero yaw uses
-        ``error/numerical.rotation_rad``; this scale preserves the zero-width
-        allowed set. A support event supplies its declared hard physical
-        inequalities divided by positive scales; their zero sets remain the
-        original finite-support requirements.
-
-        The first actual event instant is used even when progress pauses or an
-        exact anchor duplicates a regular sample. A missing required event is
-        NaN, not a falsely feasible zero. Events before a continued request's
-        start are absent from both dictionaries and retain their original IDs.
-        """
-        import torch
-        if position.shape != (*progress.shape, 3) or quaternion.shape != (*progress.shape, 4):
-            raise ValueError("Pose arrays must align with the complete progress horizon")
-        signed, masks = {}, {}
-
-        def add(key, error, tolerance, mask):
-            # BEGIN a zero yaw width is an exact declaration with numerical scaling.
-            scale = tolerance if tolerance > 0 else self.numerical.rotation_rad
-            value = torch.where(mask, (error-tolerance)/scale, 0.).sum(-1)
-            # END scaling never expands the declared interval.
-            signed[key] = torch.where(mask.any(-1), value, float("nan"))
-            masks[key] = mask
-
-        for index, requirement in enumerate(self.pose_events):
-            if requirement.progress < self.start_progress:
-                continue
-            mask = _first_event_query(progress, requirement.progress, trajectory_time)
-            # BEGIN task geometry defines the same components for optimization and delivery.
-            errors = requirement.error_components(position, quaternion)
-            for name, bound in requirement.component_tolerances.items():
-                add(f"function_pose:{index}:{name}", errors[name], bound, mask)
-            # END free yaw does not acquire a nominal-centre constraint.
-        for index, requirement in enumerate(self.coordinate_events):
-            if requirement.progress < self.start_progress:
-                continue
-            mask = _first_event_query(progress, requirement.progress, trajectory_time)
-            error = requirement.error(position, quaternion, progress, trajectory_time=trajectory_time)
-            add(f"function_coordinate:{index}", error, requirement.tolerance, mask)
-        # BEGIN expand complete support geometry only at its unique event pose.
-        for index, requirement in enumerate(self.supports):
-            if requirement.progress < self.start_progress:
-                continue
-            mask = _first_event_query(progress, requirement.progress, trajectory_time)
-            selected = mask.to(torch.int64).argmax(-1, keepdim=True)
-            event_position = position.gather(-2, selected[..., None].expand(*selected.shape, 3))
-            event_quaternion = quaternion.gather(-2, selected[..., None].expand(*selected.shape, 4))
-            components = requirement.normalized_inequalities(event_position, event_quaternion, self.numerical)
-            for component in requirement.hard_components:
-                value = components[component]
-                key = f"support:{index}:{component}"
-                signed[key] = torch.where(mask.any(-1), value.squeeze(-1), float("nan"))
-                masks[key] = mask
-        # END missing required events cannot masquerade as feasible zero values.
-        return signed, masks
-    # END these normalized optimizer inequalities do not change hard residuals.
-
     # BEGIN keep optional goal centering separate from functional feasibility.
     def optimizer_preferences(self, position, quaternion, progress, *, trajectory_time=None,
                               tool_linear_velocity=None, tool_angular_velocity=None, phase="quality"):
         """Guide process relations and optional quality-stage goal centering.
 
-        Functional feasibility is supplied only by the signed inequality AL
-        terms. ``quality`` additionally evaluates soft support components and
+        Functional feasibility is supplied by constraint_components. ``quality`` additionally evaluates soft support components and
         prefers the original goal center inside the same enforced tolerance.
         Process equations and directional commands
         retain their existing semantics in both phases; this method never

@@ -15,7 +15,7 @@ import torch
 
 from manipulation.planning import (
     JointTrajectory, MotionBackend, MotionPlanningError, PlanningBudget,
-    _CuroboPlanner, _ProgressMap, _bind_motion_work_ledger, _verified_dependency_outcomes,
+    _ConstrainedPlanner, _ProgressMap, _bind_motion_work_ledger, _verified_dependency_outcomes,
 )
 from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath
 
@@ -53,19 +53,16 @@ class Native:
         self.budget = PlanningBudget()
         core = lambda: SimpleNamespace(optimizers=[])
         self.ik = SimpleNamespace(config=SimpleNamespace(exit_early=False), core=core())
-        self.trajopt = SimpleNamespace(core=core(),
-            transition_model=SimpleNamespace(compute_inverse_dynamics=False))
         self.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         self.scene_workspace_bytes = self.scene_cpu_workspace_bytes = self.scene_gpu_workspace_bytes = 0
         self.anchor_fk_workspace_bytes = 0
         self.anchor_capacity = 256
         self.validation_storage = {}
         self.route = "constrained"
-        self.functional_constraints = SimpleNamespace(keys=("event",))
         self.reference_ik_distinct_counts = self.reference_ik_queries = self.reference_ik_chains = []
         self.goal_ik_candidates = {}
         self.reference_initialization = {"status": "completed", "scene_constraints": "not_evaluated"}
-        self.main_trajectory_iterations = self.budget.trajectory_iterations//2
+        self.main_trajectory_iterations = self.budget.trajectory_iterations
         self.joint_reference_report = None
         self.initial_seed_strategies = self.seed_strategies = ["test", "test"]
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
@@ -81,7 +78,6 @@ class Native:
         self.calls.append("seed")
         return torch.zeros((1, 2, 8, 1)), []
     # BEGIN request fixtures use the same terminal-evidence dispatch predicate.
-    known_initialization_failures = _CuroboPlanner.known_initialization_failures
     # END missing terminal evidence preserves the existing qualification route.
     def evaluate_reference(self, seed):
         self.calls.append("reference")
@@ -94,7 +90,7 @@ class Native:
         record_work(passes=1)
         # END query counts are charged only by actual completed fixture queries.
         report = {"accepted": accepted, "native_success": accepted, "seed_provenance": "test",
-                  "fixed_objective": 1., "objective_components": {"continuous_reference": 1.},
+                  "fixed_objective": 1., "objective_components": {"motion_quality": 1.},
                   "residuals": {"process_scene" if self.collision else "skill_process": 0. if accepted else 1.},
                   # BEGIN recovery evidence is distinct from the hard scene aggregate.
                   "collision_residuals": {"rollout:scene_collision": float(self.collision and not accepted)},
@@ -107,8 +103,6 @@ class Native:
         self.calls.append("ompl")
         return (seed if self.ompl_available else None), {"state_queries": 1}
     # BEGIN the default fixture has no uncovered dense collision samples.
-    def promote_collision_witnesses(self, result):
-        return {"changed": False, "parameters": []}
     # END dedicated recovery tests supply new physical-time evidence below.
     def export(self, result, native_report):
         # BEGIN delivery consumes the already completed candidate metrics.
@@ -126,7 +120,7 @@ class Native:
 
 def run(native, *, budget=None, scene=None, **kwargs):
     backend = MotionBackend({}, robot_validator=object(), budget=budget)
-    with patch("manipulation.planning._CuroboPlanner", return_value=native), \
+    with patch("manipulation.planning._ConstrainedPlanner", return_value=native), \
          patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
         result = backend.plan(problem(), Scene() if scene is None else scene, **kwargs)
     return result, backend
@@ -157,7 +151,7 @@ def test_real_candidate_binding_preserves_observed_geometry_and_rejects_mutation
     native = Native([True, True])
     backend = MotionBackend({}, robot_validator=object())
     try:
-        with patch("manipulation.planning._CuroboPlanner", return_value=native):
+        with patch("manipulation.planning._ConstrainedPlanner", return_value=native):
             result = backend.plan(problem(), scene)
         assert result.success and native.calls.count("export") == 1
         binding = check_result(result)
@@ -208,10 +202,8 @@ def test_recovery_failure_returns_no_execution_binding_or_export():
 
 
 # BEGIN a model-support gap cannot spend the collision recovery branch.
-@pytest.mark.parametrize("functional", [False, True])
-def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_recovery(functional):
+def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_recovery():
     native = Native([False, False, False])
-    native.functional_constraints.keys = ("event",) if functional else ()
     select = native.select_candidate
     def missing_support(accepted, *, record_work):
         candidate, curve, report = select(accepted, record_work=record_work)
@@ -220,7 +212,6 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
         report["scene_update_residuals"] = {"rollout:scene_update": 400000., "interpolated:scene_update": 500000.}
         return candidate, curve, report
     native.select_candidate = missing_support
-    native.promote_collision_witnesses = lambda _: pytest.fail("Support gap is not collision evidence")
     result, backend = run(native)
     try:
         assert not result.success and result.execution_binding is None
@@ -248,7 +239,6 @@ def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(
         # END the aggregate coverage channel alone is insufficient for a policy verdict.
         return candidate, curve, report
     native.select_candidate = covered
-    native.promote_collision_witnesses = lambda _: pytest.fail("Coverage is not a collision witness")
     result, backend = run(native)
     try:
         assert result.success is search_succeeds
@@ -277,7 +267,6 @@ def test_forbidden_coverage_cannot_replenish_a_zero_search_budget():
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": 1.}
         return candidate, curve, report
     native.select_candidate = forbidden
-    native.promote_collision_witnesses = lambda _: pytest.fail("Coverage is not a collision witness")
     result, backend = run(native, budget=PlanningBudget(search_seconds=0.))
     try:
         assert not result.success and result.execution_binding is None
@@ -299,7 +288,6 @@ def test_other_scene_terms_cannot_masquerade_as_forbidden_coverage(component):
         report["scene_components"] = {component: {"maximum": 1.}}
         return candidate, curve, report
     native.select_candidate = other_scene_failure
-    native.promote_collision_witnesses = lambda _: pytest.fail("Unclassified scene failure is not collision")
     result, backend = run(native)
     try:
         assert not result.success and result.execution_binding is None
@@ -336,7 +324,6 @@ def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(st
             return candidate, curve, report
 
         native.select_candidate = confirmed
-    native.promote_collision_witnesses = lambda _: pytest.fail("Observation need is not a collision witness")
     result, backend = run(native, scene=world)
     try:
         assert not result.success and result.trajectory is None and result.execution_binding is None
@@ -344,7 +331,7 @@ def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(st
         assert native.calls == ([] if stage == "initial" else
             ["seed", "reference"] if stage == "reference" else ["seed", "reference", "solve"])
         assert result.request_ledger["consumed_planning"]["search_queries"] == 0
-        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == int(stage != "initial")
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == int(stage == "main")
     finally:
         backend.close()
 
@@ -421,91 +408,10 @@ def test_unknown_policy_failure_cannot_erase_other_failures_or_missing_evidence(
 
 
 # BEGIN collision witnesses consume the original unique second solve.
-@pytest.mark.parametrize("accepted", [False, True])
-def test_new_dense_witnesses_continue_current_controls_without_search_or_third_solve(accepted):
-    native = Native([False, False, accepted], collision=True)
-    original_select = native.select_candidate
-    optimized_controls = torch.full((1, 1, 8, 1), .37)
-    recovery_seeds = []
-
-    def select(outcome, *, record_work):
-        selected, curve, report = original_select(outcome, record_work=record_work)
-        selected.solution = optimized_controls.clone()
-        return selected, curve, report
-
-    def promote(result):
-        native.calls.append("promote")
-        torch.testing.assert_close(result.solution, optimized_controls)
-        return {"changed": True, "parameters": [.37], "added_count": 1}
-
-    original_optimize = native.optimize
-    def optimize(seed, *, iterations=None):
-        recovery_seeds.append(seed.clone())
-        return original_optimize(seed, iterations=iterations)
-
-    native.select_candidate, native.promote_collision_witnesses = select, promote
-    native.optimize = optimize
-    result, backend = run(native)
-    assert result.success is accepted
-    assert result.diagnostics["recovery"] == "collision_witnesses"
-    assert native.calls.count("solve") == 2 and native.calls.count("promote") == 1
-    assert "ompl" not in native.calls
-    torch.testing.assert_close(recovery_seeds[1], optimized_controls.expand_as(recovery_seeds[1]))
-    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
-    assert result.request_ledger["planning_budget"]["planning_seconds"] == 120.
-    if not accepted:
-        assert result.execution_binding is None and "export" not in native.calls
-    backend.close()
 # END second-solve rejection remains a finite planning failure.
 
 
 # BEGIN real sampled-collision classification selects the existing recovery branch.
-@pytest.mark.parametrize("already_detected", [True, False])
-def test_sampled_collision_evidence_selects_search_or_missing_time_recovery(already_detected):
-    from manipulation.planning import _dense_collision_witnesses
-
-    native = Native([False, False, True], collision=True)
-    original_select = native.select_candidate
-
-    def metric(values):
-        collision = torch.tensor(values, dtype=torch.float32).reshape(1, -1, 1)
-        # BEGIN every native fixture supplies the complete current evidence layout.
-        return SimpleNamespace(debug=torch.cat((collision, torch.zeros_like(collision),
-                                                torch.zeros_like(collision), torch.zeros_like(collision)), dim=-1),
-            costs_and_constraints=SimpleNamespace(constraints=SimpleNamespace(
-                names=["process_scene"], values=[collision])))
-        # END coverage never acquires a collision sample through fixture defaults.
-
-    def select(accepted, *, record_work):
-        candidate, curve, report = original_select(accepted, record_work=record_work)
-        # Constant positive evidence has no sampling gap. The alternative
-        # has one collision strictly between ordinary zero-valued samples.
-        candidate.batch_size = candidate.num_seeds = 1
-        candidate.metrics = metric([1., 1., 1.] if already_detected else [0., 0., 0.])
-        candidate.interpolated_metrics = metric([1.]*9 if already_detected else
-                                                [0., 1., 0., 0., 0., 0., 0., 0., 0.])
-        candidate.interpolated_last_tstep = torch.tensor([[9]])
-        candidate.interpolated_trajectory = SimpleNamespace(position=torch.zeros(1, 9, 1))
-        if not accepted:
-            report["collision_residuals"] = {
-                "rollout:scene_collision": float(already_detected), "interpolated:scene_collision": 1.}
-        return candidate, curve, report
-
-    def promote(candidate):
-        report = _dense_collision_witnesses(candidate, regular_horizon=3,
-            anchor_parameters=(0., 1.), capacity=4)
-        return {**report, "changed": bool(report["parameters"])}
-
-    native.select_candidate, native.promote_collision_witnesses = select, promote
-    result, backend = run(native)
-    try:
-        assert result.success
-        assert result.diagnostics["recovery"] == ("ompl" if already_detected else "collision_witnesses")
-        assert native.calls.count("ompl") == int(already_detected)
-        assert native.calls.count("solve") == 2
-        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
-    finally:
-        backend.close()
 # END evidence classification neither adds a solve nor bypasses final acceptance.
 
 
@@ -520,7 +426,7 @@ def test_failed_ompl_cannot_spend_an_al_or_second_solve_slot():
 def test_two_requests_reuse_native_instances_and_reset_binding():
     native = Native([True, True, True, True])
     backend = MotionBackend({}, robot_validator=object())
-    with patch("manipulation.planning._CuroboPlanner", return_value=native) as factory, \
+    with patch("manipulation.planning._ConstrainedPlanner", return_value=native) as factory, \
          patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
         first, second = backend.plan(problem(), Scene()), backend.plan(problem(), Scene())
     assert first.success and second.success and factory.call_count == 1
@@ -593,7 +499,7 @@ def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, col
         return candidate, curve, report
     native.select_candidate = with_support
     backend = MotionBackend({}, robot_validator=object())
-    with patch("manipulation.planning._CuroboPlanner", return_value=native), \
+    with patch("manipulation.planning._ConstrainedPlanner", return_value=native), \
          patch("manipulation.execution_binding.bind_candidate", return_value={"candidate_id": "accepted"}):
         result = backend.plan(source, Scene())
     try:

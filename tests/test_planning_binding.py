@@ -10,11 +10,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from manipulation.planning import (PlanningBudget, _CuroboPlanner, _ProgressMap,
+from manipulation.planning import (PlanningBudget, _ConstrainedPlanner, _ProgressMap,
     ContinuationBindingError, _bind_event_clock, _initial_timing,
     _prepare_continuation, _continuation_timing, _fixed_spline_grid,
-    _ompl_stage, _scene_boundary_evaluate,
-    _progress_for_cubic_boundaries)
+    _ompl_stage, _scene_boundary_evaluate, reference_progress_clock)
 from manipulation.planning_ik import rank_ik_candidates
 from manipulation.planning_problem import (MotionPhase, PlanningEvent, PlanningProblem,
                                           PosePath, PoseEventRequirement)
@@ -70,28 +69,30 @@ class PlanningBindingTest(unittest.TestCase):
                 capped, _ = _initial_timing(longer, original)
                 self.assertEqual(capped.maximum_trajectory_dt, .125)
 
-    def test_selected_source_clock_binds_native_events_and_timed_fingers_together(self):
-        from curobo._src.types.control_space import ControlSpace
-        from manipulation.planning import JointTrajectory, _formal_native_clock
+    def test_selected_source_clock_binds_events_and_complete_nominal_fingers_together(self):
+        from manipulation.planning import JointTrajectory
         from manipulation.planning_scene import PrismaticGripper
 
         event = PlanningEvent("close", "current", .8, 183, "close", "transferred reference command")
         problem = self.problem((event,), source_times=(0., 9.15, 9.85), source_progress=(0., .8, 1.))
         budget, mapping = _initial_timing(problem, PlanningBudget(knots=16, interpolation_buffer_size=768))
-        native = SimpleNamespace(config=SimpleNamespace(minimum_trajectory_dt=budget.maximum_trajectory_dt,
-            maximum_trajectory_dt=budget.maximum_trajectory_dt, interpolation_dt=budget.interpolation_dt),
-            interpolation_steps=budget.interpolation_steps, action_horizon=budget.knots+2,
-            transition_model=SimpleNamespace(control_space=ControlSpace.BSPLINE_3))
-        grid = _formal_native_clock(native)
-        mapping, _ = _progress_for_cubic_boundaries(mapping, budget.knots,
+        # BEGIN bind the same independent reference schedule as the planner.
+        mapping, _ = reference_progress_clock(mapping, budget.knots,
             stop_progress=problem.stop_progress, anchors=problem.anchors)
+        # END arm coefficients retain their own measured entrance constraints.
+        # BEGIN the shared fixed grid binds the task and complete hand model.
+        grid = _fixed_spline_grid(intervals=budget.knots+4,
+            native_dt=budget.maximum_trajectory_dt, interpolation_steps=budget.interpolation_steps,
+            interpolation_dt=budget.interpolation_dt)
+        # END native IK and CPU trajectory consumers receive the same clock.
         mapping = _bind_event_clock(problem, mapping, grid["duration"], .002)
         seen = []
 
         def fingers(duration, progress_map):
             seen.append((duration, progress_map))
-            return JointTrajectory(("finger",), np.array([0., duration]), np.full((2, 1), .04),
-                np.zeros((2, 1)), progress_map.u, progress_map.s, (), (), {})
+            return JointTrajectory(("left_finger", "right_finger"), np.array([0., duration]),
+                np.tile([.04, -.03], (2, 1)), np.zeros((2, 2)),
+                progress_map.u, progress_map.s, (), (), {})
 
         # BEGIN geometry explicitly declares this constant fixture's clock scope.
         def geometry(duration, progress_map, command_reference):
@@ -101,10 +102,11 @@ class PlanningBindingTest(unittest.TestCase):
         # END matching command times alone do not authorize nominal geometry.
 
         hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002,
-            joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .04]], joint_bounds=None,
+            joint_names=("left_finger", "right_finger"), current_positions=[.04, -.03],
+            joint_limits=[[0., .05], [-.05, 0.]], joint_bounds=None,
             finger_trajectory_factory=fingers, nominal_finger_trajectory_factory=geometry,
             # BEGIN the current hand interface binds clocks and joint coordinates.
-            coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+            coupling_matrix=np.empty((0, 2)), coupling_offset=[],
             commands=[{"skill_id": "current", "event_id": "close", "occurrence": 0,
                 "command": "close", "progress": .8}], source="explicit CPU clock contract")
             # END robot collision entities are supplied by their geometry component.
@@ -117,6 +119,26 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(record["activation_time_s"], record["bound_activation_step"]*.002)
         self.assertEqual(grid["duration"], (grid["valid_count"]-1)*grid["interpolation_dt"])
         self.assertEqual(grid["duration"], (budget.knots+4)*budget.interpolation_steps*grid["native_dt"])
+        # BEGIN the CPU solver consumes both nominal hand columns on that clock.
+        from manipulation.unified_solver import robot_tool_states
+        captured = []
+        def states(q, dq, names):
+            captured.append((q, dq, names))
+            zero = q[..., 0] * 0
+            position = torch.stack((zero, zero, zero), -1)
+            quaternion = torch.stack((zero + 1, zero, zero, zero), -1)
+            return {"tool": (position, quaternion)}, {"tool": (position, position)}
+        times = torch.tensor([[0., grid["duration"] / 2, grid["duration"]]], dtype=torch.float64)
+        progress = torch.as_tensor(np.interp(times.numpy(), mapping.u * grid["duration"], mapping.s))
+        arm = torch.zeros((1, 3, 1), dtype=torch.float64)
+        robot_tool_states(problem=problem, scene=SimpleNamespace(gripper=hand),
+            kinematics=SimpleNamespace(states=states), q=arm, dq=arm,
+            joint_names=("q",), progress=progress, times=times)
+        self.assertEqual(captured[0][2], ("q", "left_finger", "right_finger"))
+        np.testing.assert_allclose(captured[0][0][0, :, 1:].numpy(),
+                                    np.tile([.04, -.03], (3, 1)), atol=1e-15)
+        self.assertEqual(torch.count_nonzero(captured[0][1]).item(), 0)
+        # END command and nominal geometry share actual physical-time samples.
     # END no extra retiming optimizer or relaxed interpolation equality is introduced.
 
     def test_command_goal_query_uses_activation_and_keeps_intent_separate(self):
@@ -146,10 +168,9 @@ class PlanningBindingTest(unittest.TestCase):
         problem.source_timestamps = np.array([3., 4., 5.])
         problem.source_progress = np.array([.4, .7, 1.])
         _, mapping = _initial_timing(problem, PlanningBudget())
-        warped, _ = _progress_for_cubic_boundaries(mapping, 8, stop_progress=(), anchors=[.4, 1.])
-        self.assertEqual(warped.s[0], .4)
-        self.assertEqual(warped.s[-1], 1.)
-        self.assertFalse(np.any(warped.s < .4))
+        self.assertEqual(mapping.s[0], .4)
+        self.assertEqual(mapping.s[-1], 1.)
+        self.assertFalse(np.any(mapping.s < .4))
 
     # BEGIN true goals guide IK while every trajectory goal keeps its original owner.
     def test_functional_ik_goal_uses_actual_target_in_native_link_coordinates(self):
@@ -158,7 +179,7 @@ class PlanningBindingTest(unittest.TestCase):
         function = np.eye(4); function[0, 3] = .1
         goal = PoseEventRequirement(.5, function, target, .01, .02, "true goal")
         problem.pose_events = (goal,)
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
+        planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
         planner.problem, planner.torch = problem, torch
         planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float32))
@@ -182,27 +203,6 @@ class PlanningBindingTest(unittest.TestCase):
             np.array([[0., 0.]]), count=1, joint_tolerance=1e-6, query_kind="reference")
         np.testing.assert_array_equal(selected, [1])
 
-    def test_all_declared_pose_events_use_shared_task_constraints(self):
-        planner = _CuroboPlanner.__new__(_CuroboPlanner)
-        planner.problem = self.problem()
-        target = PoseEventRequirement(1., np.eye(4), np.eye(4), .001, .02, "goal")
-        planner.problem.pose_events = (target,)
-        planner.scene = SimpleNamespace(contacts=())
-        planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(),
-            enable_tool_pose_tracking=Mock(), disable_joint_position_tracking=Mock())
-        goal = SimpleNamespace(tool_frames=["tool"])
-        planner._functional_goal = Mock(return_value=goal)
-        _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
-        self.assertIsNone(bound)
-        planner._functional_goal.assert_not_called()
-        self.assertEqual(planner.route, "constrained")
-        planner.problem.pose_events = ()
-        _, bound = planner._native_request(torch.zeros((1, 1, 4, 1)))
-        self.assertIsNone(bound)
-        self.assertEqual(planner.route, "constrained")
-        self.assertEqual(planner.trajopt.disable_tool_pose_tracking.call_count, 2)
-    # END full functional tolerances are checked by typed process residuals only.
-
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
         event = PlanningEvent("effect", "current", .37, 1, "verify", "dependency",
                               requires_evidence="Holding")
@@ -214,6 +214,86 @@ class PlanningBindingTest(unittest.TestCase):
         self.assertEqual(record["time"], .4)
         self.assertIsNone(record["activation_time_s"])
         self.assertEqual(bound.anchor_parameters([.37])[0, 0], .4)
+
+    # BEGIN resident rebinding replaces one task clock and its nominal hand together.
+    def test_resident_rebind_preserves_ik_and_replaces_entrance_clock_and_scene(self):
+        from manipulation.gripper_trajectory import NominalFingerGeometry
+        from manipulation.planning import JointTrajectory
+        from manipulation.planning_scene import PrismaticGripper
+
+        event = PlanningEvent("close", "instance", .4, 2, "close", "declared command")
+        problem = self.problem((event,), source_times=(0., .8, 2.), source_progress=(0., .4, 1.))
+        problem.start_q[:], problem.start_dq[:] = .1, .03
+        calls = []
+        def fingers(duration, mapping):
+            calls.append((duration, mapping))
+            return JointTrajectory(("finger",), np.array([0., duration]), np.full((2, 1), .04),
+                np.zeros((2, 1)), mapping.u, mapping.s, (), (), {})
+        def nominal(duration, mapping, command):
+            return NominalFingerGeometry.from_reference(command, valid_until_s=duration,
+                                                        source="declared complete hand model")
+        hand = PrismaticGripper(controller="timed_reference", control_timestep_s=.002,
+            joint_names=("finger",), current_positions=[.04], joint_limits=[[0., .05]],
+            joint_bounds=None, finger_trajectory_factory=fingers,
+            nominal_finger_trajectory_factory=nominal,
+            coupling_matrix=np.empty((0, 1)), coupling_offset=[],
+            commands=[dict(skill_id="instance", event_id="close", occurrence=0,
+                           command="close", progress=.4)], source="declared hand command")
+        scene = SimpleNamespace(gripper=hand, required_progress_anchors=(.6,), validate_problem=Mock())
+        scene.clone_for_rollout = lambda: SimpleNamespace(gripper=deepcopy(hand))
+        planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
+        planner.robot_validator = SimpleNamespace(validate_planning_binding=Mock())
+        planner.robot_metadata, planner.anchor_capacity = {}, 256
+        planner.torch, planner.device_cfg = torch, SimpleNamespace(device="cpu")
+        shared_clock = {"obsolete": True}
+        planner.formal_clock, planner.joint_names = shared_clock, ("q",)
+        planner.JointState = SimpleNamespace(from_numpy=lambda names, positions, *, velocity, device_cfg:
+            SimpleNamespace(joint_names=names, position=torch.as_tensor(positions),
+                            velocity=torch.as_tensor(velocity)))
+        planner._bind_online_robot, planner._bind_physical_domains = Mock(), Mock()
+        planner._manager_type = SimpleNamespace(bind_request=Mock())
+        planner.seed_parameter = torch.ones((1, 1))
+        old_goal = SimpleNamespace(link_goal_poses=object(), goal_js=object())
+        rollout = SimpleNamespace(reset=Mock(), _num_particles_goal=old_goal,
+                                  _metrics_goal=SimpleNamespace(link_goal_poses=object(), goal_js=object()))
+        registry = SimpleNamespace(_goal_buffer=SimpleNamespace(link_goal_poses=object()))
+        resident = SimpleNamespace(reset_seed=Mock(), core=SimpleNamespace(
+            goal_registry_manager=registry, get_all_rollout_instances=lambda: (rollout,)))
+        planner.ik = resident
+        identities = {"pose_events": []}
+        entrance = np.eye(4); entrance[0, 3] = .1
+        with patch("manipulation.planning._planning_workspace_bytes", return_value=SimpleNamespace(pending_cpu_bytes=0)), \
+             patch("manipulation.planning._require_planning_host_memory"), \
+             patch("manipulation.planning._require_planning_memory"), \
+             patch("manipulation.planning._reference_entrance", return_value=(entrance, np.array([.03, 0., 0., 0., 0., 0.]))):
+            result = planner.rebind(problem, scene, PlanningBudget(), goal_identities=identities)
+        self.assertIs(result, planner)
+        self.assertIs(planner.ik, resident)
+        self.assertIs(planner.formal_clock, shared_clock)
+        self.assertNotIn("obsolete", shared_clock)
+        self.assertEqual(calls, [(shared_clock["duration"], planner.progress_map)])
+        self.assertEqual(planner._verification_scene.gripper.nominal_finger_trajectory.duration,
+                         shared_clock["duration"])
+        self.assertIs(planner.finger_trajectory, hand.finger_trajectory)
+        self.assertIn(.6, planner.anchors)
+        # BEGIN a resident request replaces both reference-clock coordinates.
+        self.assertIsNotNone(planner.reference_time_map)
+        np.testing.assert_array_equal(planner.source_progress_map.u, [0., .4, 1.])
+        self.assertEqual(len(planner.progress_map.anchor_parameters([1.])), 2)
+        # END the terminal progress interval is scheduling data only.
+        np.testing.assert_array_equal(planner.start.position.numpy(), [[.1]])
+        np.testing.assert_array_equal(planner.start.velocity.numpy(), [[.03]])
+        scene.validate_problem.assert_called_once_with(problem, goal_identities=identities)
+        planner._manager_type.bind_request.assert_called_once_with(problem, planner.budget)
+        planner._bind_online_robot.assert_called_once()
+        planner._bind_physical_domains.assert_called_once()
+        resident.reset_seed.assert_called_once()
+        rollout.reset.assert_called_once()
+        self.assertIsNone(registry._goal_buffer.link_goal_poses)
+        self.assertIsNone(old_goal.link_goal_poses)
+        self.assertIsNone(old_goal.goal_js)
+        self.assertEqual(torch.count_nonzero(planner.seed_parameter).item(), 0)
+    # END request replacement retains the resident solver and one physical clock.
 
     def continuation(self, problem, *, elapsed=.25):
         from manipulation.execution_binding import plain
@@ -289,7 +369,7 @@ class PlanningBindingTest(unittest.TestCase):
             max_scene_gpu_workspace_bytes=3*1024**3)
         scene = SimpleNamespace(clone_for_rollout=lambda: SimpleNamespace(
             bind_robot_validator=Mock(), gripper=None))
-        with patch("manipulation.planning._CuroboPlanner", side_effect=RuntimeError("native allocation refused")) as native:
+        with patch("manipulation.planning._ConstrainedPlanner", side_effect=RuntimeError("native allocation refused")) as native:
             first = plan_trajectory(problem, scene, {}, robot_validator=object(),
                 budget=requested, continuation=continuation)
             continued = deepcopy(continuation)
@@ -455,7 +535,7 @@ class PlanningBindingTest(unittest.TestCase):
         observations = []
         # BEGIN the material-mode fixture consumes the explicit geometry scope.
         def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                     contact_permission_progress, query_role, local_models, geometry_evidence_out,
+                     contact_permission_progress, geometry_evidence_out,
                      geometry_scope):
             self.assertEqual(geometry_scope, "full")
             observations.append((s.clone(), joints.clone(), trajectory_time.clone()))

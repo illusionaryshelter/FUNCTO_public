@@ -6,14 +6,13 @@ They exercise the production constraints without loading robot geometry.
 from dataclasses import replace
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 import torch
 
-from manipulation.planning import _CuroboPlanner
+from manipulation.planning import _ConstrainedPlanner
 from manipulation.planning_problem import MotionPhase, PlanningProblem, PoseEventRequirement, PosePath
 
 
@@ -92,9 +91,10 @@ def test_free_yaw_has_no_constraint_or_centering_cost_and_finite_gradients(axis,
     p, q = tensors(pose(Rotation.from_rotvec(np.array(axis)*angle)))
     q.requires_grad_()
     progress = torch.ones((1, 1), dtype=torch.float64)
-    signed, _ = task.functional_inequalities(p, q, progress)
+    equalities, values = task.constraint_components(p, q, progress, trajectory_time=progress)
+    assert not equalities
+    signed = {key: value for key, value in values.items() if key.startswith("function_pose:")}
     assert set(signed) == {"function_pose:0:position", "function_pose:0:rotation"}
-    assert set(signed) == set(task.functional_constraint_keys)
     cost = task.optimizer_preferences(p, q, progress)
     cost.sum().backward()
     assert torch.isfinite(q.grad).all()
@@ -110,7 +110,8 @@ def test_zero_width_yaw_stays_exact_and_serializes_through_binding():
     requirement = event(yaw_tolerance_rad=0.)
     restored = PoseEventRequirement(**plain(requirement))
     p, q = tensors(pose(Rotation.from_euler("z", .01)))
-    signed, _ = problem(restored).functional_inequalities(p, q, torch.ones((1, 1)))
+    progress = torch.ones((1, 1), dtype=torch.float64)
+    signed, _ = problem(restored).constraint_components(p, q, progress, trajectory_time=progress)
     assert torch.isfinite(signed["function_pose:0:yaw"]).all()
     assert float(signed["function_pose:0:yaw"]) > 0
     assert restored.component_tolerances["yaw"] == 0
@@ -122,7 +123,7 @@ def test_native_nominal_buffer_preserves_complete_material_tcp_conversion():
     task = problem(requirement)
     task.base_pose = pose(Rotation.from_euler("y", .4), (-.1, .2, 0.))
     task.tool_transform = pose(Rotation.from_euler("x", -.3), (.01, .02, .03))
-    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
     planner.problem, planner.GoalToolPose = task, SimpleNamespace
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
     native = planner._functional_goal(requirement)
@@ -131,18 +132,6 @@ def test_native_nominal_buffer_preserves_complete_material_tcp_conversion():
     link = pose(Rotation.from_quat(q[[1, 2, 3, 0]]), native.position[0, 0, 0, 0].numpy())
     material = task.base_pose@link@task.tool_transform@requirement.tool_from_function
     np.testing.assert_allclose(material, requirement.target, atol=1e-14)
-
-
-def test_yaw_interval_disables_native_single_pose_convergence():
-    planner = _CuroboPlanner.__new__(_CuroboPlanner)
-    planner.problem, planner.scene = problem(event()), SimpleNamespace(contacts=())
-    planner.trajopt = SimpleNamespace(disable_tool_pose_tracking=Mock(),
-        enable_tool_pose_tracking=Mock(), disable_joint_position_tracking=Mock())
-    planner._functional_goal = Mock(return_value=SimpleNamespace(tool_frames=["tool"]))
-    planner._native_request(torch.zeros((1, 1, 4, 1)))
-    assert planner.route == "constrained"
-    planner.trajopt.disable_tool_pose_tracking.assert_called_once()
-    planner.trajopt.enable_tool_pose_tracking.assert_not_called()
 
 
 def test_free_yaw_allowed_set_accepts_arbitrary_continuous_angles():

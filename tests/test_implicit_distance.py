@@ -116,9 +116,10 @@ class ImplicitDistanceTests(unittest.TestCase):
         self.assertEqual(result["status"], "clear")
         self.assertEqual(result["queries"], 0)
 
-    def test_penetration_evidence_and_fixed_local_objective_are_separate(self):
+    def test_penetration_evidence_and_fixed_material_objective_are_separate(self):
         import torch
-        from manipulation.observed_collision import pair_residual, pair_local_model
+        from manipulation.observed_collision import pair_residual
+        from manipulation.sampled_geometry_objective import MaterialSamples, pair_objective
         first = torch.zeros(3, dtype=torch.float64, requires_grad=True)
         second = torch.tensor([.07, 0., 0.], dtype=torch.float64)
         quaternion = torch.tensor([1., 0., 0., 0.], dtype=torch.float64)
@@ -129,13 +130,12 @@ class ImplicitDistanceTests(unittest.TestCase):
             self.field, (second, quaternion), target)
         self.assertEqual(record["status"], "intersection")
         self.assertEqual(residual.item(), 1.)
-        # BEGIN only the actual local scalar supplies an optimization derivative.
-        model = pair_local_model(self.field, np.eye(4), self.field, target, record)
-        self.assertEqual(record["direction"], "local_zero_section_normal")
+        # BEGIN the finite original-material scalar supplies its own derivative.
+        samples = MaterialSamples(self.field)
         residual.backward()
         self.assertEqual(torch.count_nonzero(first.grad).item(), 0)
         first.grad.zero_()
-        model.value((first, quaternion), (second, quaternion)).backward()
+        pair_objective(samples, (first, quaternion), samples, (second, quaternion)).backward()
         # Descent moves the left box away from the box translated to its right.
         self.assertGreater(first.grad[0].item(), 0.)
         self.assertTrue(torch.isfinite(first.grad).all())

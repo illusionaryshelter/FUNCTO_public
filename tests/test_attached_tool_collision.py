@@ -31,21 +31,20 @@ def assembly(tmp_path, *, members=("first", "second"), owners=None, background=F
     return scene
 
 
-def evaluate(scene, progress=(.5,), *, role="acceptance", permission_progress=None):
+def evaluate(scene, progress=(.5,), *, permission_progress=None):
     count = len(progress)
     q = torch.tensor([[[.04, -.02]] * count], dtype=torch.float64, requires_grad=True)
     return scene.components(None, torch.zeros((1, count, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]] * count], dtype=torch.float64),
         torch.tensor([progress], dtype=torch.float64), q, ("left_slide", "right_slide"),
-        trajectory_time=torch.zeros((1, count)), query_role=role,
+        trajectory_time=torch.zeros((1, count)),
         contact_permission_progress=(None if permission_progress is None else
                                      torch.tensor([permission_progress], dtype=torch.float64)))
 
 
-@pytest.mark.parametrize("role", ["optimization", "acceptance"])
-def test_all_declared_tool_members_are_internal_with_attached_payload(tmp_path, role):
+def test_all_declared_tool_members_are_internal_with_attached_payload(tmp_path):
     scene = assembly(tmp_path)
-    values = evaluate(scene, role=role)
+    values = evaluate(scene)
     assert values["collision/robot/payload"].item() == 0.
     assert scene.last_query_report["internal_assembly_pair_count"] == 2
     assert values["collision/robot/self"].item() == 0.

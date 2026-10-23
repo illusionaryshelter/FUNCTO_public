@@ -54,8 +54,8 @@ def main():
             raise ValueError("Diagnostic replay cannot continue or reset a planning request")
         import torch
         from curobo.types import JointState
-        from manipulation.planning import _CuroboPlanner
-        planner = _CuroboPlanner(problem, scene, robot, budget, "cuda:0", robot_validator=robot_validator)
+        from manipulation.planning import _ConstrainedPlanner
+        planner = _ConstrainedPlanner(problem, scene, robot, budget, "cuda:0", robot_validator=robot_validator)
         try:
             report["initial_state"] = planner.initial_state_diagnostics()
             for label, state_name, rollout in (

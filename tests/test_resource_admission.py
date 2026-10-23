@@ -60,12 +60,12 @@ def test_host_admission_retains_two_gib_system_headroom(monkeypatch):
 def test_planner_host_check_adds_live_work_to_already_resident_scene(monkeypatch):
     admit = Mock()
     monkeypatch.setattr("manipulation.planning.require_host_memory", admit)
-    workspace = _PlanningWorkspace(4*GIB, 127, GIB, 61)
-    _require_planning_host_memory(workspace.cpu_live_bytes,
+    workspace = _PlanningWorkspace(4*GIB, 53, 127, GIB, 61)
+    _require_planning_host_memory(workspace.pending_cpu_bytes,
         encoded_record_bytes_upper=11, max_host_rss_bytes=10*GIB)
     # The frozen observed fields are resident and represented by measured RSS.
-    # Only new live query work and encoded records require another allocation.
-    admit.assert_called_once_with(127+3*11, pending_existing_bytes=0, max_rss_bytes=10*GIB)
+    # Pending fixed samples, live query work and records allocate together.
+    admit.assert_called_once_with(53+127+3*11, pending_existing_bytes=0, max_rss_bytes=10*GIB)
 
 
 def test_new_validation_records_include_previous_candidate_rss_at_one_byte_boundary(monkeypatch):
@@ -85,16 +85,69 @@ def test_new_validation_records_include_previous_candidate_rss_at_one_byte_bound
 
 def test_cpu_residency_does_not_change_gpu_budget():
     allocation = {"gpu_retained": 5, "gpu_live": 150, "gpu_shared": 23,
-                  "gpu_graph_live": 60, "cpu_shared": 17, "cpu_live": 31}
+                  "gpu_graph_live": 60, "cpu_resident": 17, "cpu_pending_shared": 19, "cpu_live": 31}
     scene = SimpleNamespace(required_progress_anchors=(), contacts=(),
+        robot_model=SimpleNamespace(joint_names=("joint",)),
         estimated_workspace_allocation=lambda *args, **kwargs: dict(allocation))
     metadata = {"active_joint_names": ["joint"], "links": 1, "spheres": 1}
-    budget = PlanningBudget(max_scene_gpu_workspace_bytes=13*5+150+23)
+    budget = PlanningBudget(max_scene_gpu_workspace_bytes=5+150+23)
     small = _planning_workspace_bytes(scene, metadata, budget, 1)
-    allocation["cpu_shared"] = 9*GIB
+    allocation["cpu_resident"] = 9*GIB
     large = _planning_workspace_bytes(scene, metadata, budget, 1)
     assert small.gpu_bytes == large.gpu_bytes == budget.max_scene_gpu_workspace_bytes
     assert large.cpu_bytes-small.cpu_bytes == 9*GIB-17
+    assert large.pending_cpu_bytes == small.pending_cpu_bytes
+
+
+# BEGIN fixed samples move from pending allocation to measured-RSS inventory.
+def test_scene_sample_materialization_preserves_single_query_peak(tmp_path):
+    import torch
+    from geometry_objective_fixtures import _moving_scene
+
+    scene = _moving_scene(tmp_path)
+    before = scene.estimated_workspace_allocation(1, 3)
+    position = torch.tensor([[[0., 1., 0.]]], dtype=torch.float64)
+    quaternion = torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64)
+    progress = torch.tensor([[.5]], dtype=torch.float64)
+    q = torch.tensor([[[.04, -.02]]], dtype=torch.float64)
+    names = ("left_slide", "right_slide")
+    scene.optimization_objective(position, quaternion, progress, q, names,
+        trajectory_time=progress, robot_link_poses=scene.kinematics.poses(q, names))
+    after = scene.estimated_workspace_allocation(1, 3)
+    samples = {id(value): value for value in scene._objective_material_samples.values()}.values()
+    allocated = sum(value.points.nbytes + value.cells.nbytes + value.zero_points.nbytes
+                    + (0 if value.point_bounds is None else value.point_bounds.nbytes)
+                    + (0 if value.negative_bounds is None else value.negative_bounds.nbytes)
+                    for value in samples)
+    assert after['cpu_resident']-before['cpu_resident'] == allocated
+    assert before['cpu_pending_shared']-after['cpu_pending_shared'] >= allocated > 0
+    assert before['cpu_live'] == after['cpu_live']
+    assert scene.clone_for_rollout().estimated_workspace_allocation(1, 3) == after
+
+
+def test_serial_optimizer_admits_current_pending_geometry_with_each_solve(monkeypatch):
+    import torch
+    from manipulation.planning import _ConstrainedPlanner
+
+    planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
+    scene = SimpleNamespace(materialized=False)
+    planner.computation = SimpleNamespace(scene=scene)
+    planner.robot_metadata, planner.anchor_capacity = {}, 3
+    planner.budget, planner.check_request = SimpleNamespace(trajectory_iterations=7), Mock()
+    pending = []
+    def estimate(actual_scene, metadata, budget, anchors):
+        assert actual_scene is scene
+        return _PlanningWorkspace(100, 0 if scene.materialized else 17, 23, 0, 0)
+    def solve(computation, initial, *, iterations, check_request, pending_geometry_bytes):
+        pending.append(pending_geometry_bytes)
+        scene.materialized = True
+        return SimpleNamespace(report={'iterations': iterations})
+    monkeypatch.setattr('manipulation.planning._planning_workspace_bytes', estimate)
+    monkeypatch.setattr('manipulation.unified_solver.solve_trajectory', solve)
+    results = planner.optimize(torch.zeros((1, 2, 4, 1)))
+    assert len(results) == 2
+    assert pending == [17+23, 23]
+# END resident geometry is never charged as a new solver allocation.
 
 
 def device_snapshot(*, free=12*GIB, total=12*GIB, reserved=0, allocated=0):
@@ -104,14 +157,14 @@ def device_snapshot(*, free=12*GIB, total=12*GIB, reserved=0, allocated=0):
 
 def test_device_admission_counts_gpu_storage_independently_of_host_inventory():
     runtime = device_snapshot()
-    workspace = _PlanningWorkspace(9*GIB, 0, GIB, 0)
+    workspace = _PlanningWorkspace(9*GIB, 0, 0, GIB, 0)
     admitted = _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=6*GIB)
     assert admitted is workspace
 
 
 def test_eager_device_overflow_is_a_typed_refusal():
     runtime = device_snapshot(free=10*GIB)
-    workspace = _PlanningWorkspace(0, 0, 2*GIB+1, 0)
+    workspace = _PlanningWorkspace(0, 0, 0, 2*GIB+1, 0)
     with pytest.raises(ResourceLimitError) as captured:
         _require_planning_memory(runtime, "cuda:0", workspace, max_device_used_bytes=6*GIB)
     assert (captured.value.resource, captured.value.required_bytes, captured.value.limit_bytes) == (
@@ -121,7 +174,7 @@ def test_eager_device_overflow_is_a_typed_refusal():
 def test_standalone_device_check_cannot_bypass_the_physical_maximum():
     runtime = device_snapshot()
     with pytest.raises(ValueError, match="ten GiB"):
-        _require_planning_memory(runtime, "cuda:0", _PlanningWorkspace(0, 0, 0, 0),
+        _require_planning_memory(runtime, "cuda:0", _PlanningWorkspace(0, 0, 0, 0, 0),
                                  max_device_used_bytes=10*GIB+1)
     runtime.cuda.mem_get_info.assert_not_called()
 

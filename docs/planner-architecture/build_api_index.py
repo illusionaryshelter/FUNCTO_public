@@ -20,11 +20,12 @@ CHAPTERS = {
 # These modules describe retired task-field conversion and contact bindings.
 # Known robot geometry adapters remain part of the current component call graph.
 RETIRED = {
+ 'functional_augmented_lagrangian', 'physical_joint_qp', 'curobo_solver_components', 'reference_tracking',
  'tsdf_geometry', 'online_observed_geometry', 'tsdf_spatial_query',
  'scene_surface_batch', 'native_voxel_sources', 'voxel_layers', 'mapper_surface',
  'online_contact', 'contact_geometry', 'native_owner_geometry',
  'prismatic_self_collision', 'collision_path', 'holding_contact',
- 'robot_coverage', 'online_native_confirmation',
+ 'robot_coverage', 'online_native_confirmation', 'local_geometry_model',
  'adapter-prepare_recorded_task', 'adapter-recorded_owner_geometry',
  'adapter-recorded_observation', 'adapter-robot_coverage_fixture',
  'adapter-contact_fixture', 'adapter-run_recorded_simulation',
@@ -105,13 +106,14 @@ def main():
     pattern = r'\| \[([^\]]+\.py)\]\(api/([^\)]+)\.md\) \| \d+ \| \[(\d+)\]'
     modules = [(p, page, chapter) for p, page, chapter in re.findall(pattern, index.read_text())
                if page not in RETIRED]
-    # BEGIN include the native continuous reference component in source generation.
+    # BEGIN include current numerical and reference components in source generation.
     for module, chapter in [('implicit_distance','02'), ('observed_mapping','02'),
                             ('observed_robot','02'), ('observed_collision','02'),
                             ('observed_coverage','02'), ('grasp_region','03'),
                             ('native_field_distance','02'), ('tool_geometry','02'),
-                            ('local_geometry_model','02'), ('geometry_motion_bound','05'),
-                            ('interval_geometry','05'), ('reference_tracking','04'),
+                            ('sampled_geometry_objective','02'), ('geometry_motion_bound','05'),
+                            ('interval_geometry','05'), ('unified_solver','04'),
+                            ('cubic_constraints','04'), ('pin_kinematics','04'),
                             ('timed_reference','01'), ('reference_visualization','01')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:

@@ -1,11 +1,11 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：`d7bcafc`。
+代码基线：`774e121-plus-unified-workspace`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
 
-[定义位置](../../../manipulation/planning.py#L53)。
+[定义位置](../../../manipulation/planning.py#L52)。
 
 输入签名：
 
@@ -65,7 +65,7 @@ float
 
 ## `_derived_spline_grid`
 
-[定义位置](../../../manipulation/planning.py#L88)。
+[定义位置](../../../manipulation/planning.py#L87)。
 
 输入签名：
 
@@ -127,7 +127,7 @@ _fixed_spline_grid
 
 ## `PlanningBudget`
 
-[定义位置](../../../manipulation/planning.py#L109)。
+[定义位置](../../../manipulation/planning.py#L108)。
 
 ```python
 class PlanningBudget():
@@ -179,7 +179,7 @@ random_seed: int = 123
 
 ## `PlanningBudget.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L160)。
+[定义位置](../../../manipulation/planning.py#L159)。
 
 输入签名：
 
@@ -237,7 +237,7 @@ _derived_spline_grid
 
 ## `JointTrajectory`
 
-[定义位置](../../../manipulation/planning.py#L213)。
+[定义位置](../../../manipulation/planning.py#L212)。
 
 ```python
 class JointTrajectory():
@@ -271,7 +271,7 @@ _curve: CubicHermiteSpline = field(init=False, repr=False)
 
 ## `JointTrajectory.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L237)。
+[定义位置](../../../manipulation/planning.py#L236)。
 
 输入签名：
 
@@ -305,7 +305,7 @@ CubicHermiteSpline
 
 ## `JointTrajectory.duration`
 
-[定义位置](../../../manipulation/planning.py#L241)。
+[定义位置](../../../manipulation/planning.py#L240)。
 
 输入签名：
 
@@ -337,7 +337,7 @@ float
 
 ## `JointTrajectory.next_verification`
 
-[定义位置](../../../manipulation/planning.py#L245)。
+[定义位置](../../../manipulation/planning.py#L244)。
 
 输入签名：
 
@@ -379,7 +379,7 @@ min
 
 ## `JointTrajectory.executable_until`
 
-[定义位置](../../../manipulation/planning.py#L253)。
+[定义位置](../../../manipulation/planning.py#L252)。
 
 输入签名：
 
@@ -418,7 +418,7 @@ float
 
 ## `JointTrajectory.sample`
 
-[定义位置](../../../manipulation/planning.py#L258)。
+[定义位置](../../../manipulation/planning.py#L257)。
 
 输入签名：
 
@@ -476,7 +476,7 @@ np.interp
 
 ## `cubic_derivative_report`
 
-[定义位置](../../../manipulation/planning.py#L277)。
+[定义位置](../../../manipulation/planning.py#L276)。
 
 输入签名：
 
@@ -662,7 +662,7 @@ upper_excess.tolist
 
 ## `PlanningResult`
 
-[定义位置](../../../manipulation/planning.py#L380)。
+[定义位置](../../../manipulation/planning.py#L379)。
 
 ```python
 class PlanningResult():
@@ -680,7 +680,7 @@ request_ledger: dict | None = None
 
 ## `_anchor_capacity`
 
-[定义位置](../../../manipulation/planning.py#L393)。
+[定义位置](../../../manipulation/planning.py#L392)。
 
 输入签名：
 
@@ -721,7 +721,7 @@ MotionPlanningError
 
 ## `_PlanningWorkspace`
 
-[定义位置](../../../manipulation/planning.py#L406)。
+[定义位置](../../../manipulation/planning.py#L402)。
 
 ```python
 class _PlanningWorkspace():
@@ -730,7 +730,8 @@ class _PlanningWorkspace():
 类字段：
 
 ```python
-cpu_shared_bytes: int
+cpu_resident_bytes: int
+cpu_pending_shared_bytes: int
 cpu_live_bytes: int
 gpu_bytes: int
 anchor_fk_bytes: int
@@ -738,11 +739,11 @@ anchor_fk_bytes: int
 
 实现说明：
 
-> Scene capacity plus one live query and native anchor FK buffers.
+> Resident geometry, pending shared arrays and one simultaneous query.
 
 ## `_PlanningWorkspace.cpu_bytes`
 
-[定义位置](../../../manipulation/planning.py#L415)。
+[定义位置](../../../manipulation/planning.py#L412)。
 
 输入签名：
 
@@ -753,13 +754,48 @@ def cpu_bytes(self):
 显式输出分支：
 
 ```python
-self.cpu_shared_bytes + self.cpu_live_bytes
+self.cpu_resident_bytes + self.pending_cpu_bytes
 ```
 
 读取的对象属性：
 
 ```python
-self.cpu_shared_bytes
+self.cpu_resident_bytes
+self.pending_cpu_bytes
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+无显式条目。
+
+## `_PlanningWorkspace.pending_cpu_bytes`
+
+[定义位置](../../../manipulation/planning.py#L416)。
+
+输入签名：
+
+```python
+def pending_cpu_bytes(self):
+```
+
+实现说明：
+
+> Additional scene peak; resident arrays already appear in RSS.
+
+显式输出分支：
+
+```python
+self.cpu_pending_shared_bytes + self.cpu_live_bytes
+```
+
+读取的对象属性：
+
+```python
+self.cpu_pending_shared_bytes
 self.cpu_live_bytes
 ```
 
@@ -773,7 +809,7 @@ self.cpu_live_bytes
 
 ## `_PlanningWorkspace.total_bytes`
 
-[定义位置](../../../manipulation/planning.py#L419)。
+[定义位置](../../../manipulation/planning.py#L421)。
 
 输入签名：
 
@@ -808,7 +844,7 @@ self.gpu_bytes
 
 ## `_planning_workspace_bytes`
 
-[定义位置](../../../manipulation/planning.py#L425)。
+[定义位置](../../../manipulation/planning.py#L428)。
 
 输入签名：
 
@@ -818,16 +854,17 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
 
 实现说明：
 
-> Return CPU/GPU scene capacity and native anchor FK storage.
+> Reserve one CPU scene query and the native IK point-query transfer.
 >
-> The main native rollout retains its original state-sampling horizon. Each trajectory
-> manager evaluates the required anchors with a separate native FK model,
-> then folds their penalties into that rollout's existing final cost column.
+> Trajectory seeds run serially. Task/geometry arrays coexist for one
+> candidate; accepted-curve geometry uses its own bounded query. Immutable
+> fields are shared. SLSQP's dense constraint/work arrays are admitted once
+> their actual row count is known by unified_solver.solve_trajectory.
 
 显式输出分支：
 
 ```python
-_PlanningWorkspace(int(cpu_shared_bytes), int(cpu_live_bytes), int(gpu_bytes), int(anchor_fk_bytes))
+_PlanningWorkspace(int(trajectory['cpu_resident']), int(trajectory['cpu_pending_shared']), int(trajectory['cpu_live'] + pin_bytes), gpu_bytes, 0)
 ```
 
 读取的对象属性：
@@ -835,59 +872,49 @@ _PlanningWorkspace(int(cpu_shared_bytes), int(cpu_live_bytes), int(gpu_bytes), i
 ```python
 budget.knots
 budget.interpolation_steps
-budget.trajectory_seeds
-budget.interpolation_buffer_size
 budget.max_validation_points
 scene.required_progress_anchors
 scene.estimated_workspace_allocation
+budget.ik_seeds
 budget.max_scene_gpu_workspace_bytes
+scene.robot_model.joint_names
+scene.robot_model
 ```
 
 写入目标：
 
 ```python
-horizon
-allocation_shapes
-scene_factor
-allocations
-copies
-batch
-length
-_
+ordinary
+states
+mode_count
+trajectory
+point
 gpu_bytes
-value
-cpu_shared_bytes
-cpu_live_bytes
 dof
 links
-spheres
-self_blocks
-self_bytes_per_state
-bytes_per_state
-anchor_fk_bytes
+full_dof
+pin_bytes
 ```
 
 直接调用符号：
 
 ```python
-min
-scene.estimated_workspace_allocation
-sum
 max
+scene.estimated_workspace_allocation
+int
 ResourceLimitError
 len
 _PlanningWorkspace
-int
 ```
 
 ## `_require_planning_host_memory`
 
-[定义位置](../../../manipulation/planning.py#L504)。
+[定义位置](../../../manipulation/planning.py#L456)。
 
 输入签名：
 
 ```python
-def _require_planning_host_memory(cpu_live_bytes, *, encoded_record_bytes_upper, max_host_rss_bytes):
+def _require_planning_host_memory(pending_cpu_bytes, *, encoded_record_bytes_upper, max_host_rss_bytes):
 ```
 
 实现说明：
@@ -920,7 +947,7 @@ require_host_memory
 
 ## `_require_planning_memory`
 
-[定义位置](../../../manipulation/planning.py#L520)。
+[定义位置](../../../manipulation/planning.py#L472)。
 
 输入签名：
 
@@ -966,7 +993,7 @@ require_device_memory
 
 ## `_bounded_robot_configuration`
 
-[定义位置](../../../manipulation/planning.py#L541)。
+[定义位置](../../../manipulation/planning.py#L493)。
 
 输入签名：
 
@@ -1037,7 +1064,7 @@ sorted
 
 ## `_ProgressMap`
 
-[定义位置](../../../manipulation/planning.py#L577)。
+[定义位置](../../../manipulation/planning.py#L529)。
 
 ```python
 class _ProgressMap():
@@ -1057,7 +1084,7 @@ event_clock: dict = field(default_factory=dict, compare=False)
 
 ## `_ProgressMap.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L586)。
+[定义位置](../../../manipulation/planning.py#L538)。
 
 输入签名：
 
@@ -1105,7 +1132,7 @@ ValueError
 
 ## `_ProgressMap.anchor_parameters`
 
-[定义位置](../../../manipulation/planning.py#L594)。
+[定义位置](../../../manipulation/planning.py#L546)。
 
 输入签名：
 
@@ -1170,7 +1197,7 @@ pairs[:, column].astype
 
 ## `_phase_aligned_parameters`
 
-[定义位置](../../../manipulation/planning.py#L620)。
+[定义位置](../../../manipulation/planning.py#L572)。
 
 输入签名：
 
@@ -1233,7 +1260,7 @@ result.append
 
 ## `_candidate_sample_times`
 
-[定义位置](../../../manipulation/planning.py#L644)。
+[定义位置](../../../manipulation/planning.py#L596)。
 
 输入签名：
 
@@ -1299,7 +1326,7 @@ zip
 
 ## `_reference_clock_issues`
 
-[定义位置](../../../manipulation/planning.py#L654)。
+[定义位置](../../../manipulation/planning.py#L606)。
 
 输入签名：
 
@@ -1365,7 +1392,7 @@ issues.append
 
 ## `_initial_timing`
 
-[定义位置](../../../manipulation/planning.py#L684)。
+[定义位置](../../../manipulation/planning.py#L636)。
 
 输入签名：
 
@@ -1452,7 +1479,7 @@ progress.copy
 
 ## `_bind_event_clock`
 
-[定义位置](../../../manipulation/planning.py#L733)。
+[定义位置](../../../manipulation/planning.py#L685)。
 
 输入签名：
 
@@ -1576,7 +1603,7 @@ record.update
 
 ## `_validate_bound_event_times`
 
-[定义位置](../../../manipulation/planning.py#L811)。
+[定义位置](../../../manipulation/planning.py#L763)。
 
 输入签名：
 
@@ -1689,7 +1716,7 @@ resolve_event_window
 
 ## `_validate_bound_event_times.past_pose_timing`
 
-[定义位置](../../../manipulation/planning.py#L831)。
+[定义位置](../../../manipulation/planning.py#L783)。
 
 输入签名：
 
@@ -1728,7 +1755,7 @@ any
 
 ## `_validate_bound_event_times.candidate_fact`
 
-[定义位置](../../../manipulation/planning.py#L845)。
+[定义位置](../../../manipulation/planning.py#L797)。
 
 输入签名：
 
@@ -1758,7 +1785,7 @@ predicted.append
 
 ## `ContinuationBindingError`
 
-[定义位置](../../../manipulation/planning.py#L929)。
+[定义位置](../../../manipulation/planning.py#L880)。
 
 ```python
 class ContinuationBindingError(ValueError):
@@ -1774,7 +1801,7 @@ class ContinuationBindingError(ValueError):
 
 ## `_obligation_contract`
 
-[定义位置](../../../manipulation/planning.py#L939)。
+[定义位置](../../../manipulation/planning.py#L890)。
 
 输入签名：
 
@@ -1845,7 +1872,7 @@ phase.metadata.get
 
 ## `_restore_original_direction_origins`
 
-[定义位置](../../../manipulation/planning.py#L980)。
+[定义位置](../../../manipulation/planning.py#L931)。
 
 输入签名：
 
@@ -1921,7 +1948,7 @@ tuple
 
 ## `PlanningWorkExhausted`
 
-[定义位置](../../../manipulation/planning.py#L1013)。
+[定义位置](../../../manipulation/planning.py#L964)。
 
 ```python
 class PlanningWorkExhausted(ValueError):
@@ -1937,7 +1964,7 @@ class PlanningWorkExhausted(ValueError):
 
 ## `_planning_work_budget`
 
-[定义位置](../../../manipulation/planning.py#L1022)。
+[定义位置](../../../manipulation/planning.py#L973)。
 
 输入签名：
 
@@ -1976,7 +2003,7 @@ values.items
 
 ## `_request_work_ledger`
 
-[定义位置](../../../manipulation/planning.py#L1028)。
+[定义位置](../../../manipulation/planning.py#L979)。
 
 输入签名：
 
@@ -2057,7 +2084,7 @@ ledger['effects'].update
 
 ## `_check_work_budget`
 
-[定义位置](../../../manipulation/planning.py#L1106)。
+[定义位置](../../../manipulation/planning.py#L1057)。
 
 输入签名：
 
@@ -2105,7 +2132,7 @@ stage_caps.items
 
 ## `_prepare_continuation`
 
-[定义位置](../../../manipulation/planning.py#L1124)。
+[定义位置](../../../manipulation/planning.py#L1075)。
 
 输入签名：
 
@@ -2391,7 +2418,7 @@ int
 
 ## `_continuation_timing`
 
-[定义位置](../../../manipulation/planning.py#L1478)。
+[定义位置](../../../manipulation/planning.py#L1429)。
 
 输入签名：
 
@@ -2472,7 +2499,7 @@ record['event']
 continuation.get
 _initial_timing
 np.unique
-_progress_for_cubic_boundaries
+reference_progress_clock
 _fixed_spline_grid
 _bind_event_clock
 mapping.event_clock.values
@@ -2493,36 +2520,36 @@ event_occurrence_key
 _ProgressMap
 ```
 
-## `_progress_for_cubic_boundaries`
+## `reference_progress_clock`
 
-[定义位置](../../../manipulation/planning.py#L1553)。
+[定义位置](../../../manipulation/planning.py#L1506)。
 
 输入签名：
 
 ```python
-def _progress_for_cubic_boundaries(progress_map, knots, *, stop_progress, anchors):
+def reference_progress_clock(progress_map, knots, *, stop_progress, anchors):
 ```
 
 实现说明：
 
-> Return the saved progress map and its shared original-path parameter.
+> Bind the fixed reference rhythm and its original-path parameter.
 >
-> The cubic retains a stopped terminal interval and explicit verification
-> stops. Build a monotone scalar reference clock for those boundaries:
-> ``z(new_u)`` parameterizes the ORIGINAL
-> path, and the returned skill progress is ``old_s(z(new_u))``. OMPL joint
-> initializers must use that same z, including inside old progress pauses.
+> For normalized physical time u=t/T, z(u) selects a time parameter in
+> the supplied reference; task progress is old_s(z(u)). This scalar
+> B-spline is an explicit scheduling prior, independent of robot q(t).
+> Its retained endpoint interval and declared event stops preserve the
+> existing event clock. Robot terminal position, velocity and acceleration
+> remain free unless explicit task rows constrain them.
 >
-> Four equal coefficients create a complete constant cubic interval with
-> zero first/second derivatives on either side. Only explicit verification
-> stops add these intervals; ordinary path vertices remain ordinary points.
-> Every original path vertex and mandatory progress anchor is retained.
+> Four equal scalar coefficients give a constant reference interval.
+> Every source time vertex and mandatory progress anchor is retained,
+> including motion inside original progress plateaus. Joint initializers
+> consume the same z; reference poses only propose their initial samples.
 >
-> The saved representation stays piecewise linear. For a uniform cubic,
-> ``|d2z/d(native_t)2| <= max|diff(coefficients, 2)|``. Splitting each native
-> interval into L pieces bounds linearization error by D2/(8*L**2). The
-> normalized-parameter bound 1e-6 is NOT a physical skill tolerance. Native
-> and exported process checks both consume this same saved finite map.
+> The saved schedule is piecewise linear. For the scalar uniform cubic,
+> |d2z/d(native_t)2| <= max|diff(coefficients, 2)|; L subdivisions bound
+> its linearization error by D2/(8*L**2). The 1e-6 bound is dimensionless
+> reference-parameter error. It does not change any physical task bound.
 
 显式输出分支：
 
@@ -2668,7 +2695,7 @@ warp.u.copy
 
 ## `_torch_interpolate`
 
-[定义位置](../../../manipulation/planning.py#L1658)。
+[定义位置](../../../manipulation/planning.py#L1611)。
 
 输入签名：
 
@@ -2712,103 +2739,9 @@ len
 ((query - keys[right - 1]) / (keys[right] - keys[right - 1])).clamp
 ```
 
-## `_hermite_at_parameters`
-
-[定义位置](../../../manipulation/planning.py#L1666)。
-
-输入签名：
-
-```python
-def _hermite_at_parameters(position, velocity, dt, counts, parameters):
-```
-
-实现说明：
-
-> Evaluate q and dq at exact u values without interpolating FK poses.
->
-> The native degree-three samples include every polynomial breakpoint.
-> Adjacent q/dq Hermite evaluation is therefore exact up to floating-point
-> arithmetic.  Counts are per seed and exclude padded final-state entries.
-
-显式输出分支：
-
-```python
-(q.to(position.dtype), dq.to(velocity.dtype))
-```
-
-读取的对象属性：
-
-```python
-position.shape
-parameters.to
-torch.float64
-torch.minimum(coordinates.floor().long(), counts[:, None] - 2).clamp_min
-torch.minimum
-coordinates.floor().long
-coordinates.floor
-(coordinates - left).unsqueeze
-left.unsqueeze(-1).expand
-left.unsqueeze
-position.gather(1, gather).to
-position.gather
-position.gather(1, gather + 1).to
-velocity.gather(1, gather).to
-velocity.gather
-velocity.gather(1, gather + 1).to
-dt.reshape(batch, 1, 1).to
-dt.reshape
-q.to
-position.dtype
-dq.to
-velocity.dtype
-```
-
-写入目标：
-
-```python
-batch
-_
-dof
-coordinates
-left
-fraction
-gather
-q0
-q1
-v0
-v1
-delta
-a
-q
-dq
-```
-
-直接调用符号：
-
-```python
-parameters.to
-torch.minimum(coordinates.floor().long(), counts[:, None] - 2).clamp_min
-torch.minimum
-coordinates.floor().long
-coordinates.floor
-(coordinates - left).unsqueeze
-left.unsqueeze(-1).expand
-left.unsqueeze
-position.gather(1, gather).to
-position.gather
-position.gather(1, gather + 1).to
-velocity.gather(1, gather).to
-velocity.gather
-velocity.gather(1, gather + 1).to
-dt.reshape(batch, 1, 1).to
-dt.reshape
-q.to
-dq.to
-```
-
 ## `_projection_tolerance`
 
-[定义位置](../../../manipulation/planning.py#L1693)。
+[定义位置](../../../manipulation/planning.py#L1623)。
 
 输入签名：
 
@@ -2857,7 +2790,7 @@ min
 
 ## `_ompl_terms_accepted`
 
-[定义位置](../../../manipulation/planning.py#L1704)。
+[定义位置](../../../manipulation/planning.py#L1634)。
 
 输入签名：
 
@@ -2916,7 +2849,7 @@ torch.stack
 
 ## `_ompl_stage`
 
-[定义位置](../../../manipulation/planning.py#L1720)。
+[定义位置](../../../manipulation/planning.py#L1650)。
 
 输入签名：
 
@@ -3102,7 +3035,7 @@ np.array_equal
 
 ## `_ompl_stage.ProcessConstraint`
 
-[定义位置](../../../manipulation/planning.py#L1745)。
+[定义位置](../../../manipulation/planning.py#L1675)。
 
 ```python
 class ProcessConstraint(ob.Constraint):
@@ -3114,7 +3047,7 @@ class ProcessConstraint(ob.Constraint):
 
 ## `_ompl_stage.ProcessConstraint.__init__`
 
-[定义位置](../../../manipulation/planning.py#L1746)。
+[定义位置](../../../manipulation/planning.py#L1676)。
 
 输入签名：
 
@@ -3145,7 +3078,7 @@ super
 
 ## `_ompl_stage.ProcessConstraint.function`
 
-[定义位置](../../../manipulation/planning.py#L1749)。
+[定义位置](../../../manipulation/planning.py#L1679)。
 
 输入签名：
 
@@ -3178,7 +3111,7 @@ np.asarray
 
 ## `_ompl_stage.ProcessConstraint.jacobian`
 
-[定义位置](../../../manipulation/planning.py#L1752)。
+[定义位置](../../../manipulation/planning.py#L1682)。
 
 输入签名：
 
@@ -3211,7 +3144,7 @@ np.asarray
 
 ## `_ompl_stage.vector`
 
-[定义位置](../../../manipulation/planning.py#L1777)。
+[定义位置](../../../manipulation/planning.py#L1707)。
 
 输入签名：
 
@@ -3246,7 +3179,7 @@ range
 
 ## `_ompl_stage.valid_array`
 
-[定义位置](../../../manipulation/planning.py#L1780)。
+[定义位置](../../../manipulation/planning.py#L1710)。
 
 输入签名：
 
@@ -3308,7 +3241,7 @@ report['rejections'].get
 
 ## `_ompl_stage.edge_key`
 
-[定义位置](../../../manipulation/planning.py#L1811)。
+[定义位置](../../../manipulation/planning.py#L1741)。
 
 输入签名：
 
@@ -3342,7 +3275,7 @@ last.tobytes
 
 ## `_ompl_stage.checked_edge`
 
-[定义位置](../../../manipulation/planning.py#L1814)。
+[定义位置](../../../manipulation/planning.py#L1744)。
 
 输入签名：
 
@@ -3442,7 +3375,7 @@ iter
 
 ## `_ompl_stage.ForwardValidator`
 
-[定义位置](../../../manipulation/planning.py#L1870)。
+[定义位置](../../../manipulation/planning.py#L1800)。
 
 ```python
 class ForwardValidator(ob.MotionValidator):
@@ -3454,7 +3387,7 @@ class ForwardValidator(ob.MotionValidator):
 
 ## `_ompl_stage.ForwardValidator.__init__`
 
-[定义位置](../../../manipulation/planning.py#L1871)。
+[定义位置](../../../manipulation/planning.py#L1801)。
 
 输入签名：
 
@@ -3485,7 +3418,7 @@ super
 
 ## `_ompl_stage.ForwardValidator.checkMotion`
 
-[定义位置](../../../manipulation/planning.py#L1874)。
+[定义位置](../../../manipulation/planning.py#L1804)。
 
 输入签名：
 
@@ -3517,7 +3450,7 @@ checked_edge
 
 ## `_independent_projection`
 
-[定义位置](../../../manipulation/planning.py#L1935)。
+[定义位置](../../../manipulation/planning.py#L1865)。
 
 输入签名：
 
@@ -3581,7 +3514,7 @@ np.sort
 
 ## `_project_allowed_boundary`
 
-[定义位置](../../../manipulation/planning.py#L1958)。
+[定义位置](../../../manipulation/planning.py#L1888)。
 
 输入签名：
 
@@ -3688,7 +3621,7 @@ allowed
 
 ## `_project_allowed_boundary.allowed`
 
-[定义位置](../../../manipulation/planning.py#L1981)。
+[定义位置](../../../manipulation/planning.py#L1911)。
 
 输入签名：
 
@@ -3738,7 +3671,7 @@ np.abs
 
 ## `_project_allowed_boundary.AllowedBoundary`
 
-[定义位置](../../../manipulation/planning.py#L2014)。
+[定义位置](../../../manipulation/planning.py#L1944)。
 
 ```python
 class AllowedBoundary(ob.Constraint):
@@ -3750,7 +3683,7 @@ class AllowedBoundary(ob.Constraint):
 
 ## `_project_allowed_boundary.AllowedBoundary.__init__`
 
-[定义位置](../../../manipulation/planning.py#L2015)。
+[定义位置](../../../manipulation/planning.py#L1945)。
 
 输入签名：
 
@@ -3786,7 +3719,7 @@ self.setMaxIterations
 
 ## `_project_allowed_boundary.AllowedBoundary.function`
 
-[定义位置](../../../manipulation/planning.py#L2025)。
+[定义位置](../../../manipulation/planning.py#L1955)。
 
 输入签名：
 
@@ -3819,7 +3752,7 @@ np.asarray
 
 ## `_project_allowed_boundary.AllowedBoundary.jacobian`
 
-[定义位置](../../../manipulation/planning.py#L2028)。
+[定义位置](../../../manipulation/planning.py#L1958)。
 
 输入签名：
 
@@ -3856,7 +3789,7 @@ np.asarray
 
 ## `_project_boundary`
 
-[定义位置](../../../manipulation/planning.py#L2054)。
+[定义位置](../../../manipulation/planning.py#L1984)。
 
 输入签名：
 
@@ -3922,7 +3855,7 @@ np.isfinite
 
 ## `_project_boundary.BoundaryConstraint`
 
-[定义位置](../../../manipulation/planning.py#L2068)。
+[定义位置](../../../manipulation/planning.py#L1998)。
 
 ```python
 class BoundaryConstraint(ob.Constraint):
@@ -3934,7 +3867,7 @@ class BoundaryConstraint(ob.Constraint):
 
 ## `_project_boundary.BoundaryConstraint.__init__`
 
-[定义位置](../../../manipulation/planning.py#L2069)。
+[定义位置](../../../manipulation/planning.py#L1999)。
 
 输入签名：
 
@@ -3965,7 +3898,7 @@ super
 
 ## `_project_boundary.BoundaryConstraint.function`
 
-[定义位置](../../../manipulation/planning.py#L2072)。
+[定义位置](../../../manipulation/planning.py#L2002)。
 
 输入签名：
 
@@ -3998,7 +3931,7 @@ np.asarray
 
 ## `_project_boundary.BoundaryConstraint.jacobian`
 
-[定义位置](../../../manipulation/planning.py#L2075)。
+[定义位置](../../../manipulation/planning.py#L2005)。
 
 输入签名：
 
@@ -4031,7 +3964,7 @@ np.asarray
 
 ## `_orientation_vjp_type`
 
-[定义位置](../../../manipulation/planning.py#L2091)。
+[定义位置](../../../manipulation/planning.py#L2021)。
 
 输入签名：
 
@@ -4073,7 +4006,7 @@ WorldQuaternionVJP
 
 ## `_orientation_vjp_type.WorldQuaternionVJP`
 
-[定义位置](../../../manipulation/planning.py#L2106)。
+[定义位置](../../../manipulation/planning.py#L2036)。
 
 ```python
 class WorldQuaternionVJP(torch.autograd.Function):
@@ -4085,7 +4018,7 @@ class WorldQuaternionVJP(torch.autograd.Function):
 
 ## `_orientation_vjp_type.WorldQuaternionVJP.forward`
 
-[定义位置](../../../manipulation/planning.py#L2108)。
+[定义位置](../../../manipulation/planning.py#L2038)。
 
 输入签名：
 
@@ -4123,7 +4056,7 @@ quaternion.clone
 
 ## `_orientation_vjp_type.WorldQuaternionVJP.backward`
 
-[定义位置](../../../manipulation/planning.py#L2116)。
+[定义位置](../../../manipulation/planning.py#L2046)。
 
 输入签名：
 
@@ -4171,7 +4104,7 @@ torch.einsum
 
 ## `_native_gradient_layout_type`
 
-[定义位置](../../../manipulation/planning.py#L2132)。
+[定义位置](../../../manipulation/planning.py#L2062)。
 
 输入签名：
 
@@ -4208,7 +4141,7 @@ NativeGradientLayout
 
 ## `_native_gradient_layout_type.NativeGradientLayout`
 
-[定义位置](../../../manipulation/planning.py#L2142)。
+[定义位置](../../../manipulation/planning.py#L2072)。
 
 ```python
 class NativeGradientLayout(torch.autograd.Function):
@@ -4220,7 +4153,7 @@ class NativeGradientLayout(torch.autograd.Function):
 
 ## `_native_gradient_layout_type.NativeGradientLayout.forward`
 
-[定义位置](../../../manipulation/planning.py#L2144)。
+[定义位置](../../../manipulation/planning.py#L2074)。
 
 输入签名：
 
@@ -4248,7 +4181,7 @@ value
 
 ## `_native_gradient_layout_type.NativeGradientLayout.backward`
 
-[定义位置](../../../manipulation/planning.py#L2148)。
+[定义位置](../../../manipulation/planning.py#L2078)。
 
 输入签名：
 
@@ -4278,172 +4211,14 @@ gradient.contiguous
 gradient.contiguous
 ```
 
-## `_verification_stop_preference`
-
-[定义位置](../../../manipulation/planning.py#L2155)。
-
-输入签名：
-
-```python
-def _verification_stop_preference(progress, joint_velocity, stop_progress, *, trajectory_time=None):
-```
-
-实现说明：
-
-> Squared speed at each declared stop's first physical occurrence.
->
-> A verification stop commands zero velocity. Its numerical acceptance
-> band still belongs exclusively to PlanningProblem.residuals(). Keeping
-> this optimizer objective active inside that band avoids terminating on
-> its floating-point edge; ordinary motion receives no added objective.
-
-显式输出分支：
-
-```python
-torch.where(stopped, joint_velocity.square().sum(-1), torch.zeros_like(progress))
-```
-
-读取的对象属性：
-
-```python
-torch.zeros_like
-torch.bool
-np.unique
-torch.where
-joint_velocity.square().sum
-joint_velocity.square
-```
-
-写入目标：
-
-```python
-stopped
-value
-```
-
-直接调用符号：
-
-```python
-torch.zeros_like
-np.unique
-_first_event_query
-torch.where
-joint_velocity.square().sum
-joint_velocity.square
-```
-
-## `_formal_native_clock`
-
-[定义位置](../../../manipulation/planning.py#L2174)。
-
-输入签名：
-
-```python
-def _formal_native_clock(trajopt):
-```
-
-实现说明：
-
-> Bind hand, rollout and saved-curve export to one physical clock.
-
-显式输出分支：
-
-```python
-{**grid, 'source': 'instantaneous-boundary cubic on unchanged exact float32 clock'}
-```
-
-读取的对象属性：
-
-```python
-trajopt.config
-config.minimum_trajectory_dt
-config.maximum_trajectory_dt
-trajopt.transition_model.control_space
-trajopt.transition_model
-ControlSpace.BSPLINE_3
-trajopt.action_horizon
-trajopt.interpolation_steps
-config.interpolation_dt
-```
-
-写入目标：
-
-```python
-config
-control
-grid
-```
-
-直接调用符号：
-
-```python
-ValueError
-_fixed_spline_grid
-```
-
-## `_joint_state_sample_times`
-
-[定义位置](../../../manipulation/planning.py#L2195)。
-
-输入签名：
-
-```python
-def _joint_state_sample_times(joint_state, counts):
-```
-
-实现说明：
-
-> Round physical time once, without a normalized-float32 roundtrip.
-
-显式输出分支：
-
-```python
-(indices.to(torch.float64) * joint_state.dt.reshape(-1, 1).to(torch.float64)).to(position.dtype)
-```
-
-读取的对象属性：
-
-```python
-joint_state.position
-torch.minimum
-torch.arange
-position.shape
-position.device
-(indices.to(torch.float64) * joint_state.dt.reshape(-1, 1).to(torch.float64)).to
-indices.to
-torch.float64
-joint_state.dt.reshape(-1, 1).to
-joint_state.dt.reshape
-joint_state.dt
-position.dtype
-```
-
-写入目标：
-
-```python
-position
-indices
-```
-
-直接调用符号：
-
-```python
-torch.minimum
-torch.arange
-(indices.to(torch.float64) * joint_state.dt.reshape(-1, 1).to(torch.float64)).to
-indices.to
-joint_state.dt.reshape(-1, 1).to
-joint_state.dt.reshape
-```
-
 ## `_scene_boundary_evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2209)。
+[定义位置](../../../manipulation/planning.py#L2097)。
 
 输入签名：
 
 ```python
-def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion, progress, joint_position, joint_names, *, trajectory_time, normalized_time, query_counts=None, component_diagnostics=None, query_role='acceptance', scene_evidence_out=None, optimizer_candidate_evidence=False, local_models=None, geometry_evidence_out=None, geometry_scope='full'):
+def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion, progress, joint_position, joint_names, *, trajectory_time, normalized_time, query_counts=None, component_diagnostics=None, scene_evidence_out=None, geometry_evidence_out=None, geometry_scope='full'):
 ```
 
 实现说明：
@@ -4587,7 +4362,7 @@ torch.stack((exact_terms, left_terms, right_terms)).amax
 
 ## `_scene_boundary_evaluate.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2226)。
+[定义位置](../../../manipulation/planning.py#L2113)。
 
 输入签名：
 
@@ -4598,7 +4373,7 @@ def evaluate(*args, **kwargs):
 显式输出分支：
 
 ```python
-scene.evaluate(*args, **kwargs, query_role=query_role, local_models=local_models, geometry_evidence_out=pair_evidence, geometry_scope=geometry_scope)
+scene.evaluate(*args, **kwargs, geometry_evidence_out=pair_evidence, geometry_scope=geometry_scope)
 ```
 
 读取的对象属性：
@@ -4619,7 +4394,7 @@ scene.evaluate
 
 ## `_scene_boundary_evaluate.retain_pair_evidence`
 
-[定义位置](../../../manipulation/planning.py#L2231)。
+[定义位置](../../../manipulation/planning.py#L2117)。
 
 输入签名：
 
@@ -4660,7 +4435,7 @@ geometry_evidence_out.append
 
 ## `_scene_boundary_evaluate.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2255)。
+[定义位置](../../../manipulation/planning.py#L2141)。
 
 输入签名：
 
@@ -4681,16 +4456,12 @@ term.detach
 components.items
 name.startswith
 torch.zeros_like
-torch.bool
-torch.isfinite
-value.detach
-invalid.to
-value.dtype
 residual.detach().reshape
 residual.detach
 torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float('inf'))).argmax().item
 torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float('inf'))).argmax
 torch.where
+torch.isfinite
 torch.full_like
 flat[index].item
 np.isfinite
@@ -4712,10 +4483,6 @@ prefix
 scene_evidence_out[category]
 name
 term
-hard
-invalid
-scene_evidence_out['optimizer_hard_invalid']
-scene_evidence_out['optimizer_hard_value']
 residual
 flat
 index
@@ -4732,15 +4499,13 @@ term.detach
 components.items
 name.startswith
 torch.zeros_like
-torch.isfinite
-value.detach
-invalid.to
 residual.detach().reshape
 residual.detach
 int
 torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float('inf'))).argmax().item
 torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float('inf'))).argmax
 torch.where
+torch.isfinite
 torch.full_like
 float
 flat[index].item
@@ -4755,7 +4520,7 @@ args[3].detach
 
 ## `_scene_boundary_evaluate.expanded`
 
-[定义位置](../../../manipulation/planning.py#L2356)。
+[定义位置](../../../manipulation/planning.py#L2217)。
 
 输入签名：
 
@@ -4787,59 +4552,43 @@ torch.cat
 value.index_select
 ```
 
-## `_process_manager_type`
+## `_ik_manager_type`
 
-[定义位置](../../../manipulation/planning.py#L2401)。
+[定义位置](../../../manipulation/planning.py#L2261)。
 
 输入签名：
 
 ```python
-def _process_manager_type(problem, scene, progress_map, anchors, budget, *, bound_reference, clock=None, seed_parameter=None, robot_dict=None, phase='feasibility', functional_constraints=None):
+def _ik_manager_type(problem, budget, *, clock, seed_parameter):
 ```
 
 实现说明：
 
-> Build V2's documented manager extension after GPU use is requested.
+> Extend native IK metrics for declared event allowed sets.
 >
-> Configuration construction must return the derived type and class_type;
-> registering a custom name alone is not dispatched by V2's base manager.
-> The ordinary cost manager evaluates the transferred reference and native
-> joint regularization. Constraint managers retain built-in joint limits,
-> declared task constraints and the same frozen observed scene model.
+> Ordinary reference IK uses the library pose objective. An event query
+> disables that objective and binds the event's original allowed set.
+> Complete trajectory tasks and geometry belong to the constrained solver
+> and candidate verifier, so this manager has no trajectory search state.
 
 显式输出分支：
 
 ```python
-ProcessCostManagerCfg
+IKCostManagerCfg
 ```
 
 读取的对象属性：
 
-```python
-problem.functional_constraint_keys
-np.empty
-manager._query_counts
-manager._process_mode
-```
+无显式条目。
 
 写入目标：
 
 ```python
 orientation_vjp
 native_layout
-functional_constraints
-managers
-geometry_models
 ik_goal_ids
-optimizer_geometry_scope
-collision_witnesses
-ProcessCostManagerCfg.bind_request
-ProcessCostManagerCfg.set_geometry_scope
-ProcessCostManagerCfg.bind_ik_goals
-ProcessCostManagerCfg.add_collision_witnesses
-ProcessCostManagerCfg.query_anchor_parameters
-ProcessCostManagerCfg.query_diagnostics
-manager
+IKCostManagerCfg.bind_request
+IKCostManagerCfg.bind_ik_goals
 ```
 
 直接调用符号：
@@ -4847,74 +4596,24 @@ manager
 ```python
 _orientation_vjp_type
 _native_gradient_layout_type
-FunctionalAugmentedLagrangian
-LocalGeometryModels
-np.empty
 staticmethod
-deepcopy
 ```
 
-## `_process_manager_type.query_anchor_parameters`
+## `_ik_manager_type.IKCostManager`
 
-[定义位置](../../../manipulation/planning.py#L2445)。
-
-输入签名：
+[定义位置](../../../manipulation/planning.py#L2275)。
 
 ```python
-def query_anchor_parameters():
-```
-
-显式输出分支：
-
-```python
-pairs
-```
-
-读取的对象属性：
-
-```python
-progress_map.anchor_parameters
-np.column_stack
-np.interp
-progress_map.u
-progress_map.s
-np.concatenate
-np.argsort
-```
-
-写入目标：
-
-```python
-pairs
-extra
-```
-
-直接调用符号：
-
-```python
-progress_map.anchor_parameters
-len
-np.column_stack
-np.interp
-np.concatenate
-np.argsort
-```
-
-## `_process_manager_type.ProcessCostManager`
-
-[定义位置](../../../manipulation/planning.py#L2455)。
-
-```python
-class ProcessCostManager(RobotCostManager):
+class IKCostManager(RobotCostManager):
 ```
 
 类字段：
 
 无显式条目。
 
-## `_process_manager_type.ProcessCostManager.initialize_from_config`
+## `_ik_manager_type.IKCostManager.initialize_from_config`
 
-[定义位置](../../../manipulation/planning.py#L2456)。
+[定义位置](../../../manipulation/planning.py#L2276)。
 
 输入签名：
 
@@ -4924,425 +4623,42 @@ def initialize_from_config(self, config, transition_model, scene_collision_check
 
 显式输出分支：
 
-```python
-None
-None
-None
-```
+无显式条目。
 
 读取的对象属性：
 
 ```python
 super().initialize_from_config
 config.process_mode
-managers.append
-self._process_mode
-config.tool_pose_cfg.weight.detach().cpu().tolist
-config.tool_pose_cfg.weight.detach().cpu
-config.tool_pose_cfg.weight.detach
-config.tool_pose_cfg.weight
-config.tool_pose_cfg
-self.get_cost('cspace').config
-self.get_cost
-self.bind_request_data
-transition_model.robot_model
-scene.clone_for_rollout
 transition_model.joint_names
 transition_model.robot_model.tool_frames.index
 transition_model.robot_model.tool_frames
+transition_model.robot_model
 problem.tool_link
-self._process_mode.startswith
-transition_model.robot_model.config
 ```
 
 写入目标：
 
 ```python
-config
 self._process_mode
-self._dense_counts
-self._scene_evidence
-self._optimizer_evidence
-self._query_counts
-self._reference_pose_weight
-self._cspace_template
-transition_model.robot_model.compute_jacobian
-self._scene
 self._joint_names
 self._tool_index
-self._anchor_fk
+transition_model.robot_model.compute_jacobian
 ```
 
 直接调用符号：
 
 ```python
-deepcopy
 super().initialize_from_config
 super
-managers.append
-config.tool_pose_cfg.weight.detach().cpu().tolist
-config.tool_pose_cfg.weight.detach().cpu
-config.tool_pose_cfg.weight.detach
-self.get_cost
-self.bind_request_data
-scene.clone_for_rollout
+deepcopy
 tuple
 transition_model.robot_model.tool_frames.index
-self._process_mode.startswith
-Kinematics
 ```
 
-## `_process_manager_type.ProcessCostManager.bind_request_data`
+## `_ik_manager_type.IKCostManager.compute_costs`
 
-[定义位置](../../../manipulation/planning.py#L2503)。
-
-输入签名：
-
-```python
-def bind_request_data(self):
-```
-
-实现说明：
-
-> Replace request values in fixed-capacity native manager buffers.
-
-显式输出分支：
-
-```python
-None
-None
-```
-
-读取的对象属性：
-
-```python
-self._process_mode
-self.device_cfg
-self._reference_pose_weight
-self._cspace_template
-self.costs
-scene.clone_for_rollout
-self._query_counts.clear
-self._query_counts
-self._query_counts.update
-self._process_mode.startswith
-progress_map.u
-np.r_
-np.arange
-progress_map.s
-np.full
-budget.max_task_anchors
-np.concatenate
-np.repeat
-self.device_cfg.to_device
-previous.shape
-tensor.shape
-previous.copy_
-torch.as_tensor
-torch.float64
-self.device_cfg.device
-self._anchor_query_u.shape
-self._anchor_query_u
-query_u.shape
-self._anchor_query_u.copy_
-functional_constraints.bind
-self._anchor_u
-```
-
-写入目标：
-
-```python
-self._dense_counts
-self._reference_cost
-config
-self.costs['cspace']
-self._batch_size
-self._horizon
-self._reference_grid_key
-self._scene
-self._scene_evidence
-self._optimizer_evidence
-pad
-keys
-values
-pairs
-anchor_count
-self._anchor_count
-self._anchor_valid
-name
-value
-tensor
-previous
-query_u
-self._anchor_query_u
-```
-
-直接调用符号：
-
-```python
-NativeReferenceCost
-freeze_cspace_time_weights
-deepcopy
-FixedTimeStateCSpaceCost
-scene.clone_for_rollout
-self._query_counts.clear
-self._query_counts.update
-self._process_mode.startswith
-len
-MotionPlanningError
-np.arange
-np.full
-query_anchor_parameters
-_anchor_capacity
-np.concatenate
-np.repeat
-self.device_cfg.to_device
-getattr
-setattr
-previous.copy_
-torch.as_tensor
-hasattr
-self._anchor_query_u.copy_
-functional_constraints.bind
-```
-
-## `_process_manager_type.ProcessCostManager.set_dense_counts`
-
-[定义位置](../../../manipulation/planning.py#L2563)。
-
-输入签名：
-
-```python
-def set_dense_counts(self, counts):
-```
-
-显式输出分支：
-
-无显式条目。
-
-读取的对象属性：
-
-```python
-counts.reshape(-1).long
-counts.reshape
-self._process_mode
-```
-
-写入目标：
-
-```python
-self._dense_counts
-self._reference_grid_key
-```
-
-直接调用符号：
-
-```python
-counts.reshape(-1).long
-counts.reshape
-```
-
-## `_process_manager_type.ProcessCostManager.optimization_constraints`
-
-[定义位置](../../../manipulation/planning.py#L2572)。
-
-输入签名：
-
-```python
-def optimization_constraints(self):
-```
-
-显式输出分支：
-
-```python
-functional_constraints if self._process_mode == 'trajectory_optimizer' else None
-```
-
-读取的对象属性：
-
-```python
-self._process_mode
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-无显式条目。
-
-## `_process_manager_type.ProcessCostManager.local_geometry_models`
-
-[定义位置](../../../manipulation/planning.py#L2576)。
-
-输入签名：
-
-```python
-def local_geometry_models(self):
-```
-
-显式输出分支：
-
-```python
-geometry_models if self._process_mode == 'trajectory_optimizer' and optimizer_geometry_scope == 'full' else None
-```
-
-读取的对象属性：
-
-```python
-self._process_mode
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-无显式条目。
-
-## `_process_manager_type.ProcessCostManager.optimizer_evidence`
-
-[定义位置](../../../manipulation/planning.py#L2580)。
-
-输入签名：
-
-```python
-def optimizer_evidence(self, trajectories):
-```
-
-实现说明：
-
-> Read hard evidence and objective from this same rollout.
->
-> Functional multipliers and centering/command preferences are
-> objectives. Original task and observed-scene residuals determine
-> sampled eligibility under the same nonpenetration rule as final
-> metrics.
-
-显式输出分支：
-
-```python
-(feasible, signed, fixed_objective)
-```
-
-读取的对象属性：
-
-```python
-trajectories.costs_and_constraints
-constraints.constraints
-self._optimizer_evidence
-collection.names
-collection.values
-collection.names.index
-source.new_zeros
-source.shape
-constraints.costs
-constraints.hybrid_costs_constraints
-costs.names
-costs.values
-value.detach().flatten
-value.detach
-torch.isfinite(detached).all
-torch.isfinite
-(detached <= 0).all
-detached.sum
-```
-
-写入目标：
-
-```python
-constraints
-collection
-source
-feasible
-signed
-scene_source
-scene_present
-objective_names
-fixed_objective
-costs
-hard
-name
-value
-detached
-finite
-valid
-```
-
-直接调用符号：
-
-```python
-RuntimeError
-collection.names.index
-source.new_zeros
-zip
-value.detach().flatten
-value.detach
-torch.isfinite(detached).all
-torch.isfinite
-(detached <= 0).all
-detached.sum
-```
-
-## `_process_manager_type.ProcessCostManager.bind_scene_evidence`
-
-[定义位置](../../../manipulation/planning.py#L2624)。
-
-输入签名：
-
-```python
-def bind_scene_evidence(self, metrics):
-```
-
-实现说明：
-
-> Attach the last query's tensor only when its constraint is identical.
->
-> Native CostCollection.merge retains the constraint tensor object.
-> Shape equality would not distinguish another candidate/seed batch;
-> object identity does, without storing or comparing complete states.
-> RolloutMetrics.clone already clones a tensor-valued debug field.
-
-显式输出分支：
-
-无显式条目。
-
-读取的对象属性：
-
-```python
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-self._scene_evidence
-constraints.names
-constraints.values
-constraints.names.index
-evidence.detach().clone
-evidence.detach
-```
-
-写入目标：
-
-```python
-constraints
-source
-evidence
-metrics.debug
-```
-
-直接调用符号：
-
-```python
-RuntimeError
-constraints.names.index
-evidence.detach().clone
-evidence.detach
-```
-
-## `_process_manager_type.ProcessCostManager.compute_costs`
-
-[定义位置](../../../manipulation/planning.py#L2643)。
+[定义位置](../../../manipulation/planning.py#L2283)。
 
 输入签名：
 
@@ -5353,8 +4669,6 @@ def compute_costs(self, state, cost_collection=None, goal=None, **kwargs):
 显式输出分支：
 
 ```python
-super().compute_costs(state, cost_collection, goal, **kwargs)
-collection
 collection
 collection
 ```
@@ -5362,31 +4676,11 @@ collection
 读取的对象属性：
 
 ```python
-self._process_mode
 super().compute_costs
-state.joint_state
-joint.position.shape
-joint.position
-self._dense_counts
-torch.full
-torch.long
-joint.position.device
-self._reference_grid_key
-self._reference_cost.bind
-self._reference_cost
-self._reference_cost.time_weights
-weights.reshape
-weights.shape
-value.ndim
-collection.values
-collection.add
-self._reference_cost.forward
-state.tool_poses
-self._scene
-self._process_mode.startswith
-state.joint_state.position.shape
+self._process_mode
 state.joint_state.position
-state.joint_state.position.device
+state.joint_state
+state.tool_poses
 orientation_vjp.apply
 tool.quaternion.detach
 tool.quaternion
@@ -5397,9 +4691,9 @@ problem.transform_tool_pose
 native_layout.apply
 tool.position
 self._tool_index
-getattr(problem, ik_goal_ids[0][0])[ik_goal_ids[0][1]].progress
 q.new_full
 q.shape
+event.progress
 seed_parameter.to(q).expand
 seed_parameter.to
 problem.residuals
@@ -5412,183 +4706,27 @@ process.square
 goals.square().sum
 goals.square
 goals.sum
+collection.add
 budget.constraint_weight
-state.joint_state.velocity
-direction.kind
-problem.mechanisms
-mechanism.directions
-torch.einsum
-state.robot_spheres
-q.device
-(torch.arange(horizon, device=q.device, dtype=q.dtype)[None, :] / (counts[:, None] - 1)).clamp
-torch.arange
-q.dtype
-self._map_u
-self._map_s
-self._anchor_u[:, :self._anchor_count].expand
-self._anchor_u
-self._anchor_count
-self._anchor_s[:, :self._anchor_count].expand
-self._anchor_s
-self._anchor_valid
-torch.ones_like
-torch.bool
-self._anchor_query_u[:, :self._anchor_count].expand
-self._anchor_query_u
-(query_anchor_u * active_clock['duration']).to
-state.joint_state.dt
-JointState.from_position
-anchor_q.contiguous
-self._anchor_fk.compute_kinematics
-self._anchor_fk
-anchor_state.tool_poses.quaternion.detach
-anchor_state.tool_poses.quaternion
-anchor_state.tool_poses
-anchor_state.tool_jacobians[..., 3:, :].detach
-anchor_state.tool_jacobians
-anchor_state.tool_poses.position
-torch.cat
-anchor_state.robot_spheres
-torch.argsort
-problem.transform_tool_velocity
-problem.transform_robot_spheres
-process_terms.items
-anchor_valid.bool().expand
-anchor_valid.bool
-active.any(0).nonzero().flatten
-active.any(0).nonzero
-active.any
-self._query_counts
-scene_columns[None].expand
-scene_value.new_zeros(progress.shape).scatter
-scene_value.new_zeros
-progress.shape
-scene_evidence_out.items
-evidence.new_zeros(progress.shape).scatter
-evidence.new_zeros
-values.append
-process_value.square
-problem.functional_inequalities
-functional_constraints.terms(signed).values
-functional_constraints.terms
-q.new_zeros
-process_terms.values
-torch.where(active, original_process, 0.0).detach
-torch.where
-torch.isfinite(original_process).all
-torch.isfinite
-(original_process <= 0).all
-signed.values
-residual.detach
-(hard_invalid <= 0).all
-torch.isfinite(raw_scene).all
-(raw_scene <= 0).all
-value.detach
-signed.items
-problem.optimizer_preferences
-active_scene.optimizer_preferences
-problem.stop_progress
-value.gather
-(value[:, horizon:] * anchor_valid).sum
-(regular + folded).unsqueeze
-self._optimizer_evidence
-scene_evidence_out[category].gather
-(evidence[:, horizon:] * anchor_valid).sum
-channels.append
-torch.stack
 ```
 
 写入目标：
 
 ```python
-context
-joint
-batch
-horizon
-counts
-reference
-key
-times
-self._reference_grid_key
 collection
-weights
-collection.values
-value
-active_scene
-active_map
-active_clock
-sample_times
 q
 tool
 orientation
-p
-r
-event_progress
+position
+quaternion
+event
 progress
+times
 terms
 process
 name
+value
 goals
-dq
-_
-quaternion
-position
-need_rates
-mechanism
-direction
-twist
-spheres
-u
-anchor_u
-anchor_s
-anchor_valid
-query_anchor_u
-anchor_times
-anchor_q
-anchor_dq
-anchor_joints
-anchor_state
-anchor_quaternion
-anchor_position
-anchor_twist
-all_u
-order
-inverse
-link_quaternion
-tool_linear
-tool_angular
-trajectory_time
-process_terms
-process_value
-valid
-active
-geometry_scope
-values
-scene_evidence_out
-scene_columns
-scene_value
-scene_indices
-evidence
-scene_evidence_out[name]
-values[0]
-signed
-augmented
-folded_augmented
-augmented_cost
-original_process
-feasible
-residual
-hard_invalid
-raw_scene
-self._optimizer_evidence
-regular
-folded
-weighted
-channels
-category
-regular_evidence
-folded_evidence
-self._scene_evidence
 ```
 
 直接调用符号：
@@ -5596,21 +4734,12 @@ self._scene_evidence
 ```python
 super().compute_costs
 super
-getattr
-torch.full
-id
-_joint_state_sample_times
-self._reference_cost.bind
-self._reference_cost.time_weights
-weights.reshape
-collection.add
-self._reference_cost.forward
-self._process_mode.startswith
 orientation_vjp.apply
 tool.quaternion.detach
 state.cuda_robot_model_state.tool_jacobians[..., 3:, :].detach
 problem.transform_tool_pose
 native_layout.apply
+getattr
 q.new_full
 seed_parameter.to(q).expand
 seed_parameter.to
@@ -5624,151 +4753,15 @@ process.square
 goals.square().sum
 goals.square
 goals.sum
-any
-torch.einsum
-(torch.arange(horizon, device=q.device, dtype=q.dtype)[None, :] / (counts[:, None] - 1)).clamp
-torch.arange
-_torch_interpolate
-self._anchor_u[:, :self._anchor_count].expand
-self._anchor_s[:, :self._anchor_count].expand
-torch.ones_like
-self._anchor_query_u[:, :self._anchor_count].expand
-(query_anchor_u * active_clock['duration']).to
-_hermite_at_parameters
-JointState.from_position
-anchor_q.contiguous
-list
-self._anchor_fk.compute_kinematics
-anchor_state.tool_poses.quaternion.detach
-anchor_state.tool_jacobians[..., 3:, :].detach
-torch.cat
-torch.argsort
-ordered
-problem.transform_tool_velocity
-problem.transform_robot_spheres
-process_terms.items
-anchor_valid.bool().expand
-anchor_valid.bool
-active.any(0).nonzero().flatten
-active.any(0).nonzero
-active.any
-_scene_boundary_evaluate
-scene_input
-scene_columns[None].expand
-scene_value.new_zeros(progress.shape).scatter
-scene_value.new_zeros
-scene_evidence_out.items
-evidence.new_zeros(progress.shape).scatter
-evidence.new_zeros
-values.append
-process_value.square
-problem.functional_inequalities
-functional_constraints.terms(signed).values
-functional_constraints.terms
-q.new_zeros
-process_terms.values
-torch.where(active, original_process, 0.0).detach
-torch.where
-torch.isfinite(original_process).all
-torch.isfinite
-(original_process <= 0).all
-signed.values
-residual.detach
-(hard_invalid <= 0).all
-torch.isfinite(raw_scene).all
-(raw_scene <= 0).all
-value.detach
-signed.items
-problem.optimizer_preferences
-active_scene.optimizer_preferences
-_verification_stop_preference
-value.gather
-(value[:, horizon:] * anchor_valid).sum
-(regular + folded).unsqueeze
-scene_evidence_out[category].gather
-(evidence[:, horizon:] * anchor_valid).sum
-channels.append
-torch.stack
+collection.add
 ```
 
-## `_process_manager_type.ProcessCostManager.compute_costs.ordered`
+## `_ik_manager_type.IKCostManagerCfg`
 
-[定义位置](../../../manipulation/planning.py#L2770)。
-
-输入签名：
+[定义位置](../../../manipulation/planning.py#L2309)。
 
 ```python
-def ordered(value):
-```
-
-显式输出分支：
-
-```python
-value.gather(1, index)
-```
-
-读取的对象属性：
-
-```python
-order.reshape(*order.shape, *(1,) * (value.ndim - 2)).expand_as
-order.reshape
-order.shape
-value.ndim
-value.gather
-```
-
-写入目标：
-
-```python
-index
-```
-
-直接调用符号：
-
-```python
-order.reshape(*order.shape, *(1,) * (value.ndim - 2)).expand_as
-order.reshape
-value.gather
-```
-
-## `_process_manager_type.ProcessCostManager.compute_costs.scene_input`
-
-[定义位置](../../../manipulation/planning.py#L2815)。
-
-输入签名：
-
-```python
-def scene_input(value):
-```
-
-显式输出分支：
-
-```python
-value.index_select(1, scene_columns)
-```
-
-读取的对象属性：
-
-```python
-value.index_select
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-```python
-value.index_select
-```
-
-## `_process_manager_type.ProcessCostManagerCfg`
-
-[定义位置](../../../manipulation/planning.py#L2925)。
-
-```python
-class ProcessCostManagerCfg(RobotCostManagerCfg):
+class IKCostManagerCfg(RobotCostManagerCfg):
 ```
 
 类字段：
@@ -5777,9 +4770,9 @@ class ProcessCostManagerCfg(RobotCostManagerCfg):
 process_mode: str = ''
 ```
 
-## `_process_manager_type.ProcessCostManagerCfg.__post_init__`
+## `_ik_manager_type.IKCostManagerCfg.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L2928)。
+[定义位置](../../../manipulation/planning.py#L2312)。
 
 输入签名：
 
@@ -5793,7 +4786,9 @@ def __post_init__(self):
 
 读取的对象属性：
 
-无显式条目。
+```python
+super().__post_init__
+```
 
 写入目标：
 
@@ -5803,11 +4798,14 @@ self.class_type
 
 直接调用符号：
 
-无显式条目。
+```python
+super().__post_init__
+super
+```
 
-## `_process_manager_type.ProcessCostManagerCfg.create`
+## `_ik_manager_type.IKCostManagerCfg.create`
 
-[定义位置](../../../manipulation/planning.py#L2932)。
+[定义位置](../../../manipulation/planning.py#L2317)。
 
 输入签名：
 
@@ -5818,7 +4816,7 @@ def create(data_dict, scene_collision_checker=None, device_cfg=None):
 显式输出分支：
 
 ```python
-ProcessCostManagerCfg(**values, process_mode=data_dict.get('process_mode', ''))
+IKCostManagerCfg(**values, process_mode=data_dict.get('process_mode', ''))
 ```
 
 读取的对象属性：
@@ -5843,18 +4841,18 @@ item
 RobotCostManagerCfg.create
 getattr
 fields
-ProcessCostManagerCfg
+IKCostManagerCfg
 data_dict.get
 ```
 
-## `_process_manager_type.bind_request`
+## `_ik_manager_type.bind_request`
 
-[定义位置](../../../manipulation/planning.py#L2937)。
+[定义位置](../../../manipulation/planning.py#L2322)。
 
 输入签名：
 
 ```python
-def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, new_constraints, new_bound_reference):
+def bind_request(new_problem, new_budget):
 ```
 
 显式输出分支：
@@ -5863,79 +4861,23 @@ def bind_request(new_problem, new_scene, new_progress, new_anchors, new_budget, 
 
 读取的对象属性：
 
-```python
-np.empty
-manager.bind_request_data
-```
+无显式条目。
 
 写入目标：
 
 ```python
 problem
-scene
-progress_map
-anchors
 budget
-functional_constraints
-bound_reference
-collision_witnesses
 ik_goal_ids
-geometry_models
-optimizer_geometry_scope
-manager
 ```
 
 直接调用符号：
 
-```python
-np.empty
-LocalGeometryModels
-manager.bind_request_data
-```
-
-## `_process_manager_type.set_geometry_scope`
-
-[定义位置](../../../manipulation/planning.py#L2954)。
-
-输入签名：
-
-```python
-def set_geometry_scope(scope):
-```
-
-实现说明：
-
-> Bind the actual geometry computed by all optimizer rollouts.
->
-> Robot self derivatives use the same query witnesses directly. Full
-> observed-field optimization also captures its block-local models.
-> A change invalidates same-forward evidence before reinitialization.
-
-显式输出分支：
-
 无显式条目。
 
-读取的对象属性：
+## `_ik_manager_type.bind_ik_goals`
 
-无显式条目。
-
-写入目标：
-
-```python
-optimizer_geometry_scope
-manager
-manager._optimizer_evidence
-```
-
-直接调用符号：
-
-```python
-ValueError
-```
-
-## `_process_manager_type.bind_ik_goals`
-
-[定义位置](../../../manipulation/planning.py#L2970)。
+[定义位置](../../../manipulation/planning.py#L2325)。
 
 输入签名：
 
@@ -5958,7 +4900,6 @@ getattr(problem, name)[index].progress
 ```python
 selected
 identity
-progress_values
 name
 index
 ik_goal_ids
@@ -5968,384 +4909,14 @@ ik_goal_ids
 
 ```python
 tuple
-getattr
 len
-ValueError
-```
-
-## `_process_manager_type.add_collision_witnesses`
-
-[定义位置](../../../manipulation/planning.py#L2980)。
-
-输入签名：
-
-```python
-def add_collision_witnesses(parameters):
-```
-
-显式输出分支：
-
-```python
-extra
-```
-
-读取的对象属性：
-
-```python
-np.asarray(parameters, dtype=np.float32).astype(float).reshape
-np.asarray(parameters, dtype=np.float32).astype
-np.asarray
-np.float32
-np.isfinite(parameters).all
-np.isfinite
-np.any
-query_anchor_parameters()[:, 0].astype(np.float32).astype
-query_anchor_parameters()[:, 0].astype
-budget.max_task_anchors
-np.sort
-np.r_
-manager.bind_request_data
-```
-
-写入目标：
-
-```python
-parameters
-known
-extra
-collision_witnesses
-manager
-```
-
-直接调用符号：
-
-```python
-np.asarray(parameters, dtype=np.float32).astype(float).reshape
-np.asarray(parameters, dtype=np.float32).astype
-np.asarray
-np.isfinite(parameters).all
-np.isfinite
-np.any
-ValueError
-set
-query_anchor_parameters()[:, 0].astype(np.float32).astype
-query_anchor_parameters()[:, 0].astype
-query_anchor_parameters
-sorted
-len
-MotionPlanningError
-np.sort
-manager.bind_request_data
-```
-
-## `_trajectory_candidate`
-
-[定义位置](../../../manipulation/planning.py#L3008)。
-
-输入签名：
-
-```python
-def _trajectory_candidate(result, index):
-```
-
-实现说明：
-
-> Select one original seed through V2's own complete result gather.
->
-> V2 has no arbitrary-index result accessor. Its top-k gather selects from
-> ``seed_rank`` for actions, flags and valid lengths. JointState's native
-> indexer separately handles the full joint states and their active-joint
-> controls; these need not have the same DOF when some joints are locked.
-> Never flatten seeds into one apparent temporal trajectory.
-
-显式输出分支：
-
-```python
-candidate
-```
-
-读取的对象属性：
-
-```python
-result.batch_size
-result.num_seeds
-result.seed_rank.new_tensor
-result.seed_rank
-ordered.get_topk_seeds(1).clone
-ordered.get_topk_seeds
-state[:, index:index + 1].clone
-state.dt
-state.dt[:, index:index + 1].clone
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-constraints.names
-value[index:index + 1].detach().clone
-value[index:index + 1].detach
-constraints.values
-metrics.debug
-metrics.debug[index:index + 1].detach().clone
-metrics.debug[index:index + 1].detach
-```
-
-写入目标：
-
-```python
-ordered
-ordered.seed_rank
-other
-ordered.js_solution
-ordered.interpolated_trajectory
-ordered.metrics
-ordered.interpolated_metrics
-candidate
-name
-state
-single
-single.dt
-metrics
-constraints
-selected_metrics
-value
-```
-
-直接调用符号：
-
-```python
-ValueError
-copy
-result.seed_rank.new_tensor
-range
-ordered.get_topk_seeds(1).clone
-ordered.get_topk_seeds
 getattr
-state[:, index:index + 1].clone
-state.dt[:, index:index + 1].clone
-setattr
-RolloutMetrics
-CostsAndConstraints
-CostCollection
-list
-value[index:index + 1].detach().clone
-value[index:index + 1].detach
-metrics.debug[index:index + 1].detach().clone
-metrics.debug[index:index + 1].detach
-```
-
-## `_scene_metric_channel`
-
-[定义位置](../../../manipulation/planning.py#L3069)。
-
-输入签名：
-
-```python
-def _scene_metric_channel(metrics, channel):
-```
-
-实现说明：
-
-> Read collision (0), support (1), forbidden (2), or conditional unknown (3).
-
-显式输出分支：
-
-```python
-metrics.debug[..., channel:channel + 1]
-```
-
-读取的对象属性：
-
-```python
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-constraints.values
-constraints.names.index
-constraints.names
-metrics.debug
-metrics.debug.shape
-scene.shape
-```
-
-写入目标：
-
-```python
-constraints
-scene
-```
-
-直接调用符号：
-
-```python
-constraints.names.index
-RuntimeError
-```
-
-## `_scene_update_metric_residuals`
-
-[定义位置](../../../manipulation/planning.py#L3078)。
-
-输入签名：
-
-```python
-def _scene_update_metric_residuals(metrics, seed_index=None):
-```
-
-实现说明：
-
-> Report support gaps for the evaluated candidate, never request infeasibility.
-
-显式输出分支：
-
-```python
-{}
-{'scene_update': float(flat[index].item())}
-```
-
-读取的对象属性：
-
-```python
-metrics.costs_and_constraints.constraints.names
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-evidence.reshape
-flat.masked_fill(~flat.isfinite(), float('inf')).argmax
-flat.masked_fill
-flat.isfinite
-flat[index].item
-```
-
-写入目标：
-
-```python
-evidence
-flat
-index
-```
-
-直接调用符号：
-
-```python
-_scene_metric_channel
-evidence.reshape
-flat.masked_fill(~flat.isfinite(), float('inf')).argmax
-flat.masked_fill
-flat.isfinite
-float
-flat[index].item
-```
-
-## `_coverage_metric_residuals`
-
-[定义位置](../../../manipulation/planning.py#L3094)。
-
-输入签名：
-
-```python
-def _coverage_metric_residuals(metrics, seed_index=None):
-```
-
-实现说明：
-
-> Report forbidden-space violations, not collision or missing map data.
->
-> A different path can stay within the same observed/explicitly permitted
-> space. Reporting this category grants no permission to enter unknown space.
-
-显式输出分支：
-
-```python
-{}
-{'unknown_forbidden': float(flat[index].item())}
-```
-
-读取的对象属性：
-
-```python
-metrics.costs_and_constraints.constraints.names
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-evidence.reshape
-flat.masked_fill(~flat.isfinite(), float('inf')).argmax
-flat.masked_fill
-flat.isfinite
-flat[index].item
-```
-
-写入目标：
-
-```python
-evidence
-flat
-index
-```
-
-直接调用符号：
-
-```python
-_scene_metric_channel
-evidence.reshape
-flat.masked_fill(~flat.isfinite(), float('inf')).argmax
-flat.masked_fill
-flat.isfinite
-float
-flat[index].item
-```
-
-## `_conditional_unknown_metric_residuals`
-
-[定义位置](../../../manipulation/planning.py#L3112)。
-
-输入签名：
-
-```python
-def _conditional_unknown_metric_residuals(metrics, seed_index=None):
-```
-
-实现说明：
-
-> Retain the same query's unknown evidence even for native-success curves.
-
-显式输出分支：
-
-```python
-{}
-{'conditional_unknown': float(flat[index].item())}
-```
-
-读取的对象属性：
-
-```python
-metrics.costs_and_constraints.constraints.names
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-evidence.reshape
-flat.masked_fill(~flat.isfinite(), float('inf')).argmax
-flat.masked_fill
-flat.isfinite
-flat[index].item
-```
-
-写入目标：
-
-```python
-evidence
-flat
-index
-```
-
-直接调用符号：
-
-```python
-_scene_metric_channel
-evidence.reshape
-flat.masked_fill(~flat.isfinite(), float('inf')).argmax
-flat.masked_fill
-flat.isfinite
-float
-flat[index].item
+ValueError
 ```
 
 ## `_unknown_policy_failure`
 
-[定义位置](../../../manipulation/planning.py#L3126)。
+[定义位置](../../../manipulation/planning.py#L2358)。
 
 输入签名：
 
@@ -6409,303 +4980,9 @@ residuals.items
 name.endswith
 ```
 
-## `_collision_metric_residuals`
-
-[定义位置](../../../manipulation/planning.py#L3165)。
-
-输入签名：
-
-```python
-def _collision_metric_residuals(metrics, seed_index=None):
-```
-
-实现说明：
-
-> Summarize collision evidence from the same observed-scene query.
->
-> The other diagnostic channels retain missing support and coverage as
-> distinct results. The aggregate process_scene value is not reclassified.
-
-显式输出分支：
-
-```python
-residuals
-```
-
-读取的对象属性：
-
-```python
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-constraints.names
-```
-
-写入目标：
-
-```python
-constraints
-residuals
-residuals['scene_collision']
-```
-
-直接调用符号：
-
-```python
-maximum
-_scene_metric_channel
-```
-
-## `_collision_metric_residuals.maximum`
-
-[定义位置](../../../manipulation/planning.py#L3172)。
-
-输入签名：
-
-```python
-def maximum(value):
-```
-
-显式输出分支：
-
-```python
-float((value if seed_index is None else value[seed_index]).max().item())
-```
-
-读取的对象属性：
-
-```python
-(value if seed_index is None else value[seed_index]).max().item
-(value if seed_index is None else value[seed_index]).max
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-```python
-float
-(value if seed_index is None else value[seed_index]).max().item
-(value if seed_index is None else value[seed_index]).max
-```
-
-## `_dense_collision_witnesses`
-
-[定义位置](../../../manipulation/planning.py#L3182)。
-
-输入签名：
-
-```python
-def _dense_collision_witnesses(result, *, regular_horizon, anchor_parameters, capacity):
-```
-
-实现说明：
-
-> Pick peaks only in intervals without an existing collision witness.
->
-> Native dense metrics store real samples in a valid prefix. The final
-> allocated column also contains folded anchor penalties, so it is never
-> interpreted as a new physical-time observation. Work already performed
-> for the selected candidate is the only source of additional queries.
-
-显式输出分支：
-
-```python
-report
-report
-```
-
-读取的对象属性：
-
-```python
-result.batch_size
-result.num_seeds
-result.interpolated_metrics
-result.interpolated_last_tstep.reshape(-1)[0].item
-result.interpolated_last_tstep.reshape
-result.interpolated_last_tstep
-result.interpolated_trajectory.position
-result.interpolated_trajectory
-like.shape
-(torch.arange(count, device=like.device, dtype=like.dtype) / (count - 1)).cpu().numpy
-(torch.arange(count, device=like.device, dtype=like.dtype) / (count - 1)).cpu
-torch.arange
-like.device
-like.dtype
-(torch.arange(regular_horizon, device=like.device, dtype=like.dtype) / (regular_horizon - 1)).cpu().numpy
-(torch.arange(regular_horizon, device=like.device, dtype=like.dtype) / (regular_horizon - 1)).cpu
-regular_u.astype
-np.asarray(anchor_parameters, dtype=dense_u.dtype).astype
-np.asarray
-dense_u.dtype
-np.array
-result.interpolated_metrics.costs_and_constraints.constraints
-result.interpolated_metrics.costs_and_constraints
-constraints.names
-constraints.values
-measurements.insert
-ordinary.costs_and_constraints.constraints
-ordinary.costs_and_constraints
-ordinary_constraints.names
-ordinary_constraints.values
-ordinary_measurements.get
-tensor.shape
-tensor[0].detach().reshape(regular_horizon, -1).amax(-1).cpu().numpy
-tensor[0].detach().reshape(regular_horizon, -1).amax(-1).cpu
-tensor[0].detach().reshape(regular_horizon, -1).amax
-tensor[0].detach().reshape
-tensor[0].detach
-np.isfinite
-tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu().numpy
-tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu
-tensor[0, :count].detach().reshape(count, -1).amax
-tensor[0, :count].detach().reshape
-tensor[0, :count].detach
-np.flatnonzero
-np.diff
-np.r_
-edges.reshape
-np.any
-np.argmax
-peaks.append
-component_peaks.append
-candidates.append
-report.update
-```
-
-写入目标：
-
-```python
-report
-count
-like
-horizon
-dense_u
-regular_u
-known
-eligible
-index
-u
-constraints
-measurements
-name
-tensor
-ordinary
-ordinary_constraints
-ordinary_measurements
-ordinary_measurements['scene_collision']
-positive_parameters
-_
-values
-positive
-positive[-1]
-positive_parameters[name]
-component_peaks
-edges
-peaks
-left
-right
-detected
-candidates
-```
-
-直接调用符号：
-
-```python
-ValueError
-int
-result.interpolated_last_tstep.reshape(-1)[0].item
-result.interpolated_last_tstep.reshape
-(torch.arange(count, device=like.device, dtype=like.dtype) / (count - 1)).cpu().numpy
-(torch.arange(count, device=like.device, dtype=like.dtype) / (count - 1)).cpu
-torch.arange
-(torch.arange(regular_horizon, device=like.device, dtype=like.dtype) / (regular_horizon - 1)).cpu().numpy
-(torch.arange(regular_horizon, device=like.device, dtype=like.dtype) / (regular_horizon - 1)).cpu
-set
-regular_u.astype
-np.asarray(anchor_parameters, dtype=dense_u.dtype).astype
-np.asarray
-np.array
-float
-enumerate
-_collision_metric_residuals
-zip
-measurements.insert
-_scene_metric_channel
-getattr
-dict
-ordinary_measurements.get
-tensor[0].detach().reshape(regular_horizon, -1).amax(-1).cpu().numpy
-tensor[0].detach().reshape(regular_horizon, -1).amax(-1).cpu
-tensor[0].detach().reshape(regular_horizon, -1).amax
-tensor[0].detach().reshape
-tensor[0].detach
-np.isfinite
-tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu().numpy
-tensor[0, :count].detach().reshape(count, -1).amax(-1).cpu
-tensor[0, :count].detach().reshape(count, -1).amax
-tensor[0, :count].detach().reshape
-tensor[0, :count].detach
-np.flatnonzero
-np.diff
-edges.reshape
-np.any
-len
-np.argmax
-peaks.append
-component_peaks.append
-sorted
-range
-max
-candidates.append
-report.update
-```
-
-## `_bind_optimizer_constraint_config`
-
-[定义位置](../../../manipulation/planning.py#L3284)。
-
-输入签名：
-
-```python
-def _bind_optimizer_constraint_config(trajectory_optimizer, trajectory_metrics):
-```
-
-实现说明：
-
-> Share ordinary scoring and native joint constraints on their existing paths.
->
-> Both arguments are newly loaded request configurations. Metric ordinary
-> costs follow the optimizer objective. Optimizer constraints reuse the
-> native metric joint-limit configuration, including its original weights
-> and zero activation distance, so same-query retention sees those limits.
-> Deep copies keep the subsequent native factories' configuration private.
-
-显式输出分支：
-
-无显式条目。
-
-读取的对象属性：
-
-无显式条目。
-
-写入目标：
-
-```python
-trajectory_metrics['rollout']['cost_cfg']
-trajectory_optimizer['rollout']['constraint_cfg']['cspace_cfg']
-```
-
-直接调用符号：
-
-```python
-deepcopy
-```
-
 ## `_reference_entrance`
 
-[定义位置](../../../manipulation/planning.py#L3300)。
+[定义位置](../../../manipulation/planning.py#L2409)。
 
 输入签名：
 
@@ -6810,12 +5087,12 @@ pin.getFrameVelocity
 np.cross
 ```
 
-## `_CuroboPlanner`
+## `_ConstrainedPlanner`
 
-[定义位置](../../../manipulation/planning.py#L3338)。
+[定义位置](../../../manipulation/planning.py#L2447)。
 
 ```python
-class _CuroboPlanner():
+class _ConstrainedPlanner():
 ```
 
 类字段：
@@ -6824,11 +5101,11 @@ class _CuroboPlanner():
 
 实现说明：
 
-> Resident native solvers with request-local online constraint inputs.
+> Resident IK proposals and one request-local constrained trajectory problem.
 
-## `_CuroboPlanner.__init__`
+## `_ConstrainedPlanner.__init__`
 
-[定义位置](../../../manipulation/planning.py#L3342)。
+[定义位置](../../../manipulation/planning.py#L2451)。
 
 输入签名：
 
@@ -6857,7 +5134,6 @@ self.close
 
 ```python
 self.ik
-self.trajopt
 self.check_request
 self._precision_torch
 self._caller_precision
@@ -6871,9 +5147,9 @@ self._initialize
 self.close
 ```
 
-## `_CuroboPlanner._initialize`
+## `_ConstrainedPlanner._initialize`
 
-[定义位置](../../../manipulation/planning.py#L3365)。
+[定义位置](../../../manipulation/planning.py#L2474)。
 
 输入签名：
 
@@ -6939,39 +5215,34 @@ self.progress_map.u
 self.progress_map.s
 self.robot_metadata
 self.anchor_capacity
-workspace.cpu_live_bytes
+workspace.pending_cpu_bytes
 self.validation_storage
 budget.max_host_rss_bytes
-torch.backends.cuda.matmul
-torch.backends.cuda
-torch.backends
-torch.backends.cudnn
-self._caller_precision
 self.device_cfg.device
 self.device_cfg
 budget.max_device_used_bytes
 workspace.total_bytes
 workspace.cpu_bytes
 workspace.gpu_bytes
+workspace.cpu_live_bytes
 workspace.anchor_fk_bytes
 self.device_cfg.to_device
-problem.functional_constraint_keys
-self.anchors
-self.bound_reference
 self.formal_clock
 self.seed_parameter
-self.robot_dict
-self.functional_constraints
 pose_cost.update
-budget.ik_iterations
-budget.trajectory_iterations
 InverseKinematicsCfg.create
 budget.ik_seeds
 problem.numerical.position_m
 problem.numerical
 problem.numerical.rotation_rad
 self._manager_type
+budget.ik_iterations
 budget.random_seed
+torch.backends.cuda.matmul
+torch.backends.cuda
+torch.backends
+torch.backends.cudnn
+self._caller_precision
 self.ik.joint_names
 self.ik
 self.joint_names
@@ -6985,15 +5256,8 @@ problem.start_dq
 self._bind_online_robot
 self.ik.kinematics.config
 scene.clone_for_rollout
-transition['transition_model_cfg'].update
-budget.trajectory_seeds
-budget.interpolation_buffer_size
-TrajectoryOptimizerCfg.create
-self._trajectory_configuration
-self._bind_formal_clock
 self._initialize_verification_constraints
 self._bind_physical_domains
-self._manager_type.bind_request
 ```
 
 写入目标：
@@ -7027,8 +5291,6 @@ entrance_twist
 self.bound_reference
 self.validation_storage
 workspace
-torch.backends.cuda.matmul.allow_tf32
-torch.backends.cudnn.allow_tf32
 self.problem
 self.scene
 self.budget
@@ -7042,14 +5304,11 @@ self.scene_gpu_workspace_bytes
 self.scene_cpu_live_bytes
 self.anchor_fk_workspace_bytes
 self.ik
-self.trajopt
 self.anchors
 self.robot_dict
 self.seed_parameter
 self.formal_clock
-self.functional_constraints
 self._manager_type
-self.phase
 self.goal_ik_candidates
 self.last_optimizer_diagnostics
 self.last_optimizer_runtime
@@ -7059,19 +5318,18 @@ self.reference_initialization
 self.reference_ik_queries
 self.reference_ik_chains
 self.initial_seed_strategies
+self.route
 ik_optimizer
+ik_optimizer['optimizer']['inner_iters']
 pose_cost
 self.reference_ik_pose_weights
 pose_cost['weight'][1]
-trajectory_optimizer
-trajectory_optimizer['rollout']['cost_cfg']['process_mode']
-trajectory_metrics
-config
-iterations
-inner_iterations
+self.motion_configuration
 ik_cfg
 ik_cfg.use_lm_seed
 ik_cfg.exit_early
+torch.backends.cuda.matmul.allow_tf32
+torch.backends.cudnn.allow_tf32
 self.joint_names
 columns
 self.start
@@ -7079,10 +5337,6 @@ self._verification_fk
 self._orientation_vjp
 self._native_layout
 self._verification_scene
-transition
-self._trajectory_configuration
-self._optimizer_class
-self._optimizer_config_class
 ```
 
 直接调用符号：
@@ -7100,7 +5354,7 @@ np.isfinite(anchors).all
 np.isfinite
 np.any
 ValueError
-_progress_for_cubic_boundaries
+reference_progress_clock
 _fixed_spline_grid
 _bind_event_clock
 _ProgressMap
@@ -7131,14 +5385,15 @@ _require_planning_host_memory
 DeviceCfg
 _require_planning_memory
 self.device_cfg.to_device
-FunctionalAugmentedLagrangian
-_process_manager_type
+_ik_manager_type
 configuration
 tuple
 pose_cost.update
-_bind_optimizer_constraint_config
-InverseKinematicsCfg.create
 deepcopy
+load_yaml
+join_path
+get_task_configs_path
+InverseKinematicsCfg.create
 InverseKinematics
 RuntimeError
 problem.joint_names.index
@@ -7149,22 +5404,13 @@ Kinematics
 _orientation_vjp_type
 _native_gradient_layout_type
 scene.clone_for_rollout
-load_yaml
-join_path
-get_task_configs_path
-transition['transition_model_cfg'].update
-cubic_transition_config_type
-ProcessTrajectoryOptimizer
-TrajectoryOptimizerCfg.create
-self._bind_formal_clock
 self._initialize_verification_constraints
 self._bind_physical_domains
-self._manager_type.bind_request
 ```
 
-## `_CuroboPlanner._initialize.configuration`
+## `_ConstrainedPlanner._initialize.configuration`
 
-[定义位置](../../../manipulation/planning.py#L3512)。
+[定义位置](../../../manipulation/planning.py#L2594)。
 
 输入签名：
 
@@ -7204,209 +5450,9 @@ data['rollout'].setdefault
 constraint.pop
 ```
 
-## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer`
+## `_ConstrainedPlanner._bind_online_robot`
 
-[定义位置](../../../manipulation/planning.py#L3616)。
-
-```python
-class ProcessTrajectoryOptimizer(TrajectoryOptimizer):
-```
-
-类字段：
-
-无显式条目。
-
-## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer._prepare_goal_buffer`
-
-[定义位置](../../../manipulation/planning.py#L3618)。
-
-输入签名：
-
-```python
-def _prepare_goal_buffer(self, solve_state, goal_tool_poses, current_state=None, use_implicit_goal=False, seed_goal_state=None, goal_state=None):
-```
-
-实现说明：
-
-> Preserve native buffers while completing goal-free metadata.
->
-> The installed registry infers its batch only from pose or joint
-> tracking goals. Our process constraints own those requirements,
-> so seed-only registries retain -1 unless the request supplies
-> this metadata. Bind it here for direct solves, candidate metrics
-> and resident reuse before any rollout allocates state storage.
-
-显式输出分支：
-
-```python
-(buffer, update_reference)
-```
-
-读取的对象属性：
-
-```python
-super()._prepare_goal_buffer
-solve_state.batch_size
-```
-
-写入目标：
-
-```python
-buffer
-update_reference
-buffer.batch_size
-```
-
-直接调用符号：
-
-```python
-super()._prepare_goal_buffer
-super
-```
-
-## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer._get_result`
-
-[定义位置](../../../manipulation/planning.py#L3636)。
-
-输入签名：
-
-```python
-def _get_result(self, opt_result, metrics_result, interpolated_metrics, interpolated_trajectory, last_tstep, num_seeds, return_seeds):
-```
-
-显式输出分支：
-
-```python
-super()._get_result(opt_result, metrics_result, interpolated_metrics, interpolated_trajectory, last_tstep, num_seeds, return_seeds)
-```
-
-读取的对象属性：
-
-```python
-self.metrics_rollout.metrics_constraint_manager.bind_scene_evidence
-self.metrics_rollout.metrics_constraint_manager
-self.metrics_rollout
-self.additional_metrics_rollouts['interpolated_rollout'].metrics_constraint_manager.bind_scene_evidence
-self.additional_metrics_rollouts['interpolated_rollout'].metrics_constraint_manager
-self.additional_metrics_rollouts
-super()._get_result
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-```python
-self.metrics_rollout.metrics_constraint_manager.bind_scene_evidence
-self.additional_metrics_rollouts['interpolated_rollout'].metrics_constraint_manager.bind_scene_evidence
-super()._get_result
-super
-```
-
-## `_CuroboPlanner._initialize.ProcessTrajectoryOptimizer.get_interpolated_trajectory`
-
-[定义位置](../../../manipulation/planning.py#L3645)。
-
-输入签名：
-
-```python
-def get_interpolated_trajectory(self, js_optimized):
-```
-
-显式输出分支：
-
-```python
-(state, counts, False)
-```
-
-读取的对象属性：
-
-```python
-self.config.interpolation_type
-self.config
-TrajInterpolationType.BSPLINE_KNOTS_CUDA
-js_optimized.position.shape
-js_optimized.position
-js_optimized.position.ndim
-self.config.num_seeds
-self.horizon
-self.action_dim
-js_optimized.knot
-js_optimized.knot.shape
-self.action_horizon
-value.numel
-value.dtype
-torch.float32
-(value == expected).all
-self.config.interpolation_buffer_size
-self._interpolated_traj_buffer
-self._interpolated_traj_buffer.shape
-JointState.zeros
-self.device_cfg
-self.joint_names
-self._interpolation_dt_buffer
-self._interpolation_dt_buffer.shape
-torch.full
-self.device_cfg.device
-(self._interpolation_dt_buffer == grid['interpolation_dt']).all
-torch.int32
-self.core._goal_buffer
-self.core
-self.transition_model.control_space
-self.transition_model
-self.transition_model._rollout_step_fn
-step.action_horizon
-step.knot_dt
-step.sample
-goal.current_js
-goal.idxs_current_js
-self.additional_metrics_rollouts
-rollout._cost_manager_list
-manager.set_dense_counts
-```
-
-写入目标：
-
-```python
-grid
-batch
-name
-expected
-value
-capacity
-shape
-self._interpolated_traj_buffer
-self._interpolation_dt_buffer
-counts
-goal
-js_optimized.control_space
-step
-state
-rollout
-manager
-```
-
-直接调用符号：
-
-```python
-_formal_native_clock
-ValueError
-getattr
-value.numel
-bool
-(value == expected).all
-JointState.zeros
-torch.full
-(self._interpolation_dt_buffer == grid['interpolation_dt']).all
-step.sample
-manager.set_dense_counts
-```
-
-## `_CuroboPlanner._bind_online_robot`
-
-[定义位置](../../../manipulation/planning.py#L3710)。
+[定义位置](../../../manipulation/planning.py#L2647)。
 
 输入签名：
 
@@ -7423,10 +5469,7 @@ def _bind_online_robot(self):
 ```python
 self.scene.bind_online_robot
 self.scene
-self.robot_dict
 self.robot_validator
-self.device_cfg.device
-self.device_cfg
 self.check_request
 ```
 
@@ -7441,9 +5484,9 @@ self.scene.bind_online_robot
 self.check_request
 ```
 
-## `_CuroboPlanner.rebind`
+## `_ConstrainedPlanner.rebind`
 
-[定义位置](../../../manipulation/planning.py#L3715)。
+[定义位置](../../../manipulation/planning.py#L2651)。
 
 输入签名：
 
@@ -7453,7 +5496,7 @@ def rebind(self, problem, scene, budget, *, continuation=None, goal_identities=N
 
 实现说明：
 
-> Reuse IK/TrajOpt while clearing all prior candidate and request state.
+> Rebind measured entrance, observations and task clock on resident IK.
 
 显式输出分支：
 
@@ -7485,7 +5528,7 @@ self.reference_time_map
 self.reference_time_map.s
 self.robot_metadata
 self.anchor_capacity
-workspace.cpu_live_bytes
+workspace.pending_cpu_bytes
 budget.max_host_rss_bytes
 self.torch
 self.device_cfg.device
@@ -7506,33 +5549,17 @@ problem.start_dq
 self._bind_online_robot
 mapping.u
 mapping.s
-problem.functional_constraint_keys
 self._manager_type.bind_request
 self._manager_type
-self.functional_constraints
-self.bound_reference
 scene.clone_for_rollout
-self.trajopt.config
-self.trajopt
-rollout.transition_model
-self.trajopt.core.get_all_rollout_instances
-self.trajopt.core
-self.trajopt.additional_metrics_rollouts.values
-self.trajopt.additional_metrics_rollouts
-rollout.metrics_transition_model
-transitions.values
-transition.update_traj_dt
-self.trajopt._interpolation_dt_buffer
-self.trajopt._interpolation_dt_buffer.fill_
-self._bind_formal_clock
 self.seed_parameter.zero_
 self.seed_parameter
+self.ik.reset_seed
 self.ik
-solver.reset_seed
-solver.core.goal_registry_manager
-solver.core
+self.ik.core.goal_registry_manager
+self.ik.core
 manager._goal_buffer
-solver.core.get_all_rollout_instances
+self.ik.core.get_all_rollout_instances
 rollout.reset
 self._bind_physical_domains
 ```
@@ -7560,28 +5587,20 @@ self.start
 entrance_pose
 entrance_twist
 self.bound_reference
-self.functional_constraints
 self._verification_scene
-self.trajopt.config.minimum_trajectory_dt
-self.trajopt.config.maximum_trajectory_dt
-transitions
-rollout
-transitions[id(rollout.metrics_transition_model)]
-transition
-self.trajopt.config.interpolation_dt
 self.last_validation
 self.last_optimizer_diagnostics
 self.goal_ik_candidates
+self.last_optimizer_runtime
 self.delivery_candidate
 self.initialization_candidate
 self.reference_initialization
 self.reference_ik_queries
 self.reference_ik_chains
 self.initial_seed_strategies
-solver
 manager
 manager._goal_buffer.link_goal_poses
-rollouts
+rollout
 goal
 goal.link_goal_poses
 goal.goal_js
@@ -7595,7 +5614,7 @@ scene.validate_problem
 _initial_timing
 _continuation_timing
 np.unique
-_progress_for_cubic_boundaries
+reference_progress_clock
 _fixed_spline_grid
 _bind_event_clock
 _ProgressMap
@@ -7613,70 +5632,19 @@ list
 self._bind_online_robot
 _reference_entrance
 BoundToolReference
-FunctionalAugmentedLagrangian
 self._manager_type.bind_request
 scene.clone_for_rollout
-id
-self.trajopt.core.get_all_rollout_instances
-self.trajopt.additional_metrics_rollouts.values
-transitions.values
-transition.update_traj_dt
-self.trajopt._interpolation_dt_buffer.fill_
-self._bind_formal_clock
 self.seed_parameter.zero_
-solver.reset_seed
-solver.core.get_all_rollout_instances
+self.ik.reset_seed
+self.ik.core.get_all_rollout_instances
 rollout.reset
 getattr
 self._bind_physical_domains
 ```
 
-## `_CuroboPlanner._bind_formal_clock`
+## `_ConstrainedPlanner._seed_u`
 
-[定义位置](../../../manipulation/planning.py#L3812)。
-
-输入签名：
-
-```python
-def _bind_formal_clock(self):
-```
-
-显式输出分支：
-
-无显式条目。
-
-读取的对象属性：
-
-```python
-self.trajopt
-native.get
-self.formal_clock.items
-self.formal_clock
-self.formal_clock.update
-```
-
-写入目标：
-
-```python
-native
-name
-value
-```
-
-直接调用符号：
-
-```python
-_formal_native_clock
-any
-native.get
-self.formal_clock.items
-ValueError
-self.formal_clock.update
-```
-
-## `_CuroboPlanner._seed_u`
-
-[定义位置](../../../manipulation/planning.py#L3820)。
+[定义位置](../../../manipulation/planning.py#L2715)。
 
 输入签名：
 
@@ -7719,9 +5687,9 @@ float
 np.interp
 ```
 
-## `_CuroboPlanner._initialize_verification_constraints`
+## `_ConstrainedPlanner._initialize_verification_constraints`
 
-[定义位置](../../../manipulation/planning.py#L3830)。
+[定义位置](../../../manipulation/planning.py#L2725)。
 
 输入签名：
 
@@ -7739,11 +5707,11 @@ def _initialize_verification_constraints(self):
 self.device_cfg
 self._verification_native.initialize_from_config
 self._verification_native
-self.trajopt.config.metrics_rollout_config.constraint_cfg
-self.trajopt.config.metrics_rollout_config
-self.trajopt.config
-self.trajopt
-self.trajopt.transition_model
+self.ik.config.metrics_rollout_config.constraint_cfg
+self.ik.config.metrics_rollout_config
+self.ik.config
+self.ik
+self.ik.transition_model
 ```
 
 写入目标：
@@ -7761,15 +5729,19 @@ self._verification_native.initialize_from_config
 deepcopy
 ```
 
-## `_CuroboPlanner._bind_physical_domains`
+## `_ConstrainedPlanner._bind_physical_domains`
 
-[定义位置](../../../manipulation/planning.py#L3843)。
+[定义位置](../../../manipulation/planning.py#L2738)。
 
 输入签名：
 
 ```python
 def _bind_physical_domains(self):
 ```
+
+实现说明：
+
+> Bind exact feedback and official limits to the single cubic model.
 
 显式输出分支：
 
@@ -7785,17 +5757,32 @@ self._verification_native
 limits.joint_names.index
 limits.joint_names
 self.joint_names
+self.torch.stack([getattr(limits, name)[:, columns] for name in ('position', 'velocity', 'acceleration', 'jerk')]).cpu().double
+self.torch.stack([getattr(limits, name)[:, columns] for name in ('position', 'velocity', 'acceleration', 'jerk')]).cpu
 self.torch.stack
 self.torch
-self.start.position
-self.start
-self.start.velocity
+self.problem.joint_names.index
+self.problem.joint_names
+self.problem
+self.torch.as_tensor
+self.problem.start_q
+self.problem.start_dq
 self.formal_clock
-self.trajopt.action_horizon
-self.trajopt
-self.ik
-self.position_domain
+self.budget.knots
+self.budget
+self.problem.tool_link
+self.scene.robot_model._geometries.values
+self.scene.robot_model._geometries
+self.scene.robot_model
+self.scene
+self.robot_validator.checker.model
+self.robot_validator.checker
+self.robot_validator
+self.problem.base_pose
+self.physical_domain.knots
 self.physical_domain
+self.budget.trajectory_iterations
+self._bind_computation
 ```
 
 写入目标：
@@ -7807,6 +5794,11 @@ name
 bounds
 self.position_domain
 self.physical_domain
+frames
+row
+self.pin_kinematics
+self.action_horizon
+self.main_trajectory_iterations
 ```
 
 直接调用符号：
@@ -7814,16 +5806,92 @@ self.physical_domain
 ```python
 self._verification_native.get_cost
 limits.joint_names.index
+self.torch.stack([getattr(limits, name)[:, columns] for name in ('position', 'velocity', 'acceleration', 'jerk')]).cpu().double
+self.torch.stack([getattr(limits, name)[:, columns] for name in ('position', 'velocity', 'acceleration', 'jerk')]).cpu
 self.torch.stack
 getattr
 JointPositionDomain
+self.problem.joint_names.index
 CubicJointDomain
-bind_solver_components
+self.torch.as_tensor
+self.scene.robot_model._geometries.values
+PinKinematics
+self._bind_computation
 ```
 
-## `_CuroboPlanner.initial_state_diagnostics`
+## `_ConstrainedPlanner._bind_computation`
 
-[定义位置](../../../manipulation/planning.py#L3865)。
+[定义位置](../../../manipulation/planning.py#L2757)。
+
+输入签名：
+
+```python
+def _bind_computation(self, extra_parameters=()):
+```
+
+实现说明：
+
+> Freeze sorted physical queries and preserve exact event identities.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+np.linspace
+self.budget.knots
+self.budget
+self.budget.interpolation_steps
+self.progress_map.anchor_parameters
+self.progress_map
+self.anchors
+np.unique
+np.r_
+self.budget.max_validation_points
+np.interp
+self.progress_map.u
+self.progress_map.s
+np.searchsorted
+self.problem
+self.scene
+self.pin_kinematics
+self.physical_domain
+self.joint_names
+self.motion_configuration
+self.formal_clock
+self.budget.constraint_weight
+self.budget.max_host_rss_bytes
+```
+
+写入目标：
+
+```python
+ordinary
+pairs
+parameters
+progress
+progress[np.searchsorted(parameters, pairs[:, 0])]
+self.computation
+```
+
+直接调用符号：
+
+```python
+np.linspace
+self.progress_map.anchor_parameters
+np.unique
+len
+MotionPlanningError
+np.interp
+np.searchsorted
+TrajectoryComputation
+```
+
+## `_ConstrainedPlanner.initial_state_diagnostics`
+
+[定义位置](../../../manipulation/planning.py#L2775)。
 
 输入签名：
 
@@ -7833,7 +5901,7 @@ def initial_state_diagnostics(self):
 
 实现说明：
 
-> Test measured q/dq and online collision geometry before proposing motion.
+> Test original binary64 feedback and the registered observed scene.
 
 显式输出分支：
 
@@ -7844,41 +5912,25 @@ def initial_state_diagnostics(self):
 读取的对象属性：
 
 ```python
-self._verification_native.get_cost('cspace').config.joint_limits
-self._verification_native.get_cost('cspace').config
-self._verification_native.get_cost
-self._verification_native
-limits.joint_names.index
-limits.joint_names
-self.joint_names
-self.start.position
-self.start
-self.start.velocity
-self.torch.no_grad
+self.torch.as_tensor
 self.torch
-self.torch.relu
-self.JointState
-q.contiguous
-dq.contiguous
-self._verification_fk.compute_kinematics
-self._verification_fk
-self._RobotState
-state.tool_poses.tool_frames.index
-state.tool_poses.tool_frames
-state.tool_poses
-self.problem.tool_link
-self.problem
-self.problem.transform_tool_pose
-state.tool_poses.position
-state.tool_poses.quaternion
+self.physical_domain._curve_map.start_q
+self.physical_domain._curve_map
+self.physical_domain
+self.physical_domain._curve_map.start_dq
 q.new_full
 q.shape
 self.problem.start_progress
-self.scene
-self.progress_map
-self.problem.transform_robot_spheres
-native.robot_spheres
+self.problem
 q.new_zeros
+self.torch.no_grad
+self.physical_domain.bounds
+self.torch.relu
+self.scene
+self.pin_kinematics
+self.joint_names
+self.progress_map
+q.new_empty
 value.max().item
 value.max
 components.items
@@ -7890,22 +5942,19 @@ self.scene.last_query_report
 写入目标：
 
 ```python
-limits
-columns
-name
 q
 dq
+progress
+times
 components
+order
+name
 value
 bounds
 components[name]
-js
-state
-native
-index
+_
 position
 quaternion
-progress
 scene_components
 components['scene']
 residuals
@@ -7915,23 +5964,15 @@ failed
 直接调用符号：
 
 ```python
-self._verification_native.get_cost
-limits.joint_names.index
-self.torch.no_grad
-getattr
-self.torch.relu
-self.JointState
-q.contiguous
-dq.contiguous
-list
-self._verification_fk.compute_kinematics
-self._RobotState
-state.tool_poses.tool_frames.index
-self.problem.transform_tool_pose
+self.torch.as_tensor
 q.new_full
-_scene_boundary_evaluate
-self.problem.transform_robot_spheres
 q.new_zeros
+self.torch.no_grad
+enumerate
+self.torch.relu
+robot_tool_states
+_scene_boundary_evaluate
+q.new_empty
 float
 value.max().item
 value.max
@@ -7941,9 +5982,9 @@ np.isfinite
 deepcopy
 ```
 
-## `_CuroboPlanner.close`
+## `_ConstrainedPlanner.close`
 
-[定义位置](../../../manipulation/planning.py#L3903)。
+[定义位置](../../../manipulation/planning.py#L2812)。
 
 输入签名：
 
@@ -7987,9 +6028,9 @@ setattr
 gc.collect
 ```
 
-## `_CuroboPlanner._goal`
+## `_ConstrainedPlanner._goal`
 
-[定义位置](../../../manipulation/planning.py#L3926)。
+[定义位置](../../../manipulation/planning.py#L2835)。
 
 输入签名：
 
@@ -8042,9 +6083,9 @@ position[:, :, None, None].contiguous
 quaternion[:, :, None, None].contiguous
 ```
 
-## `_CuroboPlanner._seed_velocity_bounds`
+## `_ConstrainedPlanner._seed_velocity_bounds`
 
-[定义位置](../../../manipulation/planning.py#L3935)。
+[定义位置](../../../manipulation/planning.py#L2844)。
 
 输入签名：
 
@@ -8096,9 +6137,9 @@ limits.velocity.detach().cpu
 limits.velocity.detach
 ```
 
-## `_CuroboPlanner._solve_ik`
+## `_ConstrainedPlanner._solve_ik`
 
-[定义位置](../../../manipulation/planning.py#L3942)。
+[定义位置](../../../manipulation/planning.py#L2851)。
 
 输入签名：
 
@@ -8154,9 +6195,9 @@ PlanningWorkExhausted
 self.ik.solve_pose
 ```
 
-## `_CuroboPlanner.reference_seeds`
+## `_ConstrainedPlanner.reference_seeds`
 
-[定义位置](../../../manipulation/planning.py#L3962)。
+[定义位置](../../../manipulation/planning.py#L2872)。
 
 输入签名：
 
@@ -8166,20 +6207,12 @@ def reference_seeds(self, joint_reference=None):
 
 实现说明：
 
-> Initialize coefficients once, then optimize the complete tool reference.
->
-> IK chains provide control-polygon proposals in active-joint order.
-> A chain value at a Greville parameter is a free coefficient proposal,
-> not an interpolation equality or a successful joint observation.
-> The physical domain constructs one admissible starting curve. The
-> complete native tool objective and original functional sets then own
-> its continuous optimization, including times with failed pose IK.
+> Construct numerical starts without treating references as constraints.
 
 显式输出分支：
 
 ```python
-(self._refine_reference_seeds(seeds), [])
-(refined, [row['native_success_count'] for row in self.reference_ik_queries])
+(seeds, [row['native_success_count'] for row in self.reference_ik_queries])
 ```
 
 读取的对象属性：
@@ -8192,14 +6225,6 @@ self.physical_domain._curve_map
 self.physical_domain
 joint_reference.joint_names
 self.joint_names
-joint_reference.joint_names.index
-joint_reference.position
-joint_reference.velocity
-np.isfinite(q).all
-np.isfinite
-np.isfinite(dq).all
-joint_reference.duration
-joint_reference.times
 joint_reference.progress_u
 joint_reference.progress_s
 self.reference_time_map
@@ -8208,29 +6233,33 @@ np.interp
 self.reference_time_map.u
 self.reference_time_map.s
 self.source_progress_map
+joint_reference.joint_names.index
+joint_reference.duration
 joint_reference.sample
-self.device_cfg.to_device(positions)[None, None].expand(1, count, -1, -1).contiguous
-self.device_cfg.to_device(positions)[None, None].expand
-self.device_cfg.to_device
-self.device_cfg
-self.physical_domain.initialize
-self.check_request
-self.reference_initialization
-self.physical_domain.initialization_report
 self.formal_clock
 source_times.tolist
-self._refine_reference_seeds
 self.start.position[:, None].clone
 self.start.position
 self.start
 self._reference_ik_query
 self.device_cfg.to_device(layer['values'][tracking:tracking + 1][None]).contiguous
+self.device_cfg.to_device
+self.device_cfg
 self._select_reference_chains
-self.start.position[:, None, None].expand(1, count, self.trajopt.action_horizon, -1).clone
-self.start.position[:, None, None].expand
-self.trajopt.action_horizon
-self.trajopt
-self.initial_seed_strategies
+self.reference_ik_chains
+targets.append
+np.asarray
+strategies.append
+np.repeat
+self.physical_domain._curve_map.start_q
+self.physical_domain.fit_samples
+controls.append
+reports.append
+self.torch.as_tensor
+self.torch
+np.stack
+self.torch.float64
+self._controls_curve
 self.reference_ik_queries
 ```
 
@@ -8241,36 +6270,35 @@ self.joint_reference_report
 self.reference_ik_queries
 self.reference_ik_distinct_counts
 self.reference_ik_chains
-self.initial_seed_strategies
-self.reference_initialization
 count
-control_parameters
-columns
-name
-q
-dq
+parameters
+targets
+strategies
 source_map
 source_parameters
 original_parameters
+columns
+name
 source_times
-positions
-proposals
-seeds
-self.reference_initialization['physical_initialization']
-self.seed_strategies
+values
 previous
 source
 layers
-u
+parameter
 layer
-layers[float(u)]
+layers[float(parameter)]
 tracking
-chains
-branch
 chain
-proposals[0, branch]
-self.initial_seed_strategies[branch]
-refined
+controls
+reports
+target
+fitted
+report
+self.initial_seed_strategies
+self.seed_strategies
+self.reference_initialization
+seeds
+self.initialization_candidate
 row
 ```
 
@@ -8280,33 +6308,34 @@ row
 isinstance
 set
 MotionPlanningError
-joint_reference.joint_names.index
-np.isfinite(q).all
-np.isfinite
-np.isfinite(dq).all
 _ProgressMap
 _phase_aligned_parameters
 np.interp
+joint_reference.joint_names.index
 joint_reference.sample
-self.device_cfg.to_device(positions)[None, None].expand(1, count, -1, -1).contiguous
-self.device_cfg.to_device(positions)[None, None].expand
-self.device_cfg.to_device
-self.physical_domain.initialize
 source_times.tolist
-self._refine_reference_seeds
 self.start.position[:, None].clone
 self._reference_ik_query
 float
 self.device_cfg.to_device(layer['values'][tracking:tracking + 1][None]).contiguous
+self.device_cfg.to_device
 self._select_reference_chains
-self.start.position[:, None, None].expand(1, count, self.trajopt.action_horizon, -1).clone
-self.start.position[:, None, None].expand
-enumerate
+targets.append
+np.asarray
+strategies.append
+len
+np.repeat
+self.physical_domain.fit_samples
+controls.append
+reports.append
+self.torch.as_tensor
+np.stack
+self._controls_curve
 ```
 
-## `_CuroboPlanner._reference_ik_query`
+## `_ConstrainedPlanner._reference_ik_query`
 
-[定义位置](../../../manipulation/planning.py#L4045)。
+[定义位置](../../../manipulation/planning.py#L2932)。
 
 输入签名：
 
@@ -8468,9 +6497,9 @@ report.update
 self.reference_ik_queries.append
 ```
 
-## `_CuroboPlanner._select_reference_chains`
+## `_ConstrainedPlanner._select_reference_chains`
 
-[定义位置](../../../manipulation/planning.py#L4123)。
+[定义位置](../../../manipulation/planning.py#L3010)。
 
 输入签名：
 
@@ -8550,462 +6579,9 @@ self.position_domain.upper.detach
 zip
 ```
 
-## `_CuroboPlanner._initialization_snapshot`
+## `_ConstrainedPlanner.ompl_seed`
 
-[定义位置](../../../manipulation/planning.py#L4145)。
-
-输入签名：
-
-```python
-def _initialization_snapshot(self, actions):
-```
-
-实现说明：
-
-> Evaluate the actual saved coefficients and export their physical curve.
->
-> This forward uses the optimizer's robot geometry scope. Its same-query
-> evidence includes original process/event sets, native joint terms and
-> the shared official robot self-collision computation.
-> The optimizer already runs inside the shared four-derivative domain.
-> These reports describe its saved polynomial and task evidence before
-> the later full-scene candidate qualification.
-
-显式输出分支：
-
-```python
-({'geometry_scope': 'robot', 'task_scene_constraints': 'not_evaluated', 'seeds': records}, curves)
-```
-
-读取的对象属性：
-
-```python
-self.check_request
-self.trajopt.optimizer_rollouts
-self.trajopt
-rollout.metrics_constraint_manager
-self.torch.no_grad
-self.torch
-rollout.compute_metrics_from_action
-manager.optimizer_evidence
-evaluated.costs_and_constraints
-value.detach().flatten(1).sum(-1).cpu().tolist
-value.detach().flatten(1).sum(-1).cpu
-value.detach().flatten(1).sum
-value.detach().flatten
-value.detach
-costs.costs.names
-costs.costs
-costs.costs.values
-value.detach().flatten(1).amax(-1).cpu().tolist
-value.detach().flatten(1).amax(-1).cpu
-value.detach().flatten(1).amax
-costs.constraints.names
-costs.constraints
-costs.constraints.values
-costs.get_sum_cost_and_constraint(sum_horizon=True).reshape(-1).cpu().tolist
-costs.get_sum_cost_and_constraint(sum_horizon=True).reshape(-1).cpu
-costs.get_sum_cost_and_constraint(sum_horizon=True).reshape
-costs.get_sum_cost_and_constraint
-costs.costs.names.index
-evaluated.state.joint_state
-evaluated.state
-manager._dense_counts
-self.torch.full
-joint.position.shape
-joint.position
-self.torch.long
-joint.position.device
-_joint_state_sample_times(joint, counts).cpu().numpy
-_joint_state_sample_times(joint, counts).cpu
-values.detach().reshape(len(actions), values.shape[1], -1).sum(-1).cpu().numpy
-values.detach().reshape(len(actions), values.shape[1], -1).sum(-1).cpu
-values.detach().reshape(len(actions), values.shape[1], -1).sum
-values.detach().reshape
-values.detach
-values.shape
-counts.cpu().tolist
-counts.cpu
-value.cpu().tolist
-value.cpu
-signed.items
-feasible.cpu().tolist
-feasible.cpu
-objective.cpu().tolist
-objective.cpu
-self._controls_curve
-self._candidate_domain_validation
-records.append
-components.items
-constraints.items
-curve.residuals
-actions[index].detach().cpu().tolist
-actions[index].detach().cpu
-actions[index].detach
-records[-1].update
-reference_times[index, :counts[index]].tolist
-reference_points[index, :counts[index]].tolist
-curves.append
-```
-
-写入目标：
-
-```python
-rollout
-manager
-evaluated
-feasible
-signed
-objective
-costs
-components
-name
-value
-constraints
-optimization_objective
-reference_points
-reference_times
-values
-joint
-counts
-records
-curves
-index
-curve
-domain
-key
-```
-
-直接调用符号：
-
-```python
-self.check_request
-self.torch.no_grad
-rollout.compute_metrics_from_action
-manager.optimizer_evidence
-value.detach().flatten(1).sum(-1).cpu().tolist
-value.detach().flatten(1).sum(-1).cpu
-value.detach().flatten(1).sum
-value.detach().flatten
-value.detach
-zip
-value.detach().flatten(1).amax(-1).cpu().tolist
-value.detach().flatten(1).amax(-1).cpu
-value.detach().flatten(1).amax
-costs.get_sum_cost_and_constraint(sum_horizon=True).reshape(-1).cpu().tolist
-costs.get_sum_cost_and_constraint(sum_horizon=True).reshape(-1).cpu
-costs.get_sum_cost_and_constraint(sum_horizon=True).reshape
-costs.get_sum_cost_and_constraint
-costs.costs.names.index
-self.torch.full
-len
-_joint_state_sample_times(joint, counts).cpu().numpy
-_joint_state_sample_times(joint, counts).cpu
-_joint_state_sample_times
-values.detach().reshape(len(actions), values.shape[1], -1).sum(-1).cpu().numpy
-values.detach().reshape(len(actions), values.shape[1], -1).sum(-1).cpu
-values.detach().reshape(len(actions), values.shape[1], -1).sum
-values.detach().reshape
-values.detach
-counts.cpu().tolist
-counts.cpu
-value.cpu().tolist
-value.cpu
-signed.items
-feasible.cpu().tolist
-feasible.cpu
-objective.cpu().tolist
-objective.cpu
-range
-self._controls_curve
-self._candidate_domain_validation
-records.append
-components.items
-constraints.items
-deepcopy
-actions[index].detach().cpu().tolist
-actions[index].detach().cpu
-actions[index].detach
-curve_snapshot
-records[-1].update
-reference_times[index, :counts[index]].tolist
-reference_points[index, :counts[index]].tolist
-curves.append
-```
-
-## `_CuroboPlanner._refine_reference_seeds`
-
-[定义位置](../../../manipulation/planning.py#L4210)。
-
-输入签名：
-
-```python
-def _refine_reference_seeds(self, seeds):
-```
-
-实现说明：
-
-> Optimize complete tool paths within the first solve's fixed quota.
->
-> The original native iteration blocks are split between this task
-> objective and full-scene optimization. Both use the same physical
-> clock, bounded cubic domain and request deadline. Native reinitialize
-> resets the objective-dependent directions, multipliers and candidates.
-> This is the only reference-quality optimization: numerical seed
-> construction supplies coefficients without a preceding joint fit.
-
-显式输出分支：
-
-```python
-result
-```
-
-读取的对象属性：
-
-```python
-self.physical_domain.validate
-self.physical_domain
-self.trajopt.optimizer
-self.trajopt
-optimizer.optimizers[-1].config.inner_iters
-optimizer.optimizers[-1].config
-optimizer.optimizers
-self.budget.trajectory_iterations
-self.budget
-self.reference_initialization
-record.update
-self.main_trajectory_iterations
-stage.reset_cuda_graph
-self._native_request
-self.JointState.from_position
-self.JointState
-seeds[:, :, -1].contiguous
-self.torch.full
-self.torch
-seeds.shape
-self.budget.maximum_trajectory_dt
-seeds.dtype
-seeds.device
-self.trajopt._prepare_goal_buffer
-self.start
-self.trajopt._update_rollout_params
-seeds.reshape(-1, self.trajopt.action_horizon, self.trajopt.action_dim).detach().clone
-seeds.reshape(-1, self.trajopt.action_horizon, self.trajopt.action_dim).detach
-seeds.reshape
-self.trajopt.action_horizon
-self.trajopt.action_dim
-self.functional_constraints.bind
-self.functional_constraints
-self.functional_constraints.reset
-self._manager_type.set_geometry_scope
-self._manager_type
-self._initialization_snapshot
-optimizer.update_niters
-self.check_request
-optimizer.reinitialize
-optimizer.optimize(actions).detach().clone
-optimizer.optimize(actions).detach
-optimizer.optimize
-actions.reshape(seeds.shape).contiguous
-actions.reshape
-self._optimizer_reports
-self.initial_seed_strategies
-type(error).__name__
-optimizer.optimizers[-1].last_completed_action
-self._controls_curve
-interrupted['seeds'].append
-action.detach().cpu().tolist
-action.detach().cpu
-action.detach
-stage.solve_diagnostics
-```
-
-写入目标：
-
-```python
-optimizer
-inner
-total
-initialization
-self.main_trajectory_iterations
-record
-stage
-stage.last_completed_action
-state
-goal
-endpoint
-endpoint.dt
-buffer
-_
-actions
-coarse
-curves
-self.initialization_candidate
-final
-result
-self.seed_strategies
-name
-completed
-interrupted
-index
-action
-curve
-record['interrupted_snapshot']
-record['optimizer_runtime']
-```
-
-直接调用符号：
-
-```python
-self.physical_domain.validate
-record.update
-stage.reset_cuda_graph
-self._native_request
-self.JointState.from_position
-seeds[:, :, -1].contiguous
-self.torch.full
-self.trajopt._prepare_goal_buffer
-self.trajopt._update_rollout_params
-seeds.reshape(-1, self.trajopt.action_horizon, self.trajopt.action_dim).detach().clone
-seeds.reshape(-1, self.trajopt.action_horizon, self.trajopt.action_dim).detach
-seeds.reshape
-self.functional_constraints.bind
-len
-self.functional_constraints.reset
-self._manager_type.set_geometry_scope
-self._initialization_snapshot
-optimizer.update_niters
-self.check_request
-optimizer.reinitialize
-optimizer.optimize(actions).detach().clone
-optimizer.optimize(actions).detach
-optimizer.optimize
-actions.reshape(seeds.shape).contiguous
-actions.reshape
-self._optimizer_reports
-str
-type
-enumerate
-self._controls_curve
-interrupted['seeds'].append
-action.detach().cpu().tolist
-action.detach().cpu
-action.detach
-curve_snapshot
-```
-
-## `_CuroboPlanner.known_initialization_failures`
-
-[定义位置](../../../manipulation/planning.py#L4302)。
-
-输入签名：
-
-```python
-def known_initialization_failures(self, seeds):
-```
-
-实现说明：
-
-> Return definite task failures for all identical returned seed curves.
->
-> The terminal snapshot already owns the control array, measured
-> entrance, physical breaks and progress map. Reuse those fields to
-> identify this exact returned curve; this performs no FK, task or
-> geometry query. A missing, mixed or different record supplies no
-> request-wide shortcut. Native objective values and unknown geometry
-> never enter the finite-positive functional-inequality criterion.
-
-显式输出分支：
-
-```python
-None
-None
-None
-None
-failures
-```
-
-读取的对象属性：
-
-```python
-self.reference_initialization.get
-self.reference_initialization
-final.get
-seeds.shape
-seeds[0].detach().cpu().numpy
-seeds[0].detach().cpu
-seeds[0].detach
-np.arange
-self.formal_clock
-row.get
-np.array_equal
-curve.get
-self.joint_names
-self.progress_map.u
-self.progress_map
-self.progress_map.s
-self.start.position[0].detach().cpu().numpy
-self.start.position[0].detach().cpu
-self.start.position[0].detach
-self.start.position
-self.start
-self.start.velocity[0].detach().cpu().numpy
-self.start.velocity[0].detach().cpu
-self.start.velocity[0].detach
-self.start.velocity
-row.get('functional_inequalities', {}).items
-np.isfinite
-failures.append
-```
-
-写入目标：
-
-```python
-final
-rows
-controls
-times
-failures
-index
-actions
-row
-curve
-positive
-name
-value
-```
-
-直接调用符号：
-
-```python
-self.reference_initialization.get
-final.get
-len
-seeds[0].detach().cpu().numpy
-seeds[0].detach().cpu
-seeds[0].detach
-np.arange
-enumerate
-zip
-row.get
-np.array_equal
-curve.get
-list
-self.start.position[0].detach().cpu().numpy
-self.start.position[0].detach().cpu
-self.start.position[0].detach
-self.start.velocity[0].detach().cpu().numpy
-self.start.velocity[0].detach().cpu
-self.start.velocity[0].detach
-float
-row.get('functional_inequalities', {}).items
-np.isfinite
-failures.append
-```
-
-## `_CuroboPlanner.ompl_seed`
-
-[定义位置](../../../manipulation/planning.py#L4344)。
+[定义位置](../../../manipulation/planning.py#L3031)。
 
 输入签名：
 
@@ -9026,7 +6602,7 @@ def ompl_seed(self, initial_seed, candidate_trajectory):
 显式输出分支：
 
 ```python
-(controls[None, None].contiguous(), report)
+(self.torch.as_tensor(controls)[None, None], report)
 (None, report)
 ```
 
@@ -9037,18 +6613,15 @@ self.torch
 time.monotonic
 self.budget.search_seconds
 self.budget
-self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy().reshape
-self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy
-self.trajopt.transition_model.action_bound_lows.detach().cpu
-self.trajopt.transition_model.action_bound_lows.detach
-self.trajopt.transition_model.action_bound_lows
-self.trajopt.transition_model
-self.trajopt
-self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy().reshape
-self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy
-self.trajopt.transition_model.action_bound_highs.detach().cpu
-self.trajopt.transition_model.action_bound_highs.detach
-self.trajopt.transition_model.action_bound_highs
+self.position_domain.lower.cpu().numpy().reshape
+self.position_domain.lower.cpu().numpy
+self.position_domain.lower.cpu
+self.position_domain.lower
+self.position_domain
+self.position_domain.upper.cpu().numpy().reshape
+self.position_domain.upper.cpu().numpy
+self.position_domain.upper.cpu
+self.position_domain.upper
 self.problem
 self.device_cfg.to_device
 self.device_cfg
@@ -9119,11 +6692,13 @@ torch.isfinite(process).all
 torch.isfinite
 (process <= 0).all
 self.problem.verification_issues
-self.physical_domain.fit_reference
+self.physical_domain.fit_samples
 self.physical_domain
-self.check_request
+initial_seed[0, 0].detach().cpu().numpy
+initial_seed[0, 0].detach().cpu
+initial_seed[0, 0].detach
 report.update
-controls[None, None].contiguous
+self.torch.as_tensor
 ```
 
 写入目标：
@@ -9212,14 +6787,12 @@ report['failure']
 
 ```python
 time.monotonic
-self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy().reshape
-self.trajopt.transition_model.action_bound_lows.detach().cpu().numpy
-self.trajopt.transition_model.action_bound_lows.detach().cpu
-self.trajopt.transition_model.action_bound_lows.detach
-self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy().reshape
-self.trajopt.transition_model.action_bound_highs.detach().cpu().numpy
-self.trajopt.transition_model.action_bound_highs.detach().cpu
-self.trajopt.transition_model.action_bound_highs.detach
+self.position_domain.lower.cpu().numpy().reshape
+self.position_domain.lower.cpu().numpy
+self.position_domain.lower.cpu
+self.position_domain.upper.cpu().numpy().reshape
+self.position_domain.upper.cpu().numpy
+self.position_domain.upper.cpu
 _projection_tolerance
 self.device_cfg.to_device
 self.progress_map.anchor_parameters
@@ -9288,14 +6861,17 @@ torch.isfinite(process).all
 torch.isfinite
 (process <= 0).all
 self.problem.verification_issues
-self.physical_domain.fit_reference
+self.physical_domain.fit_samples
+initial_seed[0, 0].detach().cpu().numpy
+initial_seed[0, 0].detach().cpu
+initial_seed[0, 0].detach
 report.update
-controls[None, None].contiguous
+self.torch.as_tensor
 ```
 
-## `_CuroboPlanner.ompl_seed.goals_at_time`
+## `_ConstrainedPlanner.ompl_seed.goals_at_time`
 
-[定义位置](../../../manipulation/planning.py#L4402)。
+[定义位置](../../../manipulation/planning.py#L3089)。
 
 输入签名：
 
@@ -9327,9 +6903,9 @@ goals_by_time.get
 float
 ```
 
-## `_CuroboPlanner.ompl_seed.check_search`
+## `_ConstrainedPlanner.ompl_seed.check_search`
 
-[定义位置](../../../manipulation/planning.py#L4406)。
+[定义位置](../../../manipulation/planning.py#L3093)。
 
 输入签名：
 
@@ -9360,9 +6936,9 @@ time.monotonic
 TimeoutError
 ```
 
-## `_CuroboPlanner.ompl_seed.state_parts`
+## `_ConstrainedPlanner.ompl_seed.state_parts`
 
-[定义位置](../../../manipulation/planning.py#L4412)。
+[定义位置](../../../manipulation/planning.py#L3099)。
 
 输入签名：
 
@@ -9449,9 +7025,9 @@ self.problem.transform_tool_pose
 _torch_interpolate
 ```
 
-## `_CuroboPlanner.ompl_seed.equations`
+## `_ConstrainedPlanner.ompl_seed.equations`
 
-[定义位置](../../../manipulation/planning.py#L4431)。
+[定义位置](../../../manipulation/planning.py#L3118)。
 
 输入签名：
 
@@ -9479,9 +7055,9 @@ cache
 
 无显式条目。
 
-## `_CuroboPlanner.ompl_seed.equations.residual_function`
+## `_ConstrainedPlanner.ompl_seed.equations.residual_function`
 
-[定义位置](../../../manipulation/planning.py#L4433)。
+[定义位置](../../../manipulation/planning.py#L3120)。
 
 输入签名：
 
@@ -9534,9 +7110,9 @@ torch.cat((process, drive, goal), -1).reshape
 torch.cat
 ```
 
-## `_CuroboPlanner.ompl_seed.equations.evaluate`
+## `_ConstrainedPlanner.ompl_seed.equations.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L4441)。
+[定义位置](../../../manipulation/planning.py#L3128)。
 
 输入签名：
 
@@ -9604,9 +7180,9 @@ answer.detach
 min
 ```
 
-## `_CuroboPlanner.ompl_seed.valid`
+## `_ConstrainedPlanner.ompl_seed.valid`
 
-[定义位置](../../../manipulation/planning.py#L4465)。
+[定义位置](../../../manipulation/planning.py#L3152)。
 
 输入签名：
 
@@ -9692,9 +7268,9 @@ term.max
 terms.items
 ```
 
-## `_CuroboPlanner.ompl_seed.proposals`
+## `_ConstrainedPlanner.ompl_seed.proposals`
 
-[定义位置](../../../manipulation/planning.py#L4497)。
+[定义位置](../../../manipulation/planning.py#L3184)。
 
 输入签名：
 
@@ -9754,9 +7330,9 @@ self.physical_domain.evaluate
 np.asarray
 ```
 
-## `_CuroboPlanner.ompl_seed.search_frame`
+## `_ConstrainedPlanner.ompl_seed.search_frame`
 
-[定义位置](../../../manipulation/planning.py#L4533)。
+[定义位置](../../../manipulation/planning.py#L3220)。
 
 输入签名：
 
@@ -9786,9 +7362,9 @@ branch_scene.check_request
 proposals
 ```
 
-## `_CuroboPlanner.ompl_seed.stage_valid`
+## `_ConstrainedPlanner.ompl_seed.stage_valid`
 
-[定义位置](../../../manipulation/planning.py#L4589)。
+[定义位置](../../../manipulation/planning.py#L3276)。
 
 输入签名：
 
@@ -9824,9 +7400,9 @@ np.asarray
 valid
 ```
 
-## `_CuroboPlanner._functional_goal`
+## `_ConstrainedPlanner._functional_goal`
 
-[定义位置](../../../manipulation/planning.py#L4668)。
+[定义位置](../../../manipulation/planning.py#L3348)。
 
 输入签名：
 
@@ -9888,9 +7464,9 @@ position[:, None, None].contiguous
 quaternion[:, None, None].contiguous
 ```
 
-## `_CuroboPlanner._rank_ik_candidates`
+## `_ConstrainedPlanner._rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning.py#L4688)。
+[定义位置](../../../manipulation/planning.py#L3368)。
 
 输入签名：
 
@@ -10030,9 +7606,9 @@ failures
 rank_ik_candidates
 ```
 
-## `_CuroboPlanner._rank_ik_candidates.failures`
+## `_ConstrainedPlanner._rank_ik_candidates.failures`
 
-[定义位置](../../../manipulation/planning.py#L4742)。
+[定义位置](../../../manipulation/planning.py#L3422)。
 
 输入签名：
 
@@ -10089,9 +7665,9 @@ maxima.items
 np.isfinite
 ```
 
-## `_CuroboPlanner._build_goal_ik_candidates`
+## `_ConstrainedPlanner._build_goal_ik_candidates`
 
-[定义位置](../../../manipulation/planning.py#L4758)。
+[定义位置](../../../manipulation/planning.py#L3438)。
 
 输入签名：
 
@@ -10233,231 +7809,9 @@ list
 candidates[index].tolist
 ```
 
-## `_CuroboPlanner._observed_native_result`
+## `_ConstrainedPlanner.evaluate_reference`
 
-[定义位置](../../../manipulation/planning.py#L4811)。
-
-输入签名：
-
-```python
-def _observed_native_result(self, actions):
-```
-
-实现说明：
-
-> Evaluate a complete reference seed through native success metrics once.
-
-显式输出分支：
-
-```python
-self.trajopt._get_best_result(result, count)
-```
-
-读取的对象属性：
-
-```python
-actions.shape
-self.torch.no_grad
-self.torch
-self.trajopt.metrics_rollout.compute_metrics_from_action
-self.trajopt.metrics_rollout
-self.trajopt
-metrics.state.joint_state
-metrics.state
-self.trajopt.joint_names
-metrics.actions
-joint.dt
-self.trajopt.interpolation_steps
-self.trajopt._interpolate_and_compute_metrics
-self.trajopt._get_result
-self.trajopt._get_best_result
-```
-
-写入目标：
-
-```python
-count
-metrics
-joint
-joint.joint_names
-joint.knot
-joint.knot_dt
-interpolated
-trajectory
-last
-result
-```
-
-直接调用符号：
-
-```python
-self.torch.no_grad
-self.trajopt.metrics_rollout.compute_metrics_from_action
-self.trajopt._interpolate_and_compute_metrics
-self.trajopt._get_result
-self.trajopt._get_best_result
-```
-
-## `_CuroboPlanner._optimizer_reports`
-
-[定义位置](../../../manipulation/planning.py#L4826)。
-
-输入签名：
-
-```python
-def _optimizer_reports(self, solution, initial):
-```
-
-显式输出分支：
-
-```python
-reports
-```
-
-读取的对象属性：
-
-```python
-optimizer.solve_diagnostics
-self.trajopt.core.optimizers
-self.trajopt.core
-self.trajopt
-solution.shape
-(solution[0, index] - initial[0, index]).abs
-reports.append
-(displacement == 0).all().item
-(displacement == 0).all
-displacement.max().item
-displacement.max
-```
-
-写入目标：
-
-```python
-core_reports
-optimizer
-reports
-index
-displacement
-rows
-```
-
-直接调用符号：
-
-```python
-range
-(solution[0, index] - initial[0, index]).abs
-reports.append
-bool
-(displacement == 0).all().item
-(displacement == 0).all
-float
-displacement.max().item
-displacement.max
-```
-
-## `_CuroboPlanner.promote_collision_witnesses`
-
-[定义位置](../../../manipulation/planning.py#L4839)。
-
-输入签名：
-
-```python
-def promote_collision_witnesses(self, result):
-```
-
-实现说明：
-
-> Rebind every manager's exact queries before the one recovery solve.
-
-显式输出分支：
-
-```python
-report
-```
-
-读取的对象属性：
-
-```python
-self._trajectory_configuration
-self._manager_type.query_anchor_parameters
-self._manager_type
-result.js_solution.position.shape
-result.js_solution.position
-result.js_solution
-self.budget.max_task_anchors
-self.budget
-self._manager_type.add_collision_witnesses
-report.update
-```
-
-写入目标：
-
-```python
-pairs
-report
-added
-```
-
-直接调用符号：
-
-```python
-MotionPlanningError
-self._manager_type.query_anchor_parameters
-_dense_collision_witnesses
-len
-self._manager_type.add_collision_witnesses
-report.update
-bool
-```
-
-## `_CuroboPlanner._native_request`
-
-[定义位置](../../../manipulation/planning.py#L4854)。
-
-输入签名：
-
-```python
-def _native_request(self, seed):
-```
-
-实现说明：
-
-> Bind the typed task constraints and continuous ordinary reference cost.
-
-显式输出分支：
-
-```python
-(state, None)
-```
-
-读取的对象属性：
-
-```python
-self.trajopt.disable_tool_pose_tracking
-self.trajopt
-self.trajopt.disable_joint_position_tracking
-SolveMode.BATCH
-seed.shape
-```
-
-写入目标：
-
-```python
-self.route
-state
-```
-
-直接调用符号：
-
-```python
-self.trajopt.disable_tool_pose_tracking
-self.trajopt.disable_joint_position_tracking
-SolveState
-```
-
-## `_CuroboPlanner.evaluate_reference`
-
-[定义位置](../../../manipulation/planning.py#L4867)。
+[定义位置](../../../manipulation/planning.py#L3492)。
 
 输入签名：
 
@@ -10465,72 +7819,40 @@ SolveState
 def evaluate_reference(self, seed):
 ```
 
-实现说明：
-
-> Qualify initial controls before the request's main reference improvement.
-
 显式输出分支：
 
 ```python
-self._observed_native_result(seed.reshape(-1, self.trajopt.action_horizon, self.trajopt.action_dim))
+[ConstrainedSolution(row.detach().cpu().numpy().copy(), {'source': 'reference_initialization', 'unchanged_from_seed': True, 'maximum_control_update': 0.0}) for row in seed[0]]
 ```
 
 读取的对象属性：
 
 ```python
-self.physical_domain.validate
-self.physical_domain
-self._native_request
-self.JointState.from_position
-self.JointState
-seed[:, :, -1].contiguous
-self.torch.full
-self.torch
-seed.shape
-self.budget.maximum_trajectory_dt
-self.budget
-seed.dtype
-seed.device
-self.trajopt._prepare_goal_buffer
-self.trajopt
-self.start
-self.trajopt._update_rollout_params
-self._observed_native_result
-seed.reshape
-self.trajopt.action_horizon
-self.trajopt.action_dim
+row.detach().cpu().numpy().copy
+row.detach().cpu().numpy
+row.detach().cpu
+row.detach
 ```
 
 写入目标：
 
 ```python
-state
-goal
-endpoint
-endpoint.dt
-buffer
-_
-self.last_optimizer_diagnostics
+row
 ```
 
 直接调用符号：
 
 ```python
-self.physical_domain.validate
-self._native_request
-self.JointState.from_position
-seed[:, :, -1].contiguous
-self.torch.full
-self.trajopt._prepare_goal_buffer
-self.trajopt._update_rollout_params
-range
-self._observed_native_result
-seed.reshape
+ConstrainedSolution
+row.detach().cpu().numpy().copy
+row.detach().cpu().numpy
+row.detach().cpu
+row.detach
 ```
 
-## `_CuroboPlanner.bind_reference_candidate`
+## `_ConstrainedPlanner.bind_reference_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4881)。
+[定义位置](../../../manipulation/planning.py#L3499)。
 
 输入签名：
 
@@ -10625,71 +7947,120 @@ mapping.s.copy
 getattr
 ```
 
-## `_CuroboPlanner._reference_for_candidate`
+## `_ConstrainedPlanner._candidate_queries`
 
-[定义位置](../../../manipulation/planning.py#L4910)。
+[定义位置](../../../manipulation/planning.py#L3528)。
 
 输入签名：
 
 ```python
-def _reference_for_candidate(self, trajectory):
+def _candidate_queries(self, trajectory, ordinary):
 ```
-
-实现说明：
-
-> Bind the original reference inputs to this candidate's actual clock.
->
-> A supplied joint trajectory retains its own time/progress map. Its
-> reference is constructed from the same nominal skill and measured
-> entrance, without retiming the candidate or carrying another clock's
-> correction coefficients into its ordinary objective.
 
 显式输出分支：
 
 ```python
-BoundToolReference(self.problem, trajectory.progress_u, trajectory.progress_s, trajectory.duration, self.bound_reference.initial_pose, self.bound_reference.initial_twist)
+(mapping, times, progress)
 ```
 
 读取的对象属性：
 
 ```python
-self.problem
 trajectory.progress_u
 trajectory.progress_s
+mapping.anchor_parameters
+self.anchors
+np.unique
+np.r_
 trajectory.duration
-self.bound_reference.initial_pose
-self.bound_reference
-self.bound_reference.initial_twist
+np.interp
+mapping.u
+mapping.s
+np.searchsorted
 ```
 
 写入目标：
 
-无显式条目。
+```python
+mapping
+pairs
+times
+progress
+progress[np.searchsorted(times, pairs[:, 0] * trajectory.duration)]
+```
 
 直接调用符号：
 
 ```python
-BoundToolReference
+_ProgressMap
+mapping.anchor_parameters
+np.unique
+np.interp
+np.searchsorted
 ```
 
-## `_CuroboPlanner._candidate_objective`
+## `_ConstrainedPlanner._candidate_robot_state`
 
-[定义位置](../../../manipulation/planning.py#L4922)。
+[定义位置](../../../manipulation/planning.py#L3536)。
 
 输入签名：
 
 ```python
-def _candidate_objective(self, trajectory):
+def _candidate_robot_state(self, trajectory, candidate_scene, times, progress):
+```
+
+显式输出分支：
+
+```python
+(states, values)
+```
+
+读取的对象属性：
+
+```python
+trajectory.joint_names.index
+trajectory.joint_names
+self.joint_names
+self.torch.as_tensor
+self.torch
+trajectory._curve
+self.problem
+self.pin_kinematics
+```
+
+写入目标：
+
+```python
+columns
+name
+states
+order
+values
+```
+
+直接调用符号：
+
+```python
+trajectory.joint_names.index
+self.torch.as_tensor
+trajectory._curve
+range
+robot_tool_states
+```
+
+## `_ConstrainedPlanner._candidate_objective`
+
+[定义位置](../../../manipulation/planning.py#L3546)。
+
+输入签名：
+
+```python
+def _candidate_objective(self, trajectory, candidate_scene):
 ```
 
 实现说明：
 
-> Evaluate fixed ordinary costs using this curve's physical derivatives.
->
-> Normalized nodes are fixed by the admitted native rollout, while each
-> curve retains its own duration and progress map. FK is the only model
-> query; scene constraints and event anchors have already defined their
-> independent qualification roles.
+> Rank by motion quality and declared task preferences on fixed queries.
 
 显式输出分支：
 
@@ -10700,100 +8071,67 @@ def _candidate_objective(self, trajectory):
 读取的对象属性：
 
 ```python
-trajectory.progress_u
-trajectory.progress_s
 np.linspace
 trajectory.duration
 self.budget.knots
 self.budget
 self.budget.interpolation_steps
-trajectory.sample
-trajectory.joint_names.index
-trajectory.joint_names
-self.joint_names
-self.device_cfg.to_device
-self.device_cfg
-self.JointState
-tensor(q[:, columns])[None].contiguous
-tensor(dq[:, columns])[None].contiguous
-tensor(ddq[:, columns])[None].contiguous
-tensor(trajectory._curve(times, 3)[:, columns])[None].contiguous
-trajectory._curve
-self.formal_clock
-self.trajopt.additional_metrics_rollouts
-self.trajopt
-rollout._cost_manager_list
-self._reference_for_candidate
-self.check_request
+self._candidate_queries
+np.searchsorted
 self.torch.no_grad
 self.torch
-rollout.transition_model.compute_augmented_state
-rollout.transition_model
-manager.compute_costs
-value.sum().item
-value.sum
-costs.names
-costs.values
+self._candidate_robot_state
+self.computation.bounds
+self.computation
+self.motion_configuration
+self.formal_clock
+self.torch.as_tensor
+self.problem.optimizer_preferences
+self.problem
+self.budget.constraint_weight
+preferences.sum
 components.values
 ```
 
 写入目标：
 
 ```python
-mapping
-times
-q
-dq
-ddq
+ordinary
 _
-columns
-name
-tensor
-js
-rollout
-manager
-item
-manager._candidate_query
-manager._reference_grid_key
-state
-costs
-components
+times
+progress
+indices
+states
+tool
+twist
+motion
 value
+preferences
+components
 ```
 
 直接调用符号：
 
 ```python
-_ProgressMap
 np.linspace
-trajectory.sample
-trajectory.joint_names.index
-self.JointState
-tensor(q[:, columns])[None].contiguous
-tensor
-tensor(dq[:, columns])[None].contiguous
-tensor(ddq[:, columns])[None].contiguous
-tensor(trajectory._curve(times, 3)[:, columns])[None].contiguous
-trajectory._curve
-list
-next
-getattr
-self._reference_for_candidate
-self.check_request
+self._candidate_queries
+np.searchsorted
 self.torch.no_grad
-rollout.transition_model.compute_augmented_state
-manager.compute_costs
+self._candidate_robot_state
+motion_cost
+tuple
+self.torch.as_tensor
+time_mean_weights
+self.problem.optimizer_preferences
 float
-value.sum().item
-value.sum
-zip
+preferences.sum
 sum
 components.values
 ```
 
-## `_CuroboPlanner._candidate_metrics`
+## `_ConstrainedPlanner._candidate_metrics`
 
-[定义位置](../../../manipulation/planning.py#L4960)。
+[定义位置](../../../manipulation/planning.py#L3564)。
 
 输入签名：
 
@@ -10803,188 +8141,100 @@ def _candidate_metrics(self, trajectory, candidate_scene, *, record_work):
 
 实现说明：
 
-> Run existing native metrics on exact, possibly nonuniform queries.
->
-> The installed rollout does not forward query kwargs to its managers.
-> A short-lived manager context therefore carries actual times and exact
-> source-curve anchors; finally clears it even when native evaluation
-> raises. All states query the same observed fields at the acceptance
-> spacing; task and observation evidence remain tied to that query.
+> Evaluate the exact saved polynomial with original task and scene rules.
 
 显式输出分支：
 
 ```python
-(report, times / trajectory.duration, len(times) + len(pairs))
+(report, times / trajectory.duration, len(times))
 ```
 
 读取的对象属性：
 
 ```python
-self.scene
-trajectory.progress_u
-trajectory.progress_s
-mapping.anchor_parameters
-self.anchors
+self._candidate_queries
 self.budget
-self.budget.max_task_anchors
 self.budget.max_validation_points
-self.budget.interpolation_buffer_size
-trajectory.joint_names.index
-trajectory.joint_names
-self.joint_names
-trajectory.sample
-trajectory.duration
-self.device_cfg.to_device
-self.device_cfg
-self._reference_for_candidate
-tensor(anchor_q[:, columns])[None].contiguous
-tensor(anchor_dq[:, columns])[None].contiguous
-self.trajopt.disable_tool_pose_tracking
-self.trajopt
-self.trajopt.disable_joint_position_tracking
-SolveMode.BATCH
-self.JointState.from_position
-self.JointState
-tensor(q[-1:, columns])[None].contiguous
-self.budget.maximum_trajectory_dt
-self.trajopt._prepare_goal_buffer
-self.start
-self.trajopt._update_rollout_params
-self.trajopt.additional_metrics_rollouts
-rollout._cost_manager_list
-rollout.metrics_constraint_manager
-tensor(q[:, columns])[None].contiguous
-tensor(dq[:, columns])[None].contiguous
-tensor(ddq[:, columns])[None].contiguous
-tensor(trajectory._curve(times, 3)[:, columns])[None].contiguous
-trajectory._curve
-self.budget.interpolation_dt
-manager._process_mode
-self.check_request
-self.torch.no_grad
+self.torch.as_tensor
 self.torch
-rollout.transition_model.compute_augmented_state
-rollout.transition_model
-rollout.compute_metrics_from_state
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-rollout.metrics_constraint_manager.bind_scene_evidence
-constraints.names
-constraints.values
-metrics.feasible
-metrics.feasible.all().item
-metrics.feasible.all
+self.torch.float64
+self.torch.no_grad
+self.check_request
+self._candidate_robot_state
+self.problem.residuals
+self.problem
+self.problem.verification_issues
+q.new_tensor
+q.new_empty
+self.joint_names
+trajectory.duration
+terms.items
 np.isfinite
 residuals.values
-collision_residuals.items
-scene_update_residuals.items
-coverage_residuals.items
-conditional_unknown_residuals.items
 candidate_scene.last_query_report
 ```
 
 写入目标：
 
 ```python
-candidate_scene
 mapping
-pairs
 times
-columns
-name
+progress
+tensor
+details
+channels
+states
 q
 dq
-ddq
-progress
-anchor_q
-anchor_dq
+names
 _
-tensor
-context
-state
-endpoint
-endpoint.dt
-buffer
-rollout
-managers
-manager
-js
-manager._candidate_query
-manager._reference_grid_key
-native
-metrics
-constraints
-collision_residuals
-scene_update_residuals
-coverage_residuals
-conditional_unknown_residuals
+tool
+twist
+terms
+issues
+terms['query_completeness']
+terms['process_scene']
 residuals
+name
 value
-feasible
+accepted
 report
+target
+category
+report[target]
 ```
 
 直接调用符号：
 
 ```python
-_ProgressMap
-mapping.anchor_parameters
+self._candidate_queries
 _candidate_sample_times
 len
-min
 MotionPlanningError
-trajectory.joint_names.index
-trajectory.sample
-self._reference_for_candidate
-tensor
-tensor(anchor_q[:, columns])[None].contiguous
-tensor(anchor_dq[:, columns])[None].contiguous
-self.trajopt.disable_tool_pose_tracking
-self.trajopt.disable_joint_position_tracking
-SolveState
-self.JointState.from_position
-tensor(q[-1:, columns])[None].contiguous
-self.trajopt._prepare_goal_buffer
-self.trajopt._update_rollout_params
-getattr
-any
-RuntimeError
-self.JointState
-tensor(q[:, columns])[None].contiguous
-tensor(dq[:, columns])[None].contiguous
-tensor(ddq[:, columns])[None].contiguous
-tensor(trajectory._curve(times, 3)[:, columns])[None].contiguous
-trajectory._curve
-list
-self.check_request
+self.torch.as_tensor
 self.torch.no_grad
-rollout.transition_model.compute_augmented_state
-rollout.compute_metrics_from_state
-record_work
-rollout.metrics_constraint_manager.bind_scene_evidence
-_collision_metric_residuals
-_scene_update_metric_residuals
-_coverage_metric_residuals
-_conditional_unknown_metric_residuals
-maximum
-zip
-isinstance
+self.check_request
+self._candidate_robot_state
+self.problem.residuals
+tensor
+self.problem.verification_issues
+q.new_tensor
+float
 bool
-metrics.feasible.all().item
-metrics.feasible.all
+_scene_boundary_evaluate
+q.new_empty
+record_work
+maximum
+terms.items
 all
 np.isfinite
 residuals.values
-collision_residuals.items
-scene_update_residuals.items
-coverage_residuals.items
-conditional_unknown_residuals.items
 deepcopy
 ```
 
-## `_CuroboPlanner._candidate_metrics.maximum`
+## `_ConstrainedPlanner._candidate_metrics.maximum`
 
-[定义位置](../../../manipulation/planning.py#L5046)。
+[定义位置](../../../manipulation/planning.py#L3585)。
 
 输入签名：
 
@@ -10995,45 +8245,35 @@ def maximum(value):
 显式输出分支：
 
 ```python
-float(flat[index].item())
+float(value.max()) if bool(self.torch.isfinite(value).all()) else float('inf')
 ```
 
 读取的对象属性：
 
 ```python
-value.detach().reshape
-value.detach
-self.torch.where(self.torch.isfinite(flat), flat, self.torch.full_like(flat, float('inf'))).argmax
-self.torch.where
-self.torch
+self.torch.isfinite(value).all
 self.torch.isfinite
-self.torch.full_like
-flat[index].item
+self.torch
+value.max
 ```
 
 写入目标：
 
-```python
-flat
-index
-```
+无显式条目。
 
 直接调用符号：
 
 ```python
-value.detach().reshape
-value.detach
-self.torch.where(self.torch.isfinite(flat), flat, self.torch.full_like(flat, float('inf'))).argmax
-self.torch.where
+bool
+self.torch.isfinite(value).all
 self.torch.isfinite
-self.torch.full_like
 float
-flat[index].item
+value.max
 ```
 
-## `_CuroboPlanner._candidate_geometry`
+## `_ConstrainedPlanner._candidate_geometry`
 
-[定义位置](../../../manipulation/planning.py#L5084)。
+[定义位置](../../../manipulation/planning.py#L3600)。
 
 输入签名：
 
@@ -11119,9 +8359,9 @@ np.isfinite
 float
 ```
 
-## `_CuroboPlanner._candidate_geometry.query`
+## `_ConstrainedPlanner._candidate_geometry.query`
 
-[定义位置](../../../manipulation/planning.py#L5105)。
+[定义位置](../../../manipulation/planning.py#L3621)。
 
 输入签名：
 
@@ -11145,28 +8385,14 @@ np.asarray
 np.empty
 self.check_request
 trajectory.sample
-self.device_cfg.to_device
-self.device_cfg
-self.torch.no_grad
+self.torch.as_tensor
 self.torch
-self.JointState
-tensor(q[:, columns])[None].contiguous
-tensor(dq[:, columns])[None].contiguous
-self.joint_names
-self._verification_fk.compute_kinematics
-self._verification_fk
-self._RobotState
-state.tool_poses.tool_frames.index
-state.tool_poses.tool_frames
-state.tool_poses
-self.problem.tool_link
+self.torch.float64
+self.torch.no_grad
+self._candidate_robot_state
 self.problem
-self.problem.transform_tool_pose
-state.tool_poses.position
-state.tool_poses.quaternion
-self.problem.transform_robot_spheres
-native.robot_spheres
-js.position
+position.new_empty
+self.joint_names
 trajectory.duration
 candidate_scene.with_release_history
 query_details.items
@@ -11200,10 +8426,7 @@ dq
 _
 progress
 tensor
-js
-state
-native
-tool
+states
 position
 quaternion
 evidence
@@ -11219,11 +8442,11 @@ details[name]
 value
 numbers
 categories[name]
-states
 row
 index
 key
 pair
+state
 ```
 
 直接调用符号：
@@ -11235,18 +8458,12 @@ np.empty
 len
 self.check_request
 trajectory.sample
+self.torch.as_tensor
 self.torch.no_grad
-self.JointState
-tensor(q[:, columns])[None].contiguous
-tensor
-tensor(dq[:, columns])[None].contiguous
-list
-self._verification_fk.compute_kinematics
-self._RobotState
-state.tool_poses.tool_frames.index
-self.problem.transform_tool_pose
+self._candidate_robot_state
 _scene_boundary_evaluate
-self.problem.transform_robot_spheres
+position.new_empty
+tensor
 record_work
 candidate_scene.with_release_history
 query_details.items
@@ -11270,12 +8487,13 @@ numbers.max
 row.items
 states.setdefault
 state['pairs'].append
+list
 states.values
 ```
 
-## `_CuroboPlanner.evaluate_candidate`
+## `_ConstrainedPlanner.evaluate_candidate`
 
-[定义位置](../../../manipulation/planning.py#L5172)。
+[定义位置](../../../manipulation/planning.py#L3685)。
 
 输入签名：
 
@@ -11364,9 +8582,9 @@ np.full
 max
 ```
 
-## `_CuroboPlanner.optimize`
+## `_ConstrainedPlanner.optimize`
 
-[定义位置](../../../manipulation/planning.py#L5212)。
+[定义位置](../../../manipulation/planning.py#L3726)。
 
 输入签名：
 
@@ -11374,242 +8592,93 @@ max
 def optimize(self, seed, *, iterations=None):
 ```
 
-实现说明：
-
-> One native solve with the current physical domain and unchanged clock.
-
 显式输出分支：
 
 ```python
-result
+results
 ```
 
 读取的对象属性：
 
 ```python
-self.physical_domain.validate
-self.physical_domain
-self._native_request
-seed.detach().clone
-seed.detach
-self.trajopt._solve_impl
-self.trajopt
-self.start
-seed.shape
-self.torch.full
-self.torch
-self.budget.maximum_trajectory_dt
+self.computation.scene
+self.computation
+self.robot_metadata
 self.budget
-seed.dtype
-seed.device
+self.anchor_capacity
+row.detach().cpu().numpy
+row.detach().cpu
+row.detach
 self.budget.trajectory_iterations
-stage.solve_diagnostics
-self.trajopt.core.optimizers
-self.trajopt.core
-self.trajopt.optimizer.update_niters
-self.trajopt.optimizer
-result.solution.shape
-result.solution
-initial.shape
-self._optimizer_reports
-```
-
-写入目标：
-
-```python
-state
-goal
-initial
-result
+self.check_request
+workspace.pending_cpu_bytes
+results.append
+self.last_optimizer_diagnostics.append
+self.last_optimizer_diagnostics
+result.report
+self.last_optimizer_runtime.append
 self.last_optimizer_runtime
-stage
+```
+
+写入目标：
+
+```python
+results
 self.last_optimizer_diagnostics
+self.last_optimizer_runtime
+row
+workspace
+result
 ```
 
 直接调用符号：
 
 ```python
-self.physical_domain.validate
-self._native_request
-seed.detach().clone
-seed.detach
-self.trajopt._solve_impl
-self.torch.full
-self.trajopt.optimizer.update_niters
-ValueError
-self._optimizer_reports
+_planning_workspace_bytes
+solve_trajectory
+row.detach().cpu().numpy
+row.detach().cpu
+row.detach
+results.append
+self.last_optimizer_diagnostics.append
+self.last_optimizer_runtime.append
+deepcopy
 ```
 
-## `_CuroboPlanner.native_diagnostics`
+## `_ConstrainedPlanner.select_candidate`
 
-[定义位置](../../../manipulation/planning.py#L5235)。
+[定义位置](../../../manipulation/planning.py#L3748)。
 
 输入签名：
 
 ```python
-def native_diagnostics(self, result, seed_index=None):
+def select_candidate(self, results, *, record_work):
 ```
 
 实现说明：
 
-> Report the native success flag and original online-model residuals.
+> Score proposed curves, then verify each on the common exact-curve boundary.
 
 显式输出分支：
 
 ```python
-report
+(result, trajectory, {**report, 'selected_seed_index': index, 'candidates': reports, 'validation_query_points': query_points, 'evaluated_candidate_count': len(reports)})
 ```
 
 读取的对象属性：
 
 ```python
-result.success
-success.all().item
-success.all
-result.metrics
-result.interpolated_metrics
-metrics.costs_and_constraints.constraints
-metrics.costs_and_constraints
-metrics.costs_and_constraints.costs
-(value if seed_index is None else value[seed_index]).detach().sum().item
-(value if seed_index is None else value[seed_index]).detach().sum
-(value if seed_index is None else value[seed_index]).detach
-ordinary.names
-ordinary.values
-constraints.names
-constraints.values
-metrics.convergence.names
-metrics.convergence
-metrics.convergence.values
-```
-
-写入目标：
-
-```python
-success
-report
-label
-metrics
-constraints
-ordinary
-ordinary_costs
-name
-value
-report[label]
-```
-
-直接调用符号：
-
-```python
-bool
-success.all().item
-success.all
-float
-(value if seed_index is None else value[seed_index]).detach().sum().item
-(value if seed_index is None else value[seed_index]).detach().sum
-(value if seed_index is None else value[seed_index]).detach
-zip
-maximum
-_collision_metric_residuals
-_scene_update_metric_residuals
-_coverage_metric_residuals
-_conditional_unknown_metric_residuals
-```
-
-## `_CuroboPlanner.native_diagnostics.maximum`
-
-[定义位置](../../../manipulation/planning.py#L5242)。
-
-输入签名：
-
-```python
-def maximum(value):
-```
-
-显式输出分支：
-
-```python
-float(flat.max().item())
-float(flat[index].item())
-```
-
-读取的对象属性：
-
-```python
-selected.detach().reshape
-selected.detach
-flat.is_floating_point
-flat.max().item
-flat.max
-torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float('inf'))).argmax
-torch.where
-torch.isfinite
-torch.full_like
-flat[index].item
-```
-
-写入目标：
-
-```python
-selected
-flat
-index
-```
-
-直接调用符号：
-
-```python
-selected.detach().reshape
-selected.detach
-flat.is_floating_point
-float
-flat.max().item
-flat.max
-torch.where(torch.isfinite(flat), flat, torch.full_like(flat, float('inf'))).argmax
-torch.where
-torch.isfinite
-torch.full_like
-flat[index].item
-```
-
-## `_CuroboPlanner.select_candidate`
-
-[定义位置](../../../manipulation/planning.py#L5282)。
-
-输入签名：
-
-```python
-def select_candidate(self, result, *, record_work):
-```
-
-实现说明：
-
-> Rank finite saved curves, then qualify them on one common boundary.
-
-显式输出分支：
-
-```python
-(owned, trajectory, {**report, 'selected_seed_index': selected, 'candidates': reports, 'validation_query_points': query_points, 'evaluated_candidate_count': evaluated})
-```
-
-读取的对象属性：
-
-```python
-result.num_seeds
-self.native_diagnostics
 self.seed_strategies
-self.last_optimizer_diagnostics
-owned.solution.isfinite().all().item
-owned.solution.isfinite().all
-owned.solution.isfinite
-owned.solution
+result.report
+np.isfinite(result.controls).all
+np.isfinite
+result.controls
 reports.append
-captured.append
-self._native_curve
+self._controls_curve
 self._candidate_objective
+self.scene
 proposals.append
 proposals.sort
-np.isfinite
 self.evaluate_candidate
 report.update
 report['residuals'].values
@@ -11619,49 +8688,39 @@ np.isfinite(values).all
 写入目标：
 
 ```python
-captured
 proposals
 reports
 index
-metrics
-owned
+result
 provenance
 trajectory
 objective
-selected_record
+selected
 selected_key
 query_points
-evaluated
 report
 points
 values
 severity
 value
 key
-selected
 self.delivery_candidate
 ```
 
 直接调用符号：
 
 ```python
-range
-self.native_diagnostics
-_trajectory_candidate
+enumerate
 deepcopy
-bool
-owned.solution.isfinite().all().item
-owned.solution.isfinite().all
-owned.solution.isfinite
+np.isfinite(result.controls).all
+np.isfinite
 reports.append
 float
-captured.append
-self._native_curve
+self._controls_curve
 self._candidate_objective
 proposals.append
 MotionPlanningError
 proposals.sort
-np.isfinite
 self.evaluate_candidate
 report.update
 list
@@ -11669,51 +8728,12 @@ report['residuals'].values
 np.isfinite(values).all
 sum
 max
+len
 ```
 
-## `_CuroboPlanner._native_curve`
+## `_ConstrainedPlanner._controls_curve`
 
-[定义位置](../../../manipulation/planning.py#L5332)。
-
-输入签名：
-
-```python
-def _native_curve(self, result):
-```
-
-实现说明：
-
-> Copy the bound native cubic without independent geometry queries.
-
-显式输出分支：
-
-```python
-self._controls_curve(result.solution[0, 0])
-```
-
-读取的对象属性：
-
-```python
-result.batch_size
-result.num_seeds
-self._controls_curve
-result.solution
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-```python
-ValueError
-self._controls_curve
-```
-
-## `_CuroboPlanner._controls_curve`
-
-[定义位置](../../../manipulation/planning.py#L5338)。
+[定义位置](../../../manipulation/planning.py#L3782)。
 
 输入签名：
 
@@ -11734,22 +8754,19 @@ trajectory
 读取的对象属性：
 
 ```python
-self.trajopt.action_horizon
-self.trajopt
+self.action_horizon
 self.formal_clock
-basis.hermite_nodes
+self.torch.Tensor
+self.torch
 actions.detach().cpu().numpy
 actions.detach().cpu
 actions.detach
-self.start.position.detach().cpu().numpy
-self.start.position.detach().cpu
-self.start.position.detach
-self.start.position
-self.start
-self.start.velocity.detach().cpu().numpy
-self.start.velocity.detach().cpu
-self.start.velocity.detach
-self.start.velocity
+np.asarray
+basis.hermite_nodes
+self.physical_domain._curve_map.start_q
+self.physical_domain._curve_map
+self.physical_domain
+self.physical_domain._curve_map.start_dq
 position.shape
 self.joint_names
 self.problem.events
@@ -11770,6 +8787,7 @@ self.finger_trajectory
 
 ```python
 basis
+values
 times
 position
 velocity
@@ -11787,16 +8805,12 @@ trajectory.satisfied_dependencies
 
 ```python
 CubicBasis
-basis.hermite_nodes
+isinstance
 actions.detach().cpu().numpy
 actions.detach().cpu
 actions.detach
-self.start.position.detach().cpu().numpy
-self.start.position.detach().cpu
-self.start.position.detach
-self.start.velocity.detach().cpu().numpy
-self.start.velocity.detach().cpu
-self.start.velocity.detach
+np.asarray
+basis.hermite_nodes
 len
 ValueError
 event_occurrence_key
@@ -11811,9 +8825,9 @@ tuple
 getattr
 ```
 
-## `_CuroboPlanner._candidate_domain_validation`
+## `_ConstrainedPlanner._candidate_domain_validation`
 
-[定义位置](../../../manipulation/planning.py#L5362)。
+[定义位置](../../../manipulation/planning.py#L3807)。
 
 输入签名：
 
@@ -11866,19 +8880,14 @@ self.joint_names
 np.max
 np.abs
 trajectory.position
-self.start.position[0].detach().cpu().numpy
-self.start.position[0].detach().cpu
-self.start.position[0].detach
-self.start.position
-self.start
+self.physical_domain._curve_map.start_q
+self.physical_domain._curve_map
+self.physical_domain
 self.problem.numerical.joint
 self.problem.numerical
 self.problem
 trajectory.velocity
-self.start.velocity[0].detach().cpu().numpy
-self.start.velocity[0].detach().cpu
-self.start.velocity[0].detach
-self.start.velocity
+self.physical_domain._curve_map.start_dq
 self.problem.numerical.velocity
 ```
 
@@ -11928,18 +8937,12 @@ max
 float
 np.max
 np.abs
-self.start.position[0].detach().cpu().numpy
-self.start.position[0].detach().cpu
-self.start.position[0].detach
-self.start.velocity[0].detach().cpu().numpy
-self.start.velocity[0].detach().cpu
-self.start.velocity[0].detach
 asdict
 ```
 
-## `_CuroboPlanner.export`
+## `_ConstrainedPlanner.export`
 
-[定义位置](../../../manipulation/planning.py#L5393)。
+[定义位置](../../../manipulation/planning.py#L3838)。
 
 输入签名：
 
@@ -11976,7 +8979,7 @@ MotionPlanningError
 
 ## `_verified_dependency_outcomes`
 
-[定义位置](../../../manipulation/planning.py#L5403)。
+[定义位置](../../../manipulation/planning.py#L3848)。
 
 输入签名：
 
@@ -12037,7 +9040,7 @@ satisfied.add
 
 ## `_bind_motion_work_ledger`
 
-[定义位置](../../../manipulation/planning.py#L5425)。
+[定义位置](../../../manipulation/planning.py#L3870)。
 
 输入签名：
 
@@ -12091,7 +9094,7 @@ deepcopy
 
 ## `MotionPlanningError`
 
-[定义位置](../../../manipulation/planning.py#L5444)。
+[定义位置](../../../manipulation/planning.py#L3889)。
 
 ```python
 class MotionPlanningError(ValueError):
@@ -12107,7 +9110,7 @@ class MotionPlanningError(ValueError):
 
 ## `MotionPlanningError.__init__`
 
-[定义位置](../../../manipulation/planning.py#L5446)。
+[定义位置](../../../manipulation/planning.py#L3891)。
 
 输入签名：
 
@@ -12140,7 +9143,7 @@ super
 
 ## `MotionBackend`
 
-[定义位置](../../../manipulation/planning.py#L5451)。
+[定义位置](../../../manipulation/planning.py#L3896)。
 
 ```python
 class MotionBackend():
@@ -12152,7 +9155,7 @@ class MotionBackend():
 
 实现说明：
 
-> Own one robot's reusable native IK and trajectory optimizer instances.
+> Own one robot's reusable IK and constrained trajectory computation.
 >
 > The robot, device and tensor capacities are constructor inputs. Requests
 > replace goals, measured q/dq, scene values and clocks; they cannot resize
@@ -12160,7 +9163,7 @@ class MotionBackend():
 
 ## `MotionBackend.__init__`
 
-[定义位置](../../../manipulation/planning.py#L5458)。
+[定义位置](../../../manipulation/planning.py#L3903)。
 
 输入签名：
 
@@ -12199,7 +9202,7 @@ Lock
 
 ## `MotionBackend._claim`
 
-[定义位置](../../../manipulation/planning.py#L5466)。
+[定义位置](../../../manipulation/planning.py#L3911)。
 
 输入签名：
 
@@ -12234,7 +9237,7 @@ get_ident
 
 ## `MotionBackend._release`
 
-[定义位置](../../../manipulation/planning.py#L5471)。
+[定义位置](../../../manipulation/planning.py#L3916)。
 
 输入签名：
 
@@ -12270,7 +9273,7 @@ self._busy.release
 
 ## `MotionBackend.bind_request`
 
-[定义位置](../../../manipulation/planning.py#L5477)。
+[定义位置](../../../manipulation/planning.py#L3922)。
 
 输入签名：
 
@@ -12310,13 +9313,13 @@ self._planner
 get_ident
 MotionPlanningError
 getattr
-_CuroboPlanner
+_ConstrainedPlanner
 self._planner.rebind
 ```
 
 ## `MotionBackend.plan`
 
-[定义位置](../../../manipulation/planning.py#L5493)。
+[定义位置](../../../manipulation/planning.py#L3938)。
 
 输入签名：
 
@@ -12351,7 +9354,7 @@ plan_trajectory
 
 ## `MotionBackend.close`
 
-[定义位置](../../../manipulation/planning.py#L5500)。
+[定义位置](../../../manipulation/planning.py#L3945)。
 
 输入签名：
 
@@ -12389,7 +9392,7 @@ self._release
 
 ## `plan_trajectory`
 
-[定义位置](../../../manipulation/planning.py#L5513)。
+[定义位置](../../../manipulation/planning.py#L3958)。
 
 输入签名：
 
@@ -12443,10 +9446,6 @@ joint_reference.duration
 backend._claim
 scene.gripper.commands
 backend.bind_request
-planner.ik
-planner.trajopt
-solver.core.optimizers
-solver.core
 budget.ik_seeds
 budget.trajectory_seeds
 planner.budget.maximum_trajectory_dt
@@ -12457,8 +9456,6 @@ planner.scene_cpu_workspace_bytes
 planner.scene_gpu_workspace_bytes
 planner.anchor_fk_workspace_bytes
 planner.anchor_capacity
-planner.trajopt.transition_model.compute_inverse_dynamics
-planner.trajopt.transition_model
 planner._verification_native.get_cost('cspace').config.joint_limits
 planner._verification_native.get_cost('cspace').config
 planner._verification_native.get_cost
@@ -12489,34 +9486,19 @@ planner.progress_map
 planner.reference_seeds
 planner.ik.config.exit_early
 planner.ik.config
+planner.ik
 planner.reference_ik_distinct_counts
 planner.initial_seed_strategies
 planner.reference_ik_queries
 planner.reference_ik_chains
 planner.joint_reference_report
-planner.known_initialization_failures
 planner.evaluate_reference
-trajectory.joint_names
-joint_reference.joint_names
-np.array_equal
-trajectory.times
-joint_reference.times
-trajectory.position
-joint_reference.position
-trajectory.velocity
-joint_reference.velocity
 planner.optimize
 planner.main_trajectory_iterations
 diagnostics['attempts'].append
 original_budget.maximum_trajectory_solves
 attempt['collision_residuals'].values
 attempt['coverage_residuals'].values
-planner.promote_collision_witnesses
-native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous
-native_result.solution.detach().clone().expand
-native_result.solution.detach().clone
-native_result.solution.detach
-native_result.solution
 budget.search_seconds
 planner.ompl_seed
 report.get
@@ -12526,7 +9508,6 @@ error.reason
 type(error).__name__
 traceback.format_exc
 planner.goal_ik_candidates
-manager_type.query_diagnostics
 backend._release
 backend.close
 ledger['binding_records'].append
@@ -12589,9 +9570,6 @@ planner.check_request
 planner.request_work
 planner.remaining_request_seconds
 planner.satisfied_dependencies
-solver
-optimizer
-optimizer.request_guard
 diagnostics['joint_state_computation']
 limits
 diagnostics['verification_joint_limits']
@@ -12614,31 +9592,25 @@ grid
 source_seconds
 source_duration
 consumed['ik_batches']
-consumed['trajectory_solves']
 seeds
 ik_success
 diagnostics['functional_ik_candidates']
-failures
-observation_required
-diagnostics['reference_candidate']
 reference_result
 native_result
 attempt
-same
-diagnostics['joint_reference']['source_curve_preserved']
-diagnostics['joint_reference']['candidate_kind']
+diagnostics['reference_candidate']
+observation_required
 recovery
+consumed['trajectory_solves']
 collision_failed
 coverage_failed
-promoted
-diagnostics['collision_witness_update']
-planner.seed_strategies
 search_started
 recovered
 report
 consumed['search_seconds']
 consumed['search_queries']
 diagnostics['ompl']
+planner.seed_strategies
 diagnostics['improvement_end']
 diagnostics['diagnostic_trajectory']
 diagnostics['diagnostic_candidate_scope']
@@ -12646,8 +9618,6 @@ outcome.success
 outcome.trajectory
 outcome.execution_binding
 diagnostics[name]
-manager_type
-diagnostics['rollout_query_counts']
 diagnostics['elapsed_seconds']
 ledger['consumed_planning']['planning_seconds']
 request_seconds
@@ -12720,27 +9690,19 @@ _fixed_spline_grid
 float
 planner.reference_seeds
 bool
-planner.known_initialization_failures
 planner.evaluate_reference
 select_candidate
-np.array_equal
 qualify_native
 planner.optimize
 diagnostics['attempts'].append
 attempt['collision_residuals'].values
 attempt['coverage_residuals'].values
-planner.promote_collision_witnesses
-native_result.solution.detach().clone().expand(1, budget.trajectory_seeds, -1, -1).contiguous
-native_result.solution.detach().clone().expand
-native_result.solution.detach().clone
-native_result.solution.detach
 planner.ompl_seed
 report.get
 deliver_incumbent
 type
 traceback.format_exc
 hasattr
-manager_type.query_diagnostics
 backend._release
 backend.close
 ledger['binding_records'].append
@@ -12750,7 +9712,7 @@ diagnostics.get
 
 ## `plan_trajectory.mark_wallclock`
 
-[定义位置](../../../manipulation/planning.py#L5538)。
+[定义位置](../../../manipulation/planning.py#L3983)。
 
 输入签名：
 
@@ -12784,7 +9746,7 @@ time.monotonic
 
 ## `plan_trajectory.check`
 
-[定义位置](../../../manipulation/planning.py#L5582)。
+[定义位置](../../../manipulation/planning.py#L4027)。
 
 输入签名：
 
@@ -12826,7 +9788,7 @@ _check_work_budget
 
 ## `plan_trajectory.record_validation_work`
 
-[定义位置](../../../manipulation/planning.py#L5593)。
+[定义位置](../../../manipulation/planning.py#L4038)。
 
 输入签名：
 
@@ -12857,7 +9819,7 @@ check
 
 ## `plan_trajectory.remaining_request_seconds`
 
-[定义位置](../../../manipulation/planning.py#L5701)。
+[定义位置](../../../manipulation/planning.py#L4146)。
 
 输入签名：
 
@@ -12897,7 +9859,7 @@ time.monotonic
 
 ## `plan_trajectory.qualify_candidate`
 
-[定义位置](../../../manipulation/planning.py#L5743)。
+[定义位置](../../../manipulation/planning.py#L4184)。
 
 输入签名：
 
@@ -12972,7 +9934,7 @@ mark_wallclock
 
 ## `plan_trajectory.deliver_incumbent`
 
-[定义位置](../../../manipulation/planning.py#L5802)。
+[定义位置](../../../manipulation/planning.py#L4243)。
 
 输入签名：
 
@@ -13015,7 +9977,7 @@ deepcopy
 
 ## `plan_trajectory.qualify_native`
 
-[定义位置](../../../manipulation/planning.py#L5816)。
+[定义位置](../../../manipulation/planning.py#L4257)。
 
 输入签名：
 
@@ -13057,7 +10019,7 @@ qualify_candidate
 
 ## `plan_trajectory.select_candidate`
 
-[定义位置](../../../manipulation/planning.py#L5894)。
+[定义位置](../../../manipulation/planning.py#L4334)。
 
 输入签名：
 

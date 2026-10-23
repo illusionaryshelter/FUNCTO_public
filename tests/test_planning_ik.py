@@ -155,8 +155,8 @@ def test_legal_failed_states_are_coarse_nodes_with_original_success_evidence():
     rows = [[report(native_pose_ik_success=False), report(native_pose_ik_success=False)],
             [report(native_pose_ik_success=False)]]
     selected = chains([[[.1], [.9]], [[.2]]], rows, pose_costs=[[.2, .1], [.3]])
-    assert selected[0]["candidate_indices"] == [1, 0]
-    assert selected[0]["selection_cost"]["failed_pose_energy"] == pytest.approx(.4)
+    assert selected[0]["candidate_indices"] == [0, 0]
+    assert selected[0]["selection_cost"]["failed_pose_energy"] == pytest.approx(.5)
     assert selected[0]["selection_cost"]["successful_pose_energy"] == 0.
     assert selected[0]["query_statuses"] == ["APPROXIMATE_PROPOSAL"]*2
     assert selected[0]["interpolated_queries"] == []
@@ -246,15 +246,15 @@ def test_bounded_dynamic_program_matches_independent_exhaustive_small_graph():
                            sum(model_states[q, i] == 1 for q, i in enumerate(path)),
                            sum(task_states[q, i] == 2 for q, i in enumerate(path)),
                            sum(model_states[q, i] == 2 for q, i in enumerate(path)))
-        expected.append(((failures, float(failed_energy), float(energy),
+        expected.append(((failures, float(energy), float(failed_energy),
                           float(successful_energy), *evidence_counts), path))
     expected.sort()
     actual = chains(pools, rows, times=times, velocity=bounds, pose_costs=costs, count=3)
     assert [tuple(row["candidate_indices"]) for row in actual] == [path for _, path in expected[:3]]
     np.testing.assert_allclose([row["selection_cost"]["normalized_velocity_energy"] for row in actual],
-                               [score[2] for score, _ in expected[:3]], rtol=1e-14)
-    np.testing.assert_allclose([row["selection_cost"]["failed_pose_energy"] for row in actual],
                                [score[1] for score, _ in expected[:3]], rtol=1e-14)
+    np.testing.assert_allclose([row["selection_cost"]["failed_pose_energy"] for row in actual],
+                               [score[2] for score, _ in expected[:3]], rtol=1e-14)
     np.testing.assert_allclose([row["selection_cost"]["successful_pose_energy"] for row in actual],
                                [score[3] for score, _ in expected[:3]], rtol=1e-14)
 
@@ -276,6 +276,22 @@ def policy_first_indices(values, rows, *, pose_costs=None):
         np.zeros((1, values.shape[1])), reports=rows)
     selected = chains([values], [rows], pose_costs=[energy], count=len(values))
     return ranked[0], tracked, selected[0]["candidate_indices"][0]
+
+
+# BEGIN all reference consumers share continuity before pose-energy diagnostics.
+@pytest.mark.parametrize("solved", [True, False])
+def test_reference_pose_energy_cannot_override_continuity_for_any_native_status(solved):
+    rows = [report(native_pose_ik_success=solved)]*2
+    assert policy_first_indices([[.01], [.8]], rows, pose_costs=[1., 1e-12]) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("solved", [True, False])
+def test_duplicate_reference_representative_uses_continuity_before_pose_energy(solved):
+    rows = [[report(native_pose_ik_success=solved)]*2]
+    selected = chains([[[.1], [.100002]]], rows, pose_costs=[[1., 1e-12]])
+    assert len(selected) == 1
+    assert selected[0]["candidate_indices"] == [0]
+# END success and functional allowed-set evidence retain their original roles.
 
 
 @pytest.mark.parametrize("component", ["collision/robot/self", "collision/entity/background",
@@ -370,7 +386,7 @@ def _static_planner(monkeypatch, *, self_failure=False, online_failure=False):
     import torch
     from manipulation import planning
 
-    planner = planning._CuroboPlanner.__new__(planning._CuroboPlanner)
+    planner = planning._ConstrainedPlanner.__new__(planning._ConstrainedPlanner)
     planner.torch = torch
     planner.joint_names = ("x", "y", "z")
     planner.budget = SimpleNamespace(ik_seeds=2, interpolation_dt=.01)
@@ -508,7 +524,7 @@ def test_true_pose_pool_uses_event_clock_and_retains_only_the_existing_two_ik_ou
     from manipulation import planning
     from manipulation.planning_problem import PoseEventRequirement
 
-    planner = planning._CuroboPlanner.__new__(planning._CuroboPlanner)
+    planner = planning._ConstrainedPlanner.__new__(planning._ConstrainedPlanner)
     # BEGIN the functional IK fixture declares the same submitted-work ledger.
     planner.budget = SimpleNamespace(ik_seeds=2, max_validation_points=32, maximum_trajectory_solves=1)
     planner.request_work = {"ik_queries": 0}

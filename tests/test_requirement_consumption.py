@@ -27,8 +27,11 @@ class RequirementConsumptionTest(unittest.TestCase):
         self.assertIn(("coordinate_events", 0), rows)
         self.assertIn(("mechanisms", 0, "coordinate_limits"), rows)
         self.assertIn(("mechanisms", 0, "directions", 0), rows)
+        # BEGIN the complete signed solver and existing reports share the declaration.
         self.assertEqual(rows[("coordinate_events", 0)]["consumers"],
-                         ("PlanningProblem.residuals", "simulation_posthoc_pose_evaluation"))
+                         ("PlanningProblem.constraint_components", "PlanningProblem.residuals",
+                          "simulation_posthoc_pose_evaluation"))
+        # END the posthoc evaluator retains its independent runtime-data role.
         progress = torch.tensor([[0., request.coordinate_events[0].progress]], dtype=torch.float64)
         mechanism = request.mechanisms[0]
         body = mechanism.model.poses(np.array([[.1], [.11]]))

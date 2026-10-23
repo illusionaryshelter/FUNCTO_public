@@ -13,7 +13,7 @@ from manipulation.implicit_distance import ObservedField
 from manipulation.native_field_distance import query_native_field
 from manipulation.observed_mapping import FrozenObservedField
 from manipulation.online_geometry import OnlinePlanningScene
-from manipulation.planning import JointTrajectory, _CuroboPlanner, _ProgressMap, _scene_boundary_evaluate
+from manipulation.planning import JointTrajectory, _ConstrainedPlanner, _ProgressMap, _scene_boundary_evaluate
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import Attachment, CollisionOwner
 from test_interval_geometry import ConstantMotion
@@ -26,12 +26,9 @@ def candidate():
 
 def planner(monkeypatch, *, permission="none", residual=0., release=False):
     curve = candidate()
-    instance = _CuroboPlanner.__new__(_CuroboPlanner)
+    instance = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
     instance.torch = torch
     instance.joint_names = ("q",)
-    instance.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
-    instance.JointState = SimpleNamespace
-    instance._RobotState = lambda **kwargs: kwargs["cuda_robot_model_state"]
     instance.check_request = Mock()
     instance.anchors = np.array([.5]) if release else np.array([])
     instance.budget = SimpleNamespace(max_validation_points=100, validation_spatial_step_m=.01)
@@ -44,11 +41,19 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
     queries = []
     instance.scene_queries = []
 
-    def fk(js):
-        p = torch.cat((js.position, torch.zeros((*js.position.shape[:2], 2))), -1)
-        q = p.new_zeros((*p.shape[:2], 1, 4)); q[..., 0] = 1
-        return SimpleNamespace(tool_poses=SimpleNamespace(tool_frames=["tool"], position=p.unsqueeze(-2),
-            quaternion=q), robot_spheres=p.new_zeros((*p.shape[:2], 0, 4)))
+    # BEGIN analytic CPU states preserve the production candidate helper output.
+    def robot_state(trajectory, candidate_scene, times, progress):
+        states = [torch.as_tensor(trajectory._curve(times, order))[None] for order in range(4)]
+        q, dq = states[:2]
+        position = torch.cat((q, q.new_zeros((*q.shape[:2], 2))), -1)
+        quaternion = q.new_zeros((*q.shape[:2], 4)); quaternion[..., 0] = 1.
+        linear = torch.cat((dq, dq.new_zeros((*dq.shape[:2], 2))), -1)
+        angular = torch.zeros_like(linear)
+        links = {"tool": (position, quaternion)}
+        return states, (q, dq, ("q",), links, (position, quaternion), (linear, angular))
+
+    instance._candidate_robot_state = robot_state
+    # END interval tests retain their original scene and release computations.
 
     def evaluate(self, spheres, p, quaternion, progress, joints, names, *, trajectory_time,
                  components_out, geometry_evidence_out, contact_permission_progress=None, **kwargs):
@@ -81,7 +86,6 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
         instance.scene_queries.append(record)
         return sum(components_out.values())
 
-    instance._verification_fk = SimpleNamespace(compute_kinematics=fk)
     # BEGIN the fixture exercises candidate-private production release storage.
     class Scene:
         clone_for_rollout = OnlinePlanningScene.clone_for_rollout
@@ -171,14 +175,13 @@ def test_release_cache_charges_each_new_time_once_and_preserves_full_scene_resul
     # One original-scene query over the entire sampled set is an independent
     # uncached reference for owner positions, pair evidence and hard residuals.
     times = np.unique(np.concatenate([value.ravel() for value in queries]))
-    q, dq, _, progress = curve.sample(times)
-    js = instance.JointState(position=torch.as_tensor(q)[None], velocity=torch.as_tensor(dq)[None],
-                             joint_names=["q"])
-    state = instance._verification_fk.compute_kinematics(js)
+    _, _, _, progress = curve.sample(times)
+    states, (_, _, _, _, (position, quaternion), _) = instance._candidate_robot_state(
+        curve, instance.scene, times, progress)
     evidence = []
     value = _scene_boundary_evaluate(instance.scene, instance.problem, _ProgressMap(curve.progress_u, curve.progress_s),
-        state.robot_spheres, state.tool_poses.position[:, :, 0], state.tool_poses.quaternion[:, :, 0],
-        torch.as_tensor(progress)[None], js.position, ("q",), trajectory_time=torch.as_tensor(times)[None],
+        position.new_empty((1, len(times), 0, 4)), position, quaternion,
+        torch.as_tensor(progress)[None], states[0], ("q",), trajectory_time=torch.as_tensor(times)[None],
         normalized_time=torch.as_tensor(times / curve.duration)[None], geometry_evidence_out=evidence,
         component_diagnostics={})
     assert float(value.max()) == result["continuous_geometry"]["hard_scene_residual"] == 0.

@@ -1,13 +1,12 @@
-"""Actual observed-set decisions and local models captured from their evidence."""
+"""Original observed-set, finite contact and supported-height decisions."""
 
-# BEGIN geometry decisions are independent of the differentiable local direction.
+# BEGIN original geometric decisions retain their own query evidence.
 import numpy as np
 import torch
 
-from .implicit_distance import inverse_points, query_distance
+from .implicit_distance import query_distance
 from .native_field_distance import query_native_field
 from .planning_problem import quaternion_rotate
-from .local_geometry_model import LocalPairModel
 
 
 def _world(point, pose):
@@ -23,8 +22,8 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
 
     Confirmed penetration has classification value one; clear and unresolved
     queries have value zero. The value is not a metric penetration depth.
-    Local optimization models are captured separately from this same evidence
-    at block boundaries. No derivative is attached to the classification.
+    No derivative is attached to this classification. Original numerical
+    witnesses and distance bounds remain part of the returned evidence.
 
     ``zero`` may be one scalar from a batch's differentiable zero baseline.
     A standalone call constructs that baseline from its two position tensors.
@@ -40,39 +39,9 @@ def pair_residual(first, first_pose, first_matrix, second, second_pose, second_m
     # BEGIN scene batches may share their already differentiable zero baseline.
     if zero is None:
         zero = first_pose[0].sum() * 0 + second_pose[0].sum() * 0
-    # END the supplied baseline changes no geometric evidence or local direction.
+    # END the supplied baseline changes no geometric evidence.
     return (zero + 1. if result["status"] == "intersection" else zero), result
     # END classification values never become optimizer objectives or directions.
-
-
-# BEGIN local directions are fixed records of the original observed geometry.
-def pair_local_model(first, first_matrix, second, second_matrix, result):
-    """Capture one local model from an already completed pair query.
-
-    The scene invokes this only on a block's actual base state. The local zero
-    point and normal belong to an original supported field; neither the
-    unknown support boundary nor a bounding volume supplies a surface.
-    """
-    from .implicit_distance import ObservedField
-    if result["status"] != "intersection":
-        return None
-    first_local = inverse_points(result["witness_first"], first_matrix)
-    second_local = inverse_points(result["witness_second"], second_matrix)
-    boundary = second.local_zero(second_local)
-    if boundary is not None:
-        _, target, normal = boundary
-        point, surface_on_second, field = first_local, True, second
-    else:
-        boundary = first.local_zero(first_local) if isinstance(first, ObservedField) else None
-        if boundary is None:
-            result["direction"] = "unavailable"
-            return None
-        _, target, normal = boundary
-        point, surface_on_second, field = second_local, False, first
-    result["direction"] = "local_zero_section_normal"
-    return LocalPairModel(tuple(map(float, point)), tuple(map(float, target)),
-                          tuple(map(float, normal)), surface_on_second, float(field.voxel_size))
-# END no trial query can update the frozen optimization model.
 
 
 def query_region_intersection(field, pose, normals, bounds, *, precision_m=1e-6, check_request=None):

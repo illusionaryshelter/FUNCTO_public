@@ -16,7 +16,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from manipulation.planning import (_CuroboPlanner, _ProgressMap, PlanningBudget,
+from manipulation.planning import (_ConstrainedPlanner, _ProgressMap, PlanningBudget,
                                     _project_allowed_boundary, _orientation_vjp_type, _ompl_stage)
 from manipulation.goals import SupportSurface
 from manipulation.motion import MotionModel
@@ -80,7 +80,7 @@ class CartesianSphereScene(OnlinePlanningScene):
 
 def cartesian_planner(problem, world=None, *, fixed_self_sphere=None):
     """Three named translation joints with a fixed tool orientation."""
-    planner = _CuroboPlanner.__new__(_CuroboPlanner)
+    planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
     planner.torch, planner.problem = torch, problem
     planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.budget = PlanningBudget(search_seconds=3., validation_joint_step=.08)

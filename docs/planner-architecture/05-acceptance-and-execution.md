@@ -1,18 +1,14 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`d7bcafc`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本组件将一个给定关节多项式及其模型验收结果转化为可执行请求，并记录实际控制、独立效果证据和续规划状态。规划验收的研究对象是固定任务与固定场景中的名义曲线；执行检查的研究对象是具名机器人反馈及原控制时钟。
+代码基线：`774e121`；正文描述该基线上本次已经实现的工作区代码，统一实现提交后更新为对应提交。阶段实验与计划对照位于项目外 `sim-version-plans`。
 
 ## 1. 候选的完整验收
 
-工具曲线初始化产出统一位置、速度、加速度和分段 jerk 域内的数值候选及实际采样证据。`reference_initialization.coarse/refined` 分别保存物理域内的数值初值和完整工具优化输出；各 `seeds[*].sampled_scope_feasible` 表示同次任务、关节及 `robot` 几何条件，该几何范围包含共享官方机器人自身与名义手部。`continuous_domain/continuous_residuals` 描述实际保存多项式的四类关节范围，任务观测场状态为 `task_scene_constraints="not_evaluated"`。
+初值由参考 IK 或原关节曲线的物理时间样本经最小二乘取得。`reference_initialization.fits` 保存拟合结果；其系数、入口和时钟定义一条可评价曲线。`evaluate_reference` 为每个初值建立 `ConstrainedSolution` 记录，`select_candidate` 将初值和求解输出统一交给保存曲线验收。
 
-`known_initialization_failures` 读取终态记录中的原始 `functional_inequalities`。它逐种子核对实际系数、关节名、入口 `q0/dq0`、原断点时刻、时长和进度映射；每个种子至少存在一个有限正值时，该记录表明所有返回初值已有具体功能违约。`plan_trajectory` 在没有调用者 `joint_reference` 的情况下省略这批初值的完整验收，直接进入主优化，并以 `reference_candidate.qualification="skipped_known_functional_failure"` 保存调度依据。混合、未知、缺失或不对应的记录，以及任何已提供原关节曲线，继续经过原完整验收路径。该调度记录不含完整验收的 `accepted` 字段。
+`_ConstrainedPlanner._candidate_metrics` 消费实际 `JointTrajectory` 和候选场景，沿保存多项式计算 `q/dq/ddq/jerk`，通过共享 Pin 模型计算完整名义机器人、TCP 及速度。`_candidate_sample_times` 保留原多项式区间端点，并按 `interpolation_dt` 分割；任务锚点按候选自身进度映射精确加入。`PlanningProblem.residuals` 计算原任务允许集合，`_scene_boundary_evaluate` 计算相同物理时刻的原场景分项。报告保存具体分项、查询时刻及覆盖范围。
 
-正式验收路径由 `evaluate_reference` 从实际返回动作建立原生结果，再由候选选择导出保存曲线并进入本章评价。主优化完成后的曲线同样进入完整验收。初始化完成、当前范围采样合格和完整交付资格分别记录。
-
-`_CuroboPlanner._candidate_metrics` 消费每条实际 `JointTrajectory` 和候选场景，沿保存多项式生成 `q/dq/ddq/jerk`，经原生 FK 计算任务、原关节指标及同一观测场景分项。`_candidate_sample_times` 保留各原多项式区间端点，并按 `interpolation_dt` 分割；确切任务锚点直接按该候选的进度映射和物理时钟求值。原生输出及调用者提供的曲线均经过这一入口，各自保留时长、节点和手指时钟。查询临时上下文在 `finally` 清理。
-
-这些轨迹指标由 `ProcessCostManager` 的 `trajectory_metrics` 模式计算，并调用同一 `PlanningProblem.residuals`。`SupportRequirement` 按实例的 `hard_components` 验收，默认硬项为整体高度 body 和有限投影范围 footprint；gap/normal 依原阈值提供 `quality` 阶段偏好，当前生产求解采用 `feasibility` 阶段。`PoseEventRequirement` 按 `component_tolerances` 验收材料原点距离、完整旋转或剩余倾斜，以及声明为有限范围的 yaw。事件 IK、搜索和优化候选保留读取相同硬集合，完整轨迹另按实际时间和速度评价过程历史、关节耦合与显式停止。
+`SupportRequirement` 按实例 `hard_components` 验收，默认硬项为整体高度和有限投影范围；其他分量按原阈值提供求解目标中的质量偏好。位姿事件按材料原点距离、完整旋转或倾斜及声明 yaw 范围验收。完整轨迹按实际时间和速度评价机构方向历史、关节耦合和显式停止。
 
 普通任务指标与连续关节域通过后，`evaluate_candidate` 调用 `_candidate_geometry`，以同一原曲线继续检查几何时间区间。`SceneMotionBounds.from_scene` 绑定完整机器人关节树、官方实体局部范围、原 owner TSDF 范围、工具标定和声明附着。`geometry_motion_bound` 中的局部包围球仅把关节转动上界转为实体点运动上界；实际碰撞查询仍使用原形状。机械臂速度由保存的 Hermite 多项式导数的 Bernstein 包络给界，名义手指曲线在其有效时间范围内提供手指速度，独立 owner 路径由原插值或机构坐标速率提供界。释放后的实体按该候选释放位姿保持静止。
 
@@ -24,25 +20,27 @@
 
 报告范围 `continuous_declared_geometry_model` 指输入数值所描述的连续运动与实体模型。该模型界的含义独立于设备浮点 FK 舍入和实际控制跟踪误差。空间细分截止、未知运动或容量不足均保留未决状态；它们不被解释为连续分离，也不新增碰撞拒绝。新增实际场景正残差以 `interval:process_scene` 进入原验收条件和恢复路径。`validation_joint_step` 继续用于 OMPL 连接检查。
 
-候选使用固定机器人官方实体与原观测任务场。任务配对在优化与验收中使用同一非穿透规则，`query_role='acceptance'` 令场景聚合实际硬分项。优化所使用的固定局部 softplus 与接触偏好不属于该聚合。已确认体积交叠产生分类残差 1，场配对未决保留原状态。原生自身配对按原结构策略与数值边界检查，任务接触、初始支撑和覆盖条件分别计算。非 conditional 正分项表示其对应硬条件未满足。
+候选使用固定机器人官方实体与原观测任务场。场景接口聚合原查询的硬分项；固定材料点几何目标为独立数值搜索目标，其零值只表示所采样材料点的结果。已确认体积交叠产生分类残差 1，场配对未决保留原状态。原生自身配对按原结构策略与数值边界检查，任务接触、初始支撑和覆盖条件分别计算。非 conditional 正分项表示其对应硬条件未满足。
 
 每个验收样本以实际进度确定附着。工具与附着实体、同一 TCP 上共同附着实体的内部配对不进入碰撞查询；各成员原几何继续完成对外配对。`internal_assembly_pair_count` 保存内部配对样本数，工具成员由快照中的 `tool_geometry_names` 明确给出。
 
 `_candidate_domain_validation` 检查保存曲线的入口 `q0/dq0` 及连续位置及一至三阶导数范围。`cubic_position_report` 对位置及其导数多项式求解析极值；`cubic_derivative_report` 另外记录加速度端值、内部节点两侧极限与跳变。`continuous_jerk` 读取每个三次段的常量三阶导数，包含断点两侧。通用 C1 Hermite 输入的位置与速度连续，加速度跳变按原报告保留，分段 jerk 描述其各段内及单侧值。`JointTrajectory.sample` 返回 `q,dq,ddq,s`，内部节点取右段导数，最终端点取左极限。
 
-`evaluate_candidate` 对保存曲线统一完成任务与场景采样、连续关节界和区间几何报告。原生提议的成功标志及历史网格残差保存在独立 `optimization_diagnostics`；正式 `native_metrics` 是原生指标 API 本次对保存曲线的计算。所有正式硬残差须有限且不大于零。区间查询使用扣除本次实际样本与任务锚点后的点数余额，包括首次几何查询所需释放锚点。成功候选可携带有范围和原因的未决几何区间。`select_candidate` 按固定普通评分依次完成这些计算；实际保存曲线的碰撞或覆盖残差决定恢复类型，原生密集见证仅为恢复增加查询。`export` 返回已完成资格的同一曲线与零新增查询数。
+`evaluate_candidate` 对保存曲线统一完成任务与场景采样、连续关节界和区间几何报告。`optimization_diagnostics` 保存 SLSQP 的实际状态；正式报告来自保存曲线的原始条件。所有正式硬残差须有限且不大于零。几何区间报告保留已证明、交叠和未决状态。`select_candidate` 按固定质量评分依次评价，恢复类型读取该保存曲线的碰撞和覆盖分项。`export` 返回已完成资格的同一曲线与零新增查询。
+
+任务过程的有限查询范围由 `test_task_sampling_scope.py` 中的显式反例界定。令目标坐标系中工具的平移为 `x(t)=0.08t(1−t)` 米，时间 `t∈[0,1]` 秒；其余位姿分量恒定，声明的 x 允许范围为 ±0.01 米。端点位置和速度唯一确定同一 Hermite 多项式。只查询两个端点时，任务有符号条件与原残差都合格；在 0.5 秒处同一曲线达到 0.02 米，原过程条件出现正违例。因而有限任务查询合格只证明所查询时刻，不扩展为相邻时刻之间的过程条件证明；连续关节极值和几何区间证据仍具有各自独立的范围。
 
 ## 2. 结果结构与输入身份
 
 `PlanningResult` 保存 `success`、`trajectory`、`diagnostics`、`execution_binding`、`request_ledger`。成功结果的 `trajectory` 为 `JointTrajectory`；其具名关节、时间、位置、速度、进度映射、原事件、条件、手指曲线及已满足依赖共同定义可执行内容。失败候选以 `diagnostics.diagnostic_trajectory` 保存，用于解释残差。
 
-`diagnostics.reference_initialization` 保存本次工具曲线初始化的实际迭代分配、数值初值 `coarse` 与优化输出 `refined`，以及各候选对应的普通成本、功能残差、连续域报告和标准轨迹快照。请求 `finally` 从已完成计算复制这些记录，并保留参考 IK 查询、数值链与种子来源。初始化中断时，`interrupted_snapshot` 另行保存优化器在下一方向构造前已选定的实际系数与完整曲线，种子字段 `qualification_status="not_evaluated_after_interruption"` 表达该状态的验收范围。记录路径仅序列化已有动作；功能残差和完整几何判定按实际已有记录保存。完整规划候选尚未产生时，第一条中断曲线成为诊断轨迹，其余候选保存在该快照中。尚无已完成优化状态时，诊断仍使用最近已保存的初始化曲线。
+`diagnostics.reference_initialization` 保存实际样本拟合及策略，参考 IK 查询与完整链保留原始候选来源。`last_optimizer_runtime` 保存每个已经完成的约束求解报告，包括状态、迭代、求值次数、原目标、归一化尺度与系数更新。异常路径保存已经完成的诊断，尚未完成的计算保持缺失。
 
-`execution_binding.bind_candidate` 接受实际候选、任务、场景、连续验收和正式采样报告，生成 `candidate_id`，保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 与同身份验收。参数及记录中沿用的 `native_report/validation.native` 名称指正式保存曲线经原生指标 API 得到的报告。`curve_snapshot` 保存原 Hermite 节点、实际系数、可执行终点和首个显式效果依赖边界；`plain` 将 NumPy 及公开 dataclass 字段转为普通记录，无界区间使用具名 JSON 表达。
+`execution_binding.bind_candidate` 接受实际候选、任务、场景、连续验收和正式采样报告，生成 `candidate_id`，保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 与同身份验收。绑定参数 `native_report` 和记录 `validation.native` 保存该曲线的正式任务及场景评价报告，其生产者为 `_candidate_metrics`。`curve_snapshot` 保存原 Hermite 节点、实际系数、可执行终点和首个显式效果依赖边界；`plain` 将 NumPy 及公开 dataclass 字段转为普通记录，无界区间使用具名 JSON 表达。
 
-`plan_trajectory` 将已完成执行绑定的曲线保存为独立最佳候选记录，包含原多项式副本、固定评分与分项、验收、候选场景、事件时间检查及资格完成时间。调用者的原关节曲线可具有自己的物理时长、进度平台和手指时钟；原生改善候选使用已绑定的三次基时钟。每条记录中的曲线、关系、命令和验收共同定义该候选。新候选完成这些计算且固定评分更低时才替换记录，后续求解器暂存值与记录分别保存。
+`plan_trajectory` 将已完成执行绑定的曲线保存为独立最佳候选记录，包含原多项式副本、固定评分与分项、验收、候选场景、事件时间检查及资格完成时间。调用者的原关节曲线可具有自己的物理时长、进度平台和手指时钟；统一求解改善候选使用已绑定的三次基时钟。每条记录中的曲线、关系、命令和验收共同定义该候选。新候选完成这些计算且固定评分更低时才替换记录，后续求解器暂存值与记录分别保存。
 
-`record_validation_work` 在每次正式候选评价前检查并登记验证尝试，在每批采样或区间查询完成后立即记录实际点数，再检查期限与预算。验证次数上限为原求解次数乘种子数；入口检查、查询点数和完整求解额度各按既有账本计量。首次轨迹求解额度仍包含初始化与第一次主优化的分配更新数。候选绑定记录完整构造后再检查预算，只有在预算内完成的记录才能成为最佳候选。
+`record_validation_work` 在每次正式候选评价前检查并登记验证尝试，在每批采样或区间查询完成后立即记录实际点数，再检查期限与预算。验证次数上限为原求解次数乘种子数；入口检查、查询点数和完整求解额度各按既有账本计量。每次实际调用统一求解器前登记轨迹求解额度；样本拟合属于初值构造。候选绑定记录完整构造后再检查预算，只有在预算内完成的记录才能成为最佳候选。
 
 已有完整合格记录时，改善遇到 `PlanningWorkExhausted`，结果从该记录恢复成功曲线与绑定，`diagnostics.improvement_end` 保存停止阶段和原因。尚无合格记录时，同一异常产生预算失败。取消、外部截止时间和其他异常保持各自类型。所有返回路径在 `finally` 保存累计工作，候选资格完成时间与请求结束时间分别记录。
 

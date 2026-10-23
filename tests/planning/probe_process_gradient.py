@@ -19,7 +19,7 @@ def run(output, *, fixture_path):
     from manipulation import planning
     from curobo._src.optim.gradient.line_search_strategy import LineSearchStrategy
 
-    original = planning._CuroboPlanner.optimize
+    original = planning._ConstrainedPlanner.optimize
 
     def measured(planner, seed):
         # Native solve establishes each line-search particle's goal mapping.
@@ -79,7 +79,7 @@ def run(output, *, fixture_path):
     # BEGIN keep diagnostic instrumentation local to this invocation.
     # Imported probe helpers can be called again in the same process. Restore
     # the exact prior method even if the experiment or observer raises.
-    with patch.object(planning._CuroboPlanner, "optimize", new=measured):
+    with patch.object(planning._ConstrainedPlanner, "optimize", new=measured):
         experiment.run(output, False, fixture_path=fixture_path)
     # END scoped diagnostic instrumentation.
 

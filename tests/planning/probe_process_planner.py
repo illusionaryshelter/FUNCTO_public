@@ -113,7 +113,7 @@ def run(output, debug_gradient, initial_joint_velocity=0., *, fixture_path):
         # END an empty synthetic background does not erase source robot fixtures.
         # BEGIN keep optional diagnostics within one planner invocation.
         if debug_gradient:
-            original_optimize = planner_module._CuroboPlanner.optimize
+            original_optimize = planner_module._ConstrainedPlanner.optimize
 
             def measured_optimize(planner, seed):
                 result = original_optimize(planner, seed)
@@ -149,7 +149,7 @@ def run(output, debug_gradient, initial_joint_velocity=0., *, fixture_path):
         with ExitStack() as instrumentation:
             if debug_gradient:
                 instrumentation.enter_context(patch.object(
-                    planner_module._CuroboPlanner, "optimize", new=measured_optimize))
+                    planner_module._ConstrainedPlanner, "optimize", new=measured_optimize))
             result = plan_trajectory(problem, scene, robot, robot_validator=validator, budget=budget)
         # END scoped optional diagnostics.
         report.update(status="completed", success=result.success, diagnostics=result.diagnostics)

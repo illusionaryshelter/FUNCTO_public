@@ -1,6 +1,6 @@
 # 记录式规划、执行与诊断入口
 
-本文对应 FUNCTO_public 代码基线 `85f67b53ffaa13b474c98061a0acfc51dea91c32`。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+本文对应 FUNCTO_public 代码基线 `774e121` 上已实现的统一约束工作区；最终代码基线随实现提交更新。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
 
 ## 运行环境与输入
 
@@ -20,7 +20,7 @@
 
 `robot_validation_fixture.tool_geometry_names` 根据已声明手指关节的机构公共父子树返回完整工具组件，运行器将其写入报告并传给场景。`CollisionOwner` 的有效 `Attachment` 把已有实体场随同一 TCP 刚性运动，并决定组合体内部配对；当前工具五个实体与附着对象、共同附着对象之间不作内部查询，各成员继续用原几何检查外部。无显式释放时，附着包含规划窗口终点。场景报告用 `internal_assembly_pair_count` 记录排除的配对样本数。
 
-`MotionBackend` 统一组织参考、IK、轨迹优化和有限搜索。碰撞计算组合已知机器人实体与原观测任务场。任务场景配对在优化、IK 和验收中采用同一非穿透规则；`query_role` 仅记录阶段。已确认体积交叠的分类残差为 1，不是米制穿透深度；场配对未决保留诊断，不作为碰撞正残差。原生自碰撞使用原配对和数值边界，任务接触、支撑及覆盖保持各自条件。任务 TSDF 的 2 mm 样本间距仍定义其网格分辨率。具体数值过程和工作预算见[求解组件](../../docs/planner-architecture/04-solver-and-search.md)。
+`MotionBackend` 组织参考 IK 样本、固定入口样条拟合、SciPy SLSQP 统一约束求解及预算内 OMPL 搜索。工具与场景运动学复用独立验证器的 Pinocchio 模型。固定材料点的原场求值提供几何搜索目标，候选验收读取官方机器人实体和原任务观测场的非穿透证据。已确认体积交叠的分类残差为 1，不是米制穿透深度；场配对未决保留诊断，不作为碰撞正残差。原生自碰撞使用原配对和数值边界，任务接触、支撑及覆盖保持各自条件。任务 TSDF 的 2 mm 样本间距仍定义其网格分辨率。具体数值过程和工作预算见[求解组件](../../docs/planner-architecture/04-solver-and-search.md)。
 
 ## 输出与执行
 

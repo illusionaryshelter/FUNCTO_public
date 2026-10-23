@@ -27,13 +27,13 @@ def reports(flags):
 # END failed reference queries keep their unqueried static state.
 
 
-def test_failed_pose_energy_precedes_distance_and_only_supplied_proposals_are_ranked():
+def test_failed_reference_continuity_precedes_pose_energy_within_supplied_proposals():
     values = np.array([[0., 0.], [1.5, 1.], [.01, .01]])
     costs = np.array([0., .02, .8])
-    # Row zero is outside the caller's supplied proposal set. The best
-    # eligible pose is farther away than row two, but its energy is smaller.
+    # Row zero is outside the supplied set. The nearer approximate reference
+    # retains its larger residual diagnostic while supplying the warm start.
     assert select_ik_tracking_candidate(values, [2, 1], costs, [[0., 0.]],
-                                         reports=reports([True, False, False])) == 1
+                                         reports=reports([True, False, False])) == 2
 
 
 def test_equal_pose_energy_uses_joint_continuity_then_original_index():

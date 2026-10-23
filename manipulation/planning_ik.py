@@ -22,12 +22,10 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
     state, initially the measured entrance. ``reports[N]`` contains the same
     query's task/model components and original native pose-success flags.
 
-    Original native success precedes numerical preferences. Successful
-    proposals minimize Euclidean joint displacement before using their pose
-    energy as a tiebreaker.
-    Failed proposals minimize pose energy before joint displacement. This
-    preserves the failed solver's numerical progress without allowing tiny
-    differences between solved poses to select a distant posture.
+    Original native success precedes numerical preferences. Every proposal
+    then minimizes Euclidean joint displacement before using pose energy as
+    a tiebreaker. Failed native outputs retain their approximation status and
+    residual diagnostics under that same continuity-first numerical rule.
     Static task/model evidence breaks only equal numerical choices; an
     unqueried failed pose cannot displace a solved numerical reference.
     The original candidate index breaks exact ties. The returned index names
@@ -39,12 +37,13 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
     _validate_reports(reports, len(values))
     solved = np.asarray([row["native_pose_ik_success"] for row in reports], dtype=bool)
     prior = np.asarray(previous, dtype=float)[0]
+    # BEGIN one reference ordering applies to solved and approximate proposals.
     selected = min(candidate_indices, default=None,
         key=lambda index: (not solved[index],
-                           0. if solved[index] else float(costs[index]),
                            float(np.linalg.norm(values[index]-prior)),
-                           float(costs[index]) if solved[index] else 0.,
+                           float(costs[index]),
                            *_static_qualification(reports[index]), int(index)))
+    # END pose residuals cannot override the preceding continuity choice.
     return None if selected is None else int(selected)
 # END one selected numerical state leaves the remaining native seed slots free.
 
@@ -81,7 +80,7 @@ def _quality(report):
 def _static_qualification(report):
     """Return known task/model failures and separate unestablished verdicts.
 
-    ``planning._CuroboPlanner._rank_ik_candidates`` owns these reports. A
+    ``planning._ConstrainedPlanner._rank_ik_candidates`` owns these reports. A
     completed task/native check provides finite positive violation values;
     NaN and infinities provide no definite violation measurement. The scene
     component families below are the definite constraints produced by
@@ -173,13 +172,13 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
     bounds only normalize the polyline's continuity cost. Neither the nodes
     nor their connecting edges certify the later continuous trajectory.
 
-    Dynamic programming first minimizes native-failure count, then failed-node
-    pose energy, normalized joint velocity energy and successful-node pose
+    Dynamic programming first minimizes native-failure count, then normalized
+    joint velocity energy, failed-node pose energy and successful-node pose
     energy. Summed static evidence only breaks equal numerical paths.
     Unqueried or unresolved checks remain unestablished verdicts. Each last node keeps
     'count' histories. Samples with no finite legal proposal are filled
     between available nodes and measured q0, without inventing pose success.
-    The resulting values initialize the common direct tool-space optimizer;
+    The resulting values initialize the common constrained trajectory solve;
     they never become mandatory event interpolation conditions.
     """
     pools = [np.asarray(values, dtype=float) for values in candidates_by_query]
@@ -213,9 +212,16 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                  & (values >= positions_bounds[0]).all(-1)
                  & (values <= positions_bounds[1]).all(-1))
         retained = []
+        # BEGIN duplicate representatives follow the ordinary reference order.
+        # The nearest preceding retained state supplies this local continuity
+        # comparison. Complete-path continuity is subsequently evaluated by
+        # dynamic programming with its actual predecessor and physical dt.
+        preceding = start if not layers else pools[layers[-1][0]][layers[-1][1]]
+        continuity = np.min(np.sum(((values[:, None]-preceding[None])/scales)**2, axis=-1), axis=-1)
         order = sorted(np.flatnonzero(legal), key=lambda index:
-            (not rows[index]["native_pose_ik_success"], energy[index],
+            (not rows[index]["native_pose_ik_success"], continuity[index], energy[index],
              *_static_qualification(rows[index]), index))
+        # END tiny residual differences cannot own a farther duplicate state.
         for index in order:
             if retained and np.any(np.max(np.abs(values[retained]-values[index]), axis=-1) <= joint_tolerance):
                 continue
@@ -248,14 +254,14 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 for cost, path in paths:
                     solved = report["native_pose_ik_success"]
                     energy = float(costs[query][index])
-                    combined = (cost[0]+int(not solved), cost[1]+(0. if solved else energy),
-                                cost[2]+edge, cost[3]+(energy if solved else 0.),
+                    combined = (cost[0]+int(not solved), cost[1]+edge,
+                                cost[2]+(0. if solved else energy), cost[3]+(energy if solved else 0.),
                                 *(cost[4+item]+int(value) for item, value in enumerate(static)))
                     options.append((combined, (*path, index)))
             next_states[index] = sorted(options)[:count]
         states = next_states
         previous_time = times[query]
-    # END the native trajectory objective owns the eventual pose/continuity tradeoff.
+    # END the unified solve enforces task requirements and scores motion quality.
 
     result = []
     for cost, path in sorted(item for paths in states.values() for item in paths):
@@ -277,7 +283,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                     for query, index in enumerate(indices)]
         # BEGIN every finite chain state is a coefficient proposal, not an observation.
         # Native success and original pool indices retain the selection
-        # evidence. Complete tool-reference optimization uses all its times.
+        # evidence. The common curve fit consumes the selected sample times.
         result.append({"candidate_indices": indices, "joint_positions": positions.tolist(),
             "anchor_query_indices": anchor_queries, "query_statuses": statuses,
             "selection_cost": {"static_task_failed_count": int(cost[4]),
@@ -285,7 +291,7 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
                 "nonconverged_candidate_count": int(cost[0]),
                 "static_task_not_established_count": int(cost[6]),
                 "static_model_not_established_count": int(cost[7]),
-                "failed_pose_energy": float(cost[1]), "normalized_velocity_energy": float(cost[2]),
+                "failed_pose_energy": float(cost[2]), "normalized_velocity_energy": float(cost[1]),
                 "successful_pose_energy": float(cost[3])},
             "interpolated_queries": [query for query, index in enumerate(indices) if index is None],
             "reference_success": all(status == "SOLVED" for status in statuses)})

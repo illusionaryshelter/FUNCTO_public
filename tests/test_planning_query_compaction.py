@@ -23,12 +23,10 @@ def test_boundary_compaction_keeps_batched_plateaus_release_witness_and_tie_grad
     upper = torch.where(right, torch.nextafter(progress, torch.full_like(progress, float('inf'))), progress)
     seen = []
 
-    # BEGIN both direct oracle and production callback declare their query role.
+    # BEGIN direct and compact callbacks share the original scene conditions.
     def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                 contact_permission_progress, query_role="acceptance", local_models=None,
-                 geometry_evidence_out=None):
-        assert query_role == "acceptance"
-        # END this numerical oracle leaves geometry-role selection to its caller.
+                 contact_permission_progress, geometry_evidence_out=None, geometry_scope="full"):
+        # END the geometry scope is independent of optimization objectives.
         seen.append((s.detach().clone(), joints.detach().clone(), trajectory_time.detach().clone(),
                      contact_permission_progress.detach().clone()))
         # A released owner needs an exact release pose in the same evaluation;
@@ -94,16 +92,15 @@ def test_declared_boundary_absent_from_samples_adds_no_side_geometry():
 # END only geometry work shrinks; task witnesses and scalar max semantics remain.
 
 
-# BEGIN a stopped request still reports the actual compact query layout.
-def test_timeout_returns_query_counts_without_authorizing_partial_candidate():
+# BEGIN a stopped request retains completed solver evidence and no authorization.
+def test_timeout_returns_completed_solver_report_without_authorizing_partial_candidate():
     from manipulation.planning import MotionPlanningError
     from test_motion_backend_contract import Native, run
     native = Native([False])
-    counts = {'process_mode': 'trajectory_optimizer', 'anchor_count': 3,
-              'anchor_capacity': 256, 'exact_states': 40, 'left_states': 4,
-              'right_states': 4, 'evaluated_states': 48}
-    native._manager_type = SimpleNamespace(query_diagnostics=lambda: [dict(counts)])
-    def stop(seed):
+    completed = {'backend': 'scipy.optimize.SLSQP', 'iterations': 3,
+                 'task_query_count': 48, 'success': False}
+    native.last_optimizer_runtime = [dict(completed)]
+    def stop(seed, *, iterations=None):
         native.calls.append('solve')
         raise MotionPlanningError('deadline_exceeded', 'actual step consumed request deadline')
     native.optimize = stop
@@ -111,11 +108,11 @@ def test_timeout_returns_query_counts_without_authorizing_partial_candidate():
     try:
         assert not result.success and result.trajectory is None and result.execution_binding is None
         assert result.diagnostics['failure'] == 'deadline_exceeded'
-        assert result.diagnostics['rollout_query_counts'] == [counts]
+        assert result.diagnostics['last_optimizer_runtime'] == [completed]
         assert 'export' not in native.calls
     finally:
         backend.close()
-# END counters preserve failure evidence, never execution permission.
+# END completed reports preserve failure evidence and the original request budget.
 
 
 # BEGIN unsupported dynamic capture fails at the shared query boundary.

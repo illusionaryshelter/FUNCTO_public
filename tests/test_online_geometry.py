@@ -9,14 +9,13 @@ import numpy as np
 import pytest
 import torch
 
-from manipulation.local_geometry_model import LocalGeometryModels
 from manipulation.planning_scene import GripperState
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from test_native_scene_contract import make_scene
 
 
 def arguments(q=None):
-    """One named joint batch and physical clock serve every query role."""
+    """One named joint batch and physical clock serve original scene conditions."""
     if q is None:
         q = torch.tensor([[[.04, -.02]]], dtype=torch.float64, requires_grad=True)
     progress = q[..., 0] * 0
@@ -26,30 +25,22 @@ def arguments(q=None):
     return (None, position, rotation, progress, q, ("left_slide", "right_slide"))
 
 
-def query(scene, scope, role="acceptance", q=None):
-    """Capture full-scene local models only for their existing consumer."""
+def query(scene, scope, q=None):
+    """Return original component evidence for the declared geometry scope."""
     args = arguments(q)
-    options = dict(trajectory_time=args[3], geometry_scope=scope, query_role=role)
-    if scope == "full" and role == "optimization":
-        models = LocalGeometryModels()
-        models.begin_capture(args[3].shape[0], 1)
-        scene.components(*args, **options, local_models=models)
-        models.finish_capture()
-        options["local_models"] = models
-    evidence, objectives = [], {}
-    terms = scene.components(*args, **options, geometry_evidence_out=evidence,
-                             objectives_out=objectives)
-    return terms, evidence, objectives
+    evidence = []
+    terms = scene.components(*args, trajectory_time=args[3], geometry_scope=scope,
+                             geometry_evidence_out=evidence)
+    return terms, evidence
 
 
 @pytest.mark.parametrize("gap,status", [(.001, "clear"), (-.001, "intersection"), (0., "unresolved")])
-def test_same_native_pair_evidence_survives_all_scope_and_query_roles(tmp_path, gap, status):
-    """Static, initializer and full optimization consume identical entity evidence."""
+def test_same_native_pair_evidence_survives_both_geometry_scopes(tmp_path, gap, status):
+    """Robot-only and full-scene queries consume identical native pair evidence."""
     scene = make_scene(tmp_path, gap=gap)
     original = None
-    for scope, role in (("full", "acceptance"), ("robot", "acceptance"),
-                        ("robot", "optimization"), ("full", "optimization")):
-        terms, evidence, objectives = query(scene, scope, role)
+    for scope in ("full", "robot"):
+        terms, evidence = query(scene, scope)
         own = [row for row in evidence if row["component"] == "collision/robot/self"]
         assert len(own) == 1 and own[0]["status"] == status
         assert own[0]["geometry_entity_key"] == {"first": "robot/first", "second": "robot/second"}
@@ -60,7 +51,6 @@ def test_same_native_pair_evidence_survives_all_scope_and_query_roles(tmp_path, 
             original = deepcopy(current)
         else:
             assert current == original
-        torch.testing.assert_close(objectives["collision/robot/self"], terms["collision/robot/self"])
         assert scene.last_query_report["geometry_scope"] == scope
         assert scene.last_query_report["robot_geometry_source"] == "registered_native_model"
         if scope == "robot":
@@ -73,7 +63,7 @@ def test_robot_scope_returns_before_task_owner_poses_and_field_queries(tmp_path)
     with patch.object(scene, "_owner_poses", side_effect=AssertionError("Task owner pose outside robot scope")), \
          patch("manipulation.online_geometry.pair_residual", side_effect=AssertionError("Task field outside robot scope")), \
          patch.object(scene.robot_model, "query", wraps=scene.robot_model.query) as native:
-        terms, _, _ = query(scene, "robot", "optimization")
+        terms, _ = query(scene, "robot")
     assert native.call_count == 1
     assert native.call_args.kwargs["pairs"] is scene.robot_validator.required_pairs
     assert sum(terms.values()).item() == 0.
@@ -94,7 +84,7 @@ def test_full_scope_queries_self_once_before_owner_poses_and_keeps_field_failure
 
     with patch.object(scene.robot_model, "query", side_effect=native) as robot, \
          patch.object(scene, "_owner_poses", side_effect=owners):
-        terms, evidence, _ = query(scene, "full")
+        terms, evidence = query(scene, "full")
     assert events == ["self", "owners"] and robot.call_count == 1
     assert terms["collision/robot/self"].item() == 0.
     assert terms["collision/robot/background"].item() > 0.
@@ -113,7 +103,7 @@ def test_hand_controller_and_unknown_motion_retain_their_original_components(tmp
     q = torch.tensor([[[.04, -.02], [.04, -.02]]], dtype=torch.float64)
     previous = None
     for scope in ("robot", "full"):
-        terms, evidence, _ = query(scene, scope, q=q)
+        terms, evidence = query(scene, scope, q=q)
         selected = {key: terms[key] for key in ("collision/robot/self", "unresolved/robot/self",
                                                 "gripper/controller", "conditional/hand_geometry")}
         assert selected["collision/robot/self"][0, 0] > 0
@@ -152,7 +142,7 @@ def moving_scene(tmp_path):
 def test_native_self_scalar_and_witness_gradient_match_finite_difference(tmp_path, scope):
     scene = moving_scene(tmp_path)
     q = torch.tensor([[[.015, -.02]]], dtype=torch.float64, requires_grad=True)
-    terms, _, _ = query(scene, scope, "optimization", q)
+    terms, _ = query(scene, scope, q)
     value = terms["collision/robot/self"].sum()
     derivative = torch.autograd.grad(value, q)[0]
     # The 2 cm boxes overlap by 5 mm along x. A positive left_slide motion

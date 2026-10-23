@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`d7bcafc`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本文说明 FUNCTO 技能、观测、规划和执行接口的持久化数据。第 4.1 节的实验适配器位于项目外，其实现由所链接脚本和阶段计划记录。总入口见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，观测场与机器人输入的对应关系见[实现与运行对照](../../../sim-version-plans/2026-10-19-put-planner-audit/observed-implementation-comparison.md)。
+代码基线：`774e121`；正文描述该基线上本次已经实现的工作区代码，统一实现提交后更新为对应提交。阶段实验与计划对照位于项目外 `sim-version-plans`。
 
 ## 1. 技能表示与运行环境状态
 
@@ -77,7 +77,7 @@
 
 表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；C 的原点由实体表示坐标确定，坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-目标坐标中的可设置-yaw-容差)。原 `SupportRequirement` 与这两个要求分别保存，`hard_components` 默认 body/footprint，gap/normal 按原阈值提供 `quality` 阶段偏好；当前生产调用固定使用 `feasibility` 阶段。
 
-`prepared-inputs/reference.npz` 保存参考采样及来源记录；当前目标构造实际查询内存中的连续 `object_path`。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点与机器人稳定尾段最后样本分别记录。
+`prepared-inputs/reference.npz` 保存参考采样及来源记录；当前目标构造实际查询内存中的连续 `object_path`。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点和实际曲线终点按各自定义记录。
 
 ## 5. 输出、执行与评价
 
@@ -87,21 +87,11 @@
 
 任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。`reference_ik_queries` 保存普通参考 IK 的原成功标志、原生连杆位置与真实转角误差、位置域资格、二次位姿能量，以及下一查询的跟踪来源。`warm_start_count/generated_seed_count` 表达固定种子总槽位中的实际分配；`proposal_candidate_indices` 与 `qualified_candidate_indices` 分别表示数值提议和原生收敛候选。`reference_ik_chains` 保存完整数值链、原候选索引、生产查询及 `SOLVED/APPROXIMATE_PROPOSAL/INTERPOLATED_PROPOSAL` 身份。链中的有限状态共同形成自由系数提议，`initial_seed_strategies` 保存其来源。
 
-`reference_initialization.iteration_allocation` 保存总更新数、原生内迭代块长度以及初始化/主求解分配；`geometry_scope="robot"` 表示共享官方机器人自身与名义手部计算，`task_scene_constraints="not_evaluated"` 表示任务观测场的计算范围。`coarse` 是物理域初始化后的数值初值，`refined` 是完整工具目标优化的实际输出。两者的 `seeds` 按 `seed_index` 保存自由系数、标准 `trajectory` 快照、同次采样资格、固定普通目标、完整优化目标、原生约束、完整任务有符号不等式，以及连续位置/速度/加速度/分段 jerk 报告。`reference_times_s/reference_point_costs` 保留普通原生网格上的时间和已加权参考贡献。
+`reference_initialization` 保存 `sample_fits_completed` 状态、每条样本拟合和原种子策略。拟合后的第一条曲线可在后续求解尚未产生结果时作为诊断输入保存，其执行资格仍由正式验收提供。`last_optimizer_runtime` 保存实际完成的 `scipy.optimize.SLSQP` 调用，含库状态、迭代次数、任务和物理求值次数、原目标、固定目标归一化尺度、系数更新以及内存准入量。每个种子串行求解，独立保存其报告。
 
-快照保留具名关节、物理时刻、位置/速度、多项式系数、进度映射、事件、条件与手指时钟；`executable_until/next_verification` 描述事件依赖定义的条件区间，完整执行资格由候选验收与绑定提供。`refined` 对应实际返回并交给完整主求解的系数。查询日志按执行顺序追加，数值链同时保存时间顺序与生产节点身份。中断后保留已完成记录，失败与缺失随对应阶段保存。
+事件 IK 由 OMPL 实际调用时，`functional_ik_candidates` 保存原目标身份、物理时刻、候选关节状态及任务/场景结论，作为搜索边界提议。候选 `fixed_objective/objective_components` 保存运动成本和声明任务质量；`returned_candidate` 指向实际返回曲线的完整验收。`qualified_candidate_elapsed_seconds` 表示完成验收和执行绑定的时刻，`elapsed_seconds` 是整次请求耗时。改善预算耗尽时 `improvement_end` 保存停止阶段，已完成资格的记录仍保持原绑定。累计工作由 `request_ledger.consumed_planning` 保存。
 
-初始化中断时的 `interrupted_snapshot` 以 `source="last_completed_optimizer_action"` 标明数值来源，外层保留 `geometry_scope="robot"` 与任务场计算范围。其每个种子保存 `seed_index/controls/trajectory` 和 `qualification_status="not_evaluated_after_interruption"`。这些曲线来自下一方向构造前已经选定的探索动作，只经标准多项式导出与序列化；验收字段按其实际缺失状态展示。第一条中断曲线可成为 `diagnostic-trajectory.*`，其身份与保存初值、完成优化输出分别保留。
-
-`reference_initialization.optimizer_runtime` 和 `last_optimizer_runtime` 分别记录初始化与最后一次主求解的各 optimizer 诊断，包含实际方向、线搜索和 QP/LP 调用数及相应时段。方向工作按种子保存；同一个 optimizer 各种子重复保存的 `shared_batch_work` 表示同一批量前向、反向、局部几何捕获、基点证据与设备等待，汇总时取一次。主机时段与后续显式流等待分别测量，报告保留其实际墙钟含义。物理域的 `initialization_report` 另记录构造初始锚点的 LP 工作。
-
-省略初值完整验收时，`reference_candidate` 保存 `qualification="skipped_known_functional_failure"`、`source="reference_initialization.refined"` 以及每个种子的有限正原始功能不等式。该记录来自同系数、同入口、同时钟与进度映射的终态快照，说明随后进入主优化的调度依据；已完成的候选验收另有实际 `accepted` 及完整报告。
-
-事件 IK 由 OMPL 搜索入口实际调用时，`functional_ik_candidates` 保存原目标身份、物理时刻、候选关节状态及独立任务/场景结论；其用途是搜索边界提议。完整轨迹的事件约束由同一任务允许集合求值。
-
-完成固定评分的候选报告以 `fixed_objective/objective_components` 保存统一网格上的普通参考和关节成本；`returned_candidate` 指向实际返回曲线的完整验收报告。`native_metrics.rollout/interpolated.ordinary_costs` 分别保存两种实际网格已完成的积分值。`qualified_candidate_elapsed_seconds` 表示该候选在请求内完成验收、复制和执行绑定的时刻，`elapsed_seconds` 表示整次请求耗时。若后续改善预算耗尽，`improvement_end` 保存停止阶段和原因，正式曲线继续使用此前已完成资格的绑定；最终 `request_ledger.consumed_planning` 保存全部实际工作。原始曲线与原生改善曲线的时长、进度映射和来源分别随各候选保存。
-
-`BoundToolReference` 独立持有名义阶段、显式边界、实际物理时钟与机器人入口位姿/速度；`NativeReferenceCost` 在普通有效网格上从它生成目标缓存，并使用请求标定转换到机器人基坐标。实验记录器在规划结果保存后保留同一绑定实例，`reference-bound.npz` 的 `tcp_poses_world` 为其物理时间输出，`nominal_tcp_poses_world` 为相同进度上的原名义路径。两者随本次时钟和代码基线分别保存。`LocalGeometryModels` 属于一次数值求解中的临时优化记录，来源是相同观测场和本块实际候选姿态；场景持久化仍保存原 TSDF 样本和关系声明。原叶节点点集与数值查询复用记录是这些已有模型的计算中间量。
+`BoundToolReference` 持有完整名义阶段、显式边界、物理时钟和机器人入口位姿/速度，参考 IK 读取其输出。实验 `reference-bound.npz` 的 `tcp_poses_world` 保存该实例的物理时间参考，`nominal_tcp_poses_world` 保存相同进度上的源名义路径。固定材料点几何目标复用原观测场和官方机器人形状；材料点、原场求值及导数属于计算中间量。场景持久化保存原 TSDF、观测支持和关系声明。
 
 场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存原条件与实体关系的模型对应，独立于实际接触与效果记录。
 

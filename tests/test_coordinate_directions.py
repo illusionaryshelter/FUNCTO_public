@@ -146,27 +146,26 @@ class CoordinateDirectionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(direction("net"), origin_coordinate=.2)
 
-    def test_export_rejects_instantaneous_reverse_rate_between_positive_positions(self):
-        from manipulation.planning import _ProgressMap
+    # BEGIN direction acceptance uses the saved cubic and actual Pin tool twist.
+    def test_saved_curve_rejects_instantaneous_reverse_rate_between_positive_positions(self):
+        from manipulation.planning import JointTrajectory, _ConstrainedPlanner, _ProgressMap
         from tests.test_manipulation_planning import cartesian_problem, constant_path, export_fixture
         request = cartesian_problem((MotionPhase("free reference", constant_path()),))
         request.mechanisms = (mechanism([direction("local_rate", start=.25, end=.75)]),)
-        planner, native = export_fixture(request, _ProgressMap(np.array([0., 1.]), np.array([0., 1.])),
-            [[0., 0., 0.], [.2, 0., 0.], [.4, 0., 0.]],
-            [[0., 0., 0.], [-.1, 0., 0.], [0., 0., 0.]], 1.)
-        original_fk = planner._verification_fk.compute_kinematics
-        def fk(state):
-            result = original_fk(state)
-            jacobian = state.position.new_zeros((*state.position.shape[:2], 1, 6, 3))
-            jacobian[..., 0, :3, :] = torch.eye(3, dtype=state.position.dtype)
-            result.tool_jacobians = jacobian
-            return result
-        planner._verification_fk.compute_kinematics = fk
-        curve, _ = planner.export(native)
-        self.assertAlmostEqual(curve.residuals["mechanism:0:direction:0:local_rate"], .1)
-        report = planner.last_validation["coordinate_direction_resolution"]
-        self.assertGreater(report["query_count"], 3)
-        self.assertIn("no continuous-time", report["scope"])
+        positions = np.array([[0., 0., 0.], [.2, 0., 0.], [.4, 0., 0.]])
+        velocities = np.array([[0., 0., 0.], [-.1, 0., 0.], [0., 0., 0.]])
+        mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+        planner, _ = export_fixture(request, mapping, positions, velocities, 1.)
+        curve = JointTrajectory(request.joint_names, np.array([0., 1., 2.]), positions,
+            velocities, mapping.u, mapping.s, (), (), {})
+        report, parameters, count = _ConstrainedPlanner._candidate_metrics(
+            planner, curve, planner.scene, record_work=lambda **kwargs: None)
+        self.assertFalse(report["accepted"])
+        self.assertAlmostEqual(report["residuals"]["mechanism:0:direction:0:local_rate"], .1)
+        self.assertGreater(count, 3)
+        self.assertIn(.5, parameters)
+        self.assertIn("finite task queries", report["scope"])
+    # END positive displacement does not replace the instantaneous rate contract.
 
     def test_delta_target_keeps_original_origin_and_compiler_evidence(self):
         skill = prismatic_input()

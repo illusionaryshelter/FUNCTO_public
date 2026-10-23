@@ -1,6 +1,6 @@
 # `manipulation/planning_ik.py` 实现契约
 
-代码基线：`d7bcafc`。
+代码基线：`774e121-plus-unified-workspace`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `select_ik_tracking_candidate`
@@ -24,12 +24,10 @@ def select_ik_tracking_candidate(candidates, candidate_indices, pose_costs, prev
 > state, initially the measured entrance. ``reports[N]`` contains the same
 > query's task/model components and original native pose-success flags.
 >
-> Original native success precedes numerical preferences. Successful
-> proposals minimize Euclidean joint displacement before using their pose
-> energy as a tiebreaker.
-> Failed proposals minimize pose energy before joint displacement. This
-> preserves the failed solver's numerical progress without allowing tiny
-> differences between solved poses to select a distant posture.
+> Original native success precedes numerical preferences. Every proposal
+> then minimizes Euclidean joint displacement before using pose energy as
+> a tiebreaker. Failed native outputs retain their approximation status and
+> residual diagnostics under that same continuity-first numerical rule.
 > Static task/model evidence breaks only equal numerical choices; an
 > unqueried failed pose cannot displace a solved numerical reference.
 > The original candidate index breaks exact ties. The returned index names
@@ -76,7 +74,7 @@ int
 
 ## `_validate_reports`
 
-[定义位置](../../../manipulation/planning_ik.py#L52)。
+[定义位置](../../../manipulation/planning_ik.py#L51)。
 
 输入签名：
 
@@ -118,7 +116,7 @@ report.get
 
 ## `_measurement`
 
-[定义位置](../../../manipulation/planning_ik.py#L62)。
+[定义位置](../../../manipulation/planning_ik.py#L61)。
 
 输入签名：
 
@@ -161,7 +159,7 @@ np.isfinite
 
 ## `_quality`
 
-[定义位置](../../../manipulation/planning_ik.py#L71)。
+[定义位置](../../../manipulation/planning_ik.py#L70)。
 
 输入签名：
 
@@ -204,7 +202,7 @@ tuple
 
 ## `_static_qualification`
 
-[定义位置](../../../manipulation/planning_ik.py#L81)。
+[定义位置](../../../manipulation/planning_ik.py#L80)。
 
 输入签名：
 
@@ -216,7 +214,7 @@ def _static_qualification(report):
 
 > Return known task/model failures and separate unestablished verdicts.
 >
-> ``planning._CuroboPlanner._rank_ik_candidates`` owns these reports. A
+> ``planning._ConstrainedPlanner._rank_ik_candidates`` owns these reports. A
 > completed task/native check provides finite positive violation values;
 > NaN and infinities provide no definite violation measurement. The scene
 > component families below are the definite constraints produced by
@@ -274,7 +272,7 @@ bool
 
 ## `_static_qualification.positive`
 
-[定义位置](../../../manipulation/planning_ik.py#L102)。
+[定义位置](../../../manipulation/planning_ik.py#L101)。
 
 输入签名：
 
@@ -306,7 +304,7 @@ np.isfinite
 
 ## `rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning_ik.py#L119)。
+[定义位置](../../../manipulation/planning_ik.py#L118)。
 
 输入签名：
 
@@ -387,7 +385,7 @@ int
 
 ## `rank_ik_candidates.key`
 
-[定义位置](../../../manipulation/planning_ik.py#L146)。
+[定义位置](../../../manipulation/planning_ik.py#L145)。
 
 输入签名：
 
@@ -431,7 +429,7 @@ int
 
 ## `select_ik_chains`
 
-[定义位置](../../../manipulation/planning_ik.py#L164)。
+[定义位置](../../../manipulation/planning_ik.py#L163)。
 
 输入签名：
 
@@ -450,13 +448,13 @@ def select_ik_chains(candidates_by_query, reports_by_query, previous, query_time
 > bounds only normalize the polyline's continuity cost. Neither the nodes
 > nor their connecting edges certify the later continuous trajectory.
 >
-> Dynamic programming first minimizes native-failure count, then failed-node
-> pose energy, normalized joint velocity energy and successful-node pose
+> Dynamic programming first minimizes native-failure count, then normalized
+> joint velocity energy, failed-node pose energy and successful-node pose
 > energy. Summed static evidence only breaks equal numerical paths.
 > Unqueried or unresolved checks remain unestablished verdicts. Each last node keeps
 > 'count' histories. Samples with no finite legal proposal are filled
 > between available nodes and measured q0, without inventing pose success.
-> The resulting values initialize the common direct tool-space optimizer;
+> The resulting values initialize the common constrained trajectory solve;
 > they never become mandatory event interpolation conditions.
 
 显式输出分支：
@@ -491,6 +489,8 @@ row.get
 np.isfinite(values).all
 (values >= positions_bounds[0]).all
 (values <= positions_bounds[1]).all
+np.min
+np.sum
 np.flatnonzero
 retained.append
 layers.append
@@ -527,6 +527,8 @@ energy
 row
 legal
 retained
+preceding
+continuity
 order
 index
 states
@@ -541,7 +543,6 @@ static
 options
 preceding_index
 paths
-preceding
 scaled_velocity
 edge
 cost
@@ -589,6 +590,8 @@ row.get
 np.isfinite(values).all
 (values >= positions_bounds[0]).all
 (values <= positions_bounds[1]).all
+np.min
+np.sum
 sorted
 np.flatnonzero
 _static_qualification

@@ -1,50 +1,22 @@
-"""Failure evidence must retain time/mode identity without changing acceptance."""
+"""Current scene reports retain physical time, pair identity and failure points."""
 
+# BEGIN failure localization consumes the current same-query scene interfaces.
 from types import SimpleNamespace
-from pathlib import Path
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
 import torch
 
-from manipulation.planning import _scene_boundary_evaluate
-from manipulation.planning_diagnostics import bind_trace_to_native_seed, scene_component_failures
+from manipulation.pin_kinematics import PinKinematics
+from manipulation.planning import (
+    JointTrajectory, PlanningBudget, _ConstrainedPlanner, _ProgressMap,
+    _scene_boundary_evaluate,
+)
+from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath
+from test_online_geometry import moving_scene
 
 
-def test_component_capture_keeps_modes_nonfinite_and_hard_unknown_only():
-    time = torch.tensor([[2., 4., 2., 4., 2., 4.]])
-    phase = time / 4
-    q = torch.zeros((1, 6, 2))
-    p, r = torch.zeros((1, 6, 3)), torch.zeros((1, 6, 4))
-    terms = {"collision": torch.tensor([[0., 0., 1., 0., 0., float('nan')]]),
-             "unknown/space/robot": torch.ones_like(time),
-             "unknown/release_anchor/owner": torch.tensor([[0., 1., 0., 0., 0., 0.]])}
-    rows = scene_component_failures(terms, time, phase, phase, q, p, r,
-                                    modes=("exact", "left", "right"))
-    assert [(row["component"], row["mode"], row["ordered_query_index"]) for row in rows] == [
-        ("collision", "left", 0), ("collision", "right", 1),
-        ("unknown/release_anchor/owner", "exact", 1)]
-    assert rows[0]["time_s"] == 2. and np.isnan(rows[1]["raw_residual"])
-
-
-def test_ranked_native_seed_is_matched_by_typed_position_and_velocity():
-    q = np.zeros((2, 3, 2), np.float32)
-    dq = q.copy()
-    dq[1] = 1
-    trace = {"input_position": q, "input_velocity": dq,
-        "component_failures": [{"batch_index": 0, "component": "first"},
-                               {"batch_index": 1, "component": "second"}], "world_geometry": {}}
-    state = SimpleNamespace(joint_names=["a", "b"],
-        position=torch.from_numpy(q[::-1].copy())[None],
-        velocity=torch.from_numpy(dq[::-1].copy())[None])
-    result = bind_trace_to_native_seed(trace, state, 0, ["a", "b"])
-    assert result["source_batch_index"] == 1
-    assert result["component_failures"] == [{"batch_index": 1, "component": "second"}]
-    state.velocity[0, 0, 0, 0] = 2
-    assert bind_trace_to_native_seed(trace, state, 0, ["a", "b"])["status"] == "unmatched"
-
-
-# BEGIN current boundary diagnostics summarize the same compact online query.
 def test_boundary_summary_retains_left_failure_at_original_time_without_requery():
     calls = []
     def evaluate(spheres, p, r, s, q, names, **kwargs):
@@ -56,11 +28,11 @@ def test_boundary_summary_retains_left_failure_at_original_time_without_requery(
 
     scene = SimpleNamespace(required_progress_anchors=[.5], contacts=(), evaluate=evaluate)
     problem = SimpleNamespace(start_progress=0., end_progress=1.)
-    mapping = SimpleNamespace(anchor_parameters=lambda _: np.array([[.5, .5]]))
+    mapping = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     s = torch.tensor([[.5]])
     def run(diagnostics):
         return _scene_boundary_evaluate(scene, problem, mapping,
-            torch.zeros((1, 1, 1, 4)), torch.zeros((1, 1, 3)), torch.zeros((1, 1, 4)),
+            torch.zeros((1, 1, 0, 4)), torch.zeros((1, 1, 3)), torch.zeros((1, 1, 4)),
             s, torch.zeros((1, 1, 2)), ("a", "b"), trajectory_time=s*4,
             normalized_time=s, component_diagnostics=diagnostics)
 
@@ -72,65 +44,133 @@ def test_boundary_summary_retains_left_failure_at_original_time_without_requery(
     assert witness["maximum"] == 1 and witness["time_s"] == 2
     assert witness["progress"] == float(torch.nextafter(s, torch.full_like(s, -float("inf"))))
     assert calls[0].shape == (1, 3)
-    # Omitting diagnostics does not rerun/change the scene acceptance query.
     assert torch.equal(run(None), result) and len(calls) == 2
-# END source-world observer hooks are not part of the online boundary contract.
 
 
-def test_world_capture_keeps_each_distinct_failure_without_repeating_queries():
-    from test_source_world_deduplication import batch_inputs, recording_scene
+def test_native_pair_failures_keep_candidate_time_and_mode_on_a_progress_plateau(tmp_path):
+    """Two candidate rows collide at different physical ends of one pause.
 
-    def report(joints, query):
-        return {"residual": 1., "unmodelled_geometry_names": [],
-            "scene": {"query_gaps": [], "pairs": [{"signed_distance_m": -.001}],
-                      "violations": [{"kind": "collision", "entity": float(joints[0])}]}}
-    args, kwargs = batch_inputs()
-    args[0][1, 0, 0] = .5
-    scene, calls = recording_scene(report)
-    diagnostics = {"capture_components": True}
-    residual = scene.check_world_geometry(*args, **kwargs, diagnostics=diagnostics)
-    assert torch.equal(residual, torch.ones_like(residual))
-    assert len(calls) == 2 and len(diagnostics["failure_witnesses"]) == 2
-    assert diagnostics["failed_states"] == 6
-    assert [row["witness_index"] for row in diagnostics["failure_witness_references"]] == [0, 0, 0, 1, 0, 0]
-    witnesses = diagnostics["failure_witnesses"]
-    assert [row["planning_joint_positions"][0] for row in witnesses] == [.25, .5]
-    assert [row["violations"][0]["entity"] for row in witnesses] == [.25, .5]
-    assert all(row["trajectory_time_s"] == .5 and row["progress"] == .75 for row in witnesses)
+    The actual registered robot consists of two 2 cm boxes. A named slide
+    translates the second box, giving 5/8 mm penetration at q=.015/.012 and 1 cm
+    separation at q=.03. Equal progress therefore cannot identify a failure
+    without its original candidate, physical time and side of the mode join.
+    """
+    original = moving_scene(tmp_path)
+    scene = SimpleNamespace(required_progress_anchors=(.5,), contacts=(), evaluate=original.evaluate)
+    mapping = _ProgressMap(np.array([0., .25, .75, 1.]), np.array([0., .5, .5, 1.]))
+    q = torch.tensor([[[.03, -.02], [.012, -.02]],
+                      [[.015, -.02], [.03, -.02]]], dtype=torch.float64)
+    progress = torch.full((2, 2), .5, dtype=q.dtype)
+    parameters = torch.tensor([[.25, .75], [.25, .75]], dtype=q.dtype)
+    quaternion = q.new_zeros((2, 2, 4)); quaternion[..., 0] = 1.
+    evidence, diagnostics, counts = [], {}, {}
+    # BEGIN full evidence is compared with its own original Coal query.
+    native_results, original_query = [], original.robot_model.query
+    def capture_native(*args, **kwargs):
+        result = original_query(*args, **kwargs)
+        native_results.append(result)
+        return result
+    with patch.object(original, "evaluate", wraps=original.evaluate) as evaluate, \
+         patch.object(original.robot_model, "query", side_effect=capture_native) as native:
+        scene.evaluate = evaluate
+        residual = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
+            mapping, q.new_empty((2, 2, 0, 4)), q.new_zeros((2, 2, 3)), quaternion,
+            progress, q, ("left_slide", "right_slide"), trajectory_time=4*parameters,
+            normalized_time=parameters, component_diagnostics=diagnostics,
+            geometry_evidence_out=evidence, geometry_scope="robot", query_counts=counts)
+    np.testing.assert_allclose(residual.numpy(), [[0., .008], [.005, 0.]], atol=1e-10)
+    assert evaluate.call_count == 1 and native.call_count == 8
+    assert counts == {"exact_states": 4, "left_states": 2, "right_states": 2, "evaluated_states": 8}
+    failures = [row for row in evidence if row["status"] == "intersection"]
+    assert {(tuple(row["query_index"]), row["side"], row["time_s"]) for row in failures} == {
+        ((0, 1), 0, 3.), ((0, 1), 1, 3.), ((1, 0), 0, 1.), ((1, 0), -1, 1.)}
+    assert len(evidence) == 8
+    assert {(tuple(row["query_index"]), row["side"], row["time_s"]) for row in evidence} == {
+        ((0, 0), 0, 1.), ((0, 1), 0, 3.), ((1, 0), 0, 1.), ((1, 1), 0, 3.),
+        ((0, 0), -1, 1.), ((1, 0), -1, 1.), ((0, 1), 1, 3.), ((1, 1), 1, 3.)}
+    expanded_shape = tuple(evaluate.call_args.args[3].shape)
+    for row in evidence:
+        assert (row["first"], row["second"]) == ("first", "second")
+        assert row["geometry_entity_key"] == {"first": "robot/first", "second": "robot/second"}
+        assert row["component"] == "collision/robot/self"
+        # Original Coal witness points reach the report unchanged. Their
+        # signed separation along the reported normal explains the rejection.
+        native_index = np.ravel_multi_index(tuple(row["state_index"]), expanded_shape)
+        saved = native_results[native_index]["pairs"][0]
+        assert row["signed_distance_m"] == saved["signed_distance_m"]
+        for key in ("witness_first", "witness_second", "normal_first_to_second"):
+            np.testing.assert_array_equal(row[key], saved[key])
+        signed = np.dot(np.asarray(row["witness_second"])-row["witness_first"],
+                        row["normal_first_to_second"])
+        assert signed == pytest.approx(row["signed_distance_m"], abs=1e-10)
+    # The bounded display summary names the earliest failure and the largest
+    # original pair residual. Both records must match the complete evidence.
+    summary = original.last_query_report["nonclear_pairs"]
+    assert len(summary) == 2
+    selected = {row["selection"][0]: row for row in summary}
+    assert selected["first"]["time_s"] == 1.
+    assert selected["first"]["state_index"] == [1, 0]
+    assert selected["maximum_pair_residual"]["time_s"] == 3.
+    assert selected["maximum_pair_residual"]["state_index"] == [0, 1]
+    for row in summary:
+        complete = next(item for item in failures if item["state_index"] == row["state_index"])
+        for key in ("component", "first", "second", "time_s", "progress", "permission_progress",
+                    "signed_distance_m", "witness_first", "witness_second", "normal_first_to_second"):
+            np.testing.assert_array_equal(row[key], complete[key])
+        assert row["pair_residual_value"] == -complete["signed_distance_m"]
+    # END reducing display records does not reduce complete pair evidence.
+    assert diagnostics["collision/robot/self"]["time_s"] == 3.
 
 
-def test_witness_binding_does_not_merge_same_q_with_different_scene_inputs():
-    q = np.zeros((2, 3, 2), np.float32)
-    q[1, -1, 0] = 1.  # Different complete trajectories meet at the same first q.
-    dq = np.zeros_like(q)
-    trace = {"input_position": q, "input_velocity": dq,
-        "component_failures": [{"batch_index": i, "component": "source_world_collision",
-                                "expanded_query_index": 0} for i in range(2)],
-        "world_geometry": {"failure_witnesses": [{"owner_pose": "first"}, {"owner_pose": "second"}],
-            "failure_witness_references": [{"batch_index": i, "expanded_query_index": 0,
-                                             "witness_index": i} for i in range(2)]}}
-    state = SimpleNamespace(joint_names=["a", "b"], position=torch.from_numpy(q)[None],
-                            velocity=torch.from_numpy(dq)[None])
-    report = bind_trace_to_native_seed(trace, state, 1, ["a", "b"])
-    assert report["component_failures"][0]["geometry_witnesses"] == [{"owner_pose": "second"}]
-
-
-def test_visualization_requires_matching_native_constraints_and_complete_scopes(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parent/"planning"))
-    from visualize_native_rejection import matched_failures
-
-    path = tmp_path/"native.npz"
-    original = {"seeds": [{"seed_index": 0, "metrics": {
-        label: {"constraints": {"process_scene": value}}
-        for label, value in (("rollout", 0.), ("interpolated", 100000.))}}]}
-    replay = {"status": "completed", "native_result": str(path), "labels": {
-        label: {"seeds": [{"seed_index": 0, "constraints": {"process_scene": value},
-            "source_trace": {"status": "recorded", "component_failures": [], "world_geometry": {}}}]}
-        for label, value in (("rollout", 0.), ("interpolated", 100000.))}}
-    assert all(row["equal"] for row in matched_failures(replay, original, path, 0)[2].values())
-    replay["labels"]["interpolated"]["seeds"][0]["constraints"]["process_scene"] = 0.
-    with pytest.raises(ValueError, match="do not reproduce"):
-        matched_failures(replay, original, path, 0)
-    replay["labels"].pop("interpolated")
-    with pytest.raises(ValueError, match="every archived"):
-        matched_failures(replay, original, path, 0)
+def test_candidate_report_owns_its_failure_time_entities_and_native_witnesses(tmp_path):
+    """A completed candidate keeps its same-query report after scene reuse."""
+    scene = moving_scene(tmp_path)
+    names = ("left_slide", "right_slide")
+    initial = np.array([.015, -.02])
+    path = PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), "declared reference")
+    problem = PlanningProblem(names, initial, np.zeros(2), "tool", "world", np.eye(4), np.eye(4),
+        (MotionPhase("reference", path),))
+    curve = JointTrajectory(names, np.array([0., .05]), np.stack((initial, initial)),
+        np.zeros((2, 2)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
+    planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
+    planner.torch, planner.problem, planner.joint_names = torch, problem, names
+    planner.budget, planner.anchors, planner.check_request = PlanningBudget(), problem.anchors, Mock()
+    planner.pin_kinematics = PinKinematics(scene.robot_model.model,
+        frames=("base", "left", "tool"), T_reference_base=np.eye(4))
+    record_work = Mock()
+    # BEGIN capture the complete same-call records alongside the public summary.
+    complete, original_evaluate = [], scene.evaluate
+    def capture_complete(*args, **kwargs):
+        kwargs["geometry_evidence_out"] = complete
+        return original_evaluate(*args, **kwargs)
+    with patch.object(scene, "evaluate", side_effect=capture_complete):
+        report, parameters, count = planner._candidate_metrics(curve, scene, record_work=record_work)
+    assert not report["accepted"]
+    assert report["collision_residuals"]["collision"] == pytest.approx(.005, abs=1e-10)
+    assert report["scene_components"]["collision/robot/self"]["time_s"] == 0.
+    record_work.assert_called_once_with(points=count)
+    assert count == len(parameters) == 3
+    complete_count = len(complete)
+    assert complete_count == report["observed_geometry"]["pair_queries"]
+    native_complete = [row for row in complete if row["component"] == "collision/robot/self"]
+    assert len(native_complete) == 3
+    assert [row["state_index"] for row in native_complete] == [[0, 0], [0, 1], [0, 2]]
+    np.testing.assert_array_equal([row["time_s"] for row in native_complete], parameters*curve.duration)
+    assert all(row["status"] == "intersection" for row in native_complete)
+    saved = report["observed_geometry"]["nonclear_pairs"]
+    assert len(saved) == 1
+    assert saved[0]["selection"] == ["first", "maximum_pair_residual"]
+    assert saved[0]["state_index"] == [0, 0] and saved[0]["time_s"] == 0.
+    assert {(row["first"], row["second"]) for row in saved} == {("first", "second")}
+    for row in native_complete:
+        assert (row["first"], row["second"]) == ("first", "second")
+        assert row["geometry_entity_key"] == {"first": "robot/first", "second": "robot/second"}
+        assert row["signed_distance_m"] == pytest.approx(-.005, abs=1e-10)
+        assert np.isfinite(row["witness_first"]).all() and np.isfinite(row["witness_second"]).all()
+    for key in ("component", "first", "second", "time_s", "progress", "permission_progress",
+                "signed_distance_m", "witness_first", "witness_second", "normal_first_to_second"):
+        np.testing.assert_array_equal(saved[0][key], native_complete[0][key])
+    scene.last_query_report["nonclear_pairs"].clear()
+    assert len(saved) == 1 and len(complete) == complete_count and len(native_complete) == 3
+    # END completed candidate summaries own their retained original witnesses.
+# END current pair evidence and completed reports retain physical failure identity.
