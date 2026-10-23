@@ -1,6 +1,6 @@
 # `manipulation/regions.py` 实现契约
 
-代码基线：`82a3d66；包含本次工作区已实现改动，待统一实现提交后更新`。
+代码基线：`2498027`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `SupportReferenceNotFound`

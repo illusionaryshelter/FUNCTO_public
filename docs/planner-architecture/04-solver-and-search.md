@@ -1,6 +1,6 @@
 # 固定时钟轨迹求解与有限搜索
 
-代码基线：`82a3d66`；本文同时描述本次工作区内已实现、待统一提交的参考初始化与约束方向改动。实现提交后统一更新代码基线引用。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
+代码基线：`2498027`。本次文档引用更新由随后文档提交保存，组件代码内容与该实现基线一致。本章讨论 `planning.py` 如何将 `PlanningProblem`、`OnlinePlanningScene` 和机器人模型联合转化为关节曲线。`q` 表示具名机械臂关节坐标，`dq` 表示其每秒变化率。问题入口按 `problem.joint_names` 排列，原生求解按 `_CuroboPlanner.joint_names` 排列，保存曲线按其 `trajectory.joint_names` 排列；各边界通过名称建立列映射。`s` 表示技能进度，`u=t/T` 表示总时长为 `T` 的轨迹归一化时间。每条候选的技能进度 `s` 与归一化时间 `u` 通过其绑定的 `_ProgressMap` 联系。原生优化在请求的一套固定时钟上运行；调用者提供的关节曲线保留自己的物理时长与进度映射。
 
 ## 1. 请求生命周期与资源分配
 
