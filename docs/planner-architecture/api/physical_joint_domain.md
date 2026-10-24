@@ -1,6 +1,6 @@
 # `manipulation/physical_joint_domain.py` 实现契约
 
-代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
+代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `cubic_position_report`
