@@ -54,14 +54,15 @@ def run(args):
     # placeholders are never submitted to any geometric query or optimizer.
     allocation_scene = copy(scene)
     # BEGIN declare every field consumed by current allocation accounting.
-    allocation_scene.owners = tuple(SimpleNamespace(moving=False, owner_id=f"static-{index}", query=None)
+    allocation_scene.owners = tuple(SimpleNamespace(moving=False, owner_id=f"static-{index}", query=None,
+            pose_path=SimpleNamespace(progress=(0., 1.)))
                                     for index in range(args.static_owners))
     allocation_scene.gripper = SimpleNamespace(self_collision_pairs=range(args.hand_pairs),
         finger_trajectory=None, nominal_finger_trajectory=None)
     # END these metadata placeholders still never enter geometric evaluation.
     budget = PlanningBudget(**audit["unchanged_budget"])
     workspace = _planning_workspace_bytes(
-        allocation_scene, audit["robot_metadata"], budget, audit["reserved_anchor_capacity"])
+        allocation_scene, audit["robot_metadata"], budget, audit["reserved_anchor_capacity"], clock_nodes=2)
     report = {"scope": __doc__, "fixture": str(args.fixture.resolve()),
         "feedback": str(args.feedback.resolve()), "observed_free": str(args.observed_free.resolve()),
         "gpu_used": not args.cpu_only, "coverage_queries": 0,

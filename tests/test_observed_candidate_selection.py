@@ -23,7 +23,7 @@ def candidate_fixture(*, scene, task=(0.,0.), flags=(False,False)):
         index = curve.seed_index
         residuals = {'process_scene':scene[index],'task':task[index]}
         return {'accepted':all(np.isfinite(v) and v <= 0 for v in residuals.values()),
-            'residuals':residuals, 'collision_residuals':{'collision':scene[index]}}, np.array([0.,1.]),3
+            'residuals':residuals, 'collision_residuals':{'collision':scene[index]}}, np.array([0.,1.]),3,(current_scene, [])
     planner._candidate_metrics = Mock(side_effect=metrics)
     planner._candidate_geometry = Mock(return_value={'query_points':0,'hard_scene_residual':0.,
         'scene_categories':{},'scene_components':{}})

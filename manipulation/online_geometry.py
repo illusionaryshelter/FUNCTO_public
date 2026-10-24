@@ -1002,18 +1002,31 @@ class OnlinePlanningScene:
         material_counts = [sum(len(field.occupied_points(node)) for node in field.nodes
                                if node.cell >= 0) for field in unique_fields]
         zero_counts = [20 * len(field.cells) for field in unique_fields]
+        # BEGIN material selection shares one immutable range index per field.
+        # Each original cell owns two int64 offsets; three float64 values
+        # bound actual material-to-tree-centre coordinate differences.
+        index_bytes = [16 * len(field.cells) + 24 for field in unique_fields]
         if self._objective_material_samples is None:
-            pending += sum(32 * count + 24 * zeros + 96 for count, zeros in zip(material_counts, zero_counts))
+            pending += sum(32 * count + 24 * zeros + 96 + index for count, zeros, index in
+                           zip(material_counts, zero_counts, index_bytes))
             pending += len(self.robot_model.geometry_names) * (27 * 32 + 96)
         else:
             samples = {id(value): value for value in self._objective_material_samples.values()}.values()
             resident += sum(value.points.nbytes + value.cells.nbytes + value.zero_points.nbytes
                             + (0 if value.point_bounds is None else value.point_bounds.nbytes)
                             + (0 if value.negative_bounds is None else value.negative_bounds.nbytes)
+                            + (0 if value.cell_ranges is None else value.cell_ranges.nbytes + value.cell_radius.nbytes)
                             for value in samples)
         rows = max((len(rule.feature_points) + 10 for rule in self.contacts), default=0)
-        temporary = max([0, *(256 * count for count in material_counts),
+        # The additional 64 bytes/material record cover expanded int64 point
+        # indices and their repeat buffer, selected coordinate copies, and
+        # active-index mapping. The 96 bytes/cell cover tree result conversion,
+        # centre/axis masks, ordered ranges and cumsum/repeat offsets. Their
+        # lifetime is one direction of one pair, independently of horizon.
+        temporary = max([0, *(320 * count + 96 * len(field.cells)
+                              for count, field in zip(material_counts, unique_fields)),
                          *((200 + 8 * rows) * count for count in zero_counts)])
+        # END construction and resident phases account for the same unique index.
         # Point derivatives are reduced to entity-pose derivatives pairwise;
         # the trajectory retains no material-point-sized autograd arrays.
         entities = len(self.robot_model.geometry_names)+len(self.owners)+1
@@ -1042,15 +1055,16 @@ class OnlinePlanningScene:
             "observation_report": deepcopy(self.observation_report)}
 
     def to_execution_binding(self):
+        # BEGIN scene and task references share the same typed path records.
+        from .execution_binding import plain
+        # END owner-motion validity is still defined by CollisionOwner.
         owners = []
         for owner in self.owners:
             path = owner.pose_path
             owners.append({"owner_id": owner.owner_id, "source": owner.source,
                 "moving": owner.moving,
                 "pose_interval": list(owner.pose_interval),
-                "pose_path": {"progress": _plain(path.progress), "poses": _plain(path.poses), "source": path.source,
-                    "motion_model": None if path.motion_model is None else _plain(asdict(path.motion_model)),
-                    "coordinates": _plain(path.coordinates), "attachment": _plain(path.attachment)},
+                "pose_path": plain(path),
                 "attachments": _plain([asdict(row) for row in owner.attachments]),
                 "query": owner.query.record()})
         hand = self.gripper

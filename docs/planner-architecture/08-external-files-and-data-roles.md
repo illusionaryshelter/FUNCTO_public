@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`6090527`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：与本次实现代码一并提交；最终验证记录回填该实现提交。组件正文描述当前实现，阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 技能表示与运行环境状态
 
@@ -43,7 +43,7 @@
 | grounding 的 `report.json.functional_frame` | 迁移所得当前功能坐标 `T_world_region` | 实验 `reference_inputs` 实际读取并传给 `generate_reference`；该字段是计算输入 |
 | grounding 的 `report.json.reference_rotation_transfer` | 布尔选择、功能坐标中的原名义/当前/选定入口 RPY，以及固定旋转修正矩阵 | `config.ground_skill` 保存 `generate_reference.rotation_transfer`；用于解释生成结果及复核参考运算 |
 | 关系 JSON 中的 `J`、`A` | `J` 为当前物体坐标到源物体坐标的明确对应；`A=T_eef_body` 为名义附着 | 参考生成、任务点坐标与附着模型 |
-| `reference.npz` | 保存采样后的工具/物体参考、时间和相关数组 | 用于结果保存及指定入口的对照；是否重新读取由调用代码决定，不能替代连续路径对象的实际消费说明 |
+| `reference.npz` | 保存采样后的工具/物体参考、时间和相关数组 | 用于结果保存及指定入口的对照；连续表达式另由 `PosePath.to_record` 保存，`PosePath.from_record` 恢复原插值、机构和组合运算 |
 
 感知入口还依赖现有 SAM、MARCO 等本地模型权重和运行配置；它们提供图像分割与特征计算能力。已保存特征属于某次图像计算的结果，权重属于算法资源，两者职责不同。
 
@@ -65,6 +65,8 @@
 
 技能表示中的功能点和接触定义提供“要做什么”的几何表达，现场碰撞模型提供“本次模型中的实体占据”。将它们变换到共同坐标后分别消费，不以改变碰撞表示为由删除技能内容。
 
+执行绑定中的任务阶段及过程关系保留带 `kind` 的连续路径记录。普通路径保存 parent、attachment 与机构坐标；功能坐标中的旋转修正保存 nominal、functional 和原修正矩阵。记录经过 JSON 转换后由 `PosePath.from_record` 重建相同计算；只保存乘积节点得到的是另一种插值函数，不能用于代替该记录。原采样 NPZ 继续承担明确时刻的数值对照。
+
 ### 4.1 已生成参考到规划要求的实际文件路径
 
 当前实验入口 [run_integration.py](../../../sim-version-plans/2026-10-24-planner-integration/run_integration.py) 通过既有 `run_replanning.build_problem` 为 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 绑定明确参考目录；该工厂的 `reference_inputs()` 调用 `generate_reference`，`build_problem()` 构造 `PlanningProblem`。该路线使用源技能包中的 `representation`，名义工具、物体运动及目标取样共用返回的连续组合路径对象；显式工具边界经 `reference_phase` 进入阶段元数据，在规划物理时钟上由 `BoundToolReference` 生成实际工具参考。具体职责如下。
@@ -78,7 +80,7 @@
 | 同一 `prepared-inputs/scene.json` | 支撑平面、有限边界、源任务点、接触面及其原容差 | `SupportRequirement` 与附着条件 |
 | 同一 `prepared-inputs/scene.json` 的 `pose_event_tolerances` 及[声明来源](../../../sim-version-plans/2026-10-21-yaw-tolerance/plan.md) | 材料原点距离 2 mm、消去自由 yaw 后总倾斜 1°、yaw 容差 π | 两个 `PoseEventRequirement` 读取数值；yaw 轴为观测支撑法向在目标材料坐标中的表示，来源随任务保存 |
 
-表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；C 的原点由实体表示坐标确定，坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-目标坐标中的可设置-yaw-容差)。原 `SupportRequirement` 与这两个要求分别保存，`hard_components` 默认 body/footprint，gap/normal 按原阈值提供 `quality` 阶段偏好；当前统一目标调用 `optimizer_preferences(..., phase="quality")`，硬条件另由原有符号约束接口提供。
+表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；C 的原点由实体表示坐标确定，坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-目标坐标中的可设置-yaw-容差)。原 `SupportRequirement` 与这两个要求分别保存，`hard_components` 默认 body/footprint，gap/normal 按原阈值提供 `quality` 阶段偏好；统一搜索目标调用 `optimizer_preferences(..., phase="feasibility")`，完整质量偏好由候选的固定质量记录保存；硬条件由原有符号约束接口提供。
 
 `grounding-region-center/reference.npz` 保存当前参考采样；目标构造实际查询内存中的连续 `object_path`。工厂输出的顶层来源与两个事件的 `source.saved_reference_artifact/functional_frame_input` 指向这一参考及对应功能坐标文件，数值条件沿原生成函数计算。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点和实际曲线终点按各自定义记录。
 
@@ -94,7 +96,7 @@
 
 `last_optimizer_runtime` 保存各个已开始的 `scipy.optimize.SLSQP` 调用，包含状态、迭代和求值开始/完成计数、原目标、固定目标归一化尺度、系数更新及内存量。`evaluation_seconds` 记录 objective/task/physical 的累计实际计算时间，包含中断计算且排除缓存命中。`complete_task_equalities/complete_task_inequalities` 为原任务行数，`solver_task_equalities/solver_task_inequalities` 为已核对常量后实际提交的行数，`fixed_task_constraints` 保存被省去行的原键、组内索引、数值与判定。每个候选串行求解并立即验收，原 seed 索引和实际来源随结果保存。
 
-事件 IK 由 OMPL 实际调用时，`functional_ik_candidates` 保存原目标身份、物理时刻、候选关节状态及任务/场景结论，作为搜索边界提议。候选 `fixed_objective/objective_components` 保存运动成本和声明任务质量；`returned_candidate` 指向实际返回曲线的完整验收。`qualified_candidate_elapsed_seconds` 表示完成验收和执行绑定的时刻，`elapsed_seconds` 是整次请求耗时。改善预算耗尽时 `improvement_end` 保存停止阶段，已完成资格的记录仍保持原绑定。累计工作由 `request_ledger.consumed_planning` 保存。
+事件 IK 由 OMPL 实际调用时，`functional_ik_candidates` 保存原目标身份、物理时刻、候选关节状态及任务/场景结论，作为搜索边界提议。候选 `fixed_objective/objective_components` 保存运动成本和声明任务质量；`returned_candidate` 指向实际返回曲线的完整验收。`qualified_candidate_elapsed_seconds` 表示完成验收和执行绑定的时刻，`elapsed_seconds` 是整次请求耗时。首个候选完成原资格检查与执行绑定后立即返回，后续候选不再启动。累计工作由 `request_ledger.consumed_planning` 保存。
 
 `BoundToolReference` 持有完整名义阶段、显式边界、物理时钟和机器人入口位姿/速度，参考 IK 读取其输出。实验 `reference-bound.npz` 的 `tcp_poses_world` 保存该实例的物理时间参考，`nominal_tcp_poses_world` 保存相同进度上的源名义路径。固定材料点几何目标复用原观测场和官方机器人形状；材料点、原场求值及导数属于计算中间量。场景持久化保存原 TSDF、观测支持和关系声明。
 

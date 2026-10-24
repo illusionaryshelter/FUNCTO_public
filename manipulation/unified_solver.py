@@ -170,16 +170,21 @@ class TrajectoryComputation:
                      for group in groups)
 
     def objective_components(self, controls, *, include_geometry=True):
-        """Motion quality and declared task preferences share the same candidate."""
+        """Search the declared feasible set using motion and process preferences."""
         states = self.states(controls)
         q, dq, names, poses, tool, twist = self.robot_states(*states[:2])
         ordinary = tuple(value[:, self.ordinary_indices] for value in states)
         costs = {"motion_quality": motion_cost(ordinary, self.bounds, self.motion_configuration,
                                                self.native_dt, self.time_weights)}
+        # BEGIN first-result search uses the existing feasibility-stage objective.
+        # Signed task rows remain in task(); process equations and directions
+        # retain their preferences. Optional event/support centering belongs
+        # to the separately recorded quality score, not this search objective.
         preferences = self.problem.optimizer_preferences(*tool, self.progress,
             trajectory_time=self.times, tool_linear_velocity=twist[0], tool_angular_velocity=twist[1],
-            phase="quality")
-        costs["task_quality"] = self.constraint_weight * preferences.sum()
+            phase="feasibility")
+        costs["task_preferences"] = self.constraint_weight * preferences.sum()
+        # END physical/task constraints and the original geometry term are unchanged.
         if include_geometry:
             costs["observed_geometry"] = self.constraint_weight * self.scene.optimization_objective(
                 *tool, self.progress, q, names, trajectory_time=self.times,

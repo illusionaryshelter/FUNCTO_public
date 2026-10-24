@@ -1,11 +1,11 @@
 # `manipulation/execution_binding.py` 实现契约
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`CURRENT_IMPLEMENTATION`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `plain`
 
-[定义位置](../../../manipulation/execution_binding.py#L17)。
+[定义位置](../../../manipulation/execution_binding.py#L21)。
 
 输入签名：
 
@@ -23,6 +23,7 @@ def plain(value):
 显式输出分支：
 
 ```python
+plain(value.to_record())
 {item.name: plain(getattr(value, item.name)) for item in fields(value) if not item.name.startswith('_')}
 plain(value.tolist())
 plain(value.item())
@@ -35,6 +36,7 @@ value if np.isfinite(value) else {'unbounded': '+' if value > 0 else '-'}
 读取的对象属性：
 
 ```python
+value.to_record
 item.name
 item.name.startswith
 np.ndarray
@@ -58,11 +60,12 @@ key
 
 ```python
 is_dataclass
+isinstance
 plain
+value.to_record
 getattr
 fields
 item.name.startswith
-isinstance
 value.tolist
 value.item
 str
@@ -76,7 +79,7 @@ type
 
 ## `curve_snapshot`
 
-[定义位置](../../../manipulation/execution_binding.py#L44)。
+[定义位置](../../../manipulation/execution_binding.py#L52)。
 
 输入签名：
 
@@ -132,7 +135,7 @@ trajectory.finger_trajectory.describe
 
 ## `bind_candidate`
 
-[定义位置](../../../manipulation/execution_binding.py#L66)。
+[定义位置](../../../manipulation/execution_binding.py#L74)。
 
 输入签名：
 
@@ -199,7 +202,7 @@ deepcopy
 
 ## `_relaxed_pose_contract`
 
-[定义位置](../../../manipulation/execution_binding.py#L97)。
+[定义位置](../../../manipulation/execution_binding.py#L105)。
 
 输入签名：
 
@@ -283,7 +286,7 @@ contract.get
 
 ## `relax_pose_goal_tolerances`
 
-[定义位置](../../../manipulation/execution_binding.py#L157)。
+[定义位置](../../../manipulation/execution_binding.py#L165)。
 
 输入签名：
 
@@ -355,7 +358,7 @@ PlanningResult
 
 ## `check_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L196)。
+[定义位置](../../../manipulation/execution_binding.py#L204)。
 
 输入签名：
 
@@ -440,7 +443,7 @@ deepcopy
 
 ## `validate_controller_policy`
 
-[定义位置](../../../manipulation/execution_binding.py#L248)。
+[定义位置](../../../manipulation/execution_binding.py#L256)。
 
 输入签名：
 
@@ -496,7 +499,7 @@ np.any
 
 ## `validate_result_only_goal_ids`
 
-[定义位置](../../../manipulation/execution_binding.py#L276)。
+[定义位置](../../../manipulation/execution_binding.py#L284)。
 
 输入签名：
 
@@ -555,7 +558,7 @@ binding['problem'].get
 
 ## `rebind_execution_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L315)。
+[定义位置](../../../manipulation/execution_binding.py#L323)。
 
 输入签名：
 

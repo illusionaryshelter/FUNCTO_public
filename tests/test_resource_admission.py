@@ -86,14 +86,15 @@ def test_new_validation_records_include_previous_candidate_rss_at_one_byte_bound
 def test_cpu_residency_does_not_change_gpu_budget():
     allocation = {"gpu_retained": 5, "gpu_live": 150, "gpu_shared": 23,
                   "gpu_graph_live": 60, "cpu_resident": 17, "cpu_pending_shared": 19, "cpu_live": 31}
-    scene = SimpleNamespace(required_progress_anchors=(), contacts=(),
-        robot_model=SimpleNamespace(joint_names=("joint",)),
+    scene = SimpleNamespace(required_progress_anchors=(), contacts=(), owners=(),
+        robot_validator=SimpleNamespace(required_pairs=()),
+        robot_model=SimpleNamespace(joint_names=("joint",), geometry_names=("body",)),
         estimated_workspace_allocation=lambda *args, **kwargs: dict(allocation))
     metadata = {"active_joint_names": ["joint"], "links": 1, "spheres": 1}
     budget = PlanningBudget(max_scene_gpu_workspace_bytes=5+150+23)
-    small = _planning_workspace_bytes(scene, metadata, budget, 1)
+    small = _planning_workspace_bytes(scene, metadata, budget, 1, clock_nodes=2)
     allocation["cpu_resident"] = 9*GIB
-    large = _planning_workspace_bytes(scene, metadata, budget, 1)
+    large = _planning_workspace_bytes(scene, metadata, budget, 1, clock_nodes=2)
     assert small.gpu_bytes == large.gpu_bytes == budget.max_scene_gpu_workspace_bytes
     assert large.cpu_bytes-small.cpu_bytes == 9*GIB-17
     assert large.pending_cpu_bytes == small.pending_cpu_bytes
@@ -118,6 +119,9 @@ def test_scene_sample_materialization_preserves_single_query_peak(tmp_path):
     allocated = sum(value.points.nbytes + value.cells.nbytes + value.zero_points.nbytes
                     + (0 if value.point_bounds is None else value.point_bounds.nbytes)
                     + (0 if value.negative_bounds is None else value.negative_bounds.nbytes)
+                    # BEGIN the immutable original-cell index changes ownership once.
+                    + (0 if value.cell_ranges is None else value.cell_ranges.nbytes + value.cell_radius.nbytes)
+                    # END native material has no observed-cell index.
                     for value in samples)
     assert after['cpu_resident']-before['cpu_resident'] == allocated
     assert before['cpu_pending_shared']-after['cpu_pending_shared'] >= allocated > 0
@@ -133,9 +137,10 @@ def test_serial_optimizer_admits_current_pending_geometry_with_each_solve(monkey
     scene = SimpleNamespace(materialized=False)
     planner.computation = SimpleNamespace(scene=scene)
     planner.robot_metadata, planner.anchor_capacity = {}, 3
+    planner.progress_map = SimpleNamespace(u=(0., 1.))
     planner.budget, planner.check_request = SimpleNamespace(trajectory_iterations=7), Mock()
     pending = []
-    def estimate(actual_scene, metadata, budget, anchors):
+    def estimate(actual_scene, metadata, budget, anchors, *, clock_nodes):
         assert actual_scene is scene
         return _PlanningWorkspace(100, 0 if scene.materialized else 17, 23, 0, 0)
     def solve(computation, initial, *, iterations, check_request, pending_geometry_bytes, report_out):
@@ -279,3 +284,65 @@ def test_reparented_worker_cannot_admit_an_empty_old_simulator_tree(monkeypatch)
     root.memory_info.assert_not_called()
 # END resource tests allocate only small Python stand-ins.
 # END no test constructs a real planner, initializes CUDA or allocates a large array.
+
+
+# BEGIN actual complete record schemas are measured recursively before retention.
+def test_complete_pair_evidence_fits_candidate_allocation_before_robot_binding(tmp_path, record_property):
+    from sys import getsizeof
+    import numpy as np
+    import torch
+    from manipulation.planning import _candidate_evidence_workspace_bytes, _geometry_query_states
+    from manipulation.planning_scene import CollisionOwner
+    from manipulation.planning_problem import PosePath
+    from test_native_scene_contract import make_scene
+
+    scene = make_scene(tmp_path, occupied_background=True)
+    path = PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), 'declared path')
+    from manipulation.observed_mapping import FrozenObservedField
+    material = FrozenObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
+        weights=np.ones((2, 2, 2)), origin=[-.005]*3, voxel_size=.01,
+        name='material', source='synthetic RGB-D')
+    scene.owners = (CollisionOwner('material', material, path, 'observed field', moving=True),)
+    count, rows = 3, []
+    progress = torch.linspace(0., 1., count, dtype=torch.float64)[None]
+    values = scene.evaluate(None, torch.zeros((1, count, 3), dtype=torch.float64),
+        torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64).expand(1, count, 4), progress,
+        torch.tensor([[[.04, -.02]]], dtype=torch.float64).expand(1, count, 2),
+        ('left_slide', 'right_slide'), trajectory_time=progress, geometry_evidence_out=rows)
+    for row in rows:
+        row.update(query_index=row['state_index'].copy(), side=0)
+    states = _geometry_query_states(rows, progress.numpy()[0], progress.numpy()[0], values.numpy()[0])
+    seen = set()
+    def nbytes(value):
+        if id(value) in seen:
+            return 0
+        seen.add(id(value))
+        total = getsizeof(value)
+        if isinstance(value, dict):
+            total += sum(nbytes(key)+nbytes(item) for key, item in value.items())
+        elif isinstance(value, (tuple, list)):
+            total += sum(nbytes(item) for item in value)
+        return total
+
+    measured = nbytes((rows, states))
+    estimate = _candidate_evidence_workspace_bytes(scene, count, 0, 2)
+    assert measured < estimate
+    assert any('witness_first_bounds' in row for row in rows)
+    assert any('normal_first_to_second' in row for row in rows)
+    assert any(row['geometry_entity_key']['first'] == 'owner/material' for row in rows)
+    record_property('complete_pair_rows', len(rows))
+    record_property('live_original_and_grouped_bytes', measured)
+    record_property('candidate_evidence_bound_bytes', estimate)
+    scene.robot_validator = None
+    assert _candidate_evidence_workspace_bytes(scene, count, 0, 2) == estimate
+
+
+def test_evidence_allocation_tracks_actual_progress_clock_independently_of_cubic_knots(tmp_path):
+    from manipulation.planning import _candidate_evidence_workspace_bytes
+    from test_native_scene_contract import make_scene
+    scene = make_scene(tmp_path)
+    short = _candidate_evidence_workspace_bytes(scene, 2, 2, 2)
+    dense = _candidate_evidence_workspace_bytes(scene, 2, 2, 1001)
+    assert dense > short
+    assert dense-short > 999*3*500  # Every extra clock span reserves every possible pair.
+# END already allocated geometry is shared; records and proof outputs remain distinct.

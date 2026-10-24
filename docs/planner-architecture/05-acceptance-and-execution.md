@@ -1,14 +1,16 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：本次实现待统一提交后回填，实施前保存基线为 `063f88b`。组件正文描述当前工作区已实现行为；阶段验证位于项目外 `sim-version-plans/2026-10-24-performance-implementation`。
 
 ## 1. 候选的完整验收
 
 初值由参考 IK 或原关节曲线的物理时间样本经最小二乘取得。`reference_initialization.fits` 保存拟合结果；其系数、入口和时钟定义一条可评价曲线。`evaluate_reference` 为每个初值建立 `ConstrainedSolution` 记录，`select_candidate` 将初值和求解输出统一交给保存曲线验收。
 
-`_ConstrainedPlanner._candidate_metrics` 消费实际 `JointTrajectory` 和候选场景，沿保存多项式计算 `q/dq/ddq/jerk`，通过共享 Pin 模型计算完整名义机器人、TCP 及速度。`_candidate_sample_times` 保留原多项式区间端点，并按 `interpolation_dt` 分割；任务锚点按候选自身进度映射精确加入。`PlanningProblem.residuals` 计算原任务允许集合，`_scene_boundary_evaluate` 计算相同物理时刻的原场景分项。报告保存具体分项、查询时刻及覆盖范围。
+`_ConstrainedPlanner._candidate_metrics` 消费实际 `JointTrajectory` 和候选场景，沿保存多项式计算 `q/dq/ddq/jerk`，通过共享 Pin 模型计算完整名义机器人、TCP 及速度。`_candidate_sample_times` 保留原多项式区间端点，并按 `interpolation_dt` 分割；任务锚点按候选自身进度映射精确加入。`PlanningProblem.residuals` 计算原任务允许集合，`_scene_boundary_evaluate` 在同一次查询中计算相同物理时刻的原场景分项及完整实体对证据。`_geometry_query_states` 按精确物理时刻与关系侧 `−1/0/+1` 组织原距离界、状态、许可及见证；即使没有实体对，该物理时刻也保留已完成记录。方法返回正式报告、规范时间参数、实际物理点数和候选几何上下文；上下文由候选私有释放场景及这些完整状态组成。报告保存具体分项、查询时刻及覆盖范围。
 
-`SupportRequirement` 按实例 `hard_components` 验收，默认硬项为整体高度和有限投影范围；其他分量按原阈值提供求解目标中的质量偏好。位姿事件按材料原点距离、完整旋转或倾斜及声明 yaw 范围验收。完整轨迹按实际时间和速度评价机构方向历史、关节耦合和显式停止。
+`progress_clock.progress_anchor_parameters` 为所有消费者产生同一组 `(u,s)` 事件记录，其中 `u` 是候选归一化时间、`s` 是声明进度；事件物理时间为 `uT`，`T` 是该候选时长。`progress_query_parameters` 在此精确物理时间使用原 `u,s`，普通查询按原进度映射插值。固定任务查询、场景关系侧、区间分区与实体速度界因此使用相同事件身份。进度平台的入口和出口分别保留；CPU 实体路径折点按 binary64 存储，原生张量的 float32 约束仍在 `_ProgressMap.anchor_parameters` 中核对。
+
+`SupportRequirement` 按实例 `hard_components` 验收，默认硬项为整体高度和有限投影范围；其他分量按原阈值提供候选独立质量评分中的偏好。位姿事件按材料原点距离、完整旋转或倾斜及声明 yaw 范围验收。完整轨迹按实际时间和速度评价机构方向历史、关节耦合和显式停止。
 
 普通任务指标与连续关节域通过后，`evaluate_candidate` 调用 `_candidate_geometry`，以同一原曲线继续检查几何时间区间。`SceneMotionBounds.from_scene` 绑定完整机器人关节树、官方实体局部范围、原 owner TSDF 范围、工具标定和声明附着。`geometry_motion_bound` 中的局部包围球仅把关节转动上界转为实体点运动上界；实际碰撞查询仍使用原形状。机械臂速度由保存的 Hermite 多项式导数的 Bernstein 包络给界，名义手指曲线在其有效时间范围内提供手指速度，独立 owner 路径由原插值或机构坐标速率提供界。释放后的实体按该候选释放位姿保持静止。
 
@@ -20,7 +22,11 @@
 
 存在有限接触或初始支撑许可的端点使用独立的 `full_entity_lower_m`，该界由许可裁剪前的完整实体计算；无许可端点使用覆盖完整实体对的 `lower_m`。因此，完整实体范围已经足够分离的区间可以沿用上述证明。其余具有变化许可域的实体对保留 `dynamic_permission`，受许可裁剪的静态距离仅描述本次姿态下的未许可点对域。
 
-未取得上述证明的区间按实体最大位移继续二分，直到位移上界不超过 `validation_spatial_step_m`、时间无法再分或共享查询容量用尽，保留为 `unresolved_intervals`。新增查询调用原多项式、完整 FK 和相同场景，并计算同一物理时刻的关系左右侧；进度平台只在入口使用左侧、出口使用右侧。第一次查询同时计算该曲线所需的释放锚点，后续细分从候选私有场景读取相同预测释放位姿。查询发现实际交叠后，保存见证并将其余待查区间记为 `not_checked_after_intersection`。`proved_intervals`、`confirmed_intersections`、`unresolved_intervals`、实际查询数量与时刻共同构成报告。
+`check_interval_geometry` 每轮收集当前待判区间已经需要、尚未查询的端点，按物理时间排序，在剩余物理点容量内发起一次场景数组查询。返回后才对这些区间应用上述证明并生成子区间。所有已完成固定查询作为 `initial_states` 进入同一缓存，释放位姿来自其候选私有场景；一个物理时刻的实际计算只计费一次，各关系侧分别保存证据。数组内任何状态确认交叠后，整批已计算点完整计费，后续批次停止，其余待查区间保存 `not_checked_after_intersection`。有限点容量会决定这一批调度实际覆盖的时刻。
+
+未取得分离证明的区间按实体最大位移二分，直到位移上界不超过 `validation_spatial_step_m`、时间无法再分或共享查询容量用尽，保留为 `unresolved_intervals`。剩余新点容量为零时，已有中点仍可继续分割并完成证明。新增查询沿原多项式计算完整 FK 与原场景，进度平台仅在入口使用左侧、出口使用右侧。`proved_intervals`、`confirmed_intersections`、`unresolved_intervals` 与 `initial_query_points`、新增 `query_points`、各实际批次大小 `query_batch_sizes` 和新增查询时刻共同组成报告。
+
+候选几何缓存与新查询使用同一主机资源准入。`_candidate_evidence_workspace_bytes` 从注册机器人实体数 G、任务实体数 O 构造配对数量上界 `G(G−1)/2+G(O+1)+O(O+1)/2`；该上界在机器人验证器绑定前即可计算，实际配对仍由原场景规则确定。令 P 为候选物理点上限、A 为锚点参数数目、C 为实际进度映射节点数，则完整状态数至多 `P+2A`；令 N 为各实体路径进度节点数之和，则带完整配对证明或失败行的区间数上界为 `L=P+C+2A+1+2N`。最终一批可能只覆盖部分新中点，其余子区间各自保留缺边界记录，因此区间容器单独按 `2L` 计入；完整配对行仍按 L 计入。每条完整记录的存储估算覆盖当前原生/观测模式的字典、嵌套列表、数字与实体身份，并包含重组时的临时字典和最终区间证明。`_planning_workspace_bytes` 将其与同批场景、Pin 状态及共享材料索引合并。初始化、重绑定、求解和 `_candidate_metrics` 分别传入各自明确时钟长度；保存曲线的实际 C 在查询前重新完成主机准入。
 
 报告范围 `continuous_declared_geometry_model` 指输入数值所描述的连续运动与实体模型。该模型界的含义独立于设备浮点 FK 舍入和实际控制跟踪误差。空间细分截止、未知运动或容量不足均保留未决状态；它们不被解释为连续分离，也不新增碰撞拒绝。新增实际场景正残差以 `interval:process_scene` 进入原验收条件和恢复路径。`validation_joint_step` 继续用于 OMPL 连接检查。
 
@@ -30,7 +36,7 @@
 
 `_candidate_domain_validation` 检查保存曲线的入口 `q0/dq0` 及连续位置及一至三阶导数范围。`cubic_position_report` 对位置及其导数多项式求解析极值；`cubic_derivative_report` 另外记录加速度端值、内部节点两侧极限与跳变。`continuous_jerk` 读取每个三次段的常量三阶导数，包含断点两侧。通用 C1 Hermite 输入的位置与速度连续，加速度跳变按原报告保留，分段 jerk 描述其各段内及单侧值。`JointTrajectory.sample` 返回 `q,dq,ddq,s`，内部节点取右段导数，最终端点取左极限。
 
-`evaluate_candidate` 对保存曲线统一完成任务与场景采样、连续关节界和区间几何报告。`optimization_diagnostics` 保存 SLSQP 的实际状态；正式报告来自保存曲线的原始条件。所有正式硬残差须有限且不大于零。几何区间报告保留已证明、交叠和未决状态。`select_candidate` 按实际结果产生顺序逐条评价，以固定质量评分比较已经完成的候选。每次完成立即通过 `on_candidate` 交给请求层绑定合格记录，然后才推进下一条优化。恢复类型读取同一保存曲线的碰撞和覆盖分项。`export` 返回已完成资格的同一曲线与零新增查询。
+`evaluate_candidate` 对保存曲线统一完成任务与场景采样、连续关节界和区间几何报告。`optimization_diagnostics` 保存 SLSQP 的实际状态；正式报告来自保存曲线的原始条件。所有正式硬残差须有限且不大于零。几何区间报告保留已证明、交叠和未决状态。`select_candidate` 按实际结果产生顺序逐条评价。首个通过原验收且 `on_candidate` 回调完成执行绑定与请求检查的候选立即交付，生成器不再推进；固定质量评分仍需有限，并保存在报告中。全部候选被拒绝时，原残差严重度及原索引决定交付哪条失败诊断。恢复类型读取同一保存曲线的碰撞和覆盖分项。`export` 返回已完成资格的同一曲线与零新增查询。
 
 任务过程的有限查询范围由 `test_task_sampling_scope.py` 中的显式反例界定。令目标坐标系中工具的平移为 `x(t)=0.08t(1−t)` 米，时间 `t∈[0,1]` 秒；其余位姿分量恒定，声明的 x 允许范围为 ±0.01 米。端点位置和速度唯一确定同一 Hermite 多项式。只查询两个端点时，任务有符号条件与原残差都合格；在 0.5 秒处同一曲线达到 0.02 米，原过程条件出现正违例。因而有限任务查询合格只证明所查询时刻，不扩展为相邻时刻之间的过程条件证明；连续关节极值和几何区间证据仍具有各自独立的范围。
 
@@ -42,11 +48,11 @@
 
 `execution_binding.bind_candidate` 接受实际候选、任务、场景、连续验收和正式采样报告，生成 `candidate_id`，保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 与同身份验收。绑定参数 `native_report` 和记录 `validation.native` 保存该曲线的正式任务及场景评价报告，其生产者为 `_candidate_metrics`。`curve_snapshot` 保存原 Hermite 节点、实际系数、可执行终点和首个显式效果依赖边界；`plain` 将 NumPy 及公开 dataclass 字段转为普通记录，无界区间使用具名 JSON 表达。
 
-`plan_trajectory` 将已完成执行绑定的曲线保存为独立最佳候选记录，包含原多项式副本、固定评分与分项、验收、候选场景、事件时间检查及资格完成时间。调用者的原关节曲线可具有自己的物理时长、进度平台和手指时钟；统一求解改善候选使用已绑定的三次基时钟。每条记录中的曲线、关系、命令和验收共同定义该候选。新候选完成这些计算且固定评分更低时才替换记录，后续求解器暂存值与记录分别保存。
+`plan_trajectory` 将首个完成执行绑定的曲线保存为独立交付记录，包含原多项式副本、固定评分与分项、验收、候选场景、事件时间检查及资格完成时间，并立即返回。调用者的原关节曲线可具有自己的物理时长、进度平台和手指时钟；构造参考、主求解和恢复求解分别使用其已绑定时钟。每条记录中的曲线、关系、命令和验收共同定义该候选，冻结记录与求解器暂存值分别保存。
 
-`record_validation_work` 在每次正式候选评价前检查并登记验证尝试，在每批采样或区间查询完成后立即记录实际点数，再检查期限与预算。令 M 为运动块的绑定/优化批上限、K 为每批候选上限、P 为单次验收查询上限，已获准初始化的绑定 B 次、优化 S 批对应 `V≤2B+KS≤M(K+2)` 次验收，累计点查询 `Q≤PV+B`；入口检查贡献最后的 B 项。每个优化批启动前登记一次轨迹求解额度，批内多条实际种子共用该批计数；样本拟合属于初值构造。候选绑定记录完整构造后再检查预算，只有在预算内完成的记录才能成为最佳候选。
+`record_validation_work` 在每次正式候选评价前检查并登记验证尝试，在每批采样或区间查询完成后立即记录实际点数，再检查期限与预算。令 M 为运动块的绑定/优化批上限、K 为每批候选上限、P 为单次验收查询上限，已获准初始化的绑定 B 次、优化 S 批对应 `V≤2B+KS≤M(K+2)` 次验收，累计点查询 `Q≤PV+B`；入口检查贡献最后的 B 项。每个优化批启动前登记一次轨迹求解额度，批内多条实际种子共用该批计数；样本拟合属于初值构造。候选绑定记录完整构造后再检查预算，只有在预算内完成的记录才能交付。
 
-已有完整合格记录时，改善遇到 `PlanningWorkExhausted`，结果从该记录恢复成功曲线与绑定，`diagnostics.improvement_end` 保存停止阶段和原因。尚无合格记录时，同一异常产生预算失败。取消、外部截止时间和其他异常保持各自类型。所有返回路径在 `finally` 保存累计工作，候选资格完成时间与请求结束时间分别记录。
+`PlanningWorkExhausted` 表示在形成完整交付记录前数值预算已经用尽，产生预算失败。取消、外部截止时间和其他异常保持各自类型。首个完整记录立即交付；所有返回路径在 `finally` 保存累计工作，候选资格完成时间与请求结束时间分别记录。
 
 `check_result` 要求正式成功结果及完成的验收，读取 `validation.native.accepted` 和导出报告中的有限非正残差，然后核对候选身份、曲线、原始输入、时间和执行范围的一致性。这里消费轨迹验收已完成的结论；完整名义条件继续作为任务输入保存。可选 `execution_limits` 对照已绑定设备限制。返回独立字典副本，供执行入口消费。
 
@@ -97,7 +103,6 @@
 | `needs_observation` | 当前未知空间策略要求取得相关新观察，且完成的分项证据支持该分类 | 覆盖与条件未知分项、涉及对象和样本 |
 | `no_feasible_solution_found` | 有限候选与有限求解工作结束后，所选候选仍不满足声明条件 | 分项残差、种子来源、诊断曲线、搜索记录 |
 | `cancelled` / `deadline_exceeded` | 调用者取消或外部请求期限到达 | 失败阶段、已消耗工作、最后完成候选 |
-| 成功且 `improvement_end.reason='cumulative_planning_budget_exhausted'` | 改善预算耗尽前已有完成验收和执行绑定的候选 | 返回候选的评分、完整资格时间、改善停止阶段及最终累计工作 |
 | `cumulative_planning_budget_exhausted` | 累计数值工作或请求时间达到预算，尚无完整合格候选 | 原预算、累计计数、当前运动块消耗 |
 | `continuation_binding_gap` | 续规划数据与原事件/义务/反馈契约无法对应 | 具体绑定错误及原历史 |
 | `event_time_requirement_unsatisfied` | 原事件物理时间要求无法成立 | 时间窗口、发生次数、相关原点 |

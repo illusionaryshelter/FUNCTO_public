@@ -6,7 +6,6 @@ intervals separately. Observed free-space coverage and execution decisions
 remain responsibilities of the scene and its caller.
 """
 
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,6 +16,7 @@ from .geometry_motion_bound import (
     _linear_norm_up,
 )
 from .implicit_distance import box_corners
+from .progress_clock import progress_anchor_parameters, progress_query_parameters
 
 
 def _polynomial_ranges(curve, start, end, derivative=0):
@@ -60,15 +60,9 @@ def _polynomial_ranges(curve, start, end, derivative=0):
 
 def _progress_times(trajectory, values):
     """Map progress events to all physical crossings, including plateaus."""
-    times = np.asarray(trajectory.progress_u, float)*trajectory.duration
-    progress = np.asarray(trajectory.progress_s, float)
-    output = []
-    for value in values:
-        output.extend(times[progress == value].tolist())
-        for a, b, sa, sb in zip(times[:-1], times[1:], progress[:-1], progress[1:]):
-            if sa < value < sb:
-                output.append(float(a+(b-a)*(value-sa)/(sb-sa)))
-    return output
+    u, s = np.asarray(trajectory.progress_u, float), np.asarray(trajectory.progress_s, float)
+    anchors = [float(value) for value in values if s[0] <= value <= s[-1]]
+    return (progress_anchor_parameters(u, s, anchors)[:, 0] * trajectory.duration).tolist()
 
 
 @dataclass
@@ -226,8 +220,18 @@ class SceneMotionBounds:
                 for joint, coefficient in zip(self.robot.joint_names, coefficients):
                     value = _add_up(value, _mul_up(float(coefficient), float(rates.get(joint, 0.))))
                 speeds[name] = value
-        s0, s1 = np.interp(np.asarray([start, end])/trajectory.duration,
-                           trajectory.progress_u, trajectory.progress_s)
+        # BEGIN motion relations use the same canonical clock as pair queries.
+        # Owner path corners and declared relation events already partition
+        # time. Restore their original progress before choosing an attachment
+        # or path segment, including binary64 event boundaries.
+        anchors = list(self.scene.required_progress_anchors)
+        for owner in self.scene.owners:
+            a, b = owner.pose_interval
+            anchors.extend(a+(b-a)*owner.pose_path.progress)
+        anchors = [value for value in anchors if trajectory.progress_s[0] <= value <= trajectory.progress_s[-1]]
+        _, (s0, s1) = progress_query_parameters(trajectory.progress_u, trajectory.progress_s,
+            [start, end], trajectory.duration, anchors)
+        # END the displacement bound and collision evidence share event identity.
         for owner in self.scene.owners:
             name = f"owner/{owner.owner_id}"
             value = self._owner_speed(owner, float(s0), float(s1), end-start)
@@ -265,7 +269,7 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
     if not np.isfinite(spatial_step_m) or spatial_step_m <= 0:
         raise ValueError("Spatial subdivision requires a positive finite maximum movement")
     cache, intersections, seen_intersections = {}, [], set()
-    queried_times, consumed = set(), 0
+    queried_times, consumed, batch_sizes = set(), 0, []
 
     def retain(states):
         for state in states:
@@ -279,105 +283,115 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
                     intersections.append({"time_s": key[0], "side": key[1], **pair})
 
     retain(initial_states)
+    initial_points = len({time for time, side in cache})
     declarations = motion.declaration_times(trajectory)
     partition = np.asarray(motion.partition_times(trajectory), float)
-    pending = deque(zip(partition[:-1], partition[1:]))
+    pending = list(zip(partition[:-1], partition[1:]))
     proved, unresolved = [], []
 
-    def get_states(start, end):
-        nonlocal consumed
-        keys = [(float(start), 1 if 1 in declarations.get(start, ()) and start > 0 else 0),
+    # BEGIN a batch contains only endpoints already requested by this frontier.
+    def boundary_keys(start, end):
+        return [(float(start), 1 if 1 in declarations.get(start, ()) and start > 0 else 0),
                 (float(end), -1 if -1 in declarations.get(end, ()) and end < trajectory.duration else 0)]
-        needed = sorted({time for time, side in keys if (time, side) not in cache})
-        exhausted = False
-        if needed:
-            response = query_geometry(needed, point_budget=int(max_query_points-consumed))
-            used = int(response["query_points"])
-            if used < 0 or used > max_query_points-consumed:
-                raise ValueError("Geometry query exceeded its explicit physical point budget")
-            consumed += used
-            retain(response["states"])
-            queried_times.update(float(state["time_s"]) for state in response["states"])
-            exhausted = bool(response["capacity_exhausted"])
-        return [cache.get(key) for key in keys], exhausted
 
     while pending:
-        start, end = map(float, pending.popleft())
-        if not intersections:
-            states, exhausted = get_states(start, end)
+        # A complete physical query already contains every applicable side.
+        # Missing side evidence at a known time is reported explicitly, rather
+        # than billing the same physical point again.
+        known_times = {time for time, side in cache}
+        needed = sorted({time for start, end in pending for time, side in boundary_keys(start, end)
+                         if (time, side) not in cache and time not in known_times})
+        remaining = int(max_query_points-consumed)
+        requested = needed[:remaining]
+        exhausted = len(requested) < len(needed)
+        if requested and not intersections:
+            response = query_geometry(requested, point_budget=remaining)
+            used = int(response["query_points"])
+            if used < 0 or used > remaining:
+                raise ValueError("Geometry query exceeded its explicit physical point budget")
+            consumed += used
+            batch_sizes.append(used)
+            retain(response["states"])
+            queried_times.update(float(state["time_s"]) for state in response["states"])
+            exhausted = exhausted or bool(response["capacity_exhausted"])
         if intersections:
             unresolved.extend({"start_s": float(a), "end_s": float(b),
                 "maximum_entity_movement_m": None,
-                "reason": "not_checked_after_intersection"}
-                for a, b in [(start, end), *pending])
-            pending.clear()
+                "reason": "not_checked_after_intersection"} for a, b in pending)
             break
-        bounds = motion.interval(trajectory, start, end)
-        speeds, unavailable = bounds["speeds"], bounds["unavailable"]
-        movement = _mul_up(max(speeds.values(), default=0.), end-start)
-        base = {"start_s": start, "end_s": end,
-                "maximum_entity_movement_m": None if unavailable else movement}
-        if any(state is None for state in states):
-            unresolved.append({**base, "reason": "sampling_capacity" if exhausted else "missing_boundary_side"})
-            continue
-        maps = [{(row["component"], row["geometry_entity_key"]["first"],
-                  row["geometry_entity_key"]["second"]): row
-                 for row in state["pairs"]} for state in states]
-        failures, proofs = [], []
-        for key in sorted(set(maps[0]) | set(maps[1])):
-            a, b = maps[0].get(key), maps[1].get(key)
-            display = a if a is not None else b
-            item = {"component": key[0], "first": display["first"], "second": display["second"],
-                    "geometry_entity_key": display["geometry_entity_key"]}
-            if a is None or b is None:
-                failures.append({**item, "reason": "missing_pair_evidence"})
+        # Children become eligible only after this actual response. All work
+        # in the returned batch remains charged even if one state intersects.
+        current, pending = pending, []
+        for start, end in current:
+            start, end = float(start), float(end)
+            states = [cache.get(key) for key in boundary_keys(start, end)]
+            bounds = motion.interval(trajectory, start, end)
+            speeds, unavailable = bounds["speeds"], bounds["unavailable"]
+            movement = _mul_up(max(speeds.values(), default=0.), end-start)
+            base = {"start_s": start, "end_s": end,
+                    "maximum_entity_movement_m": None if unavailable else movement}
+            if any(state is None for state in states):
+                unresolved.append({**base, "reason": "sampling_capacity" if exhausted else "missing_boundary_side"})
                 continue
-            if "intersection" in (a["status"], b["status"]):
-                failures.append({**item, "reason": "confirmed_endpoint_intersection"})
+            maps = [{(row["component"], row["geometry_entity_key"]["first"],
+                      row["geometry_entity_key"]["second"]): row
+                     for row in state["pairs"]} for state in states]
+            failures, proofs = [], []
+            for key in sorted(set(maps[0]) | set(maps[1])):
+                a, b = maps[0].get(key), maps[1].get(key)
+                display = a if a is not None else b
+                item = {"component": key[0], "first": display["first"], "second": display["second"],
+                        "geometry_entity_key": display["geometry_entity_key"]}
+                if a is None or b is None:
+                    failures.append({**item, "reason": "missing_pair_evidence"})
+                    continue
+                if "intersection" in (a["status"], b["status"]):
+                    failures.append({**item, "reason": "confirmed_endpoint_intersection"})
+                    continue
+                if a["status"] == b["status"] == "internal_assembly":
+                    proofs.append({**item, "basis": "declared_rigid_assembly"})
+                    continue
+                if a.get("empty_set") and b.get("empty_set"):
+                    proofs.append({**item, "basis": "empty_represented_set"})
+                    continue
+                if any(name in unavailable or name not in speeds for name in key[1:]):
+                    failures.append({**item, "reason": "unmodelled_entity_motion"})
+                    continue
+                relative = _add_up(speeds[key[1]], speeds[key[2]])
+                finite_permission = any(row.get("permission_kind", "none") != "none" for row in (a, b))
+                # BEGIN only complete entity domains prove an entire time span.
+                # Without a permission, lower_m already covers the full pair.
+                # A finite permission has a separate full-entity bound; its
+                # clipped distance cannot be used after that permission moves.
+                distance = [row.get("full_entity_lower_m")
+                            if row.get("permission_kind", "none") != "none"
+                            else row.get("lower_m") for row in (a, b)]
+                # END the existing relative motion bound remains the proof rule.
+                change = _mul_up(relative, end-start)
+                if (all(value is not None for value in distance)
+                        and (max(distance) > change or min(distance) > _mul_up(change, .5))):
+                    proofs.append({**item, "basis": "full_entity_distance_and_motion",
+                                   "endpoint_lower_m": distance, "relative_speed_m_s": relative})
+                else:
+                    failures.append({**item, "reason": "dynamic_permission" if finite_permission
+                                     else "unresolved_separation"})
+            if not failures:
+                proved.append({**base, "pairs": proofs})
                 continue
-            if a["status"] == b["status"] == "internal_assembly":
-                proofs.append({**item, "basis": "declared_rigid_assembly"})
-                continue
-            if a.get("empty_set") and b.get("empty_set"):
-                proofs.append({**item, "basis": "empty_represented_set"})
-                continue
-            if any(name in unavailable or name not in speeds for name in key[1:]):
-                failures.append({**item, "reason": "unmodelled_entity_motion"})
-                continue
-            relative = _add_up(speeds[key[1]], speeds[key[2]])
-            finite_permission = any(row.get("permission_kind", "none") != "none" for row in (a, b))
-            # BEGIN only complete entity domains prove an entire time span.
-            # Without a permission, lower_m already covers the full pair.
-            # A finite permission has a separate full-entity bound; its
-            # clipped distance cannot be used after that permission moves.
-            distance = [row.get("full_entity_lower_m")
-                        if row.get("permission_kind", "none") != "none"
-                        else row.get("lower_m") for row in (a, b)]
-            # END the existing relative motion bound remains the proof rule.
-            change = _mul_up(relative, end-start)
-            if (all(value is not None for value in distance)
-                    and (max(distance) > change or min(distance) > _mul_up(change, .5))):
-                proofs.append({**item, "basis": "full_entity_distance_and_motion",
-                               "endpoint_lower_m": distance, "relative_speed_m_s": relative})
+            reason = ("unmodelled_entity_motion" if all(row["reason"] == "unmodelled_entity_motion"
+                       for row in failures) else "spatial_resolution" if movement <= spatial_step_m else None)
+            middle = (start+end)/2
+            if reason is None and (middle == start or middle == end):
+                reason = "time_resolution"
+            if reason is not None:
+                unresolved.append({**base, "reason": reason, "pairs": failures, "proved_pairs": proofs})
+            elif consumed >= max_query_points and (middle, 0) not in cache:
+                unresolved.append({**base, "reason": "sampling_capacity", "pairs": failures, "proved_pairs": proofs})
             else:
-                failures.append({**item, "reason": "dynamic_permission" if finite_permission
-                                 else "unresolved_separation"})
-        if not failures:
-            proved.append({**base, "pairs": proofs})
-            continue
-        reason = ("unmodelled_entity_motion" if all(row["reason"] == "unmodelled_entity_motion"
-                   for row in failures) else "spatial_resolution" if movement <= spatial_step_m else None)
-        middle = (start+end)/2
-        if reason is None and (middle == start or middle == end):
-            reason = "time_resolution"
-        if reason is not None:
-            unresolved.append({**base, "reason": reason, "pairs": failures, "proved_pairs": proofs})
-        elif consumed >= max_query_points:
-            unresolved.append({**base, "reason": "sampling_capacity", "pairs": failures, "proved_pairs": proofs})
-        else:
-            pending.appendleft((middle, end))
-            pending.appendleft((start, middle))
+                pending.extend(((start, middle), (middle, end)))
+    # END the next iteration evaluates the new frontier, never speculative descendants.
     return {"confirmed_intersections": intersections, "proved_intervals": proved,
             "unresolved_intervals": unresolved, "query_points": consumed,
+            "initial_query_points": initial_points, "query_batch_sizes": batch_sizes,
             "queried_times_s": sorted(queried_times), "spatial_step_m": float(spatial_step_m),
             "scope": "continuous_declared_geometry_model"}

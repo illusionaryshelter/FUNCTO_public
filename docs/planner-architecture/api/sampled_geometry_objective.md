@@ -1,11 +1,11 @@
 # `manipulation/sampled_geometry_objective.py` 实现契约
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`CURRENT_IMPLEMENTATION`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_world`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L23)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L26)。
 
 输入签名：
 
@@ -49,7 +49,7 @@ len
 
 ## `_local`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L29)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L32)。
 
 输入签名：
 
@@ -84,7 +84,7 @@ len
 
 ## `_numeric_points`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L33)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L36)。
 
 输入签名：
 
@@ -144,7 +144,7 @@ Rotation.from_quat(target_quaternion[[1, 2, 3, 0]]).as_matrix
 
 ## `_allowed`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L48)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L51)。
 
 输入签名：
 
@@ -197,7 +197,7 @@ np.asarray
 
 ## `MaterialSamples`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L64)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L67)。
 
 ```python
 class MaterialSamples():
@@ -219,7 +219,7 @@ class MaterialSamples():
 
 ## `MaterialSamples.__init__`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L74)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L77)。
 
 输入签名：
 
@@ -234,13 +234,30 @@ def __init__(self, geometry):
 读取的对象属性：
 
 ```python
+np.empty
+geometry.cells
+np.int64
+np.zeros
 geometry.nodes
 node.cell
-np.concatenate
 geometry.occupied_points
-np.empty
+self.cell_ranges
+parts.append
+cells.append
 np.full
-np.int64
+np.concatenate
+self.points
+geometry.tree.data
+geometry.tree
+self.cells
+np.nextafter(np.abs(points - centers), np.inf).max
+np.nextafter
+np.abs
+np.inf
+np.maximum
+self.cell_radius
+self.cell_ranges.flags
+self.cell_radius.flags
 geometry.voxel_size
 geometry.cell_origins
 geometry._cell_values
@@ -254,12 +271,10 @@ np.linspace
 self.native_bounds.T
 self.native_bounds
 np.mean
-self.points
 np.linalg.norm
 np.linalg
 self.points.flags
 self.cells.flags
-self.cells
 self.zero_points.flags
 self.zero_points
 np.stack
@@ -268,10 +283,7 @@ self.points.max
 geometry.root
 root.lower
 root.upper
-np.abs
 geometry.origin
-np.nextafter
-np.inf
 self.point_bounds
 self.negative_bounds
 bounds.flags
@@ -281,10 +293,21 @@ bounds.flags
 
 ```python
 self.geometry
-leaves
+self.cell_ranges
+self.cell_radius
+parts
+cells
+offset
 node
+points
+self.cell_ranges[node.cell]
 self.points
 self.cells
+start
+centers
+radius
+self.cell_ranges.flags.writeable
+self.cell_radius.flags.writeable
 self.length_scale
 zero_points
 origin
@@ -298,7 +321,6 @@ identity
 proposals
 low
 high
-points
 point
 self.points.flags.writeable
 self.cells.flags.writeable
@@ -315,11 +337,19 @@ bounds.flags.writeable
 
 ```python
 isinstance
-np.concatenate
-geometry.occupied_points
 np.empty
-np.full
 len
+np.zeros
+geometry.occupied_points
+parts.append
+cells.append
+np.full
+np.concatenate
+range
+np.nextafter(np.abs(points - centers), np.inf).max
+np.nextafter
+np.abs
+np.maximum
 zip
 zero_points.extend
 zero_points.append
@@ -339,13 +369,206 @@ np.linalg.norm
 np.stack
 self.points.min
 self.points.max
-np.abs
+```
+
+## `MaterialSamples.indices_in_box`
+
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L162)。
+
+输入签名：
+
+```python
+def indices_in_box(self, bounds):
+```
+
+实现说明：
+
+> Select original point indices whose cells can meet a local closed box.
+>
+> cKDTree returns original cell IDs. A containing infinity-norm ball
+> proposes cells, an axis comparison retains the closed query box, and
+> the stored start offsets restore the original material summation order.
+> The query radius includes only coordinate arithmetic, not clearance.
+
+显式输出分支：
+
+```python
+np.empty(0, dtype=np.int64)
+indices
+```
+
+读取的对象属性：
+
+```python
+self.geometry.tree
+self.geometry
+np.empty
+np.int64
 np.nextafter
+np.asarray
+self.cell_radius
+np.inf
+np.max
+np.abs
+self.geometry.tree.query_ball_point
+self.geometry.tree.data
+np.all
+np.argsort
+self.cell_ranges
+np.cumsum
+np.arange
+lengths.sum
+np.repeat
+```
+
+写入目标：
+
+```python
+low
+high
+center
+radius
+error
+cells
+centers
+ranges
+lengths
+offsets
+indices
+```
+
+直接调用符号：
+
+```python
+np.empty
+np.nextafter
+np.asarray
+max
+np.max
+np.abs
+self.geometry.tree.query_ball_point
+np.all
+np.argsort
+np.cumsum
+np.arange
+lengths.sum
+np.repeat
+```
+
+## `_material_indices`
+
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L194)。
+
+输入签名：
+
+```python
+def _material_indices(source, source_pose, target, target_pose):
+```
+
+实现说明：
+
+> Retain every source sample that can have negative target distance.
+>
+> With column-vector transforms (A,a) and (B,b), _numeric_points evaluates
+> w_hat=fl(A*x+a), y_hat=fl(B.T*(w_hat-b)). Its negative target box is first
+> expanded by both forward errors. Mapping that box through B rather than
+> B**(-T) requires the finite orthogonality defect below; the final existing
+> source inverse interval also encloses A's inverse defect. All quantities
+> are numerical length bounds, independent of any task or physical margin.
+
+显式输出分支：
+
+```python
+np.arange(len(source.points), dtype=np.int64)
+np.empty(0, dtype=np.int64)
+source.indices_in_box(_local_interval(world, source_matrix))
+```
+
+读取的对象属性：
+
+```python
+source.geometry
+np.arange
+source.points
+np.int64
+source.point_bounds
+target.negative_bounds
+np.empty
+np.eye
+Rotation.from_quat(quaternion.detach().cpu().numpy()[[1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+quaternion.detach().cpu().numpy
+quaternion.detach().cpu
+quaternion.detach
+position.detach().cpu().numpy
+position.detach().cpu
+position.detach
+matrices.append
+np.abs
+np.max
+np.nextafter
+np.inf
+np.linalg.norm
+np.linalg
+rotation.T
+absolute_rotation.T
+source.indices_in_box
+```
+
+写入目标：
+
+```python
+matrices
+position
+quaternion
+matrix
+matrix[:3, :3]
+matrix[:3, 3]
+source_matrix
+target_matrix
+rotation
+translation
+absolute_rotation
+source_size
+forward_error
+world
+world_size
+error
+target_bounds
+defect
+inverse_error
+```
+
+直接调用符号：
+
+```python
+isinstance
+np.arange
+len
+np.empty
+np.eye
+Rotation.from_quat(quaternion.detach().cpu().numpy()[[1, 2, 3, 0]]).as_matrix
+Rotation.from_quat
+quaternion.detach().cpu().numpy
+quaternion.detach().cpu
+quaternion.detach
+position.detach().cpu().numpy
+position.detach().cpu
+position.detach
+matrices.append
+np.abs
+np.max
+transform_point_error
+world_bounds
+np.nextafter
+np.linalg.norm
+source.indices_in_box
+_local_interval
 ```
 
 ## `_pair_separated`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L138)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L246)。
 
 输入签名：
 
@@ -426,7 +649,7 @@ np.any
 
 ## `_field_direction`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L169)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L277)。
 
 输入签名：
 
@@ -441,6 +664,7 @@ def _field_direction(source, source_pose, target, target_pose, permission, *, re
 显式输出分支：
 
 ```python
+zero
 zero
 zero
 torch.relu(-signed / target.length_scale).square().sum() / len(source.points)
@@ -473,6 +697,7 @@ target.length_scale
 
 ```python
 zero
+indices
 world
 relative
 excluded
@@ -498,6 +723,7 @@ report['zero_gradient_negative_count']
 source_pose[0].sum
 target_pose[0].sum
 len
+_material_indices
 _numeric_points
 target.geometry.sample
 _allowed
@@ -519,7 +745,7 @@ torch.relu
 
 ## `_native_direction`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L199)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L312)。
 
 输入签名：
 
@@ -539,6 +765,7 @@ def _native_direction(source, source_pose, target, target_pose, permission, *, r
 显式输出分支：
 
 ```python
+zero
 zero
 zero
 torch.relu(-signed / source.length_scale).square().sum() / len(source.points)
@@ -581,6 +808,7 @@ source.length_scale
 
 ```python
 zero
+indices
 world
 numeric
 active
@@ -606,6 +834,7 @@ report['negative_native_sample_count']
 source_pose[0].sum
 target_pose[0].sum
 len
+_material_indices
 _numeric_points
 np.all
 _allowed
@@ -636,7 +865,7 @@ torch.relu
 
 ## `_pair_value`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L238)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L356)。
 
 输入签名：
 
@@ -681,7 +910,7 @@ _native_direction
 
 ## `pair_objective`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L254)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L372)。
 
 输入签名：
 
@@ -757,7 +986,7 @@ value.detach
 
 ## `contact_objective`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L286)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L404)。
 
 输入签名：
 
@@ -835,7 +1064,7 @@ violation.square
 
 ## `native_pair_objective`
 
-[定义位置](../../../manipulation/sampled_geometry_objective.py#L298)。
+[定义位置](../../../manipulation/sampled_geometry_objective.py#L416)。
 
 输入签名：
 
@@ -855,6 +1084,7 @@ def native_pair_objective(first, first_pose, first_matrix, second, second_pose, 
 显式输出分支：
 
 ```python
+first_pose[0].new_zeros(())
 torch.relu(-signed / length).square()
 ```
 
@@ -866,6 +1096,7 @@ coal.DistanceResult
 coal.distance
 first.geometry
 second.geometry
+first_pose[0].new_zeros
 np.asarray
 result.getNearestPoint1
 result.getNearestPoint2
@@ -902,6 +1133,7 @@ coal.DistanceRequest
 coal.DistanceResult
 coal.distance
 _transform
+first_pose[0].new_zeros
 inverse_points
 np.asarray
 result.getNearestPoint1

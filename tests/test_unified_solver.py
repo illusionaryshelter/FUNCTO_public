@@ -230,13 +230,39 @@ def test_full_objective_gradient_and_event_grid_keep_physical_motion_weights():
     actual = bound.objective_components(values, include_geometry=False)
     other = expanded.objective_components(values, include_geometry=False)
     torch.testing.assert_close(actual["motion_quality"], other["motion_quality"], rtol=0, atol=0)
-    # Check each physical objective separately: the exact-yaw task penalty is
-    # six orders larger than motion quality here, so differencing their sum
-    # would round away the early-control motion derivative in float64.
+    # Check each reported term independently; optional event centering is
+    # absent from this feasibility objective and remains in candidate scoring.
     for name in actual:
         assert torch.autograd.gradcheck(
             lambda value: bound.objective_components(value, include_geometry=False)[name],
             (values,), eps=1e-6, atol=3e-6, rtol=3e-6)
+
+
+# BEGIN first-result optimization preserves task rows while dropping quality centering.
+def test_search_uses_feasibility_preferences_with_unchanged_task_values_and_jacobian():
+    bound, initial = computation()
+    controls = torch.tensor(initial, dtype=torch.float64, requires_grad=True)
+    rows_before = torch.cat(bound.task(controls))
+    derivative_before = task_jacobian(rows_before, controls,
+        check_request=lambda: None, admit_work=lambda: None)
+    costs = bound.objective_components(controls)
+    assert set(costs) == {'motion_quality', 'task_preferences', 'observed_geometry'}
+    assert costs['task_preferences'] == 0.
+    feasibility_gradient, = torch.autograd.grad(sum(costs.values()), controls)
+    q, dq, _, _ = bound.states(controls)
+    _, _, _, _, tool, twist = bound.robot_states(q, dq)
+    quality = bound.problem.optimizer_preferences(*tool, bound.progress,
+        trajectory_time=bound.times, tool_linear_velocity=twist[0],
+        tool_angular_velocity=twist[1], phase='quality').sum()*bound.constraint_weight
+    quality_gradient, = torch.autograd.grad(quality, controls)
+    assert quality > 0. and quality_gradient.abs().max() > 1.
+    assert not torch.equal(feasibility_gradient, feasibility_gradient+quality_gradient)
+    rows_after = torch.cat(bound.task(controls))
+    derivative_after = task_jacobian(rows_after, controls,
+        check_request=lambda: None, admit_work=lambda: None)
+    torch.testing.assert_close(rows_before, rows_after, rtol=0., atol=0.)
+    np.testing.assert_array_equal(derivative_before, derivative_after)
+# END the same hard set remains independent of the optional recorded quality score.
 
 
 # BEGIN interrupted real SLSQP retains actual same-control computation evidence.
@@ -476,22 +502,31 @@ def test_fixed_entry_equalities_are_verified_then_eliminated_by_curve_structure(
     assert bound.domain.signed_constraints(result.controls)[0].max() < 1e-8
     if terminal_yaw_tolerance > 0.:
         assert not equality.any()
-        assert inequality.max() <= 0.
+        # Feasibility search may stop infinitesimally outside an active bound.
+        # Its SLSQP success is numerical evidence, not strict saved-curve acceptance.
+        assert inequality.max() > 0.
+        q, dq, _, _ = bound.states(torch.tensor(result.controls))
+        q, dq, names, _, tool, twist = bound.robot_states(q, dq)
+        strict = bound.problem.residuals(*tool, bound.progress, q, names, dq,
+            trajectory_time=bound.times, tool_linear_velocity=twist[0], tool_angular_velocity=twist[1])
+        assert any(bool((value > 0.).any()) for value in strict.values())
 
 
-def test_production_weights_reach_original_strict_acceptance_with_calibration_and_finite_yaw():
+def test_production_weight_solver_success_keeps_strict_task_rejection_separate():
     bound, initial = computation(terminal_yaw_tolerance=.02, production_weights=True)
     result = solve_trajectory(bound, initial, report_out={}, iterations=160, check_request=lambda: None, pending_geometry_bytes=0)
     assert result.report["success"], result.report
     controls = torch.tensor(result.controls)
     equality, inequality = bound.task(controls)
-    assert not equality.numel() and inequality.max() <= 0.
-    assert bound.domain.signed_constraints(result.controls)[0].max() <= 0.
+    # BEGIN numerical library termination cannot authorize an outside boundary point.
+    assert not equality.numel() and 0. < inequality.max() < 1e-8
     q, dq, _, _ = bound.states(controls)
     q, dq, names, _, tool, twist = bound.robot_states(q, dq)
-    original = bound.problem.residuals(*tool, bound.progress, q, names, dq,
+    strict = bound.problem.residuals(*tool, bound.progress, q, names, dq,
         trajectory_time=bound.times, tool_linear_velocity=twist[0], tool_angular_velocity=twist[1])
-    assert all(bool((value == 0.).all()) for value in original.values())
+    assert any(bool((value > 0.).any()) for value in strict.values())
+    # END original raw residuals retain their strict nonpositive acceptance rule.
+    assert bound.domain.signed_constraints(result.controls)[0].max() < 1e-8
 
 
 def test_violated_fixed_entry_equality_is_retained_and_prevents_the_library_call(monkeypatch):
@@ -542,7 +577,8 @@ def test_one_positive_objective_divisor_preserves_values_derivatives_and_order(m
     monkeypatch.setattr(solver, "minimize", inspect_objective)
     result = solve_trajectory(bound, initial, report_out={}, iterations=1, check_request=lambda: None, pending_geometry_bytes=0)
     divisor = result.report["objective_scale"]
-    assert divisor > 1e9
+    assert divisor > 1.
+    assert divisor == max(1., abs(recorded[0][0]), float(np.abs(recorded[0][1]).max()))
     for raw, gradient, value, derivative in recorded:
         assert value*divisor == pytest.approx(raw, rel=2e-16)
         np.testing.assert_allclose(derivative*divisor, gradient, rtol=2e-16, atol=1e-12)

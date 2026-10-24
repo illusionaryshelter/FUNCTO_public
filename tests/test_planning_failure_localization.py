@@ -135,6 +135,7 @@ def test_candidate_report_owns_its_failure_time_entities_and_native_witnesses(tm
     planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
     planner.torch, planner.problem, planner.joint_names = torch, problem, names
     planner.budget, planner.anchors, planner.check_request = PlanningBudget(), problem.anchors, Mock()
+    planner.robot_metadata = {'active_joint_names': list(names), 'links': scene.robot_model.model.nframes}
     planner.pin_kinematics = PinKinematics(scene.robot_model.model,
         frames=("base", "left", "tool"), T_reference_base=np.eye(4))
     record_work = Mock()
@@ -144,7 +145,7 @@ def test_candidate_report_owns_its_failure_time_entities_and_native_witnesses(tm
         kwargs["geometry_evidence_out"] = complete
         return original_evaluate(*args, **kwargs)
     with patch.object(scene, "evaluate", side_effect=capture_complete):
-        report, parameters, count = planner._candidate_metrics(curve, scene, record_work=record_work)
+        report, parameters, count, context = planner._candidate_metrics(curve, scene, record_work=record_work)
     assert not report["accepted"]
     assert report["collision_residuals"]["collision"] == pytest.approx(.005, abs=1e-10)
     assert report["scene_components"]["collision/robot/self"]["time_s"] == 0.

@@ -158,7 +158,7 @@ class CoordinateDirectionTest(unittest.TestCase):
         planner, _ = export_fixture(request, mapping, positions, velocities, 1.)
         curve = JointTrajectory(request.joint_names, np.array([0., 1., 2.]), positions,
             velocities, mapping.u, mapping.s, (), (), {})
-        report, parameters, count = _ConstrainedPlanner._candidate_metrics(
+        report, parameters, count, context = _ConstrainedPlanner._candidate_metrics(
             planner, curve, planner.scene, record_work=lambda **kwargs: None)
         self.assertFalse(report["accepted"])
         self.assertAlmostEqual(report["residuals"]["mechanism:0:direction:0:local_rate"], .1)

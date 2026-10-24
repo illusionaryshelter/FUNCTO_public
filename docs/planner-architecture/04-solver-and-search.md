@@ -1,6 +1,6 @@
 # 固定时钟的统一约束求解与有限搜索
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：与本次实现代码一并提交；最终验证记录回填该实现提交。组件正文描述当前实现，阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 请求、变量与依赖
 
@@ -12,7 +12,7 @@
 
 ## 2. 参考与初值
 
-`_reference_entrance` 从具名反馈、同一官方机器人和 TCP 标定取得当前参考坐标系的工具位姿及线/角速度。`BoundToolReference` 保留源完整工具路径，通过显式边界适配产生物理时间参考。`reference_seeds` 在既定正时间样本处调用 cuRobo IK，或者采样调用者原关节曲线。
+`_reference_entrance` 从具名反馈、同一官方机器人和 TCP 标定取得当前参考坐标系的工具位姿及线/角速度。`BoundToolReference` 保留源完整工具路径，通过显式边界适配产生物理时间参考。调用者提供的完整关节曲线先保留其原多项式及物理时钟，完成全部候选验收和执行绑定，合格即交付。其未通过且允许继续搜索时，`reference_seeds` 才采样该曲线；未提供关节曲线时，该方法在既定正时间样本处调用 cuRobo IK。
 
 后端长期持有两个独立 cuRobo `InverseKinematics` 实例。`reference_ik` 使用原生普通位姿管理器和固定一个 seed；`ik` 使用 `_ik_manager_type` 表达功能事件允许集合，容量为 `budget.ik_seeds`。两者的 `inner_iters=1`，原生外层迭代完整消费 `ik_iterations`，保留原数值状态。配置在交给原生构造器前独立复制，原生构造过程中产生的配置对象属于各自实例。部分构造失败时释放已经创建的实例；`close` 逐一解除所有权并释放工作区，恢复调用者精度设置，重复释放不重复调用原生资源。
 
@@ -25,6 +25,8 @@
 ## 3. 一次轨迹计算
 
 `TrajectoryComputation` 固定普通积分网格、任务锚点和场景关系锚点。每个查询具有归一化时间、物理秒和原技能进度；同刻事件保留原进度数值。`verification_issues` 在构造时检查所需事件和历史查询是否齐全。普通积分网格的索引独立保存，增加事件锚点保持原运动成本积分权重。
+
+`progress_clock.progress_anchor_parameters` 从同一固定进度表计算 binary64 锚点，暂停区间保留入口与出口。`_ProgressMap` 对原生张量查询另外检查 float32 可表达性。`query_parameters` 以锚点原归一化时间乘总时长得到物理查询键；遇到同一键时直接恢复原归一化时间和进度，避免乘除反算改变事件身份。连续 CPU 几何的原物体路径分段直接使用 binary64 锚点。
 
 `robot_tool_states` 从仿射样条取得 `q,dq`，加入场景声明的名义手指坐标与速度，调用 `PinKinematics.states`。Pin 模型复用验证器的完整机器人。位姿导数使用帧 Jacobian；速度导数使用 Pin 的 LOCAL 帧原生导数，再经可微旋转表达在参考系中。工具固定平移贡献线速度杆臂项，固定旋转组成 TCP 姿态。`_candidate_robot_state` 对任意保存曲线调用同一接口。
 
@@ -40,11 +42,13 @@
 
 `motion_cost` 读取安装 cuRobo `trajopt/lbfgs_bspline_trajopt.yml` 的 STATE 配置，计算关节边界激活成本及速度、加速度、jerk 平方正则。原时间系数以请求 `native_dt` 一次绑定。普通时刻采用归一化物理梯形积分；当前状态只含运动学量，力矩项对应未计算状态。
 
-`PlanningProblem.optimizer_preferences(..., phase='quality')` 提供声明的任务质量项，包括支持要求中非硬分量的原容差偏好。`OnlinePlanningScene.optimization_objective` 在原 TSDF 的固定局部材料点、原官方机器人形状与现有许可上计算有限几何目标；具体定义见观测组件。总代价为运动成本加 `constraint_weight` 倍任务质量与几何目标。最终合格候选用运动成本和任务质量计算固定比较分数。
+`TrajectoryComputation.objective_components` 使用 `PlanningProblem.optimizer_preferences(..., phase='feasibility')`：显式过程等式与方向命令保留原偏好，支持要求的非硬分量和位姿/坐标事件中心偏好由独立质量记录承担。全部硬任务行仍由 `constraint_components` 产生。`OnlinePlanningScene.optimization_objective` 在原 TSDF 的固定局部材料点、原官方机器人形状与现有许可上计算有限几何目标；具体定义见观测组件。搜索总代价为运动成本加 `constraint_weight` 倍过程/方向偏好及几何目标，报告分项分别为 `motion_quality`、`task_preferences`、`observed_geometry`。
+
+`_candidate_objective` 在固定查询上另外使用 `phase='quality'`，记录运动质量与完整声明任务质量之和 `fixed_objective`，分项为 `motion_quality` 和 `task_quality`。该分数必须有限，继续作为完整候选资格条件及结果记录；它不再比较首个合格候选与尚未计算的后续候选。普通参考路径只初始化曲线，不自动生成任务中心代价或必须通过的 waypoint。
 
 `solve_trajectory` 直接调用 `scipy.optimize.minimize(method='SLSQP', jac=True)`。原任务和连续关节条件作为独立约束行提交。Torch 反向传播计算目标梯度，`task_jacobian` 计算完整任务 Jacobian，连续关节 Jacobian 由仿射多项式计算。设自由曲线系数为 `x∈Rⁿ`、原任务向量为 `c(x)∈Rᵐ`、其导数为 `J(x)∈Rᵐˣⁿ`。m 是结构消元后实际提交的任务行数。m<n 时，对每一标量任务值调用 `autograd.grad` 得到一行。m≥n 时，先以独立权向量 `v∈Rᵐ` 建立 `p(x,v)=J(x)ᵀv` 的反向图，再逐个计算 `∂p_i/∂v=J[:,i]`。第二次求导的变量是 v，机器人 FK 的一阶导数在此作为系数。每条路径分别需要 m 或 n 次标量反向查询，保留相同有符号条件及原单位。被保留的常量导数通过显式零依赖表示。
 
-一次正比例目标归一化固定于初值，使数值尺度适配库算法；原目标、约束与候选评分保存原单位。正比例变换保留精确最优解集合；SLSQP 的固定 `ftol` 同时作用于目标、梯度和约束判据，因此有限迭代路径和停止时刻随尺度变化。运动、任务质量和几何项的相对权重表达实际优化偏好。库负责步长、子问题和停止判定。报告保存库状态、迭代数、实际求值数、系数更新、原目标、`task_jacobian_method` 及内存估计。`_planning_workspace_bytes` 分别保留场景驻留量、未分配共享数组和单次场景／Pinocchio 临时需求。每个串行候选求解前按当前样本构造状态重算 `pending_cpu_bytes`，通过 `solve_trajectory(pending_geometry_bytes=...)` 与实际约束行数确定的 SLSQP 工作区、Jacobian、独立权向量和额外反向缓冲合并。第一次主机准入位于 SLSQP 工作区、密集任务 Jacobian 分配及标量反向求导之前；初始任务求值已经建立的原生 Pinocchio Jacobian 和速度导数由 RSS 计入。列方向在第一次反向图建立后、行方向在首行反向前，由 `task_jacobian` 的 `admit_work` 回调检查当前 RSS 与即将新增的密集矩阵、一个返回行或列及 Pinocchio 求导临时缓冲之和。行路径的任务矩阵加单行临时向量为 `8(mn+n)` 字节，列路径的任务矩阵加单列临时向量为 `8(mn+m)` 字节。随后分配最终密集矩阵，每次只保留一个返回向量。此时原任务值、SLSQP 工作区、场景数组和早先结果由实测 RSS 计入；列路径的独立权向量和第一次反向图也已驻留，行路径未建立这两项。
+一次正比例目标归一化固定于初值，使数值尺度适配库算法；原目标、约束与候选评分保存原单位。正比例变换保留精确最优解集合；SLSQP 的固定 `ftol` 同时作用于目标、梯度和约束判据，因此有限迭代路径和停止时刻随尺度变化。运动、过程/方向偏好和几何项的相对权重表达实际优化偏好。库负责步长、子问题和停止判定。报告保存库状态、迭代数、实际求值数、系数更新、原目标、`task_jacobian_method` 及内存估计。`_planning_workspace_bytes` 分别保留场景驻留量、未分配共享数组和单次场景／Pinocchio 临时需求。每个串行候选求解前按当前样本构造状态重算 `pending_cpu_bytes`，通过 `solve_trajectory(pending_geometry_bytes=...)` 与实际约束行数确定的 SLSQP 工作区、Jacobian、独立权向量和额外反向缓冲合并。第一次主机准入位于 SLSQP 工作区、密集任务 Jacobian 分配及标量反向求导之前；初始任务求值已经建立的原生 Pinocchio Jacobian 和速度导数由 RSS 计入。列方向在第一次反向图建立后、行方向在首行反向前，由 `task_jacobian` 的 `admit_work` 回调检查当前 RSS 与即将新增的密集矩阵、一个返回行或列及 Pinocchio 求导临时缓冲之和。行路径的任务矩阵加单行临时向量为 `8(mn+n)` 字节，列路径的任务矩阵加单列临时向量为 `8(mn+m)` 字节。随后分配最终密集矩阵，每次只保留一个返回向量。此时原任务值、SLSQP 工作区、场景数组和早先结果由实测 RSS 计入；列路径的独立权向量和第一次反向图也已驻留，行路径未建立这两项。
 
 Pinocchio 临时增量为 `8[S(6FNᵣ+12F+Nᵣ)+2]` 字节，其中 `S` 是任务物理时间查询数，`F` 是完整机器人计算帧数，`Nᵣ` 是含名义手指的机器人关节数。对应同时存活的数据为一份 `[S,F,6,Nᵣ]` 乘积、两份 `[S,F,6]` 空间权向量、一份 `[S,Nᵣ]` 关节累积量及两个标量；每个元素为 float64。该数量计入当前求导新增工作区，原生运动学导数与第一次反向图由 RSS 计入。
 
@@ -56,12 +60,14 @@ Pinocchio 临时增量为 `8[S(6FNᵣ+12F+Nᵣ)+2]` 字节，其中 `S` 是任�
 
 ## 6. 搜索、验收与预算
 
-初值首先通过完整候选评价。若 require_observation 策略的完整分项证据将失败隔离为仅覆盖不足，返回 `needs_observation`；否则已有正碰撞或覆盖残差触发一次 `ompl_seed`，再进入主求解。forbid 的覆盖违例可由搜索处理，require_observation 与其他失败混合的证据沿同一几何调度；allow_attempt 的条件未知保持原含义。功能事件 IK 给出允许集合中的边界提议；搜索将每个提议放到当前前缀私有场景中，按该分支已建立的释放锚点和关系计算任务及几何资格。预计算时缺少释放锚点的静态判定只作为记录。
+初值首先通过完整候选评价；合格并完成执行绑定时立即交付。若 require_observation 策略的完整分项证据将失败隔离为仅覆盖不足，返回 `needs_observation`；否则已有正碰撞或覆盖残差触发一次 `ompl_seed`，再进入主求解。forbid 的覆盖违例可由搜索处理，require_observation 与其他失败混合的证据沿同一几何调度；allow_attempt 的条件未知保持原含义。功能事件 IK 给出允许集合中的边界提议；搜索将每个提议放到当前前缀私有场景中，按该分支已建立的释放锚点和关系计算任务及几何资格。预计算时缺少释放锚点的静态判定只作为记录。
 
 搜索路径按同一固定物理时间和最小二乘接口产生一个初值。搜索成功时该初值优先，候选上限 K≥2 时再加入原普通初值；搜索失败时主求解继续使用原初值，仍只消耗该次优化批。初次验收无几何违例、主求解随后发现几何违例且尚无合格候选时，可在尚有批次数额度的条件下使用这一次未消耗的搜索机会。搜索调用的 `finally` 汇总实际开始的状态查询和已耗时间，取消、超时及原生异常同样计入累计账本。
 
-`optimize` 依原始种子顺序逐条产生 `ConstrainedSolution`。`select_candidate` 立即将每个结果转为保存曲线，运行完整 `evaluate_candidate`，以必填 `on_candidate(result, report)` 把当前曲线和验收送给 `plan_trajectory.qualify_native`。该回调在推进生成器之前完成执行绑定并冻结合格记录。固定评分用于比较已评价候选，原始 seed 索引、来源和各自验收保持一致；方法返回时恢复所选曲线的独立验收记录。后续改善耗尽预算时交付已完成绑定的最佳候选，取消及外部期限按各自类型结束请求。
+`optimize` 依原始种子顺序逐条产生 `ConstrainedSolution`。`select_candidate` 立即将每个结果转为保存曲线，运行完整 `evaluate_candidate`，以必填 `on_candidate(result, report)` 把当前曲线和验收送给 `plan_trajectory.qualify_native`。该回调在推进生成器之前完成执行绑定并冻结合格记录。回调完成执行绑定和原请求检查后，第一个合格结果立即返回，选择器不再推进求解生成器。原始 seed 索引、来源和验收保持一致；若所有结果均被拒绝，则按原残差严重度及原索引选取失败诊断。`plan_trajectory` 对原关节曲线、参考初值、主求解及恢复求解采用同一完整资格边界，首次绑定完成后直接交付。取消、外部期限、累计预算和原生异常在资格完成之前按各自类型结束请求。`finally` 释放后端所有权并写入实际消耗；交付记录完成后的清理耗时继续记账。
 
 `PlanningBudget` 规定每个运动块最多 M 次绑定和 M 批优化，每批至多 K 条实际候选，每次验收至多 P 个查询。令 B 为已获准初始化的绑定数、S 为已开始优化批数、V 为已开始正式验收数，则 `V≤2B+KS≤M(K+2)`；其中每次绑定最多验收一条原关节曲线和一条拟合参考。入口场景查询另计一次，所以累计正式查询量 `Q≤PV+B≤PM(K+2)+M`。验证在开始时计次，查询在完成每批时计数，中断部分保留其实际消耗。K 与功能 IK 的 seed 容量各自定义上限。
 
 CPU 工作区包含固定 FK 导数、实际提交的任务 Jacobian、连续关节 Jacobian 和 SLSQP 工作区；`solver_storage_bytes` 在分配前按实际行列数计算。场景工作区按固定材料点和活动查询估算。双 IK 实例构造前使用原资源准入，构造后根据真实主机与设备占用核对同一请求上限。后端重绑定更新请求任务、时钟和计算对象，继续复用这两个固定形状实例；所有者 `close` 释放它们。
+
+`_candidate_evidence_workspace_bytes` 将候选验收保存的完整实体对记录、同次查询的重组字典及后续区间证明记录计入主机峰值。记录数量由注册实体对、物理查询上限、关系侧锚点和原物体路径分段确定；它与单批场景查询和 Pinocchio 临时量一起进入 `_planning_workspace_bytes`。同一候选已经完成的物理查询在区间检查中复用，批量查询只计入新请求时刻；记录的距离界、见证和关系侧保持原场景求值语义。

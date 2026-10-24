@@ -1,11 +1,11 @@
 # `manipulation/representation.py` 实现契约
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`CURRENT_IMPLEMENTATION`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_timeline`
 
-[定义位置](../../../manipulation/representation.py#L22)。
+[定义位置](../../../manipulation/representation.py#L21)。
 
 输入签名：
 
@@ -43,7 +43,7 @@ len
 
 ## `_progress`
 
-[定义位置](../../../manipulation/representation.py#L27)。
+[定义位置](../../../manipulation/representation.py#L26)。
 
 输入签名：
 
@@ -76,7 +76,7 @@ np.zeros
 
 ## `_aligned_poses`
 
-[定义位置](../../../manipulation/representation.py#L31)。
+[定义位置](../../../manipulation/representation.py#L30)。
 
 输入签名：
 
@@ -110,7 +110,7 @@ ValueError
 
 ## `sample_poses`
 
-[定义位置](../../../manipulation/representation.py#L38)。
+[定义位置](../../../manipulation/representation.py#L37)。
 
 输入签名：
 
@@ -171,7 +171,7 @@ path.sample_numpy
 
 ## `trajectory_summary`
 
-[定义位置](../../../manipulation/representation.py#L55)。
+[定义位置](../../../manipulation/representation.py#L54)。
 
 输入签名：
 
@@ -215,7 +215,7 @@ sample_poses
 
 ## `_sampled_summary`
 
-[定义位置](../../../manipulation/representation.py#L68)。
+[定义位置](../../../manipulation/representation.py#L67)。
 
 输入签名：
 
@@ -269,7 +269,7 @@ max
 
 ## `_relative`
 
-[定义位置](../../../manipulation/representation.py#L92)。
+[定义位置](../../../manipulation/representation.py#L91)。
 
 输入签名：
 
@@ -310,7 +310,7 @@ zip
 
 ## `build_representation`
 
-[定义位置](../../../manipulation/representation.py#L97)。
+[定义位置](../../../manipulation/representation.py#L96)。
 
 输入签名：
 
@@ -382,7 +382,7 @@ trajectory_summary
 
 ## `_component_path`
 
-[定义位置](../../../manipulation/representation.py#L166)。
+[定义位置](../../../manipulation/representation.py#L165)。
 
 输入签名：
 
@@ -435,7 +435,7 @@ np.eye
 
 ## `_right_path`
 
-[定义位置](../../../manipulation/representation.py#L183)。
+[定义位置](../../../manipulation/representation.py#L182)。
 
 输入签名：
 
@@ -476,7 +476,7 @@ len
 
 ## `_require_same_pose`
 
-[定义位置](../../../manipulation/representation.py#L189)。
+[定义位置](../../../manipulation/representation.py#L188)。
 
 输入签名：
 
@@ -511,128 +511,9 @@ max
 ValueError
 ```
 
-## `_RotationOffsetPath`
-
-[定义位置](../../../manipulation/representation.py#L197)。
-
-```python
-class _RotationOffsetPath(PosePath):
-```
-
-类字段：
-
-无显式条目。
-
-实现说明：
-
-> Rotate a material frame in F while preserving its world position curve.
->
-> ``nominal`` gives T_W_M(s), ``functional`` gives T_W_F(s), and ``rotation``
-> is the constant left correction D expressed in F. This path evaluates
-> R_W_M(s) = R_W_F(s) D R_W_F(s)^T R_nominal(s), with the original material
-> origin p_W_M(s). Sampling both parents before composition preserves their
-> continuous source interpolation and progress derivatives. Body and tool
-> offsets are applied by the ordinary child PosePath after this operation.
-
-## `_RotationOffsetPath.__init__`
-
-[定义位置](../../../manipulation/representation.py#L208)。
-
-输入签名：
-
-```python
-def __init__(self, nominal, functional, rotation, *, source):
-```
-
-显式输出分支：
-
-无显式条目。
-
-读取的对象属性：
-
-```python
-Rotation.from_matrix(rotation).as_quat
-Rotation.from_matrix
-nominal.sample_numpy
-nominal.progress
-functional.sample_numpy
-np.swapaxes
-super().__init__
-```
-
-写入目标：
-
-```python
-self.nominal
-self.functional
-self.rotation_quaternion
-poses
-frame
-poses[:, :3, :3]
-```
-
-直接调用符号：
-
-```python
-Rotation.from_matrix(rotation).as_quat
-Rotation.from_matrix
-nominal.sample_numpy
-functional.sample_numpy
-np.swapaxes
-super().__init__
-super
-```
-
-## `_RotationOffsetPath.sample`
-
-[定义位置](../../../manipulation/representation.py#L219)。
-
-输入签名：
-
-```python
-def sample(self, progress, *, side='right'):
-```
-
-显式输出分支：
-
-```python
-(position, quaternion_multiply(functional, corrected))
-```
-
-读取的对象属性：
-
-```python
-self.nominal.sample
-self.nominal
-self.functional.sample
-self.functional
-self.rotation_quaternion
-```
-
-写入目标：
-
-```python
-position
-orientation
-_
-functional
-local
-corrected
-```
-
-直接调用符号：
-
-```python
-self.nominal.sample
-self.functional.sample
-quaternion_multiply
-quaternion_conjugate
-_tensor
-```
-
 ## `_initial_rotation_offset`
 
-[定义位置](../../../manipulation/representation.py#L227)。
+[定义位置](../../../manipulation/representation.py#L196)。
 
 输入签名：
 
@@ -702,7 +583,7 @@ flags.tolist
 
 ## `generate_reference`
 
-[定义位置](../../../manipulation/representation.py#L259)。
+[定义位置](../../../manipulation/representation.py#L228)。
 
 输入签名：
 
@@ -846,7 +727,7 @@ _require_same_pose
 _component_path
 function_path
 _initial_rotation_offset
-_RotationOffsetPath
+RotationOffsetPath
 diagnostic
 publish
 raw.sample_numpy
@@ -868,7 +749,7 @@ raw_eef.sample_numpy
 
 ## `generate_reference.function_path`
 
-[定义位置](../../../manipulation/representation.py#L345)。
+[定义位置](../../../manipulation/representation.py#L314)。
 
 输入签名：
 
@@ -898,7 +779,7 @@ _component_path
 
 ## `generate_reference.diagnostic`
 
-[定义位置](../../../manipulation/representation.py#L348)。
+[定义位置](../../../manipulation/representation.py#L317)。
 
 输入签名：
 
@@ -934,7 +815,7 @@ _progress
 
 ## `generate_reference.publish`
 
-[定义位置](../../../manipulation/representation.py#L352)。
+[定义位置](../../../manipulation/representation.py#L321)。
 
 输入签名：
 
@@ -988,7 +869,7 @@ _sampled_summary
 
 ## `generate_reference.publish.sample`
 
-[定义位置](../../../manipulation/representation.py#L369)。
+[定义位置](../../../manipulation/representation.py#L338)。
 
 输入签名：
 
@@ -1023,7 +904,7 @@ path.sample_numpy
 
 ## `generate_reference.mechanism_path`
 
-[定义位置](../../../manipulation/representation.py#L408)。
+[定义位置](../../../manipulation/representation.py#L377)。
 
 输入签名：
 
@@ -1061,7 +942,7 @@ motion_model.poses
 
 ## `generate_reference.material_path`
 
-[定义位置](../../../manipulation/representation.py#L452)。
+[定义位置](../../../manipulation/representation.py#L421)。
 
 输入签名：
 
@@ -1072,7 +953,7 @@ def material_path(clock):
 显式输出分支：
 
 ```python
-_RotationOffsetPath(nominal, functional, correction, source=result['rotation_transfer'])
+RotationOffsetPath(nominal, functional, correction, source=result['rotation_transfer'])
 nominal
 ```
 
@@ -1093,5 +974,5 @@ nominal
 function_path
 _component_path
 _inverse
-_RotationOffsetPath
+RotationOffsetPath
 ```

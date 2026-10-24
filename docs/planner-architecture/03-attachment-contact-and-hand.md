@@ -1,6 +1,6 @@
 # 附着、接触与手指
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：本次实现待统一提交后回填，实施前保存基线为 `063f88b`。组件正文描述当前工作区已实现行为；阶段验证位于项目外 `sim-version-plans/2026-10-24-performance-implementation`。
 
 ## 1. 实体观测与固定关系
 
@@ -10,7 +10,9 @@
 
 `Attachment` 保存区间、`position_tool_owner`、`quaternion_tool_owner`、条件身份与可选释放身份。设区间为 `[a,b]`、当前实际技能进度为 `s`：具有释放声明时，`active(s)` 在 `a≤s<b` 为真；没有释放声明时，在 `s≥a` 为真，包含窗口终点并继续延续。`CollisionOwner.pose` 与碰撞配对共同使用这个判定。释放后使用该候选释放锚点的预测位姿；`with_release_history` 为搜索分支保留已选前缀的释放位姿，未来释放仍为变量。
 
-完整候选的多项式确定后，`_candidate_geometry` 在第一次区间几何查询中加入本窗口所需释放时刻，按该曲线计算工具 FK，再由 `with_release_history` 保存这些预测释放位姿。后续细分查询复用同一候选的场景副本和释放记录，新增查询数只计算本次所需时刻。该记录的生命周期限于这条固定候选及其几何验收；另一条曲线重新计算自己的释放锚点。
+完整候选的多项式确定后，`_candidate_metrics` 的原固定查询包含本窗口所需释放锚点，按该曲线计算工具 FK，并在同一次 `_scene_boundary_evaluate` 中取得完整实体对记录。`with_release_history` 随后从这些相同工具状态建立候选私有场景；`_candidate_geometry` 接收该场景及已经计费的完整记录。连续区间检查仅查询尚未完成的物理时刻，后续批次复用同一预测释放位姿。该记录的生命周期属于一条固定候选及其验收，另一条曲线从自己的固定查询建立释放记录。
+
+`progress_clock.progress_anchor_parameters` 统一产生进度事件的时间参数和原进度值，平台返回入口与出口。`progress_query_parameters` 按同一参数乘以候选时长得到物理事件时刻，并在这些精确时刻直接使用事件原参数及进度。场景关系左右侧、区间分区与 `SceneMotionBounds.interval` 的附着/路径运动界共同消费这份时钟语义。CPU 中的实体路径折点保留 binary64 身份；原生张量所需 float32 可表示性由 `_ProgressMap.anchor_parameters` 在其调用范围内核对。
 
 源任务坐标到 C 的关系记为 `M_D`。任务点通过 `M_D` 重表达，法线使用其旋转部分；`generate_reference` 使用 `J=M_D⁻¹`。源轨迹、功能区域、任务点和原事件仍承担技能表示职责。
 

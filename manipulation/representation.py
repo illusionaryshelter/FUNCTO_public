@@ -14,8 +14,7 @@ from scipy.spatial.transform import Rotation
 
 from .grasp import validate_timeline
 from .motion import MotionModel, _errors, _inverse, _pose_array, _poses_array
-from .planning_problem import (PosePath, _tensor, quaternion_conjugate,
-                               quaternion_multiply)
+from .planning_problem import PosePath, RotationOffsetPath
 # END no additional rotation convention or numerical dependency is introduced.
 
 
@@ -193,37 +192,7 @@ def _require_same_pose(first, second, message):
         raise ValueError(message)
 
 
-# BEGIN continuous orientation adjustment in an explicitly supplied functional frame.
-class _RotationOffsetPath(PosePath):
-    """Rotate a material frame in F while preserving its world position curve.
-
-    ``nominal`` gives T_W_M(s), ``functional`` gives T_W_F(s), and ``rotation``
-    is the constant left correction D expressed in F. This path evaluates
-    R_W_M(s) = R_W_F(s) D R_W_F(s)^T R_nominal(s), with the original material
-    origin p_W_M(s). Sampling both parents before composition preserves their
-    continuous source interpolation and progress derivatives. Body and tool
-    offsets are applied by the ordinary child PosePath after this operation.
-    """
-
-    def __init__(self, nominal, functional, rotation, *, source):
-        self.nominal = nominal
-        self.functional = functional
-        self.rotation_quaternion = Rotation.from_matrix(rotation).as_quat()[[3, 0, 1, 2]]
-        # PosePath.poses remains an exact cache of this path at its own knots;
-        # continuous consumers always call the overridden sample method.
-        poses = nominal.sample_numpy(nominal.progress)
-        frame = functional.sample_numpy(nominal.progress)[:, :3, :3]
-        poses[:, :3, :3] = frame @ rotation @ np.swapaxes(frame, -1, -2) @ poses[:, :3, :3]
-        super().__init__(nominal.progress, poses, source=source)
-
-    def sample(self, progress, *, side="right"):
-        position, orientation = self.nominal.sample(progress, side=side)
-        _, functional = self.functional.sample(progress, side=side)
-        local = quaternion_multiply(quaternion_conjugate(functional), orientation)
-        corrected = quaternion_multiply(_tensor(self.rotation_quaternion, progress), local)
-        return position, quaternion_multiply(functional, corrected)
-
-
+# BEGIN continuous orientation adjustment uses the serializable path operation.
 def _initial_rotation_offset(nominal, functional, current, flags):
     """Select the initial RPY anchor, then retain the full relative rotation.
 
@@ -383,7 +352,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
             if rotation_flags is not None:
                 correction, result["rotation_transfer"] = _initial_rotation_offset(
                     raw, function_path(path_times), current_eef, rotation_flags)
-                raw = _RotationOffsetPath(raw, function_path(path_times), correction,
+                raw = RotationOffsetPath(raw, function_path(path_times), correction,
                                           source=result["rotation_transfer"])
             # END attachment-free tool references consume the same declared rotation rule.
             diagnostic("eef", raw, path_times)
@@ -454,7 +423,7 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                 nominal = _component_path(Q, times, clock, source="source chart-invariant relative displacement",
                     parent=functional, attachment=_inverse(Qc))
                 if correction is not None:
-                    return _RotationOffsetPath(nominal, functional, correction,
+                    return RotationOffsetPath(nominal, functional, correction,
                                                source=result["rotation_transfer"])
                 return nominal
             # END material position stays on the original continuous path before body/tool offsets.

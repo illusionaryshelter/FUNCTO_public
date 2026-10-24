@@ -7,7 +7,7 @@ convergence or geometry accuracy.
 # BEGIN resident motion backend regression coverage.
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -131,11 +131,11 @@ def run(native, *, budget=None, scene=None, **kwargs):
     return result, backend
 
 
-def test_feasible_reference_is_retained_through_one_main_improvement():
+def test_feasible_reference_is_delivered_before_the_main_solve():
     native = Native([True, True])
     result, backend = run(native)
-    assert result.success and native.calls == ["seed", "reference", "export", "solve"]
-    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+    assert result.success and native.calls == ["seed", "reference", "export"]
+    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 0
     assert result.execution_binding["verification_joint_limits"]["joint_names"] == ["q"]
     assert result.diagnostics["joint_state_computation"] == {
         "kinematic_derivative_orders": [0, 1, 2, 3], "effort": "not_computed"}
@@ -538,10 +538,10 @@ def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, col
 # END only completed hard metrics determine whether a fixed transfer is achieved.
 
 
-# BEGIN qualified incumbents own delivery independently of later solver buffers.
-@pytest.mark.parametrize("improved_score,expected_end,exports", [(0.5, .2, 2), (2., .1, 1)])
-def test_complete_candidates_compare_one_fixed_objective(improved_score, expected_end, exports):
-    native = Native([(True, 1., .1), (True, improved_score, .2)])
+# BEGIN first qualified records own delivery without a later quality comparison.
+@pytest.mark.parametrize("later_score", [.5, 2.])
+def test_first_complete_candidate_keeps_its_recorded_score_without_later_comparison(later_score):
+    native = Native([(True, 1., .1), (True, later_score, .2)])
     select = native.select_candidate
 
     def scored(outcome, *, record_work, on_candidate):
@@ -558,41 +558,36 @@ def test_complete_candidates_compare_one_fixed_objective(improved_score, expecte
     result, backend = run(native)
     try:
         assert result.success
-        assert result.trajectory.position[-1, 0] == expected_end
-        assert result.diagnostics["returned_candidate"]["fixed_objective"] == min(1., improved_score)
-        assert native.calls.count("solve") == 1 and native.calls.count("export") == exports
+        assert result.trajectory.position[-1, 0] == .1
+        assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
+        assert native.calls.count("solve") == 0 and native.calls.count("export") == 1
     finally:
         backend.close()
 
 
-def test_improvement_budget_keeps_completed_record_after_mutable_buffers_change():
-    from manipulation.planning import PlanningWorkExhausted
+def test_first_qualified_record_remains_owned_after_reusable_buffers_change():
     native = Native([True])
     original = native.curve.position.copy()
 
-    def exhausted(seed, *, iterations=None):
-        native.calls.append("solve")
-        native.curve.position[:] = .8
-        native.last_validation["violations"][:] = 10.
-        raise PlanningWorkExhausted("Test improvement exhausted its existing allowance")
-
-    native.optimize = exhausted
+    native.optimize = Mock(side_effect=AssertionError("No solve follows complete qualification"))
     result, backend = run(native)
     try:
         assert result.success and result.execution_binding is not None
+        native.optimize.assert_not_called()
+        native.curve.position[:] = .8
+        native.last_validation["violations"][:] = 10.
         np.testing.assert_array_equal(result.trajectory.position, original)
         assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
-        assert result.diagnostics["improvement_end"]["reason"] == "cumulative_planning_budget_exhausted"
-        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 0
         assert "failure" not in result.diagnostics
     finally:
         backend.close()
 
 
-@pytest.mark.parametrize("error", [MotionPlanningError("cancelled", "cancelled during improvement"),
-    MotionPlanningError("deadline_exceeded", "deadline during improvement"), RuntimeError("native error")])
-def test_nonbudget_improvement_errors_retain_failure_semantics(error):
-    native = Native([True])
+@pytest.mark.parametrize("error", [MotionPlanningError("cancelled", "cancelled before qualification"),
+    MotionPlanningError("deadline_exceeded", "deadline before qualification"), RuntimeError("native error")])
+def test_solver_errors_before_qualification_retain_failure_semantics(error):
+    native = Native([False])
 
     def fail(seed, *, iterations=None):
         raise error
@@ -605,7 +600,7 @@ def test_nonbudget_improvement_errors_retain_failure_semantics(error):
         assert "improvement_end" not in result.diagnostics
     finally:
         backend.close()
-# END budget exhaustion cannot promote an unfinished or cancelled computation.
+# END no unfinished or cancelled computation becomes an execution binding.
 
 
 # BEGIN real interrupted numerical controls remain separate from seed validation.
@@ -759,10 +754,8 @@ def test_diagnostic_curve_export_error_preserves_original_solver_exception():
     assert native.diagnostic_optimizer_candidate is native.diagnostic_optimizer_provenance is None
 # END diagnostic export failure remains evidence, not a new planner outcome.
 
-# BEGIN serial production iteration freezes accepted work before a later interruption.
-@pytest.mark.parametrize('failure', ['budget', 'cancelled', 'deadline_exceeded', 'native'])
-def test_completed_first_optimized_seed_survives_only_budget_exhaustion(failure):
-    from manipulation.planning import PlanningWorkExhausted
+# BEGIN serial production iteration never starts a later solve after qualification.
+def test_first_optimized_seed_stops_the_actual_solver_generator():
     from manipulation.unified_solver import ConstrainedSolution
 
     native = Native([])
@@ -786,18 +779,9 @@ def test_completed_first_optimized_seed_survives_only_budget_exhaustion(failure)
         return curve, report, 0
 
     native.evaluate_candidate = evaluate
-    error = (PlanningWorkExhausted('second seed exhausted') if failure == 'budget' else
-        RuntimeError('second seed native failure') if failure == 'native' else
-        MotionPlanningError(failure, 'second seed request interruption'))
-
     def solve(computation, controls, *, report_out, **kwargs):
         if completed:
-            # The first completed candidate must already own an independent
-            # execution binding when the second solve touches native storage.
-            assert native.calls.count('export') == 1
-            native.curve.position[:] = .8
-            native.last_validation['violations'][:] = 100.
-            raise error
+            pytest.fail('A second solve started after the first complete binding')
         completed.append(controls.copy())
         return ConstrainedSolution(controls.copy(), {'success': True})
 
@@ -808,16 +792,14 @@ def test_completed_first_optimized_seed_survives_only_budget_exhaustion(failure)
         assert evaluations == [False, True]
         assert result.request_ledger['consumed_planning']['trajectory_solves'] == 1
         assert result.request_ledger['consumed_planning']['validation_passes'] == 2
-        assert len(native.last_optimizer_runtime) == 2
+        assert len(native.last_optimizer_runtime) == 1
         assert result.diagnostics['attempts'][0]['selected_seed_index'] == 0
         assert result.diagnostics['attempts'][0]['seed_provenance'] == 'ompl'
-        if failure == 'budget':
-            assert result.success and result.execution_binding is not None
-            np.testing.assert_array_equal(result.trajectory.position, np.zeros((2, 1)))
-            assert result.diagnostics['returned_candidate']['seed_provenance'] == 'ompl'
-        else:
-            assert not result.success and result.execution_binding is None
-            assert result.diagnostics['failure'] == ('planning_stage_failed' if failure == 'native' else failure)
+        assert result.success and result.execution_binding is not None
+        np.testing.assert_array_equal(result.trajectory.position, np.zeros((2, 1)))
+        assert result.diagnostics['returned_candidate']['seed_provenance'] == 'ompl'
+        assert backend._request_owner is None
+        assert result.execution_binding['request_ledger'] == result.request_ledger
     finally:
         backend.close()
 
@@ -851,4 +833,4 @@ def test_search_exception_accounts_started_queries_and_elapsed_time_once(failure
             else 'planning_stage_failed' if failure == 'native' else failure)
     finally:
         backend.close()
-# END only the original cumulative-work exception can preserve a qualified incumbent.
+# END first completion ends the request; earlier exceptions retain actual search work.

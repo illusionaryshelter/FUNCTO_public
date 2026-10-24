@@ -49,7 +49,7 @@ def candidate_fixture(*, accepted=True, components=None, native_outcomes=(), int
         record_work(points=4)
         return {"accepted": accepted, "native_success": accepted,
             "residuals": {"interpolated:process_scene": 0. if accepted else 1.},
-            "scene_components": components or {}}, np.array([0., 1.]), 4
+            "scene_components": components or {}}, np.array([0., 1.]), 4, (scene, [])
     native._candidate_metrics = Mock(side_effect=completed_metrics)
     # BEGIN fixed objective evidence has the same explicit fixture ownership.
     native._candidate_objective = Mock(return_value={
@@ -58,7 +58,7 @@ def candidate_fixture(*, accepted=True, components=None, native_outcomes=(), int
     # Interval geometry is a separate required consumer. These two completed
     # endpoint queries are fixture evidence; production joint-domain checks,
     # residual combination and remaining query-budget arithmetic stay real.
-    def completed_geometry(curve, scene, *, remaining_points, record_work):
+    def completed_geometry(curve, scene, *, initial_states, remaining_points, record_work):
         record_work(points=2)
         return {"query_points": 2, "hard_scene_residual": interval_residual,
             "scene_categories": {"collision": interval_residual}, "scene_components": {},
@@ -68,61 +68,51 @@ def candidate_fixture(*, accepted=True, components=None, native_outcomes=(), int
 # END geometry accuracy is covered by the native scene and interval test modules.
 
 
-# BEGIN a qualified original survives exhaustion while improvement is prepared.
-def test_supplied_curve_remains_immutable_when_improvement_budget_ends():
+# BEGIN a complete supplied curve is delivered before any new initialization.
+def test_supplied_curve_is_immutable_and_skips_all_later_initialization():
     reference = supplied_curve()
     originals = [value.copy() for value in (reference.times, reference.position, reference.velocity)]
     native = candidate_fixture()
 
-    def exhausted_improvement(joint_reference=None):
-        native.calls.append("seed")
-        # Later solver buffers are independent of the qualified delivery
-        # record. Mutate them to expose any retained alias to the incumbent.
-        native.delivery_candidate.position[:] = .8
-        native.last_validation = None
-        raise PlanningWorkExhausted("CPU fixture ends the admitted improvement work")
-
-    native.reference_seeds = exhausted_improvement
+    native.reference_seeds = Mock(side_effect=AssertionError("A qualified original needs no initializer"))
     result, backend = run(native, joint_reference=reference)
     try:
         assert result.success, result.diagnostics
-        assert native.calls == ["candidate", "seed"]
+        assert native.calls == ["candidate"]
+        native.reference_seeds.assert_not_called()
+        # The returned record owns its curve even after reusable buffers move.
+        native.delivery_candidate.position[:] = .8
+        native.last_validation = None
         for actual, original in zip((result.trajectory.times, result.trajectory.position, result.trajectory.velocity), originals):
             np.testing.assert_array_equal(actual, original)
         np.testing.assert_array_equal(result.trajectory.progress_u, reference.progress_u)
         np.testing.assert_array_equal(result.trajectory.progress_s, reference.progress_s)
         assert result.diagnostics["joint_reference"]["source_curve_preserved"]
         assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
-        assert result.diagnostics["improvement_end"]["reason"] == "cumulative_planning_budget_exhausted"
         assert "failure" not in result.diagnostics
         counts = result.request_ledger["consumed_planning"]
-        assert counts["ik_batches"] == 1 and counts["trajectory_solves"] == 0
+        assert counts["ik_batches"] == 0 and counts["trajectory_solves"] == 0
+        assert counts["validation_passes"] == 1
         assert result.execution_binding["request_ledger"]["consumed_planning"] == counts
     finally:
         backend.close()
 # END the original polynomial and progress map keep their completed qualification.
 
 
-# BEGIN a supplied incumbent participates in the same bounded main improvement.
-def test_supplied_curve_keeps_its_own_clock_when_native_improvements_score_worse():
+# BEGIN first qualification retains the supplied curve's complete physical clock.
+def test_supplied_curve_keeps_its_own_clock_without_scoring_native_candidates():
     reference = supplied_curve()
     native = candidate_fixture(native_outcomes=(True, True))
     native.joint_reference_report = {"source_curve_preserved": False,
         "source_duration_s": reference.duration, "bound_duration_s": 2.}
     native.curve = JointTrajectory(("q",), np.array([0., 2.]), np.zeros((2, 1)),
         np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
-    select = native.select_candidate
-
-    def worse_native_candidate(value, *, record_work):
-        result, curve, report = select(value, record_work=record_work)
-        report.update(fixed_objective=2., objective_components={"fixture_reference": 2.})
-        return result, curve, report
-
-    native.select_candidate = worse_native_candidate
+    native.select_candidate = Mock(side_effect=AssertionError("The supplied curve already qualified"))
     result, backend = run(native, joint_reference=reference)
     try:
         assert result.success, result.diagnostics
-        assert native.calls == ["candidate", "seed", "reference", "solve"]
+        assert native.calls == ["candidate"]
+        native.select_candidate.assert_not_called()
         np.testing.assert_array_equal(result.trajectory.times, reference.times)
         np.testing.assert_array_equal(result.trajectory.position, reference.position)
         np.testing.assert_array_equal(result.trajectory.velocity, reference.velocity)
@@ -131,11 +121,11 @@ def test_supplied_curve_keeps_its_own_clock_when_native_improvements_score_worse
         assert result.diagnostics["joint_reference"]["source_curve_preserved"]
         assert result.diagnostics["joint_reference"]["bound_duration_s"] == reference.duration
         assert result.diagnostics["returned_candidate"]["fixed_objective"] == 1.
-        assert result.diagnostics["attempts"][0]["fixed_objective"] == 2.
-        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
+        assert result.diagnostics["attempts"] == []
+        assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 0
     finally:
         backend.close()
-# END finite ranking preserves the selected candidate's physical interpretation.
+# END no old callback adapter or unused quality-improvement route remains.
 
 
 # BEGIN supplied curves obey the same explicit policy as native candidate routes.
@@ -222,7 +212,7 @@ def test_nonuniform_query_grid_retains_every_original_piece_and_bounds_spacing()
 
 
 # BEGIN exact saved-curve metrics and interval queries share one qualification.
-@pytest.mark.parametrize("interval_residual", [0., .01])
+@pytest.mark.parametrize("interval_residual", [0., 1e-12, .01])
 def test_saved_curve_queries_sampled_and_interval_evidence(interval_residual):
     native = candidate_fixture(interval_residual=interval_residual)
     reference = supplied_curve()
@@ -233,7 +223,7 @@ def test_saved_curve_queries_sampled_and_interval_evidence(interval_residual):
     assert attempt["residuals"]["interval:process_scene"] == interval_residual
     native._candidate_metrics.assert_called_once_with(reference, native.scene, record_work=record_work)
     native._candidate_geometry.assert_called_once_with(reference, native.scene,
-        remaining_points=native.budget.max_validation_points-4, record_work=record_work)
+        initial_states=[], remaining_points=native.budget.max_validation_points-4, record_work=record_work)
     assert record_work.call_count == 3
     if interval_residual == 0.:
         assert native.last_validation["cubic_derivatives"]["acceleration"]["maximum_bound_excess"] == 0
@@ -242,6 +232,17 @@ def test_saved_curve_queries_sampled_and_interval_evidence(interval_residual):
         assert native.last_validation is None
     assert curve is native.delivery_candidate
 # END a positive interval witness rejects the curve despite clear sampled metrics.
+
+
+# BEGIN first-result delivery retains the original finite quality requirement.
+@pytest.mark.parametrize("score", [float("nan"), float("inf")])
+def test_nonfinite_fixed_quality_cannot_qualify_a_clear_curve(score):
+    native = candidate_fixture()
+    native._candidate_objective.return_value = {"fixed_objective": score}
+    _, report, _ = native.evaluate_candidate(supplied_curve(), record_work=Mock())
+    assert not report["accepted"] and native.last_validation is None
+    assert not np.isfinite(report["fixed_objective"])
+# END recorded task quality is not converted into an optional acceptance check.
 
 
 

@@ -13,6 +13,10 @@ from uuid import uuid4
 
 import numpy as np
 
+# BEGIN path expressions declare their operands before dataclass serialization.
+from .planning_problem import PosePath
+# END this import has no planning backend or device initialization.
+
 
 def plain(value):
     """Copy declared input fields without retaining solver/cache objects.
@@ -21,6 +25,10 @@ def plain(value):
     missing measurement. Private dataclass caches are deliberately excluded.
     """
     if is_dataclass(value):
+        # BEGIN continuous operands take precedence over inherited data fields.
+        if isinstance(value, PosePath):
+            return plain(value.to_record())
+        # END sampled caches do not identify a complete composed expression.
         return {item.name: plain(getattr(value, item.name)) for item in fields(value)
                 if not item.name.startswith("_")}
     if isinstance(value, np.ndarray):

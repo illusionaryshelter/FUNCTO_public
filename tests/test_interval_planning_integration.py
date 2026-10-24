@@ -13,7 +13,7 @@ from manipulation.implicit_distance import ObservedField
 from manipulation.native_field_distance import query_native_field
 from manipulation.observed_mapping import FrozenObservedField
 from manipulation.online_geometry import OnlinePlanningScene
-from manipulation.planning import JointTrajectory, _ConstrainedPlanner, _ProgressMap, _scene_boundary_evaluate
+from manipulation.planning import JointTrajectory, PlanningBudget, _ConstrainedPlanner, _ProgressMap, _scene_boundary_evaluate
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import Attachment, CollisionOwner
 from test_interval_geometry import ConstantMotion
@@ -31,9 +31,12 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
     instance.joint_names = ("q",)
     instance.check_request = Mock()
     instance.anchors = np.array([.5]) if release else np.array([])
-    instance.budget = SimpleNamespace(max_validation_points=100, validation_spatial_step_m=.01)
+    instance.budget = PlanningBudget(max_validation_points=100, max_task_anchors=32,
+        validation_spatial_step_m=.01, interpolation_dt=.025, interpolation_buffer_size=2048)
+    instance.robot_metadata = {'active_joint_names': ['q'], 'links': 1}
     instance.problem = SimpleNamespace(tool_link="tool", tool_transform=np.eye(4), start_progress=0.,
-        end_progress=1., transform_tool_pose=lambda p, q: (p, q), transform_robot_spheres=lambda x: x)
+        end_progress=1., residuals=lambda *args, **kwargs: {}, verification_issues=lambda progress: [],
+        transform_tool_pose=lambda p, q: (p, q), transform_robot_spheres=lambda x: x)
     instance._candidate_domain_validation = lambda value: {}
     shape = coal.Box(.002, .002, .002)
     field = ObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
@@ -105,6 +108,11 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
                                    moving=release, attachments=relations),)
     scene.contacts, scene.required_progress_anchors = (), (.5,) if release else ()
     scene._fixed_release_poses, scene.last_query_report, scene.gripper = {}, {}, None
+    # The analytic fixture declares its tiny query buffers explicitly; the
+    # production evidence/Pin allocation estimator still runs unchanged.
+    scene.robot_model = SimpleNamespace(geometry_names=('body',), joint_names=('q',))
+    scene.estimated_workspace_allocation = lambda *args: dict(cpu_resident=0, cpu_pending_shared=0,
+        cpu_live=0, gpu_shared=0, gpu_live=0, gpu_retained=0)
     # END the original scene and every selected candidate own distinct dictionaries.
     instance.scene = scene
     monkeypatch.setattr("manipulation.interval_geometry.SceneMotionBounds.from_scene",
@@ -114,11 +122,9 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
         "conditional_unknown_residuals": {},
         # This integration fixture isolates interval evidence from scoring.
         "fixed_objective": 0., "objective_components": {"fixture_objective": 0.}}
-    # BEGIN isolate interval queries behind explicit completed sampled evidence.
-    instance._candidate_metrics = Mock(side_effect=lambda curve, scene, *, record_work:
-        (deepcopy(report), np.array([0., 1.]), 0))
+    # BEGIN fixed queries feed their complete original evidence to interval checks.
     instance._candidate_objective = Mock(return_value={"fixed_objective": 0.})
-    # END native sampled-metric numerics have their separate factory regression.
+    # END both stages now exercise the same production query and release context.
     return instance, curve, report, queries
 
 
@@ -146,17 +152,19 @@ def test_unresolved_finite_permission_preserves_warning_and_original_hard_result
 def test_interval_sampling_keeps_controller_residual_separate_from_intersection(monkeypatch):
     instance, curve, report, _ = planner(monkeypatch, permission="finite_region", residual=.2)
     _, result, _ = instance.evaluate_candidate(curve, record_work=Mock())
-    assert not result["accepted"] and result["residuals"]["interval:process_scene"] == .2
-    assert result["collision_residuals"]["interval:scene_collision"] == 0.
-    assert result["continuous_geometry"]["scene_components"]["gripper/controller"]["maximum"] == .2
+    assert not result["accepted"] and result["residuals"]["process_scene"] == .2
+    assert result["collision_residuals"]["collision"] == 0.
+    assert result["scene_components"]["gripper/controller"]["maximum"] == .2
+    assert "continuous_geometry" not in result
 
 
 def test_release_query_keeps_original_anchor_and_physical_sides_in_one_call(monkeypatch):
     instance, curve, report, queries = planner(monkeypatch, release=True)
     _, result, _ = instance.evaluate_candidate(curve, record_work=Mock())
     assert len(queries) == 1 and np.count_nonzero(queries[0] == .0125) == 3
-    rows = result["continuous_geometry"]["confirmed_intersections"]
-    assert {row["side"] for row in rows if row["time_s"] == .0125} == {-1, 0, 1}
+    assert not result["accepted"] and "continuous_geometry" not in result
+    assert result["residuals"]["process_scene"] == 1.
+    assert instance.scene_queries[0]["times"].shape == (1, 5)
 
 
 # BEGIN one immutable candidate reuses its first complete release evidence.
@@ -165,7 +173,7 @@ def test_release_cache_charges_each_new_time_once_and_preserves_full_scene_resul
     _, result, points = instance.evaluate_candidate(curve, record_work=Mock())
     saved = deepcopy(instance.scene_queries)
     assert result["accepted"] and points == 5
-    assert len(queries) == 4 and np.count_nonzero(queries[0] == .0125) == 3
+    assert len(queries) == 2 and np.count_nonzero(queries[0] == .0125) == 3
     assert all(not np.any(times == .0125) for times in queries[1:])
     assert sum(len(np.unique(times)) for times in queries) == points
     assert saved[0]["fixed_release_keys"] == ()
@@ -209,6 +217,105 @@ def test_rejected_task_or_joint_domain_does_not_spend_interval_geometry_work(mon
     instance, curve, report, queries = planner(monkeypatch)
     instance._candidate_domain_validation = lambda value: value.residuals.update(continuous_position=.1) or {}
     _, result, points = instance.evaluate_candidate(curve, record_work=Mock())
-    assert not result["accepted"] and points == 0 and not queries
+    assert not result["accepted"] and points == 2 and len(queries) == 1
     assert "continuous_geometry" not in result
 # END only actual scene violations reject; interval proof gaps retain their own meaning.
+
+
+# BEGIN fixed evidence and new batches share one exact candidate clock.
+def test_fixed_queries_supply_complete_states_and_release_without_duplicate_work(monkeypatch):
+    instance, curve, _, queries = planner(monkeypatch, permission='finite_region', release=True)
+    record_work = Mock()
+    _, result, points = instance.evaluate_candidate(curve, record_work=record_work)
+    assert result['continuous_geometry']['initial_query_points'] == 3
+    assert result['continuous_geometry']['query_points'] == 2
+    assert result['continuous_geometry']['query_batch_sizes'] == [2]
+    assert points == 5
+    assert [call.kwargs['points'] for call in record_work.call_args_list if 'points' in call.kwargs] == [3, 2]
+    assert len(queries) == 2
+    assert instance.scene_queries[1]['fixed_release_keys'] == (('material', 0),)
+
+
+def test_event_ulp_identity_matches_interval_partition_and_boundary_sides(monkeypatch):
+    from manipulation.interval_geometry import _progress_times
+    u = np.array([0., .038557137974987485, .2702740738263834, .998034361190033, 1.])
+    s = np.array([0., .6608281629629073, .6925010468048584, .7285616397930895, 1.])
+    anchor, duration = .08538524674570802, 10.4040002823
+    mapping = _ProgressMap(u, s)
+    parameter = float(mapping.anchor_parameters([anchor])[0, 0])
+    physical_time = parameter*duration
+    assert float(np.interp(physical_time/duration, u, s)) != anchor
+    curve = SimpleNamespace(progress_u=u, progress_s=s, duration=duration)
+    assert _progress_times(curve, [anchor]) == [physical_time]
+    parameters, progress = mapping.query_parameters([physical_time], duration, [anchor])
+    assert parameters.tolist() == [parameter] and progress.tolist() == [anchor]
+
+    class Scene:
+        required_progress_anchors, contacts = (anchor,), ()
+        def evaluate(self, spheres, position, quaternion, progress, joints, names, **kwargs):
+            self.progress = progress.numpy().ravel().tolist()
+            for index in np.ndindex(progress.shape):
+                kwargs['geometry_evidence_out'].append({'state_index': list(index)})
+            return torch.zeros_like(progress)
+
+    scene, evidence = Scene(), []
+    tensor = lambda value: torch.as_tensor(value, dtype=torch.float64)[None]
+    _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.), mapping,
+        torch.empty((1, 1, 0, 4)), torch.zeros((1, 1, 3)), torch.tensor([[[1., 0., 0., 0.]]]),
+        tensor(progress), torch.zeros((1, 1, 1)), ('q',), trajectory_time=tensor([physical_time]),
+        normalized_time=tensor(parameters), geometry_evidence_out=evidence)
+    assert [row['side'] for row in evidence] == [0, -1, 1]
+    assert scene.progress == [anchor, np.nextafter(anchor, -np.inf), np.nextafter(anchor, np.inf)]
+
+
+def test_actual_candidate_array_and_split_queries_have_identical_cached_release_results(monkeypatch):
+    import manipulation.interval_geometry as interval
+
+    def invoke(groups):
+        instance, curve, _, _ = planner(monkeypatch, permission='finite_region', release=True)
+        _, _, points, (scene, initial) = instance._candidate_metrics(curve, instance.scene, record_work=Mock())
+        responses = []
+        def capture(curve, motion, query, **kwargs):
+            assert kwargs['initial_states'] == initial
+            responses.extend(query(group, point_budget=100) for group in groups)
+            return {'query_points': sum(row['query_points'] for row in responses)}
+        monkeypatch.setattr(interval, 'check_interval_geometry', capture)
+        instance._candidate_geometry(curve, scene, initial_states=initial, remaining_points=100-points,
+                                     record_work=Mock())
+        return {(row['time_s'], row['side']): row for response in responses for row in response['states']}
+
+    assert invoke([[.00625, .01875]]) == invoke([[.00625], [.01875]])
+# END actual scene evidence, release poses and physical counts agree for both layouts.
+
+
+def test_each_candidate_recomputes_its_own_release_and_complete_evidence(monkeypatch):
+    instance, first, _, queries = planner(monkeypatch, permission='finite_region', release=True)
+    _, result, _ = instance.evaluate_candidate(first, record_work=Mock())
+    first_records = deepcopy(instance.scene_queries)
+    assert result['accepted']
+    second = JointTrajectory(first.joint_names, first.times.copy(), first.position+.1,
+        first.velocity.copy(), first.progress_u.copy(), first.progress_s.copy(), (), (), {})
+    _, result, _ = instance.evaluate_candidate(second, record_work=Mock())
+    second_records = instance.scene_queries[len(first_records):]
+    assert result['accepted'] and len(first_records) == len(second_records) == 2
+    assert second_records[0]['fixed_release_keys'] == ()
+    assert second_records[1]['fixed_release_keys'] == (('material', 0),)
+    np.testing.assert_allclose(second_records[1]['owner_position'][second_records[1]['progress'] > .5, 0], .1155, atol=1e-15)
+    np.testing.assert_allclose(first_records[1]['owner_position'][first_records[1]['progress'] > .5, 0], .0155, atol=1e-15)
+    assert not instance.scene._fixed_release_poses
+
+
+def test_actual_dense_progress_clock_is_admitted_before_fixed_query(monkeypatch):
+    instance, curve, _, _ = planner(monkeypatch, permission='finite_region')
+    u = np.linspace(0., 1., 1001)
+    curve = JointTrajectory(curve.joint_names, curve.times, curve.position, curve.velocity,
+        u, u.copy(), (), (), {})
+    from manipulation import planning
+    actual = planning._planning_workspace_bytes
+    clocks = []
+    def workspace(*args, **kwargs):
+        clocks.append(kwargs['clock_nodes'])
+        return actual(*args, **kwargs)
+    monkeypatch.setattr(planning, '_planning_workspace_bytes', workspace)
+    instance._candidate_metrics(curve, instance.scene, record_work=Mock())
+    assert clocks == [1001]

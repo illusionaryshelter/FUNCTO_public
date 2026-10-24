@@ -24,6 +24,7 @@ import numpy as np
 from scipy.interpolate import BSpline, CubicHermiteSpline
 from .planning_problem import event_occurrence_key
 from .collision_records import encode_array
+from .progress_clock import _ProgressMap
 # BEGIN physical memory ownership is independent of optimizer workspace size.
 from .resource_admission import (
     ResourceLimitError, require_host_memory, require_device_memory,
@@ -33,7 +34,6 @@ from .resource_admission import (
 # END source geometry and native CUDA buffers use the same typed refusals.
 
 # BEGIN final validation separates total finite work from live geometry storage.
-_VALIDATION_CHUNK_SIZE = 256
 _NATIVE_STAGE_POINT_LIMIT = 8192
 # BEGIN byte admission is owned by actual record/scene consumers.
 # No unused byte constants here may be mistaken for enforced protections.
@@ -426,13 +426,56 @@ class _PlanningWorkspace:
 # END host geometry and device query buffers retain separate ownership.
 
 
+# BEGIN retained complete pair rows share the admitted candidate point capacity.
+def _candidate_evidence_workspace_bytes(scene, points, anchor_capacity, clock_nodes):
+    """Bound Python pair records, regrouping and interval proof output.
+
+    The current native/observed pair schemas have at most 32 dictionary
+    entries, 12 lists and 48 numeric/reference slots (including both 2x3
+    witness boxes). Entity namespace strings and their two-entry mapping
+    are included. Original component/status/schema strings are shared.
+    One extra row dictionary covers regrouping while the original query
+    list is live. Accepted or unresolved leaves retain smaller proof records;
+    their count is bounded by original clock/owner-path corners plus acquired
+    midpoints. These objects coexist with the admitted scene/FK batch.
+    """
+    from sys import getsizeof
+    robot_names = tuple(scene.robot_model.geometry_names)
+    owner_names = tuple(owner.owner_id for owner in scene.owners)
+    robots, owners = len(robot_names), len(owner_names)
+    # This allocation precedes robot-validator binding. Every unordered pair
+    # is an upper bound; actual structural exclusions only reduce the rows.
+    pair_count = (robots*(robots-1)//2 + robots*(owners+1) + owners*(owners+1)//2)
+    namespace_bytes = max(getsizeof('robot/'+name) for name in (*robot_names, *owner_names, 'background'))
+    scalar = max(getsizeof(0.), getsizeof(2**63-1))
+    pointer = np.dtype(np.intp).itemsize
+    row_dict = getsizeof(dict.fromkeys(range(32)))
+    entity_dict = getsizeof(dict.fromkeys(range(2)))
+    record = row_dict+entity_dict+12*getsizeof([])+48*(scalar+pointer)+2*namespace_bytes
+    proof = getsizeof(dict.fromkeys(range(10)))+entity_dict+getsizeof([None, None])+2*scalar
+    # Two side states per declared anchor suffice, including plateau ends;
+    # ordinary physical points have only their exact relation state.
+    state_count = int(points)+2*int(anchor_capacity)
+    state_bytes = getsizeof(dict.fromkeys(range(6)))+getsizeof({})+getsizeof([])+8*(scalar+pointer)
+    return int(state_count*(pair_count*(record+row_dict)+state_bytes)
+               +(int(points)+int(clock_nodes)+2*int(anchor_capacity)+1
+                   +sum(2*len(owner.pose_path.progress) for owner in scene.owners))
+                   # A final partially covered frontier can retain two empty-
+                   # pair children per known span. Complete pair rows still
+                   # occupy only spans whose two endpoints were acquired.
+                   *(pair_count*proof+2*state_bytes))
+# END no material point array is charged as a retained evidence record.
+
+
 # BEGIN serial constrained search and candidate checks have one live scene query.
-def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
+def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity, *, clock_nodes):
     """Reserve one CPU scene query and the native IK point-query transfer.
 
     Trajectory seeds run serially. Task/geometry arrays coexist for one
     candidate; accepted-curve geometry uses its own bounded query. Immutable
-    fields are shared. SLSQP's dense constraint/work arrays are admitted once
+    fields are shared. Complete fixed-query records, new-batch records and
+    interval proof records are included in the same host peak. SLSQP's dense
+    constraint/work arrays are admitted once
     their actual row count is known by unified_solver.solve_trajectory.
     """
     ordinary = (budget.knots+4)*budget.interpolation_steps+1
@@ -451,7 +494,9 @@ def _planning_workspace_bytes(scene, robot_metadata, budget, anchor_capacity):
     full_dof = max(dof, len(scene.robot_model.joint_names))
     pin_bytes = 8*states*links*(7+6+3*6*full_dof)
     return _PlanningWorkspace(int(trajectory['cpu_resident']), int(trajectory['cpu_pending_shared']),
-        int(trajectory['cpu_live']+pin_bytes), gpu_bytes, 0)
+        int(trajectory['cpu_live']+pin_bytes+_candidate_evidence_workspace_bytes(
+            scene, budget.max_validation_points, anchor_capacity,
+            clock_nodes)), gpu_bytes, 0)
 # END no trajectory optimizer particles or native anchor FK are allocated.
 
 
@@ -527,47 +572,6 @@ def _bounded_robot_configuration(robot, problem, scene, budget):
                   "links": len(links), "selected_link_names": sorted(links), "spheres": 0}
 
 
-@dataclass(frozen=True)
-class _ProgressMap:
-    """A fixed, monotone phase schedule; repeated s values encode pauses."""
-
-    u: np.ndarray
-    s: np.ndarray
-    # BEGIN original intent and device activation are distinct bound facts.
-    event_clock: dict = field(default_factory=dict, compare=False)
-    # END only initial binding creates this record.
-
-    def __post_init__(self):
-        if (self.u.ndim != 1 or self.s.shape != self.u.shape or len(self.u) < 2
-                or not np.isfinite(self.u).all() or not np.isfinite(self.s).all()
-                or self.u[0] != 0 or self.u[-1] != 1 or self.s[0] < 0
-                or np.any(np.diff(self.u) <= 0) or np.any(np.diff(self.s) < 0)
-                or np.any(np.diff(self.u.astype(np.float32)) <= 0)):
-            raise ValueError("A progress map needs increasing u and nondecreasing s")
-
-    def anchor_parameters(self, anchors):
-        """Preserve both ends of an s plateau, including a paused event."""
-        pairs = []
-        for value in anchors:
-            equal = np.flatnonzero(self.s == value)
-            if len(equal):
-                pairs.append((float(self.u[equal[0]]), float(value)))
-                if equal[-1] != equal[0]:
-                    pairs.append((float(self.u[equal[-1]]), float(value)))
-            else:
-                right = int(np.searchsorted(self.s, value, side="right"))
-                if right == 0 or right == len(self.s):
-                    raise ValueError("An event anchor is outside the planned progress interval")
-                fraction = (value - self.s[right-1]) / (self.s[right] - self.s[right-1])
-                pairs.append((float(self.u[right-1] + fraction * (self.u[right] - self.u[right-1])), float(value)))
-        pairs = np.asarray(sorted(set(pairs)), dtype=float).reshape(-1, 2)
-        # Required source knots and event boundaries must remain distinct in
-        # the native float32 process tensors.  Reject an unrepresentable clock
-        # instead of silently merging or moving a supplied hard anchor.
-        if any(len(np.unique(pairs[:, column])) != len(np.unique(pairs[:, column].astype(np.float32)))
-               for column in (0, 1)):
-            raise ValueError("Required progress anchors exceed native float32 clock precision")
-        return pairs
 
 
 # BEGIN reference samples retain phase and motion within progress plateaus.
@@ -2099,6 +2103,28 @@ def _native_gradient_layout_type():
 # END padding repeats the same final instant as the shared cubic sampler.
 
 
+# BEGIN complete scene rows belong to one physical candidate query.
+def _geometry_query_states(evidence, times, progress, residuals):
+    """Group complete pair records by exact physical time and relation side.
+
+    Empty pair sets still represent completed physical queries. Pair records
+    retain their original bounds, witnesses, permissions and namespaced entity
+    keys; the surrounding state supplies the query's physical coordinates.
+    """
+    states = {(float(time), 0): {"time_s": float(time), "side": 0,
+        "progress": float(progress[index]), "residuals": {"scene": float(residuals[index])}, "pairs": []}
+        for index, time in enumerate(times)}
+    for row in evidence:
+        index = row["query_index"][1]
+        key = (float(times[index]), int(row["side"]))
+        state = states.setdefault(key, {"time_s": key[0], "side": key[1],
+            "progress": float(progress[index]), "residuals": {"scene": float(residuals[index])}, "pairs": []})
+        state["pairs"].append({name: value for name, value in row.items()
+            if name not in {"state_index", "query_index", "time_s", "side"}})
+    return list(states.values())
+# END cached evidence is private to this curve, hand model and release history.
+
+
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
@@ -2568,7 +2594,8 @@ class _ConstrainedPlanner:
             initial_clock["duration"], entrance_pose, entrance_twist)
         # END the same physical-time reference serves IK and ordinary costs.
         self.validation_storage = {"encoded_record_bytes_upper": 0}
-        workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
+        workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity,
+            clock_nodes=len(self.progress_map.u))
         _require_planning_host_memory(workspace.pending_cpu_bytes,
             encoded_record_bytes_upper=self.validation_storage["encoded_record_bytes_upper"],
             max_host_rss_bytes=budget.max_host_rss_bytes)
@@ -2706,7 +2733,8 @@ class _ConstrainedPlanner:
                 before_tick, mapping, self.reference_time_map.u), self.reference_time_map.s)
         # END no coefficient or endpoint constraint is introduced by this schedule.
         _anchor_capacity(mapping, anchors, budget)
-        workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity)
+        workspace = _planning_workspace_bytes(scene, self.robot_metadata, budget, self.anchor_capacity,
+            clock_nodes=len(mapping.u))
         _require_planning_host_memory(workspace.pending_cpu_bytes, encoded_record_bytes_upper=0,
                                      max_host_rss_bytes=budget.max_host_rss_bytes)
         _require_planning_memory(self.torch, self.device_cfg.device, workspace,
@@ -3494,8 +3522,7 @@ class _ConstrainedPlanner:
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         pairs = mapping.anchor_parameters(self.anchors)
         times = np.unique(np.r_[ordinary, pairs[:, 0]*trajectory.duration])
-        progress = np.interp(times/trajectory.duration, mapping.u, mapping.s)
-        progress[np.searchsorted(times, pairs[:, 0]*trajectory.duration)] = pairs[:, 1]
+        _, progress = mapping.query_parameters(times, trajectory.duration, self.anchors)
         return mapping, times, progress
 
     def _candidate_robot_state(self, trajectory, candidate_scene, times, progress):
@@ -3509,7 +3536,7 @@ class _ConstrainedPlanner:
         return states, values
 
     def _candidate_objective(self, trajectory, candidate_scene):
-        """Rank by motion quality and declared task preferences on fixed queries."""
+        """Record finite motion and declared task quality on fixed queries."""
         from .unified_solver import motion_cost, time_mean_weights
         ordinary = np.linspace(0., trajectory.duration, (self.budget.knots+4)*self.budget.interpolation_steps+1)
         _, times, progress = self._candidate_queries(trajectory, ordinary)
@@ -3531,8 +3558,18 @@ class _ConstrainedPlanner:
         mapping, times, progress = self._candidate_queries(trajectory, _candidate_sample_times(trajectory, self.budget))
         if len(times) > self.budget.max_validation_points:
             raise MotionPlanningError('capacity_exceeded', 'Candidate queries exceed the declared budget')
+        # BEGIN candidate-specific clocks admit their actual interval record peak.
+        # An input curve may have many progress knots independent of its cubic
+        # knots. The original initialization estimate is refined before this
+        # candidate allocates records, using the same host cap and scene model.
+        workspace = _planning_workspace_bytes(candidate_scene, self.robot_metadata, self.budget,
+            len(mapping.anchor_parameters(self.anchors)), clock_nodes=len(mapping.u))
+        _require_planning_host_memory(workspace.pending_cpu_bytes, encoded_record_bytes_upper=0,
+                                     max_host_rss_bytes=self.budget.max_host_rss_bytes)
+        # END already resident fields remain in measured RSS, not pending bytes.
         tensor = lambda value: self.torch.as_tensor(value, dtype=self.torch.float64)[None]
-        details, channels = {}, {}
+        details, channels, evidence = {}, {}, []
+        parameters, progress = mapping.query_parameters(times, trajectory.duration, self.anchors)
         with self.torch.no_grad():
             self.check_request()
             states, (q, dq, names, _, tool, twist) = self._candidate_robot_state(
@@ -3543,8 +3580,8 @@ class _ConstrainedPlanner:
             terms['query_completeness'] = q.new_tensor(float(bool(issues)))
             terms['process_scene'] = _scene_boundary_evaluate(candidate_scene, self.problem, mapping,
                 q.new_empty((1, len(times), 0, 4)), *tool, tensor(progress), states[0], self.joint_names,
-                trajectory_time=tensor(times), normalized_time=tensor(times/trajectory.duration),
-                component_diagnostics=details, scene_evidence_out=channels)
+                trajectory_time=tensor(times), normalized_time=tensor(parameters),
+                component_diagnostics=details, scene_evidence_out=channels, geometry_evidence_out=evidence)
             record_work(points=len(times))
             self.check_request()
             def maximum(value):
@@ -3558,11 +3595,18 @@ class _ConstrainedPlanner:
         for target, category in (('collision_residuals', 'collision'), ('scene_update_residuals', 'scene_update'),
                 ('coverage_residuals', 'coverage'), ('conditional_unknown_residuals', 'conditional_unknown')):
             report[target] = {category: maximum(channels[category])} if category in channels else {}
-        return report, times/trajectory.duration, len(times)
+        # BEGIN the original finite query also owns release and interval evidence.
+        released_scene = (candidate_scene.with_release_history(*tool, tensor(progress))
+            if any(relation.release_condition_id is not None for owner in candidate_scene.owners
+                   for relation in owner.attachments) else candidate_scene)
+        initial_states = _geometry_query_states(evidence, times, progress,
+            terms['process_scene'].detach().cpu().numpy()[0])
+        return report, parameters, len(times), (released_scene, initial_states)
+        # END later batches reuse these charged times and candidate-private poses.
     # END final acceptance is independent of numerical solver termination.
 
     # BEGIN one exact-curve scene callback supplies interval proof and hard evidence.
-    def _candidate_geometry(self, trajectory, candidate_scene, *, remaining_points, record_work):
+    def _candidate_geometry(self, trajectory, candidate_scene, *, initial_states, remaining_points, record_work):
         """Check continuous entity separation on the candidate's physical clock.
 
         Scene queries evaluate the original polynomial and its release anchors.
@@ -3573,43 +3617,30 @@ class _ConstrainedPlanner:
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         motion = SceneMotionBounds.from_scene(candidate_scene, tool_link=self.problem.tool_link,
                                               T_link_tool=self.problem.tool_transform)
-        columns = [trajectory.joint_names.index(name) for name in self.joint_names]
-        release_progress = [relation.interval[1] for owner in candidate_scene.owners
-                            for relation in owner.attachments if relation.release_condition_id is not None
-                            and self.problem.start_progress <= relation.interval[1] <= self.problem.end_progress]
-        release_times = (mapping.anchor_parameters(release_progress)[:, 0]*trajectory.duration
-                         if release_progress else np.empty(0))
-        hard, categories, details = [], {}, {}
-        # BEGIN one immutable candidate owns one set of modeled release anchors.
-        released_scene = candidate_scene if not len(release_times) else None
+        hard = [state["residuals"]["scene"] for state in initial_states]
+        categories, details = {}, {}
 
         def query(times_s, *, point_budget):
-            nonlocal released_scene
-            times = np.unique(np.r_[np.asarray(times_s, float),
-                release_times if released_scene is None else np.empty(0)])
+            times = np.asarray(times_s, float)
             if len(times) > point_budget:
-                return {"states": [], "query_points": 0, "capacity_exhausted": True}
+                raise ValueError("Interval batch exceeds its remaining physical point budget")
+            parameters, progress = mapping.query_parameters(times, trajectory.duration, self.anchors)
             self.check_request()
-            q, dq, _, progress = trajectory.sample(times)
             # BEGIN interval witnesses use the saved binary64 curve and CPU FK.
             tensor = lambda value: self.torch.as_tensor(value, dtype=self.torch.float64)
             with self.torch.no_grad():
                 states, (_, _, _, _, (position, quaternion), _) = self._candidate_robot_state(
                     trajectory, candidate_scene, times, progress)
                 evidence, scene_channels, query_details = [], {}, {}
-                active_scene = candidate_scene if released_scene is None else released_scene
-                values = _scene_boundary_evaluate(active_scene, self.problem, mapping,
+                values = _scene_boundary_evaluate(candidate_scene, self.problem, mapping,
                     position.new_empty((1, len(times), 0, 4)), position, quaternion,
                     tensor(progress)[None], states[0], self.joint_names,
-                    trajectory_time=tensor(times)[None], normalized_time=tensor(times/trajectory.duration)[None],
+                    trajectory_time=tensor(times)[None], normalized_time=tensor(parameters)[None],
                     component_diagnostics=query_details, scene_evidence_out=scene_channels,
                     geometry_evidence_out=evidence)
                 # BEGIN count each completed scene query exactly once.
                 record_work(points=len(times))
                 # END counts remain committed if a later batch is interrupted.
-                if released_scene is None:
-                    released_scene = candidate_scene.with_release_history(position, quaternion, tensor(progress)[None])
-                # END subsequent samples reuse anchors from this same exact curve.
                 # Keep the most severe original component and its own time;
                 # a later smaller violation must not replace that witness.
                 for name, entry in query_details.items():
@@ -3625,20 +3656,13 @@ class _ConstrainedPlanner:
                     categories[name] = (float("inf") if not np.isfinite(numbers).all()
                                         else max(previous, float(numbers.max())))
             # END no rounded native state supplies interval acceptance evidence.
-            states = {}
-            for row in evidence:
-                index = row["query_index"][1]
-                key = (float(times[index]), row["side"])
-                pair = {name: value for name, value in row.items()
-                        if name not in {"state_index", "query_index", "time_s", "side"}}
-                state = states.setdefault(key, {"time_s": key[0], "side": key[1],
-                    "progress": float(progress[index]), "residuals": {"scene": float(values[index])}, "pairs": []})
-                state["pairs"].append(pair)
+            states = _geometry_query_states(evidence, times, progress, values)
             self.check_request()
-            return {"states": list(states.values()), "query_points": len(times), "capacity_exhausted": False}
+            return {"states": states, "query_points": len(times), "capacity_exhausted": False}
 
         report = check_interval_geometry(trajectory, motion, query,
-            max_query_points=max(0, remaining_points), spatial_step_m=self.budget.validation_spatial_step_m)
+            max_query_points=remaining_points, spatial_step_m=self.budget.validation_spatial_step_m,
+            initial_states=initial_states)
         report["hard_scene_residual"] = (float("inf") if not np.isfinite(hard).all()
                                          else max(hard, default=0.))
         report["scene_categories"] = categories
@@ -3652,18 +3676,19 @@ class _ConstrainedPlanner:
 
         ``record_work`` commits started validation attempts and completed query
         points to the request ledger. ``objective`` may contain the fixed score
-        already computed for this same curve during native candidate ranking.
+        already computed for this same curve before complete qualification.
         """
         record_work(passes=1)
         self.delivery_candidate, self.last_validation = trajectory, None
         scene = self.scene if candidate_scene is None else candidate_scene
-        attempt, parameters, points = self._candidate_metrics(trajectory, scene, record_work=record_work)
+        attempt, parameters, points, (geometry_scene, initial_states) = self._candidate_metrics(
+            trajectory, scene, record_work=record_work)
         validation = self._candidate_domain_validation(trajectory)
         residuals = {**attempt["residuals"], **trajectory.residuals}
         accepted = bool(attempt["accepted"]) and all(
             np.isfinite(value) and value <= 0 for value in residuals.values())
         if accepted:
-            geometry = self._candidate_geometry(trajectory, scene,
+            geometry = self._candidate_geometry(trajectory, geometry_scene, initial_states=initial_states,
                 remaining_points=self.budget.max_validation_points-points, record_work=record_work)
             points += geometry["query_points"]
             attempt["continuous_geometry"] = geometry
@@ -3700,7 +3725,8 @@ class _ConstrainedPlanner:
             # fixed samples. Recompute their pending/resident split before
             # the solver combines this amount with its actual dense row count.
             workspace = _planning_workspace_bytes(self.computation.scene, self.robot_metadata,
-                                                  self.budget, self.anchor_capacity)
+                                                  self.budget, self.anchor_capacity,
+                                                  clock_nodes=len(self.progress_map.u))
             runtime = {"seed_index": seed_index}
             self.last_optimizer_runtime.append(runtime)
             try:
@@ -3744,14 +3770,15 @@ class _ConstrainedPlanner:
         # END report_out survives the original exception without qualifying a curve.
 
     def select_candidate(self, results, *, record_work, on_candidate):
-        """Validate each completed result and publish it before advancing its iterator.
+        """Return the first candidate whose complete qualification callback finishes.
 
-        The callback receives the current saved curve and its exact validation
-        while they still own the native delivery buffers. The caller freezes a
-        qualified incumbent there. Result order is the original seed order;
-        fixed_objective compares completed accepted curves in common units.
+        The callback receives the current curve and exact validation while they
+        own the delivery buffers. For an accepted curve it completes execution
+        binding and the request check before returning. Only rejected curves
+        advance the original seed iterator; all-rejected requests retain the
+        least severe completed failure for diagnosis.
         """
-        # BEGIN selection consumes a serial result stream, retaining original indices.
+        # BEGIN first qualified delivery stops the serial solver result stream.
         reports, selected, selected_key, query_points = [], None, None, 0
         for index, result in enumerate(results):
             provenance = {'seed_index': index, 'seed_provenance': self.seed_strategies[index],
@@ -3769,9 +3796,14 @@ class _ConstrainedPlanner:
                 'validation_query_points': query_points, 'evaluated_candidate_count': len(reports)}
             self.delivery_candidate = trajectory
             on_candidate(result, current)
+            if report['accepted']:
+                # A successful callback has completed binding and its deadline
+                # check. Returning here never requests the next solver seed;
+                # fixed_objective remains finite evidence for this same curve.
+                return result, trajectory, current
             values = list(report['residuals'].values())
             severity = sum(max(0., value) for value in values) if np.isfinite(values).all() else float('inf')
-            key = (not report['accepted'], report['fixed_objective'] if report['accepted'] else severity, index)
+            key = (severity, index)
             if selected_key is None or key < selected_key:
                 selected = (index, result, trajectory, report, deepcopy(self.last_validation))
                 selected_key = key
@@ -3781,7 +3813,7 @@ class _ConstrainedPlanner:
         self.delivery_candidate = trajectory
         return result, trajectory, {**report, 'selected_seed_index': index, 'candidates': reports,
             'validation_query_points': query_points, 'evaluated_candidate_count': len(reports)}
-        # END later rejected candidates cannot detach a selected curve from its evidence.
+        # END failed-candidate diagnosis retains its own saved curve and evidence.
     # END library status is reported independently of physical/task/scene acceptance.
 
     def _controls_curve(self, actions):
@@ -3969,9 +4001,8 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
     schedule of remaining work or creates selected retry occurrences; ordinary
     continuation preserves the original frozen clock. Every request admitted
     including initialization failure carries the cumulative ledger. No GPU stage is
-    claimed to be preemptible. A candidate qualifies only after all required
-    work completes within budget; later improvement exhaustion preserves that
-    independently stored delivery record.
+    claimed to be preemptible. The first candidate whose required validation
+    and execution binding finish within budget is delivered immediately.
     """
     from .execution_binding import bind_candidate, plain
     from .planning_problem import TimeBindingError
@@ -4165,6 +4196,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         check()
         diagnostics.update(backend="scipy_slsqp_with_native_ik", batch_size=1, ik_seeds=budget.ik_seeds,
             trajectory_seeds=budget.trajectory_seeds, used_ompl=False,
+            route=planner.route, recovery=None,
             timing_policy="explicit_rebind_then_frozen" if rebind is not None else "source_proposal_then_frozen_binding",
             native_trajectory_dt=planner.budget.maximum_trajectory_dt,
             scene=scene.describe(), scene_workspace_bytes=planner.scene_workspace_bytes,
@@ -4196,8 +4228,6 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             nonlocal incumbent
             if not attempt["accepted"] or validation is None:
                 raise ValueError("Only a completely validated candidate may enter execution binding")
-            if incumbent is not None and attempt["fixed_objective"] >= incumbent["report"]["fixed_objective"]:
-                return False
             bound_scene = scene if binding_scene is None else binding_scene
             binding = bind_candidate(trajectory, problem=problem, scene=scene if binding_scene is None else binding_scene,
                 validation=deepcopy(validation), native_report=attempt)
@@ -4230,10 +4260,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                 binding.update({name: deepcopy(prior[name]) for name in (
                     "physics_budget", "consumed_physics_steps", "remaining_physics_steps",
                     "device_policy", "active_finger_interval")})
-            # All work required to qualify and bind this candidate must
-            # finish within budget. Cleanup after that fact is recorded,
-            # but cannot erase an already available qualified candidate.
-            # BEGIN freeze all delivery data before a later query replaces native buffers.
+            # BEGIN the first complete binding owns delivery before cleanup.
+            # Required qualification and binding finish within budget. Cleanup
+            # is recorded afterward and cannot erase this completed record.
             binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
             record = {"trajectory": deepcopy(trajectory), "binding": binding,
                 "report": deepcopy(attempt), "validation": deepcopy(validation),
@@ -4244,7 +4273,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             check()
             record["qualified_elapsed_seconds"] = time.monotonic()-started
             incumbent = record
-            # END a completed record does not depend on the planner's last candidate.
+            # END a completed record does not depend on mutable planner buffers.
 
             # BEGIN only a fully qualified candidate receives this readiness milestone.
             mark_wallclock("qualified_candidate_ready")
@@ -4267,8 +4296,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
 
         def qualify_native(result, attempt):
             """Export immediately while the selected native validation still belongs to this curve."""
-            if not attempt["accepted"] or (incumbent is not None
-                    and attempt["fixed_objective"] >= incumbent["report"]["fixed_objective"]):
+            if not attempt["accepted"]:
                 return
             check()
             curve, _ = planner.export(result, attempt)
@@ -4295,6 +4323,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             if reference_attempt["accepted"]:
                 qualify_candidate(candidate, planner.last_validation, reference_attempt, binding_scene=candidate_scene)
                 diagnostics.update(reference_candidate=deepcopy(reference_attempt), route="candidate_metrics")
+                # BEGIN an accepted supplied polynomial needs no later initializer.
+                return deliver_incumbent()
+                # END its original physical clock remains the delivered clock.
             # BEGIN explicit observation requests stop at the completed reference verdict.
             policy_failure = _unknown_policy_failure(reference_attempt, candidate_scene.unknown_policy)
             if policy_failure == "needs_observation":
@@ -4311,7 +4342,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                     diagnostic_candidate_scope="Supplied joint curve; no execution authorization",
                     failure_scope="Supplied curve lacks current model support; other routes were not evaluated")
                 return outcome
-        # END the supplied curve remains eligible while native proposals improve reference fit.
+        # END rejected supplied curves retain the same bounded repair route.
         grid = _fixed_spline_grid(intervals=planner.budget.knots+4,
             native_dt=planner.budget.maximum_trajectory_dt, interpolation_steps=planner.budget.interpolation_steps,
             interpolation_dt=planner.budget.interpolation_dt)
@@ -4360,6 +4391,10 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             **deepcopy(attempt), "source": "validated_reference_seed", "validation_status": "completed",
             "curve": curve_snapshot(trajectory)}
         # END later numerical trials have separate geometry and validation status.
+        # BEGIN every source stops after the same complete execution binding.
+        if incumbent is not None:
+            return deliver_incumbent()
+        # END rejected reference initialization alone enters search and solving.
         observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == 'needs_observation'
         recovery = None
         search_used = False
@@ -4409,9 +4444,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             stage = "main_solve"
             native_result, trajectory, attempt = select_candidate(planner.optimize(
                 seeds, iterations=planner.main_trajectory_iterations))
+            if incumbent is not None:
+                diagnostics.update(route=planner.route, recovery=recovery,
+                    used_ompl=recovery in {"ompl", "ompl_failed"})
+                return deliver_incumbent()
             check()
             observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
-            if (incumbent is None and not attempt["accepted"] and not observation_required and not search_used
+            if (not attempt["accepted"] and not observation_required and not search_used
                     and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves):
                 # Newly discovered geometry failure can use the still-unspent
                 # search and optimization batch. Failed search adds no batch.
@@ -4422,11 +4461,13 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
                         consumed["trajectory_solves"] += 1
                         stage = "recovery_solve"
                         native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
+                        if incumbent is not None:
+                            diagnostics.update(route=planner.route, recovery=recovery,
+                                used_ompl=recovery in {"ompl", "ompl_failed"})
+                            return deliver_incumbent()
                         check()
         # END task, contact, unknown-space and continuous-domain checks are unchanged.
         diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})
-        if incumbent is not None:
-            return deliver_incumbent()
         # BEGIN completed finite search reports its selected failure evidence.
         candidate_source = ("validated_reference_seed" if trajectory is reference_trajectory
                             else "validated_optimizer_candidate")
@@ -4440,12 +4481,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         return outcome
         # END an executable result is delivered only by the completed incumbent record.
     except Exception as error:
-        # BEGIN improvement exhaustion preserves only work completed within budget.
-        if isinstance(error, PlanningWorkExhausted) and incumbent is not None:
-            diagnostics["improvement_end"] = {"reason": "cumulative_planning_budget_exhausted",
-                "stage": stage, "detail": str(error)}
-            return deliver_incumbent()
-        # END cancellation, deadlines and unexpected errors keep their own failure semantics.
+        # BEGIN every error precedes completed delivery and retains its own type.
         # BEGIN preserve the original failure stack without repeating any query.
         import traceback
         diagnostics.update(failure=(error.reason if isinstance(error, MotionPlanningError)
@@ -4454,6 +4490,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             else "event_time_requirement_unsatisfied" if isinstance(error, TimeBindingError)
             else "planning_stage_failed"), failed_stage=stage, reason=str(error), error_type=type(error).__name__,
             failure_traceback=traceback.format_exc())
+        # END no unsuccessful binding or interrupted solve authorizes execution.
         # END stage context and native API failures remain directly diagnosable.
         # BEGIN interruption diagnostics identify the curve that produced each record.
         candidate = getattr(planner, "diagnostic_optimizer_candidate", None)

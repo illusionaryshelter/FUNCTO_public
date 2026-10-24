@@ -224,14 +224,14 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
         try:
             self.assertTrue(result.success)
-            self.assertEqual(completed, [True, True])
+            self.assertEqual(completed, [True])
             self.assertEqual(native.export.call_count, 1)
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 2)
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 1 + 14)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 1)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 1 + 7)
         finally:
             backend.close()
 
-    def test_partial_second_validation_retains_queries_and_only_a_qualified_incumbent(self):
+    def test_first_qualification_avoids_a_later_partial_validation(self):
         for reference_passed in (False, True):
             with self.subTest(reference_passed=reference_passed):
                 native = Native([reference_passed, False])
@@ -260,16 +260,18 @@ class PlanningRequestBudgetTest(unittest.TestCase):
                     result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
                 try:
                     self.assertEqual(result.success, reference_passed)
-                    self.assertEqual(attempts, [reference_passed, False])
                     work = result.request_ledger['consumed_planning']
-                    self.assertEqual(work['validation_passes'], 2)
-                    self.assertEqual(work['validation_queries'], 1 + 7 + 5)
                     if reference_passed:
+                        self.assertEqual(attempts, [True])
+                        self.assertEqual(work['validation_passes'], 1)
+                        self.assertEqual(work['validation_queries'], 1 + 7)
+                        self.assertEqual(work['trajectory_solves'], 0)
                         self.assertIsNotNone(result.execution_binding)
-                        self.assertEqual(result.diagnostics['improvement_end']['reason'],
-                                         'cumulative_planning_budget_exhausted')
                         self.assertEqual(native.calls.count('export'), 1)
                     else:
+                        self.assertEqual(attempts, [False, False])
+                        self.assertEqual(work['validation_passes'], 2)
+                        self.assertEqual(work['validation_queries'], 1 + 7 + 5)
                         self.assertIsNone(result.execution_binding)
                         self.assertEqual(result.diagnostics['failure'], 'cumulative_planning_budget_exhausted')
                         self.assertNotIn('export', native.calls)

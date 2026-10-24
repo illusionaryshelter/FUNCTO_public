@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：与本次实现代码一并提交；最终验证记录回填该实现提交。组件正文描述当前实现，阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 输入的来源与相互依赖
 
@@ -57,7 +57,9 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 对于物体运动，旋转对象是上述固定材料功能坐标 M。记原名义路径为 `T_W_M(s)`，功能路径为 `T_W_F(s)`，技能进度为 s。原初始旋转在 F 中为 `R_n0=R_W_F(0)^T R_W_M(0)`，当前初始旋转为 `R_c=R_W_F(0)^T R_W_body(0) R_body_M`。当前物体模型位姿由已有观测或 `T_W_E A` 给出。`_initial_rotation_offset` 将二者转换为上述 RPY，按布尔值选定入口 `R_a`，计算固定修正 `D=R_a R_n0^T`，同时返回选择依据与修正矩阵。抓取工具参考使用同一规则，移动坐标 M 取已标定的 E。
 
-`_RotationOffsetPath` 保存原连续材料路径、连续功能路径与 D。每次查询时先求两个父路径，再计算 `R'_W_M(s)=R_W_F(s) D R_W_F(s)^T R_W_M(s)`，材料原点位置 `p_W_M(s)` 保持原函数。其 `sample` 返回保持 Torch 进度导数的位置和 wxyz 四元数；继承的 `sample_numpy` 返回同一位姿函数。该类型的 `poses` 为自身节点处的精确缓存，物体和末端变换通过普通子 `PosePath` 在每次查询时右乘。因而旋转偏移造成的物体原点与 TCP 杆臂位移仍属于同一连续函数。当前入口的三个分量全部选择运行初态时，材料入口朝向与本次模型初态一致；仅 yaw 选择运行初态时，D 是 F-z 轴的固定旋转，原参考的 roll/pitch 曲线保持原值。
+`planning_problem.RotationOffsetPath` 保存原连续材料路径、连续功能路径与 D，参考生成和归档恢复共同调用该路径类型。每次查询时先求两个父路径，再计算 `R'_W_M(s)=R_W_F(s) D R_W_F(s)^T R_W_M(s)`，材料原点位置 `p_W_M(s)` 保持原函数。其 `sample` 返回保持 Torch 进度导数的位置和 wxyz 四元数；继承的 `sample_numpy` 返回同一位姿函数。该类型的 `poses` 为自身节点处的精确缓存，物体和末端变换通过普通子 `PosePath` 在每次查询时右乘。因而旋转偏移造成的物体原点与 TCP 杆臂位移仍属于同一连续函数。当前入口的三个分量全部选择运行初态时，材料入口朝向与本次模型初态一致；仅 yaw 选择运行初态时，D 是 F-z 轴的固定旋转，原参考的 roll/pitch 曲线保持原值。
+
+`PosePath.to_record` 声明可重建的连续表达式，`execution_binding.plain` 将其递归转换为 JSON 数据。`kind='pose'` 保存原节点、源依据、机构模型与展开坐标、固定 attachment 以及完整 parent；`kind='functional_rotation_offset'` 保存 nominal、functional、原修正矩阵 D 和源依据。旋转偏移的派生节点缓存不替代这两个连续输入。`PosePath.from_record` 按上述运算类型恢复相同路径对象，机构恢复复用 `_model_from_diagnostics`；JSON 往返保持节点间位姿、左右分支进度导数及多圈机构坐标。任务阶段和显式过程关系经 `plain` 使用同一记录入口，场景 owner 的位姿归档也复用该接口，其可用运动类型仍由 `CollisionOwner` 定义。
 
 `generate_reference` 在字段的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
 
@@ -144,7 +146,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `task_jacobian` 在实际任务行数 m 小于自由系数数 n 时逐行反向，否则先建立 `p(x,v)=J(x)ᵀv`，再仅对独立权向量 v 求导得到 J 的各列。这里 x 为自由系数、J 为所提交原任务行对 x 的一阶导数。两种路径都使用既有 Pinocchio 一阶运动学接口和 Torch 标量反向传播。
 
-`TrajectoryComputation.objective_components` 在同一候选上计算三部分：普通积分查询上的 STATE 关节运动质量、`optimizer_preferences(phase="quality")` 的声明任务偏好、场景已观测几何的搜索目标。STATE 的权重、激活距离与物理时间因子来自既有 cuRobo 配置，梯形积分按物理时长归一化；补入事件查询不会改变普通运动质量的积分权重。工具和物体的几何允许条件仍由对应原任务行及场景验收计算确定。候选保存后的复核调用同一 `robot_tool_states`，输入为保存曲线自身的时间、关节状态和技能进度。
+`TrajectoryComputation.objective_components` 在同一候选上计算三部分：普通积分查询上的 STATE 关节运动质量、`optimizer_preferences(phase="feasibility")` 的过程关系与方向偏好、场景已观测几何的搜索目标。STATE 的权重、激活距离与物理时间因子来自既有 cuRobo 配置，梯形积分按物理时长归一化；补入事件查询不会改变普通运动质量的积分权重。工具和物体的几何允许条件仍由对应原任务行及场景验收计算确定。候选保存后的复核调用同一 `robot_tool_states`，输入为保存曲线自身的时间、关节状态和技能进度。
 
 数值求解器在核对声明常量后确定实际提交的任务行数，并据此计算 SciPy 密集工作区、约束 Jacobian、矩阵拼接和反向传播的同时存活数组。每个串行候选开始前，调用方重算场景待分配固定材料和一次几何/FK 临时图，以 `pending_geometry_bytes` 传入。第一次主机准入位于 SLSQP 工作区、密集任务 Jacobian 和标量反向求导之前；初始任务求值中已分配的 Pinocchio 原生 Jacobian/速度导数由 RSS 计入。`task_jacobian` 的第二次准入在行路径首行求导前、列路径建立第一次反向图之后，分别考虑新密集矩阵、一个返回行或列及 Pinocchio 临时反向缓冲。列路径的独立权向量和第一次反向图此时属于 RSS，行路径没有这两项。每次系数改变时，目标、任务与连续关节约束缓存同步清空。求解器报告保留库终止原因、系数变化及各部分内存需求，最终接受由原条件的保存曲线复核决定。
 

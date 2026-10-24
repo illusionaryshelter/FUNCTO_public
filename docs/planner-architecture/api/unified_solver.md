@@ -1,6 +1,6 @@
 # `manipulation/unified_solver.py` 实现契约
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`CURRENT_IMPLEMENTATION`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `time_mean_weights`
@@ -509,7 +509,7 @@ def objective_components(self, controls, *, include_geometry=True):
 
 实现说明：
 
-> Motion quality and declared task preferences share the same candidate.
+> Search the declared feasible set using motion and process preferences.
 
 显式输出分支：
 
@@ -552,7 +552,7 @@ ordinary
 value
 costs
 preferences
-costs['task_quality']
+costs['task_preferences']
 costs['observed_geometry']
 ```
 
@@ -570,7 +570,7 @@ self.scene.optimization_objective
 
 ## `ConstrainedSolution`
 
-[定义位置](../../../manipulation/unified_solver.py#L191)。
+[定义位置](../../../manipulation/unified_solver.py#L196)。
 
 ```python
 class ConstrainedSolution():
@@ -589,7 +589,7 @@ report: dict
 
 ## `task_jacobian`
 
-[定义位置](../../../manipulation/unified_solver.py#L198)。
+[定义位置](../../../manipulation/unified_solver.py#L203)。
 
 输入签名：
 
@@ -679,7 +679,7 @@ column.detach
 
 ## `solver_storage_bytes`
 
-[定义位置](../../../manipulation/unified_solver.py#L241)。
+[定义位置](../../../manipulation/unified_solver.py#L246)。
 
 输入签名：
 
@@ -732,7 +732,7 @@ max
 
 ## `solve_trajectory`
 
-[定义位置](../../../manipulation/unified_solver.py#L280)。
+[定义位置](../../../manipulation/unified_solver.py#L285)。
 
 输入签名：
 
@@ -955,7 +955,7 @@ type
 
 ## `solve_trajectory.snapshot_for`
 
-[定义位置](../../../manipulation/unified_solver.py#L313)。
+[定义位置](../../../manipulation/unified_solver.py#L318)。
 
 输入签名：
 
@@ -995,7 +995,7 @@ np.asarray
 
 ## `solve_trajectory.callback`
 
-[定义位置](../../../manipulation/unified_solver.py#L320)。
+[定义位置](../../../manipulation/unified_solver.py#L325)。
 
 输入签名：
 
@@ -1034,7 +1034,7 @@ check_request
 
 ## `solve_trajectory.admit_task_derivatives`
 
-[定义位置](../../../manipulation/unified_solver.py#L409)。
+[定义位置](../../../manipulation/unified_solver.py#L414)。
 
 输入签名：
 
@@ -1069,7 +1069,7 @@ require_host_memory
 
 ## `solve_trajectory.evaluate`
 
-[定义位置](../../../manipulation/unified_solver.py#L422)。
+[定义位置](../../../manipulation/unified_solver.py#L427)。
 
 输入签名：
 
@@ -1176,7 +1176,7 @@ required.issubset
 
 ## `solve_trajectory.scaled_objective`
 
-[定义位置](../../../manipulation/unified_solver.py#L484)。
+[定义位置](../../../manipulation/unified_solver.py#L489)。
 
 输入签名：
 

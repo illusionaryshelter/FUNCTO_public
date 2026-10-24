@@ -227,6 +227,78 @@ class PosePath:
             quaternion.detach().numpy().reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape(*values.shape, 3, 3)
         return output
 
+    # BEGIN archived paths retain the expression evaluated between their knots.
+    def to_record(self):
+        """Declare the original interpolation, mechanism and composition inputs.
+
+        Array and nested object conversion belongs to execution_binding.plain.
+        The explicit kind identifies this operation, not a task or skill. A
+        parent remains an independently evaluated path rather than multiplied
+        pose samples; motion coordinates preserve unwrapped mechanism motion.
+        """
+        return {"kind": "pose", "progress": self.progress, "poses": self.poses,
+                "source": self.source, "motion_model": self.motion_model,
+                "coordinates": self.coordinates, "attachment": self.attachment,
+                "parent": self.parent}
+
+    @staticmethod
+    def from_record(record):
+        """Restore a typed path produced by plain(path), using the same API.
+
+        Both expression kinds below have concrete current producers and
+        consumers. A record of sampled poses alone does not identify an
+        omitted continuous composition and is not interpreted as one.
+        """
+        kind = record["kind"]
+        if kind == "functional_rotation_offset":
+            return RotationOffsetPath(PosePath.from_record(record["nominal"]),
+                PosePath.from_record(record["functional"]), record["rotation"],
+                source=deepcopy(record["source"]))
+        if kind != "pose":
+            raise ValueError(f"Unknown continuous pose path operation: {kind}")
+        model = record["motion_model"]
+        parent = record["parent"]
+        return PosePath(record["progress"], record["poses"], deepcopy(record["source"]),
+            None if model is None else _model_from_diagnostics(model), record["coordinates"],
+            record["attachment"], None if parent is None else PosePath.from_record(parent))
+    # END the numeric cache cannot substitute for a composed curve's operands.
+
+
+# BEGIN one reusable path operation owns functional-frame rotation correction.
+class RotationOffsetPath(PosePath):
+    """Rotate a material frame in F, retaining its original world position.
+
+    nominal supplies T_W_M(s), functional supplies T_W_F(s), and rotation is
+    a constant left correction D in F. Sampling evaluates
+    R_W_M = R_W_F D R_W_F.T R_nominal and p_W_M = p_nominal.
+    Child PosePath attachments retain the resulting rotating lever arms.
+    """
+
+    def __init__(self, nominal, functional, rotation, *, source):
+        self.nominal = nominal
+        self.functional = functional
+        # Keep the original matrix operand so JSON restoration repeats the
+        # same quaternion conversion; derived knot poses remain only a cache.
+        self.rotation = np.asarray(rotation, dtype=float).copy()
+        self.rotation_quaternion = Rotation.from_matrix(self.rotation).as_quat()[[3, 0, 1, 2]]
+        poses = nominal.sample_numpy(nominal.progress)
+        frame = functional.sample_numpy(nominal.progress)[:, :3, :3]
+        poses[:, :3, :3] = frame @ self.rotation @ np.swapaxes(frame, -1, -2) @ poses[:, :3, :3]
+        super().__init__(nominal.progress, poses, source=source)
+
+    def sample(self, progress, *, side="right"):
+        position, orientation = self.nominal.sample(progress, side=side)
+        _, functional = self.functional.sample(progress, side=side)
+        local = quaternion_multiply(quaternion_conjugate(functional), orientation)
+        corrected = quaternion_multiply(_tensor(self.rotation_quaternion, progress), local)
+        return position, quaternion_multiply(functional, corrected)
+
+    def to_record(self):
+        """Retain the two continuous inputs and the actual constant operand."""
+        return {"kind": "functional_rotation_offset", "nominal": self.nominal,
+                "functional": self.functional, "rotation": self.rotation, "source": self.source}
+# END reference generation and archival restoration call this same operation.
+
 
 @dataclass(frozen=True)
 class NumericalTolerance:

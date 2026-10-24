@@ -530,8 +530,8 @@ class PhysicalTimeRequirementsTest(unittest.TestCase):
 
     def test_cleanup_overrun_keeps_an_already_qualified_candidate(self):
         from test_motion_backend_contract import Native, Scene
-        # BEGIN the completed request includes one main reference improvement.
-        planner = Native([True, True])
+        # BEGIN the first complete qualification enters cleanup immediately.
+        planner = Native([True])
         # END cleanup still happens after complete qualification.
         clock = {"time": 0.}
         planner.close = lambda: clock.update(time=2.)

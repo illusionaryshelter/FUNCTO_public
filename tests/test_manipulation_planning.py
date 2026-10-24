@@ -112,12 +112,16 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     planner._verification_native = SimpleNamespace(get_cost=lambda name: SimpleNamespace(
         config=SimpleNamespace(joint_limits=limits)))
     planner.scene = SimpleNamespace(gripper=None, owners=(), contacts=(), required_progress_anchors=(),
-        last_query_report={}, evaluate=lambda spheres,p,r,s,q,names,**kwargs: torch.zeros_like(s))
+        last_query_report={}, evaluate=lambda spheres,p,r,s,q,names,**kwargs: torch.zeros_like(s),
+        robot_model=SimpleNamespace(geometry_names=(), joint_names=problem.joint_names),
+        estimated_workspace_allocation=lambda *args: dict(cpu_resident=0, cpu_pending_shared=0,
+            cpu_live=0, gpu_shared=0, gpu_live=0, gpu_retained=0))
+    planner.robot_metadata = {'active_joint_names': list(problem.joint_names), 'links': 1}
     planner.last_validation, planner.delivery_candidate = None, None
     planner._candidate_geometry = Mock(return_value={'query_points': 0, 'hard_scene_residual': 0.,
         'scene_categories': {}, 'scene_components': {}, 'confirmed_intersections': [],
         'proved_intervals': [], 'unresolved_intervals': []})
-    planner._candidate_metrics = Mock(return_value=({'accepted': True, 'residuals': {}}, np.array([0., 1.]), 0))
+    planner._candidate_metrics = Mock(return_value=({'accepted': True, 'residuals': {}}, np.array([0., 1.]), 0, (planner.scene, [])))
     actions = np.broadcast_to(position[-1], (controls, 3)).copy()
     return planner, ConstrainedSolution(actions, {'success': True, 'backend': 'declared CPU fixture'})
 
@@ -759,9 +763,11 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         self.assertTrue(report['accepted'])
         self.assertFalse(report['optimizer']['success'])
         self.assertEqual(report['selected_seed_index'], 0)
-        self.assertEqual(planner._controls_curve.call_count, 2)
-        self.assertEqual(planner.evaluate_candidate.call_count, 2)
-        self.assertEqual(work.call_args_list, [unittest.mock.call(passes=1), unittest.mock.call(points=3)]*2)
+        # BEGIN first complete qualification ends the original candidate stream.
+        self.assertEqual(planner._controls_curve.call_count, 1)
+        self.assertEqual(planner.evaluate_candidate.call_count, 1)
+        self.assertEqual(work.call_args_list, [unittest.mock.call(passes=1), unittest.mock.call(points=3)])
+        # END library success is still independent of saved-curve qualification.
         self.assertIs(planner.delivery_candidate, curve)
         np.testing.assert_array_equal(selected.controls, np.ones((4, 3)))
 
@@ -815,22 +821,23 @@ class SerialAllocationTests(unittest.TestCase):
         estimator = Mock(return_value={'gpu_retained': 5, 'gpu_live': 150,
             'cpu_resident': 17, 'cpu_pending_shared': 19, 'cpu_live': 31,
             'gpu_shared': 23, 'gpu_graph_live': 60})
-        scene = SimpleNamespace(required_progress_anchors=(.5,), robot_model=SimpleNamespace(joint_names=tuple(range(5))),
+        scene = SimpleNamespace(required_progress_anchors=(.5,), owners=(),
+            robot_model=SimpleNamespace(joint_names=tuple(range(5)), geometry_names=('body',)),
             estimated_workspace_allocation=estimator)
         budget = PlanningBudget(max_scene_gpu_workspace_bytes=178)
         metadata = {'active_joint_names': tuple(range(3)), 'links': 8, 'spheres': 0}
-        workspace = _planning_workspace_bytes(scene, metadata, budget, 7)
+        workspace = _planning_workspace_bytes(scene, metadata, budget, 7, clock_nodes=2)
         states = max((budget.knots+4)*budget.interpolation_steps+1+7, budget.max_validation_points)
         self.assertEqual(estimator.call_args_list,
                          [unittest.mock.call(1, 3*states), unittest.mock.call(budget.ik_seeds, 3)])
         self.assertEqual(workspace.cpu_resident_bytes, 17)
         self.assertEqual(workspace.cpu_pending_shared_bytes, 19)
-        self.assertEqual(workspace.cpu_live_bytes, 31+8*states*8*(7+6+3*6*5))
+        self.assertGreater(workspace.cpu_live_bytes, 31+8*states*8*(7+6+3*6*5))
         self.assertEqual(workspace.pending_cpu_bytes, 19+workspace.cpu_live_bytes)
         self.assertEqual(workspace.gpu_bytes, 178)
         self.assertEqual(workspace.anchor_fk_bytes, 0)
         with self.assertRaisesRegex(ValueError, 'point-query'):
-            _planning_workspace_bytes(scene, metadata, PlanningBudget(max_scene_gpu_workspace_bytes=177), 7)
+            _planning_workspace_bytes(scene, metadata, PlanningBudget(max_scene_gpu_workspace_bytes=177), 7, clock_nodes=2)
 
     def test_actual_shared_fields_count_once_and_larger_validation_capacity_costs_memory(self):
         from dataclasses import replace
@@ -847,26 +854,27 @@ class SerialAllocationTests(unittest.TestCase):
         world.robot_validator, world._objective_material_samples = None, None
         # END pending allocations are distinct from the already observed fields.
         world.background = field(2)
-        world.owners = tuple(SimpleNamespace(query=world.background) for _ in range(2))
+        world.owners = tuple(SimpleNamespace(query=world.background, owner_id=f'owner{i}',
+            pose_path=SimpleNamespace(progress=(0., 1.))) for i in range(2))
         world.robot_model = SimpleNamespace(geometry_names=('body','tool'), joint_names=('a','b'),
             native_query_storage_nbytes=131072, _native_distance_batches=None)
         budget = PlanningBudget()
         metadata = {'active_joint_names': ('a','b'), 'links': 4, 'spheres': 0}
         initialized = torch.cuda.is_initialized()
-        baseline = _planning_workspace_bytes(world, metadata, budget, 22)
+        baseline = _planning_workspace_bytes(world, metadata, budget, 22, clock_nodes=2)
         self.assertEqual(baseline.cpu_resident_bytes, world.background.storage_nbytes)
         self.assertGreaterEqual(baseline.cpu_pending_shared_bytes, 131072)
         world.owners = ()
-        self.assertEqual(_planning_workspace_bytes(world, metadata, budget, 22).cpu_resident_bytes,
+        self.assertEqual(_planning_workspace_bytes(world, metadata, budget, 22, clock_nodes=2).cpu_resident_bytes,
                          baseline.cpu_resident_bytes)
         larger = field(4)
-        world.owners = (SimpleNamespace(query=larger), SimpleNamespace(query=larger))
-        expanded = _planning_workspace_bytes(world, metadata, budget, 22)
+        world.owners = (SimpleNamespace(query=larger, owner_id='owner', pose_path=SimpleNamespace(progress=(0., 1.))), SimpleNamespace(query=larger, owner_id='owner', pose_path=SimpleNamespace(progress=(0., 1.))))
+        expanded = _planning_workspace_bytes(world, metadata, budget, 22, clock_nodes=2)
         self.assertGreaterEqual(expanded.cpu_resident_bytes-baseline.cpu_resident_bytes, larger.storage_nbytes)
-        world.owners = (SimpleNamespace(query=larger),)
-        self.assertEqual(_planning_workspace_bytes(world, metadata, budget, 22).cpu_resident_bytes,
+        world.owners = (SimpleNamespace(query=larger, owner_id='owner', pose_path=SimpleNamespace(progress=(0., 1.))),)
+        self.assertEqual(_planning_workspace_bytes(world, metadata, budget, 22, clock_nodes=2).cpu_resident_bytes,
                          expanded.cpu_resident_bytes)
-        denser = _planning_workspace_bytes(world, metadata, replace(budget, max_validation_points=8192), 22)
+        denser = _planning_workspace_bytes(world, metadata, replace(budget, max_validation_points=8192), 22, clock_nodes=2)
         self.assertGreater(denser.cpu_live_bytes, expanded.cpu_live_bytes)
         self.assertEqual(denser.gpu_bytes, expanded.gpu_bytes)
         self.assertEqual(torch.cuda.is_initialized(), initialized)

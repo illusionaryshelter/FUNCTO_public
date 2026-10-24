@@ -339,3 +339,97 @@ def test_scene_output_contains_complete_pair_records_through_evaluate(tmp_path):
     assert 0 < native["lower_m"] <= .001
     assert native["distance_scope"] == "full_entities"
     assert all("permission_kind" in row and "state_index" in row for row in evidence)
+
+
+# BEGIN current-frontier batches retain actual work and original clock partitions.
+def test_current_frontier_is_batched_before_new_midpoints_and_stops_after_response():
+    curve = trajectory(duration=1.)
+    query = callback(lambda time, side: [pair(lower_m=0.,
+        status='intersection' if time == .25 else 'unresolved')], sides=(-1, 0, 1))
+    result = check_interval_geometry(curve, ConstantMotion(boundary=.5), query,
+        max_query_points=10, spatial_step_m=.01)
+    assert [times for times, budget in query.calls] == [[0., .5, 1.], [.25, .75]]
+    assert result['query_points'] == 5
+    assert result['queried_times_s'] == [0., .25, .5, .75, 1.]
+    assert result['query_batch_sizes'] == [3, 2]
+    assert result['confirmed_intersections'][0]['time_s'] == .25
+    assert all(row['reason'] == 'not_checked_after_intersection' for row in result['unresolved_intervals'])
+
+
+def test_finite_point_capacity_truncates_only_known_endpoints():
+    curve = trajectory(duration=1.)
+    query = callback(lambda time, side: [pair(lower_m=0.)], sides=(-1, 0, 1))
+    result = check_interval_geometry(curve, ConstantMotion(boundary=.5), query,
+        max_query_points=2, spatial_step_m=.01)
+    assert query.calls == [([0., .5], 2)]
+    assert result['query_points'] == 2
+    assert all(row['reason'] == 'sampling_capacity' for row in result['unresolved_intervals'])
+
+
+def test_initial_intersection_retains_every_supplied_row_without_starting_batch():
+    curve = trajectory(duration=1.)
+    initial = [{'time_s': time, 'side': 0, 'pairs': [pair(status='intersection')]}
+               for time in (0., 1.)]
+    query = callback(lambda time, side: pytest.fail('Initial intersection stops the next batch'))
+    result = check_interval_geometry(curve, ConstantMotion(), query,
+        max_query_points=10, spatial_step_m=.01, initial_states=initial)
+    assert len(result['confirmed_intersections']) == 2
+    assert result['query_points'] == 0 and result['initial_query_points'] == 2
+    assert not query.calls
+# END finite capacities describe the single online schedule actually executed.
+
+
+def test_already_charged_midpoints_refine_with_zero_remaining_point_budget():
+    initial = [{'time_s': time, 'side': 0, 'pairs': [pair(lower_m=.3)]} for time in (0., .5, 1.)]
+    query = callback(lambda time, side: pytest.fail('All three physical points were already charged'))
+    result = check_interval_geometry(trajectory(duration=1.), ConstantMotion(), query,
+        max_query_points=0, spatial_step_m=.01, initial_states=initial)
+    assert len(result['proved_intervals']) == 2 and not result['unresolved_intervals']
+    assert result['query_points'] == 0 and not query.calls
+
+
+def test_cpu_owner_path_clock_preserves_distinct_binary64_crossings():
+    from manipulation.interval_geometry import _progress_times
+    curve = trajectory(duration=1.)
+    values = np.array([.5, np.nextafter(.5, np.inf)])
+    assert values[0].astype(np.float32) == values[1].astype(np.float32)
+    assert _progress_times(curve, values) == values.tolist()
+
+
+def test_actual_attachment_speed_uses_canonical_event_progress_at_ulp_boundary():
+    from manipulation.progress_clock import _ProgressMap
+    u = np.array([0., .5802389457968181, .7626802952975775, .8809815571613527, 1.])
+    s = np.array([0., .23353042542369984, .5599101972234084, .9209446654848804, 1.])
+    anchor, duration = .6152209451882686, 5.247236818531108
+    mapping = _ProgressMap(u, s)
+    start = float(mapping.anchor_parameters([anchor])[0, 0]*duration)
+    end = np.nextafter(start, np.inf)
+    old = np.interp(np.array([start, end])/duration, u, s)
+    assert old.mean() < anchor
+    field = FrozenObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
+        weights=np.ones((2, 2, 2)), origin=[.2, 0., 0.], voxel_size=.1,
+        name='material', source='synthetic RGB-D')
+    path = PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), 'declared stationary relation')
+    owner = CollisionOwner('material', field, path, 'observed field', moving=True,
+        attachments=(Attachment((anchor, 1.), [0., 0., 0.], [1., 0., 0., 0.], 'attachment', None),))
+    bound = SceneMotionBounds.from_scene(bound_scene(owners=(owner,)), tool_link='link1', T_link_tool=np.eye(4))
+    curve = trajectory(duration=duration, names=('arm',))
+    curve.progress_u, curve.progress_s = u, s
+    assert start in bound.declaration_times(curve)
+    assert bound._owner_speed(owner, *old, end-start) < 1e-300
+    actual = bound.interval(curve, start, end)
+    assert actual['speeds']['owner/material'] > .2
+
+
+def test_final_partial_batch_retains_pair_free_children_as_actual_output():
+    initial = [{'time_s': time, 'side': 0, 'pairs': [pair(lower_m=0.)]}
+               for time in np.linspace(0., 1., 9)]
+    query = callback(lambda time, side: [pair(lower_m=0.)])
+    result = check_interval_geometry(trajectory(duration=1.), ConstantMotion(), query,
+        max_query_points=1, spatial_step_m=.001, initial_states=initial)
+    assert query.calls == [([.0625], 1)]
+    rows = result['unresolved_intervals']
+    assert len(rows) == 16
+    assert sum(bool(row.get('pairs')) for row in rows) == 2
+    assert sum('pairs' not in row for row in rows) == 14
+    assert all(row['reason'] == 'sampling_capacity' for row in rows)

@@ -1,6 +1,6 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`CURRENT_IMPLEMENTATION`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -1986,6 +1986,10 @@ value.point_bounds
 value.point_bounds.nbytes
 value.negative_bounds
 value.negative_bounds.nbytes
+value.cell_ranges
+value.cell_ranges.nbytes
+value.cell_radius.nbytes
+value.cell_radius
 rule.feature_points
 self.contacts
 self.robot_model.joint_names
@@ -2008,8 +2012,10 @@ pair
 material_counts
 node
 zero_counts
+index_bytes
 count
 zeros
+index
 samples
 rows
 rule
@@ -2039,7 +2045,7 @@ dict
 
 ## `OnlinePlanningScene.describe`
 
-[定义位置](../../../manipulation/online_geometry.py#L1032)。
+[定义位置](../../../manipulation/online_geometry.py#L1045)。
 
 输入签名：
 
@@ -2083,7 +2089,7 @@ deepcopy
 
 ## `OnlinePlanningScene.to_execution_binding`
 
-[定义位置](../../../manipulation/online_geometry.py#L1044)。
+[定义位置](../../../manipulation/online_geometry.py#L1057)。
 
 输入签名：
 
@@ -2107,12 +2113,6 @@ owner.owner_id
 owner.source
 owner.moving
 owner.pose_interval
-path.progress
-path.poses
-path.source
-path.motion_model
-path.coordinates
-path.attachment
 owner.attachments
 owner.query.record
 owner.query
@@ -2165,6 +2165,7 @@ pair
 ```python
 owners.append
 list
+plain
 _plain
 asdict
 owner.query.record

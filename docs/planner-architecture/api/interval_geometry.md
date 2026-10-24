@@ -1,6 +1,6 @@
 # `manipulation/interval_geometry.py` 实现契约
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`CURRENT_IMPLEMENTATION`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_polynomial_ranges`
@@ -130,7 +130,7 @@ def _progress_times(trajectory, values):
 显式输出分支：
 
 ```python
-output
+(progress_anchor_parameters(u, s, anchors)[:, 0] * trajectory.duration).tolist()
 ```
 
 读取的对象属性：
@@ -138,40 +138,32 @@ output
 ```python
 np.asarray
 trajectory.progress_u
-trajectory.duration
 trajectory.progress_s
-output.extend
-times[progress == value].tolist
-output.append
+(progress_anchor_parameters(u, s, anchors)[:, 0] * trajectory.duration).tolist
+trajectory.duration
 ```
 
 写入目标：
 
 ```python
-times
-progress
-output
+u
+s
+anchors
 value
-a
-b
-sa
-sb
 ```
 
 直接调用符号：
 
 ```python
 np.asarray
-output.extend
-times[progress == value].tolist
-zip
-output.append
 float
+(progress_anchor_parameters(u, s, anchors)[:, 0] * trajectory.duration).tolist
+progress_anchor_parameters
 ```
 
 ## `SceneMotionBounds`
 
-[定义位置](../../../manipulation/interval_geometry.py#L75)。
+[定义位置](../../../manipulation/interval_geometry.py#L69)。
 
 ```python
 class SceneMotionBounds():
@@ -196,7 +188,7 @@ owner_radii: dict
 
 ## `SceneMotionBounds.from_scene`
 
-[定义位置](../../../manipulation/interval_geometry.py#L88)。
+[定义位置](../../../manipulation/interval_geometry.py#L82)。
 
 输入签名：
 
@@ -291,7 +283,7 @@ cls
 
 ## `SceneMotionBounds.declaration_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L127)。
+[定义位置](../../../manipulation/interval_geometry.py#L121)。
 
 输入签名：
 
@@ -347,7 +339,7 @@ result.setdefault(last, set()).add
 
 ## `SceneMotionBounds.partition_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L145)。
+[定义位置](../../../manipulation/interval_geometry.py#L139)。
 
 输入签名：
 
@@ -406,7 +398,7 @@ np.unique
 
 ## `SceneMotionBounds._owner_speed`
 
-[定义位置](../../../manipulation/interval_geometry.py#L159)。
+[定义位置](../../../manipulation/interval_geometry.py#L153)。
 
 输入签名：
 
@@ -509,7 +501,7 @@ max
 
 ## `SceneMotionBounds.interval`
 
-[定义位置](../../../manipulation/interval_geometry.py#L201)。
+[定义位置](../../../manipulation/interval_geometry.py#L195)。
 
 输入签名：
 
@@ -549,12 +541,15 @@ self.robot
 self.robot.coefficients
 self.robot.joint_names
 rates.get
-np.interp
-np.asarray
-trajectory.duration
-trajectory.progress_u
-trajectory.progress_s
+self.scene.required_progress_anchors
 self.scene.owners
+owner.pose_interval
+anchors.extend
+owner.pose_path.progress
+owner.pose_path
+trajectory.progress_s
+trajectory.progress_u
+trajectory.duration
 owner.owner_id
 self._owner_speed
 self.attached_names.values
@@ -584,9 +579,13 @@ joint
 coefficient
 unavailable[name]
 speeds[name]
+anchors
+owner
+a
+b
+_
 s0
 s1
-owner
 ```
 
 直接调用符号：
@@ -601,8 +600,9 @@ _add_up
 _mul_up
 float
 rates.get
-np.interp
-np.asarray
+list
+anchors.extend
+progress_query_parameters
 self._owner_speed
 isinstance
 self.attached_names.values
@@ -612,7 +612,7 @@ unavailable.pop
 
 ## `check_interval_geometry`
 
-[定义位置](../../../manipulation/interval_geometry.py#L249)。
+[定义位置](../../../manipulation/interval_geometry.py#L253)。
 
 输入签名：
 
@@ -637,7 +637,7 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
 显式输出分支：
 
 ```python
-{'confirmed_intersections': intersections, 'proved_intervals': proved, 'unresolved_intervals': unresolved, 'query_points': consumed, 'queried_times_s': sorted(queried_times), 'spatial_step_m': float(spatial_step_m), 'scope': 'continuous_declared_geometry_model'}
+{'confirmed_intersections': intersections, 'proved_intervals': proved, 'unresolved_intervals': unresolved, 'query_points': consumed, 'initial_query_points': initial_points, 'query_batch_sizes': batch_sizes, 'queried_times_s': sorted(queried_times), 'spatial_step_m': float(spatial_step_m), 'scope': 'continuous_declared_geometry_model'}
 ```
 
 读取的对象属性：
@@ -647,9 +647,10 @@ np.isfinite
 motion.declaration_times
 np.asarray
 motion.partition_times
-pending.popleft
+batch_sizes.append
+queried_times.update
 unresolved.extend
-pending.clear
+cache.get
 motion.interval
 speeds.values
 unresolved.append
@@ -661,7 +662,7 @@ a.get
 b.get
 row.get
 proved.append
-pending.appendleft
+pending.extend
 ```
 
 写入目标：
@@ -672,28 +673,39 @@ intersections
 seen_intersections
 queried_times
 consumed
+batch_sizes
+initial_points
+time
+side
 declarations
 partition
 pending
 proved
 unresolved
+known_times
+needed
 start
 end
-states
+remaining
+requested
 exhausted
+response
+used
+state
 a
 b
+current
+states
+key
 bounds
 speeds
 unavailable
 movement
 base
-state
 maps
 row
 failures
 proofs
-key
 display
 item
 name
@@ -714,24 +726,27 @@ ValueError
 np.isfinite
 set
 retain
+len
 motion.declaration_times
 np.asarray
 motion.partition_times
-deque
+list
 zip
-map
-pending.popleft
-get_states
-unresolved.extend
+sorted
+boundary_keys
+query_geometry
+batch_sizes.append
+queried_times.update
 float
-pending.clear
+bool
+unresolved.extend
+cache.get
 motion.interval
 _mul_up
 max
 speeds.values
 any
 unresolved.append
-sorted
 maps[0].get
 maps[1].get
 failures.append
@@ -743,12 +758,12 @@ row.get
 all
 min
 proved.append
-pending.appendleft
+pending.extend
 ```
 
 ## `check_interval_geometry.retain`
 
-[定义位置](../../../manipulation/interval_geometry.py#L270)。
+[定义位置](../../../manipulation/interval_geometry.py#L274)。
 
 输入签名：
 
@@ -787,20 +802,20 @@ seen_intersections.add
 intersections.append
 ```
 
-## `check_interval_geometry.get_states`
+## `check_interval_geometry.boundary_keys`
 
-[定义位置](../../../manipulation/interval_geometry.py#L287)。
+[定义位置](../../../manipulation/interval_geometry.py#L293)。
 
 输入签名：
 
 ```python
-def get_states(start, end):
+def boundary_keys(start, end):
 ```
 
 显式输出分支：
 
 ```python
-([cache.get(key) for key in keys], exhausted)
+[(float(start), 1 if 1 in declarations.get(start, ()) and start > 0 else 0), (float(end), -1 if -1 in declarations.get(end, ()) and end < trajectory.duration else 0)]
 ```
 
 读取的对象属性：
@@ -808,36 +823,15 @@ def get_states(start, end):
 ```python
 declarations.get
 trajectory.duration
-queried_times.update
-cache.get
 ```
 
 写入目标：
 
-```python
-keys
-needed
-time
-side
-exhausted
-response
-used
-consumed
-state
-key
-```
+无显式条目。
 
 直接调用符号：
 
 ```python
 float
 declarations.get
-sorted
-query_geometry
-int
-ValueError
-retain
-queried_times.update
-bool
-cache.get
 ```

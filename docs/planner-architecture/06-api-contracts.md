@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`13fefbc`。本次文档引用提交仅回填实际实现基线，源码与该代码提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：与本次实现代码一并提交；最终验证记录回填该实现提交。组件正文描述当前实现，阶段验证位于项目外 `sim-version-plans`。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -16,7 +16,7 @@
 | `sample_poses` | 在源时间轴上插值位姿 | 有序时刻及位姿、查询时刻 → 刚体变换序列；参考适配 |
 | `generate_reference` | 将源功能运动组合到当前功能坐标，按显式布尔字段选择初始旋转基准，并声明工具/物体入口和名义事件 | 表示及可选 `is_initial_relative_rotation_rpy`、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 完整名义组合路径、采样数组、显式 `*_boundaries`、`rotation_transfer` 及缺失状态；任务适配器与 reference_phase |
 | `_initial_rotation_offset` | 在同一功能参考坐标 F 中选择移动材料坐标 M 的初始 RPY 来源 | 原连续材料路径、功能路径、当前材料位姿、三个布尔值 → 固定左旋转 D 及入口选择记录；generate_reference |
-| `_RotationOffsetPath.__init__/sample` | 保持材料功能点位置，逐次求值后在 F 中施加固定旋转 D | 原材料路径、功能路径、D、来源及查询进度/侧别 → 连续位置与 wxyz 四元数，保留进度导数；物体/工具子路径与边界求值 |
+| `RotationOffsetPath.__init__/sample` | 保持材料功能点位置，逐次求值后在 F 中施加固定旋转 D | 原材料路径、功能路径、D、来源及查询进度/侧别 → 连续位置与 wxyz 四元数，保留进度导数；物体/工具子路径与边界求值 |
 | `config.ground_skill.ground_skill` | 从当前 RGB-D 实体观测得到功能区域并生成同一声明的参考 | 技能目录、场景目录、输出目录、任务指令、J/A 及来源 → 区域记录、reference.npz、含 reference_rotation_transfer 的 report.json 与网页；命令行入口 |
 | `program.ground_program` | 按程序声明绑定当前几何；持物声明与入口须代数一致 | `program,scene` → 工具参考、事件及几何诊断；`build_planning_problem` |
 | `ground_object_program` | 生成当前物体参考 | 物体程序、当前关系与功能绑定 → 物体路径；持物参考调用者 |
@@ -25,6 +25,7 @@
 | `MotionModel.coordinates_of` | 计算位姿对应坐标及模型相容性 | 机构模型、位姿 → 机构坐标；参考与机构诊断 |
 | `build_planning_problem` | 编译一个技能、原事件、目标与过程要求 | `skills`、具名 `start_q/start_dq`、工具/基座标定、数值容差 → `PlanningProblem`；`plan_trajectory` |
 | `PosePath.sample/sample_numpy` | 在给定进度读取完整组合路径及指定单侧导数 | 进度与 `side=left/right` → 位置/四元数或齐次变换；任务、物体运动与名义边界求导 |
+| `PosePath.to_record/from_record` | 保存并恢复实际连续路径表达式 | 基础路径的节点、运动模型、坐标、父路径和局部变换，或功能旋转偏移的名义/功能路径与旋转矩阵 → 类型明确的递归记录或同语义路径；execution_binding.plain、场景绑定与离线参考恢复 |
 | `reference_phase` | 将具名名义参考及其显式边界组织为阶段 | generate_reference 的 eef_path/eef_boundaries、技能身份、来源 → 保留组合路径与 reference_boundaries 元数据的 MotionPhase；问题构造 |
 | `BoundToolReference.__init__` | 把实际物理时钟及机器人入口连接到已声明参考边界 | PlanningProblem、progress_u/s、duration、入口 T_W_E 与 `[v_W,omega_W]` → 名义阶段、物理边界、一阶修正多项式及诊断；规划器绑定、重绑与候选自身时钟 |
 | `BoundToolReference.sample/sample_numpy` | 在物理秒上求同一完整工具参考 | 任意形状时刻 Tensor/NumPy → 同形状前缀的 W 系位置和 wxyz 四元数，或 4×4 齐次变换；参考 IK、保存与网页 |
@@ -37,7 +38,7 @@
 | `program._material_pose_requirement` | 在准备阶段绑定同一材料姿态集合 | 当前功能帧、目标、位置/旋转/可选 yaw 容差 → `PoseEventRequirement`；入口与功能点检查 |
 | `quaternion_axis_angle` | 有限旋转的主值绕轴分解 | 同一坐标系的相对四元数及单位轴 → `[-π,π]` 内绕轴角；姿态事件与机构误差 |
 | `SupportRequirement.raw_inequalities` | 计算有限支撑四条件 | 候选工具位姿、物体点/材料、目标平面/边界 → gap/body/footprint/normal 原始有符号值；优化、验收选择与分析 |
-| `SupportRequirement.normalized_inequalities` | 缩放完整支持条件，保留各项零集合 | 四类原始条件与数值尺度 → 四项有符号归一化条件；硬分量供功能 AL，补集供 `quality` 阶段任务偏好 |
+| `SupportRequirement.normalized_inequalities` | 缩放完整支持条件，保留各项零集合 | 四类原始条件与数值尺度 → 四项有符号归一化条件；硬分量供有符号任务约束，补集供 `quality` 阶段评分 |
 | `SupportRequirement.hard_components/evaluate` | 声明支持硬分量并计算相应残差 | 原几何、数值容差、四个名称的显式子集（默认 body/footprint）→ 硬分量正部和；任务残差、事件 IK、搜索与验收 |
 | `InteriorRequirement.evaluate` | 计算物体点在指定凸区域中的包含条件 | 候选位姿、点集、半空间、数值容差 → 非负越界；过程要求 |
 | `MechanismRequirement.coordinates/errors` | 将候选位姿解释为机构坐标和流形偏差 | 已绑定机构、附着、候选位姿 → 坐标或模型误差；机构约束 |
@@ -152,16 +153,17 @@
 | `_ConstrainedPlanner._build_goal_ik_candidates/ompl_seed` | 原功能允许集合、场景、固定时钟和搜索预算 | 事件候选及有限路径拟合系数；预算内恢复 |
 | `_ConstrainedPlanner.evaluate_reference/optimize` | CPU系数及可选迭代数 | 直接初值记录或逐条产生的SLSQP结果生成器；每次调用前登记 `last_optimizer_runtime`，中断时另存实际系数的诊断曲线与来源，导出失败单独记录且保留原求解异常；候选选择及失败报告 |
 | `_ConstrainedPlanner._controls_curve` | `[M,J]`系数、入口、原时钟、事件与手指曲线 | `JointTrajectory`；验收、归档和执行 |
-| `_ConstrainedPlanner._candidate_objective` | 实际保存曲线及其场景 | 固定网格运动成本和声明任务质量；跨候选排序 |
-| `_ConstrainedPlanner._candidate_metrics/_candidate_domain_validation` | 保存曲线、场景和记账接口、原关节界 | 原任务及场景采样报告、连续关节极值和入口残差；统一验收 |
-| `_ConstrainedPlanner._candidate_geometry` | 保存曲线、候选场景、剩余点数与记账接口 | 分离证明、交叠见证、未决区间及硬分项；正式验收 |
+| `_ConstrainedPlanner._candidate_objective` | 实际保存曲线及其场景 | 固定网格运动成本和声明任务质量；同候选有限性检查与结果记录 |
+| `_ConstrainedPlanner._candidate_metrics/_candidate_domain_validation` | 保存曲线、场景和记账接口、原关节界 | 原任务及场景采样报告、完整实体对证据和候选释放历史；连续关节极值及入口残差另由 _candidate_domain_validation 返回；统一验收 |
+| `_ConstrainedPlanner._candidate_geometry` | 保存曲线、已固定释放历史的候选场景、已有完整证据、剩余点数与记账接口 | 分离证明、交叠见证、未决区间及硬分项；正式验收 |
 | `SphereBody` | 原实体在一个已注册Pin frame中的完整局部球覆盖 | name/link/spheres；仅供全实体速度界 |
 | `build_geometry_motion_bound` | 已注册完整Pin模型、同一T_reference_base、完整实体covers | GeometryMotionBound中的具名关节、原位置界及逐实体/关节系数；SceneMotionBounds |
 | `GeometryMotionBound.speed_bounds` | 全部具名关节的非负速度上界 | 逐实体点速度上界；完整具名速度查询与独立数值复核；生产interval直接消费coefficients并记录缺失坐标 |
+| `progress_clock.progress_anchor_parameters/progress_query_parameters` 及 `_ProgressMap` | 单调进度时钟、声明锚点及物理时刻 | 锚点的同一 u、s、u×duration，平台两端及普通时刻插值；固定候选查询、场景关系侧别、几何区间分区与运动速度界 |
 | `SceneMotionBounds.from_scene/partition_times/interval` | 完整关节树、官方实体、TSDF、关系和曲线 | 时间分区与逐实体速度界；区间验收 |
-| `check_interval_geometry` | 原曲线、运动界、几何查询回调和预算 | 已证明、交叠、未决及实际查询时刻；候选报告 |
-| `_ConstrainedPlanner.select_candidate/evaluate_candidate/export` | 结果可迭代对象、同一候选评分及原模型验收；select必填on_candidate回调 | 逐结果验收并立即调用请求资格绑定，再计算下一结果；最终恢复选中曲线、来源和验收；export交付已评价对象 |
-| `plan_trajectory.record_validation_work/qualify_candidate/qualify_native/deliver_incumbent` | 已开始的验证与完成查询、已合格曲线和固定评分 | 即时工作账本与独立最佳绑定；请求返回 |
+| `check_interval_geometry` | 原曲线、运动界、几何查询回调、已有完整证据和预算 | 每轮当前缺失端点数组查询；已证明、交叠、未决及实际查询时刻、批大小和完整消耗；候选报告 |
+| `_ConstrainedPlanner.select_candidate/evaluate_candidate/export` | 结果可迭代对象、同一候选评分及原模型验收；select必填on_candidate回调 | 逐结果验收并立即调用请求资格绑定；首个完整合格候选终止生成器推进；失败出口恢复选中失败曲线及其证据；export交付已评价对象 |
+| `plan_trajectory.record_validation_work/qualify_candidate/qualify_native/deliver_incumbent` | 已开始的验证与完成查询、已合格曲线和固定评分 | 即时工作账本与首个完整合格绑定；请求返回 |
 
 中断报告的 `latest_trial/latest_complete_trial` 以自由系数和递增 `trial_index` 标识实际计算，`completed_components` 指明哪些值及导数已完成；其中 `geometry_objective` 与同一系数的目标计算绑定。`last_callback_iterate` 以 `callback_index` 记录库迭代，并在系数相同的条件下记录对应试算编号。`reference_candidate.curve` 保存已检查参考种子的多项式快照，原 `accepted` 与几何验收证据继续属于该曲线。`diagnostic_optimizer_provenance` 保存所导出试算的身份及已有计算证据，`diagnostic_candidate_source` 指明 `diagnostic_optimizer_trial/last_solver_iterate/validated_reference_seed/validated_optimizer_candidate`，`diagnostic_validation_status` 明确完整验收是否完成。完整验收的失败出口另以 `diagnostic_candidate_report` 保存实际该曲线的原 `attempt`，来源由实际曲线身份决定。归档入口 `tests/planning/recorded_task_planning.plan_and_record` 将来源与状态写入候选记录，诊断曲线保留 `rejected_diagnostic_not_executable` 分类。
 
@@ -190,7 +192,7 @@
 
 `collision_records.encode_array/decode_array` 保存 dtype、形状和压缩数组；消费者据其真实尺寸检查资源，再恢复同一数组。`slice_layer_selection` 从分层证据中选取指定样本。`tensor_cpu_snapshot` 将完成的张量复制到 CPU 报告，`runtime_profiling` 记录请求阶段的时间及资源。这些数据接口服务可复现记录。
 
-`implicit_distance` 对同一原场完成非穿透分类并保留有范围定义的距离界。`observed_collision` 返回原分类、有限接触和最低高度证据。`sampled_geometry_objective` 保存原材料点，在每次试探计算实际原场值或原生有符号距离及同一标量的一阶导数；当原点范围与原负值范围的坐标变换区间能证明两个方向均为零时，返回相同零值和零导数。报告单列此类配对数，支持与未知计数仅覆盖实际查询点。`observed_coverage` 解释实体是否处于原自由射线或明确条件区域。`observed_robot` 将完整具名关节映射为机器人连杆位姿。`native_field_distance` 连接固定机器人官方实体与原任务场，双方保留各自表示及共同世界坐标。场配对未决保存在查询证据中，原生自身数值边界、任务接触、初始支撑和覆盖各有独立硬条件。
+`implicit_distance` 对同一原场完成非穿透分类并保留有范围定义的距离界。`observed_collision` 返回原分类、有限接触和最低高度证据。`sampled_geometry_objective` 保存原材料点，在每次试探计算实际原场值或原生有符号距离及同一标量的一阶导数；当原点范围与原负值范围的坐标变换区间能证明两个方向均为零时，返回相同零值和零导数。原场材料点通过已有单元中心树和原点连续索引筛选；反向坐标包围含两次前向变换舍入与旋转非正交误差，选中点保持原顺序、cell 身份和完整点数分母。机器人原生距离非负时仅返回零标量，场景统一连接所有控制量的零梯度。报告单列跳过的零贡献配对数，支持与未知计数仅覆盖实际查询点。`observed_coverage` 解释实体是否处于原自由射线或明确条件区域。`observed_robot` 将完整具名关节映射为机器人连杆位姿。`native_field_distance` 连接固定机器人官方实体与原任务场，双方保留各自表示及共同世界坐标。场配对未决保存在查询证据中，原生自身数值边界、任务接触、初始支撑和覆盖各有独立硬条件。
 
 `resource_admission.require_host_memory/require_device_memory` 输入新增存储需求、当前物理占用与明确上限，返回准入记录或类型化 `ResourceLimitError`。`optimizer_device_checks.require_tensor` 同步消费标量布尔张量，条件为真时返回 `None`，否则抛出声明的异常。手指曲线、任务定义与物理域在读取对应输入时使用该接口。`constant_tensor` 把声明的模型常量直接转换到消费者的 dtype/device，保留张量原有求导关系。预算、诊断和数值错误共享同一 eager 请求生命周期。
 

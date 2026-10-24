@@ -114,7 +114,8 @@ def main():
                             ('sampled_geometry_objective','02'), ('geometry_motion_bound','05'),
                             ('interval_geometry','05'), ('unified_solver','04'),
                             ('cubic_constraints','04'), ('pin_kinematics','04'),
-                            ('timed_reference','01'), ('reference_visualization','01')]:
+                            ('timed_reference','01'), ('reference_visualization','01'),
+                            ('progress_clock','05')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:
             modules.append(row)
