@@ -1,6 +1,6 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：本文件随候选验证记录的复制精简一同提交；实现提交生成后由文档提交回填其具体引用。
+代码基线：`efa06ac`。本文所在的后续文档提交仅回填实现引用，生产代码与该实现提交相同。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
