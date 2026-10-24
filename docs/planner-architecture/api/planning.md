@@ -1,7 +1,7 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：`当前实现提交；提交后固定实际代码引用`。
-职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`99eae0c`。本文所在的后续文档提交固定实现引用，生产代码与该实现提交相同。
+职责和数据语义见[求解组件](../04-solver-and-search.md)、[验收交付组件](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
 
@@ -9697,6 +9697,10 @@ time.monotonic
 ```python
 def qualify_candidate(trajectory, validation, attempt, *, binding_scene=None):
 ```
+
+前置条件是当前候选已完成原资格检查，`attempt.accepted` 为真且 validation 存在。回调把原验证对象同步传给 `bind_candidate`，由其读取验收数组并以 `plain` 建立独立的 `binding.validation.export` 和 `validation.native`。内部交付记录接收已完成 `attempt` 报告的引用，并保存独立曲线、场景说明和时钟检查。完整请求预算检查通过后设置 incumbent，供 `deliver_incumbent` 返回。
+
+首个合格候选结束选择。已完成报告包含自有 CPU 数值，后续请求替换验证引用；公开参考诊断和返回诊断保持各自副本，正式绑定具有独立容器。原输入双份保存、曲线副本和 `check_result` 返回副本分别承担输入变更检测、轨迹所有权及执行消费者私有记录的职责。
 
 显式输出分支：
 

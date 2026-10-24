@@ -1,6 +1,6 @@
 # `manipulation/implicit_distance.py` 实现契约
 
-代码基线：`当前实现提交；提交后固定实际代码引用`。
+代码基线：`99eae0c`。本文所在的后续文档提交固定实现引用，生产代码与该实现提交相同。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `transform_points`

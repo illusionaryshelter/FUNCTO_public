@@ -1,6 +1,6 @@
 # 候选验收、执行交接与续规划
 
-候选验收与执行算法的代码基线为 `be44b54`；候选交付与执行绑定数据转换的当前代码基线分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md)。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+候选验收与执行算法的代码基线为 `be44b54`；当前候选报告交付代码为 `99eae0c`，详见 [planning API](api/planning.md)；执行绑定数据转换的代码基线见 [execution_binding API](api/execution_binding.md)。本次文档引用提交与 `99eae0c` 的相关生产代码相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 候选的完整验收
 
