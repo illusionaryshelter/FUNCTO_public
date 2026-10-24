@@ -1,6 +1,8 @@
 # API 契约与调用关系
 
-观测场与求解算法接口基线为 `be44b54`，官方机器人距离批处理接口基线为 `NATIVE_IMPLEMENTATION_COMMIT`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+观测场与求解算法接口基线为 `be44b54`，官方机器人距离批处理接口基线为 `12e0ef5`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+
+本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 

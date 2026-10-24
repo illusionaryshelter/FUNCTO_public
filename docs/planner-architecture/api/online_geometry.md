@@ -1,6 +1,8 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`NATIVE_IMPLEMENTATION_COMMIT`。
+代码基线：`12e0ef5`。
+
+本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`

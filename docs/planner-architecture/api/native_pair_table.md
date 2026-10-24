@@ -1,6 +1,8 @@
 # 官方机器人实体对的原生数值接口
 
-代码基线：`NATIVE_IMPLEMENTATION_COMMIT`。实现为 `manipulation/_coal_scene_batch.cpp` 的 `NativePairTable`，由 `RobotGeometryChecker` 调用；[组件职责](../02-observation-and-collision.md)说明模型来源、规划场景和执行检查的关系。
+代码基线：`12e0ef5`。实现为 `manipulation/_coal_scene_batch.cpp` 的 `NativePairTable`，由 `RobotGeometryChecker` 调用；[组件职责](../02-observation-and-collision.md)说明模型来源、规划场景和执行检查的关系。
+
+本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
 
 研究对象是同一固定机器人的官方凸实体、解析盒体和圆柱。实体形状、连杆固定关系来自官方配置；当前位姿由具名关节反馈或名义关节状态、标定和 Pinocchio 正运动学确定。任务实体仍由原观测场接口计算。这里的计算结果描述所声明机器人模型的几何关系。
 
