@@ -11,6 +11,10 @@ from collections.abc import Mapping
 from copy import deepcopy
 from uuid import uuid4
 
+# BEGIN scalar classification uses the standard library for exact floats.
+import math
+# END NumPy retains array and scalar-subclass conversion semantics.
+
 import numpy as np
 
 # BEGIN path expressions declare their operands before dataclass serialization.
@@ -24,6 +28,18 @@ def plain(value):
     Unbounded intervals are explicit JSON data; NaN never represents a
     missing measurement. Private dataclass caches are deliberately excluded.
     """
+    # BEGIN immutable built-in leaves bypass unrelated structural dispatch.
+    # Exact types preserve dataclass/NumPy conversion and custom subclass
+    # behavior in the branches below. Finite floats retain their bit pattern,
+    # including negative zero; containers still acquire independent storage.
+    kind = type(value)
+    if kind is float:
+        if math.isnan(value):
+            raise ValueError("A formal execution binding cannot contain NaN")
+        return value if math.isfinite(value) else {"unbounded": "+" if value > 0 else "-"}
+    if kind is str or kind is bool or kind is int or value is None:
+        return value
+    # END remaining input types keep their declared conversion precedence.
     if is_dataclass(value):
         # BEGIN continuous operands take precedence over inherited data fields.
         if isinstance(value, PosePath):

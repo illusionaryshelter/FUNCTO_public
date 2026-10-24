@@ -1,6 +1,6 @@
 # 候选验收、执行交接与续规划
 
-代码基线：`be44b54`。本次文档提交回填实际实现引用，生产代码与该实现提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+候选验收与执行算法的代码基线为 `be44b54`；执行绑定数据转换的当前代码基线见 [execution_binding API](api/execution_binding.md)。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 候选的完整验收
 
@@ -47,6 +47,8 @@
 `diagnostics.reference_initialization` 保存实际样本拟合及策略，普通参考 IK 查询保留前次状态、实际 dt、原生成功与位姿误差，以及有限返回状态的来源。`last_optimizer_runtime` 保存每个已经开始的约束求解报告，包括状态、迭代、求值次数、原目标、归一化尺度与系数更新。异常路径保存已经完成的诊断，尚未完成的计算保持缺失。
 
 `execution_binding.bind_candidate` 接受实际候选、任务、场景、连续验收和正式采样报告，生成 `candidate_id`，保存任务输入、`scene.to_execution_binding()`、`curve_snapshot` 与同身份验收。绑定参数 `native_report` 和记录 `validation.native` 保存该曲线的正式任务及场景评价报告，其生产者为 `_candidate_metrics`。`curve_snapshot` 保存原 Hermite 节点、实际系数、可执行终点和首个显式效果依赖边界；`plain` 将 NumPy 及公开 dataclass 字段转为普通记录，无界区间使用具名 JSON 表达。
+
+`plain` 首先处理精确内置 `float/str/bool/int` 及 `None`。有限浮点直接返回原值，保留负零；`math.isnan/isfinite` 将 NaN 拒绝与无穷区间编码分别落实。精确类型判断让 NumPy 标量、dataclass 子类和自定义数值子类继续按原接口转换。`PosePath` 优先保存其连续表达式操作数，其他 dataclass 仅保存公开字段；数组和 NumPy 标量通过 `tolist/item` 转换后递归，Mapping 的键字符串化，序列输出为新列表。每次递归独立建立容器，原输入、绑定顶层输入及验收输入保持其交接所有权。该转换同时服务请求义务合同、事件与续执行声明，输入的坐标、单位和数据职责沿用各声明本身。
 
 `plan_trajectory` 将首个完成执行绑定的曲线保存为独立交付记录，包含原多项式副本、固定评分与分项、验收、候选场景、事件时间检查及资格完成时间，并立即返回。调用者的原关节曲线可具有自己的物理时长、进度平台和手指时钟；构造参考、主求解和恢复求解分别使用其已绑定时钟。每条记录中的曲线、关系、命令和验收共同定义该候选，冻结记录与求解器暂存值分别保存。
 
