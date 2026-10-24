@@ -51,7 +51,7 @@
     -0.03923001169079247
   ],
   "sim_time_s": 1.0000000000000007,
-  "source": "Same unstepped scene state: named robot q/dq and native tool-site FK",
+  "source": "Original named robot joint feedback and calibrated FK; scene layout translated without physics steps",
   "qvel": [
     -0.015280709418220215,
     -3.584760855043446e-05,

@@ -1,23 +1,151 @@
 {
   "source_case": "original",
   "case": "drawer_original",
-  "kept_body": "white_cabinet_1_main",
-  "removed_body": "wooden_shelf_1_main",
-  "furniture_root_position_m": [
-    0.0,
-    0.0,
-    0.905
-  ],
-  "table_center_xy_m": [
-    0.0,
-    0.0
-  ],
+  "construction": {
+    "source_case": "original",
+    "destination_case": "drawer_original",
+    "moved_body": "white_cabinet_1_main",
+    "depth_axis_world": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "displacement_depth_fraction": -0.5,
+    "removed_bodies": [
+      "wooden_shelf_1_main",
+      "white_yellow_mug_1_main"
+    ],
+    "removed_background_meshes": [
+      "kitchen_background_vis",
+      "kitchen_background_pot_vis",
+      "kitchen_background_hot_pot_vis",
+      "kitchen_background_stove_vis",
+      "kitchen_background_fridge_vis"
+    ],
+    "removed_sites": [
+      "kitchen_table_shelf_init_region",
+      "kitchen_table_mug_init_region"
+    ],
+    "translated_sites": [
+      "kitchen_table_cabinet_init_region"
+    ],
+    "preserved_pose_bodies": [
+      "orange_block_1_main",
+      "robot0_base"
+    ],
+    "views": [
+      "view_a",
+      "view_b",
+      "top"
+    ]
+  },
+  "removed_assets": {
+    "mesh": [
+      "kitchen_background_vis",
+      "kitchen_background_pot_vis",
+      "kitchen_background_hot_pot_vis",
+      "kitchen_background_stove_vis",
+      "kitchen_background_fridge_vis",
+      "white_yellow_mug_1_white_yellow_mug_vis",
+      "wooden_shelf_1_wooden_shelf_vis"
+    ],
+    "material": [
+      "kitchen_background",
+      "kitchen_background_pot",
+      "kitchen_background_hot_pot",
+      "kitchen_background_stove",
+      "kitchen_background_fridge",
+      "white_yellow_mug_1_white_yellow_mug",
+      "wooden_shelf_1_wooden_shelf"
+    ],
+    "texture": [
+      "tex-kitchen_background",
+      "tex-kitchen_background_pot",
+      "tex-kitchen_background_stove",
+      "tex-kitchen_background_fridge",
+      "white_yellow_mug_1_tex-white_yellow_mug",
+      "wooden_shelf_1_tex-wooden_shelf"
+    ]
+  },
   "physics_steps": 0,
-  "state_transfer": "Surviving named joint q/dq, actuator ctrl, mocap and time; new integration state",
+  "state_transfer": "Existing restore_named_state; surviving named q/dq, controls, mocap and time",
   "sim_time_s": 1.0000000000000007,
+  "translation": {
+    "coordinate_frame": "world",
+    "depth_definition": "Full subtree native box envelope along world Y, including handles and saved drawer joint positions",
+    "depth_bounds_world_m": [
+      0.17197799999999996,
+      0.39299229438331656
+    ],
+    "depth_geom_names": [
+      "white_cabinet_1_g1",
+      "white_cabinet_1_g2",
+      "white_cabinet_1_g3",
+      "white_cabinet_1_g4",
+      "white_cabinet_1_g5",
+      "white_cabinet_1_g6",
+      "white_cabinet_1_g7",
+      "white_cabinet_1_g8",
+      "white_cabinet_1_g9",
+      "white_cabinet_1_g11",
+      "white_cabinet_1_g12",
+      "white_cabinet_1_g13",
+      "white_cabinet_1_g14",
+      "white_cabinet_1_g15",
+      "white_cabinet_1_g16",
+      "white_cabinet_1_g18",
+      "white_cabinet_1_g19",
+      "white_cabinet_1_g20",
+      "white_cabinet_1_g22",
+      "white_cabinet_1_g23",
+      "white_cabinet_1_g24",
+      "white_cabinet_1_g25",
+      "white_cabinet_1_g26",
+      "white_cabinet_1_g27",
+      "white_cabinet_1_g29",
+      "white_cabinet_1_g30",
+      "white_cabinet_1_g31",
+      "white_cabinet_1_g33",
+      "white_cabinet_1_g34",
+      "white_cabinet_1_g35",
+      "white_cabinet_1_g36",
+      "white_cabinet_1_g37",
+      "white_cabinet_1_g38",
+      "white_cabinet_1_g40",
+      "white_cabinet_1_g41",
+      "white_cabinet_1_g42"
+    ],
+    "depth_m": 0.2210142943833166,
+    "distance_m": 0.1105071471916583,
+    "delta_world_m": [
+      -0.0,
+      -0.1105071471916583,
+      -0.0
+    ],
+    "old_root_position_world_m": [
+      0.0379608,
+      0.281288,
+      0.905
+    ],
+    "new_root_position_world_m": [
+      0.0379608,
+      0.17078085280834168,
+      0.905
+    ]
+  },
+  "validation": {
+    "removed_entities_absent": true,
+    "entire_subtree_translated": true,
+    "subtree_rotations_preserved": true,
+    "robot_and_block_poses_preserved": true,
+    "robot_joint_feedback_preserved": true
+  },
   "views": {
     "view_a": {
+      "width": 640,
+      "height": 480,
       "valid_depth_pixels": 307200,
+      "calibration_preserved": true,
       "renderer": {
         "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
         "vendor": "Mesa",
@@ -28,7 +156,10 @@
       }
     },
     "view_b": {
+      "width": 640,
+      "height": 480,
       "valid_depth_pixels": 307200,
+      "calibration_preserved": true,
       "renderer": {
         "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
         "vendor": "Mesa",
@@ -39,7 +170,10 @@
       }
     },
     "top": {
+      "width": 640,
+      "height": 480,
       "valid_depth_pixels": 307200,
+      "calibration_preserved": true,
       "renderer": {
         "renderer": "llvmpipe (LLVM 15.0.7, 256 bits)",
         "vendor": "Mesa",

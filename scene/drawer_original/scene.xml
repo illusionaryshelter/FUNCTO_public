@@ -1,4 +1,5 @@
 <mujoco model="base">
+  <!-- BEGIN requested layout: original minus selected furniture/background; fixed drawer root translated by [-0.0, -0.1105071471916583, -0.0] world metres. Matching integration state and rendered observations are stored beside this XML. END requested layout -->
   <compiler angle="radian" />
   <option impratio="20" density="1.2" viscosity="2e-05" cone="elliptic" />
   <size njmax="5000" nconmax="5000" />
@@ -12,12 +13,6 @@
     <texture type="cube" name="tex-table-legs" file="../assets/LIBERO/libero/libero/assets/textures/martin_novak_wood_table.png" />
     <texture type="2d" name="tex-wall" file="../assets/LIBERO/libero/libero/assets/textures/yellow_linen_wall_texture.png" />
     <texture type="cube" name="textable" builtin="flat" rgb2="0.8 0.8 0.8" width="512" height="3072" />
-    <texture type="2d" name="tex-kitchen_background" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background/kitchen_background.png" />
-    <texture type="2d" name="tex-kitchen_background_pot" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background_pot/kitchen_background_pot.png" />
-    <texture type="2d" name="tex-kitchen_background_stove" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background_stove/kitchen_background_stove.png" />
-    <texture type="2d" name="tex-kitchen_background_fridge" file="../assets/LIBERO/libero/libero/assets/scenes/fridge/metal.png" />
-    <texture type="2d" name="white_yellow_mug_1_tex-white_yellow_mug" file="../assets/LIBERO/libero/libero/assets/turbosquid_objects/white_yellow_mug/white_yellow_mug_texture.png" />
-    <texture type="2d" name="wooden_shelf_1_tex-wooden_shelf" file="../assets/LIBERO/libero/libero/assets/turbosquid_objects/wooden_shelf/dark_fine_wood.png" />
     <texture type="2d" name="white_cabinet_1_tex-white_cabinet" file="../assets/LIBERO/libero/libero/assets/articulated_objects/white_cabinet/white_wood.png" />
     <texture type="2d" name="white_cabinet_1_tex-white_cabinet_base" file="../assets/LIBERO/libero/libero/assets/articulated_objects/white_cabinet/white_wood.png" />
     <texture type="2d" name="white_cabinet_1_tex-white_cabinet_handle" file="../assets/LIBERO/libero/libero/assets/articulated_objects/white_cabinet/metal.png" />
@@ -26,11 +21,6 @@
     <material name="table_legs" texture="tex-table-legs" shininess="0.8" reflectance="0.8" />
     <material name="walls_mat" texture="tex-wall" texuniform="true" texrepeat="3 3" specular="0.8" shininess="0.3" />
     <material name="table_mat" texture="textable" />
-    <material name="kitchen_background" texture="tex-kitchen_background" reflectance="0.5" />
-    <material name="kitchen_background_pot" texture="tex-kitchen_background_pot" reflectance="0.5" />
-    <material name="kitchen_background_hot_pot" reflectance="0.5" rgba="0.4 0.4 0.4 1" />
-    <material name="kitchen_background_stove" texture="tex-kitchen_background_stove" reflectance="0.5" />
-    <material name="kitchen_background_fridge" texture="tex-kitchen_background_fridge" reflectance="0.9" />
     <material name="robot0_Face636_001" shininess="0.45" rgba="0.901961 0.921569 0.929412 1" />
     <material name="robot0_Part__Feature017_001" shininess="0.45" />
     <material name="robot0_Part__Feature018_001" shininess="0.45" />
@@ -81,8 +71,6 @@
     <material name="robot0_Part__Mirroring006_004_001" shininess="0.45" rgba="0.25098 0.25098 0.25098 1" />
     <material name="robot0_Part__Mirroring007_004_001" shininess="0.45" rgba="0.25098 0.25098 0.25098 1" />
     <material name="robot0_Part__Mirroring_004_001" shininess="0.45" rgba="0.898039 0.917647 0.929412 1" />
-    <material name="white_yellow_mug_1_white_yellow_mug" texture="white_yellow_mug_1_tex-white_yellow_mug" reflectance="0.5" />
-    <material name="wooden_shelf_1_wooden_shelf" texture="wooden_shelf_1_tex-wooden_shelf" reflectance="0.5" />
     <material name="white_cabinet_1_white_cabinet_top" texture="white_cabinet_1_tex-white_cabinet" reflectance="0.5" />
     <material name="white_cabinet_1_white_cabinet_base" texture="white_cabinet_1_tex-white_cabinet_base" reflectance="0.5" />
     <material name="white_cabinet_1_white_cabinet_top_handle" texture="white_cabinet_1_tex-white_cabinet_handle" reflectance="0.5" />
@@ -90,11 +78,6 @@
     <material name="white_cabinet_1_white_cabinet_middle_handle" texture="white_cabinet_1_tex-white_cabinet_handle" reflectance="0.5" />
     <material name="white_cabinet_1_white_cabinet_bottom" texture="white_cabinet_1_tex-white_cabinet" reflectance="0.5" />
     <material name="white_cabinet_1_white_cabinet_bottom_handle" texture="white_cabinet_1_tex-white_cabinet_handle" reflectance="0.5" />
-    <mesh name="kitchen_background_vis" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background/visual/kitchen_background_vis.msh" scale="0.01 0.01 0.01" />
-    <mesh name="kitchen_background_pot_vis" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background_pot/visual/kitchen_background_pot_vis.msh" scale="0.01 0.01 0.01" />
-    <mesh name="kitchen_background_hot_pot_vis" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background_hot_pot/visual/kitchen_background_hot_pot_vis.msh" scale="0.01 0.01 0.01" />
-    <mesh name="kitchen_background_stove_vis" file="../assets/LIBERO/libero/libero/assets/scenes/kitchen_background_stove/visual/kitchen_background_stove_vis.msh" scale="0.01 0.01 0.01" />
-    <mesh name="kitchen_background_fridge_vis" file="../assets/LIBERO/libero/libero/assets/scenes/fridge/visual/fridge_vis.msh" scale="0.01 0.01 0.01" />
     <mesh name="robot0_link0" file="../assets/external/home/shelter/miniforge3/envs/recovery/lib/python3.10/site-packages/robosuite/models/assets/robots/panda/meshes/link0.stl" />
     <mesh name="robot0_link1" file="../assets/external/home/shelter/miniforge3/envs/recovery/lib/python3.10/site-packages/robosuite/models/assets/robots/panda/meshes/link1.stl" />
     <mesh name="robot0_link2" file="../assets/external/home/shelter/miniforge3/envs/recovery/lib/python3.10/site-packages/robosuite/models/assets/robots/panda/meshes/link2.stl" />
@@ -159,8 +142,6 @@
     <mesh name="gripper0_right_finger" file="../assets/external/home/shelter/miniforge3/envs/recovery/lib/python3.10/site-packages/robosuite/models/assets/grippers/meshes/panda_gripper/finger.stl" />
     <mesh name="gripper0_right_finger_vis" file="../assets/external/home/shelter/miniforge3/envs/recovery/lib/python3.10/site-packages/robosuite/models/assets/grippers/meshes/panda_gripper/finger_vis.stl" />
     <mesh name="gripper0_right_finger_vis2" file="../assets/external/home/shelter/miniforge3/envs/recovery/lib/python3.10/site-packages/robosuite/models/assets/grippers/meshes/panda_gripper/finger_longer.stl" />
-    <mesh name="white_yellow_mug_1_white_yellow_mug_vis" file="../assets/LIBERO/libero/libero/assets/turbosquid_objects/white_yellow_mug/visual/white_yellow_mug_vis.msh" />
-    <mesh name="wooden_shelf_1_wooden_shelf_vis" file="../assets/LIBERO/libero/libero/assets/turbosquid_objects/wooden_shelf/visual/wooden_shelf_vis.msh" scale="0.05 0.05 0.05" />
     <mesh name="white_cabinet_1_white_cabinet_top_vis" file="../assets/LIBERO/libero/libero/assets/articulated_objects/white_cabinet/white_cabinet_top/visual/white_cabinet_top_vis.msh" scale="0.05 0.05 0.05" />
     <mesh name="white_cabinet_1_white_cabinet_base_vis" file="../assets/LIBERO/libero/libero/assets/articulated_objects/white_cabinet/white_cabinet_base/visual/white_cabinet_base_vis.msh" scale="0.05 0.05 0.05" />
     <mesh name="white_cabinet_1_white_cabinet_top_handle_vis" file="../assets/LIBERO/libero/libero/assets/articulated_objects/white_cabinet/white_cabinet_top_handle/visual/white_cabinet_top_handle_vis.msh" scale="0.05 0.05 0.05" />
@@ -171,11 +152,6 @@
   </asset>
   <worldbody>
     <geom name="floor" size="3 3 0.125" type="plane" group="1" material="floorplane" />
-    <geom pos="-1.65 0 0.9" quat="0 0 0 1" type="mesh" contype="0" conaffinity="0" group="1" material="kitchen_background_stove" mesh="kitchen_background_stove_vis" />
-    <geom pos="-1.5 0.23 0.93" quat="0.316228 0 0 0.948683" type="mesh" contype="0" conaffinity="0" group="1" material="kitchen_background_hot_pot" mesh="kitchen_background_hot_pot_vis" />
-    <geom pos="-1.85 -0.85 0.9" quat="0 0 0 1" type="mesh" contype="0" conaffinity="0" group="1" material="kitchen_background_pot" mesh="kitchen_background_pot_vis" />
-    <geom pos="-1.75 -2.4 0" quat="0 0 0 1" type="mesh" contype="0" conaffinity="0" group="1" material="kitchen_background_fridge" mesh="kitchen_background_fridge_vis" />
-    <geom pos="-1.65 0 0" quat="0 0 0 1" type="mesh" contype="0" conaffinity="0" group="1" material="kitchen_background" mesh="kitchen_background_vis" />
     <geom name="wall_left_visual" size="2.5 1.5 0.01" pos="0.5 3 1.5" quat="0.707107 0.707107 0 0" type="box" contype="0" conaffinity="0" group="1" material="walls_mat" />
     <geom name="wall_right_visual" size="2.5 1.5 0.01" pos="0.5 -3 1.5" quat="0.707107 -0.707107 0 0" type="box" contype="0" conaffinity="0" group="1" material="walls_mat" />
     <geom name="wall_rear_visual" size="3 1.5 0.01" pos="-2 0 1.5" quat="0.5 0.5 0.5 0.5" type="box" contype="0" conaffinity="0" group="1" material="walls_mat" />
@@ -197,9 +173,7 @@
       <geom name="table_leg3_visual" size="0.025 0.4375" pos="-0.4 -0.5 -0.4375" type="cylinder" contype="0" conaffinity="0" group="1" material="table_legs" />
       <geom name="table_leg4_visual" size="0.025 0.4375" pos="0.4 -0.5 -0.4375" type="cylinder" contype="0" conaffinity="0" group="1" material="table_legs" />
       <site name="table_top" pos="0 0 0.025" size="0.001" rgba="0 0 0 0" />
-      <site name="kitchen_table_shelf_init_region" pos="-0.24 0.28 0" size="0.005 0.005 0.007" type="box" rgba="0 0 1 0" />
-      <site name="kitchen_table_cabinet_init_region" pos="0.04 0.28 0" size="0.005 0.005 0.007" type="box" rgba="0 0 1 0" />
-      <site name="kitchen_table_mug_init_region" pos="-0.24 -0.25 0" size="0.005 0.005 0.007" type="box" rgba="0 0 1 0" />
+      <site name="kitchen_table_cabinet_init_region" pos="0.040000000000000001 0.16949285280834173 0" size="0.005 0.005 0.007" type="box" rgba="0 0 1 0" />
       <site name="kitchen_table_block_init_region" pos="0.03 -0.24 0" size="0.005 0.005 0.007" type="box" rgba="0 0 1 0" />
     </body>
     <body name="left_eef_target" pos="0 0 -1" mocap="true">
@@ -360,57 +334,13 @@
         </body>
       </body>
     </body>
-    <body name="white_yellow_mug_1_main">
-      <joint name="white_yellow_mug_1_joint0" type="free" limited="false" actuatorfrclimited="false" damping="0.0005" />
-      <geom name="white_yellow_mug_1_g0" type="mesh" contype="0" conaffinity="0" group="1" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" material="white_yellow_mug_1_white_yellow_mug" mesh="white_yellow_mug_1_white_yellow_mug_vis" />
-      <geom name="white_yellow_mug_1_g1" size="0.00412 0.00876 0.02924" pos="0.06406 0 0.05598" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g2" size="0.00413 0.00876 0.02493" pos="0.04022 0 0.02629" quat="0.63072 0 -0.77601 0" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g3" size="0.00411 0.00876 0.02172" pos="0.04641 0 0.07965" quat="0.744728 0 0.667368 0" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g4" size="0.00412 0.00876 0.04361" pos="0.02428 -0.001 0.05934" quat="0.997858 0 0.0654099 0" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g5" size="0.00412 0.00876 0.04361" pos="0.02168 0.01468 0.05934" quat="0.0122299 0.980266 0.186549 -0.0642597" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g6" size="0.00412 0.00876 0.04361" pos="0.01459 0.02702 0.05934" quat="0.02282 0.93515 0.34816 -0.0613" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g7" size="0.00413 0.00876 0.04361" pos="0.00383 0.03634 0.05934" quat="0.0566099 0.499919 -0.863598 0.0327699" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g8" size="0.00412 0.00876 0.04361" pos="-0.00868 0.04141 0.05934" quat="0.0413402 0.773263 0.630703 -0.0506902" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g9" size="0.00412 0.00876 0.04361" pos="-0.02322 0.04219 0.05934" quat="0.0494198 0.653728 0.753898 -0.0428499" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g10" size="0.00412 0.00876 0.04361" pos="-0.03613 0.03851 0.05934" quat="0.526399 -0.0555699 0.0345099 0.847718" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g11" size="0.00413 0.00876 0.04361" pos="-0.04594 0.03217 0.05934" quat="0.0597801 0.404871 0.912032 -0.02654" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g12" size="0.00412 0.00876 0.04361" pos="-0.05444 0.02216 0.05934" quat="0.259 -0.06317 0.01698 0.96366" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g13" size="0.00412 0.00876 0.04361" pos="-0.05951 0.00987 0.05934" quat="0.0650497 0.10512 0.992306 -0.00688997" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g14" size="0.00413 0.00876 0.04361" pos="-0.06044 -0.0045 0.05934" quat="0.0646601 0.0652701 0.00424001 -0.995761" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g15" size="0.00412 0.00876 0.04361" pos="-0.05654 -0.0183 0.05934" quat="0.0636197 -0.231699 0.970586 0.0151899" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g16" size="0.00413 0.00876 0.04361" pos="-0.04863 -0.02964 0.05934" quat="0.386511 0.0603002 0.0253301 -0.919963" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g17" size="0.00412 0.00876 0.04361" pos="-0.03703 -0.03808 0.05934" quat="0.0551598 -0.536318 0.841477 0.0351599" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g18" size="0.00413 0.00876 0.04361" pos="-0.0222 -0.0423 0.05934" quat="0.680041 0.04787 0.04458 -0.730251" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g19" size="0.00412 0.00876 0.04361" pos="-0.00773 -0.04118 0.05934" quat="0.0395498 -0.794776 0.603367 0.0520998" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g20" size="0.00412 0.00876 0.04361" pos="0.00471 -0.03578 0.05934" quat="0.03072 -0.880921 0.468721 0.0577501" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g21" size="0.00412 0.00876 0.04361" pos="0.01547 -0.02593 0.05934" quat="0.0203499 -0.948318 0.310509 0.0621598" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g22" size="0.00412 0.00876 0.04361" pos="0.02184 -0.01422 0.05934" quat="0.01035 -0.985278 0.15795 0.0645899" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g23" size="0.00407 0.00876 0.01028" pos="0.01284 -0.001 0.0106" quat="0.950387 0 0.311069 0" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g24" size="0.00407 0.00876 0.01028" pos="0.00804 0.01661 0.0106" quat="0.0914002 0.908432 0.27925 -0.297351" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g25" size="0.00407 0.00876 0.01028" pos="-0.00359 0.0274 0.0106" quat="0.806911 -0.16435 0.26412 0.50212" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g26" size="0.00407 0.00876 0.01028" pos="-0.02029 0.03097 0.0106" quat="0.637708 -0.230629 0.208729 0.704678" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g27" size="0.00407 0.00876 0.01028" pos="-0.034 0.02672 0.0106" quat="0.14973 0.83305 -0.45745 0.27267" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g28" size="0.00407 0.00876 0.01028" pos="-0.04548 0.0148 0.0106" quat="0.21896 -0.302709 0.0716599 0.924818" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g29" size="0.00407 0.00876 0.01028" pos="-0.04922 -0.0011 0.0106" quat="0.01047 -0.949846 -0.0319999 -0.310899" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g30" size="0.00407 0.00876 0.01028" pos="-0.04438 -0.01667 0.0106" quat="0.280291 0.297241 0.0917502 -0.908112" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g31" size="0.00407 0.00876 0.01028" pos="-0.03258 -0.02751 0.0106" quat="0.263461 -0.505291 0.804932 0.16539" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g32" size="0.00407 0.00876 0.01028" pos="-0.0177 -0.03104 0.0106" quat="0.21464 -0.687908 0.655748 0.225179" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g33" size="0.00407 0.00876 0.01028" pos="-0.00302 -0.02709 0.0106" quat="0.827539 0.15297 0.27086 -0.467349" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g34" size="0.00407 0.00876 0.01028" pos="0.00801 -0.01666 0.0106" quat="0.91668 0.08211 0.30004 -0.25086" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g35" size="0.0025 0.01861 0.01861" pos="-0.01819 0 0.00274" quat="0.5 0.5 -0.5 0.5" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g36" size="0.0025 0.00383 0.01861" pos="-0.01819 -0.0221 0.00274" quat="0.707107 0 0.707107 0" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g37" size="0.0025 0.00383 0.01861" pos="-0.01819 0.0221 0.00274" quat="0.707107 0 0.707107 0" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g38" size="0.0025 0.00383 0.0186" pos="-0.0412 0 0.00274" quat="0.503589 -0.496379 0.503599 0.496379" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <geom name="white_yellow_mug_1_g39" size="0.0025 0.00383 0.0186" pos="0.0046 0 0.00274" quat="0.503589 -0.496379 0.503599 0.496379" type="box" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" rgba="0.8 0.8 0.8 0.3" />
-      <site name="white_yellow_mug_1_default_site" pos="0 0 0" size="0.002" rgba="1 0 0 0" />
-    </body>
     <body name="orange_block_1_main">
       <joint name="orange_block_1_joint0" type="free" limited="false" actuatorfrclimited="false" />
       <geom name="orange_block_1_g0" size="0.03 0.03 0.03" type="box" rgba="0.5 0 0 1" />
       <geom name="orange_block_1_g0_vis" size="0.03 0.03 0.03" type="box" contype="0" conaffinity="0" group="1" mass="0" rgba="1 0.32 0.03 1" />
       <site name="orange_block_1_default_site" pos="0 0 0" size="0.002" rgba="1 0 0 -1" />
     </body>
-    <body name="white_cabinet_1_main" pos="0 0 0.90500000000000003">
+    <body name="white_cabinet_1_main" pos="0.037960800000000003 0.17078085280834168 0.90500000000000003">
       <site name="white_cabinet_1_default_site" pos="0 0 0" size="0.002" rgba="1 0 0 0" />
       <body name="white_cabinet_1_base">
         <geom name="white_cabinet_1_g0" type="mesh" contype="0" conaffinity="0" group="1" friction="0.95 0.3 0.1" solref="0.001" solimp="0.998 0.998" density="100" material="white_cabinet_1_white_cabinet_base" mesh="white_cabinet_1_white_cabinet_base_vis" />
