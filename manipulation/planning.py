@@ -4229,8 +4229,12 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             if not attempt["accepted"] or validation is None:
                 raise ValueError("Only a completely validated candidate may enter execution binding")
             bound_scene = scene if binding_scene is None else binding_scene
+            # BEGIN the binding owns the validation tree at its conversion boundary.
+            # bind_candidate reads the candidate's arrays synchronously, then
+            # plain(validation) creates independent containers and array values.
             binding = bind_candidate(trajectory, problem=problem, scene=scene if binding_scene is None else binding_scene,
-                validation=deepcopy(validation), native_report=attempt)
+                validation=validation, native_report=attempt)
+            # END the source validation remains owned by this active candidate.
             for event in problem.events:
                 if event.timing and not any(event_occurrence_key(row) == event_occurrence_key(event)
                                             for row in ledger["timing_events"]):
@@ -4264,12 +4268,16 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             # Required qualification and binding finish within budget. Cleanup
             # is recorded afterward and cannot erase this completed record.
             binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
+            # BEGIN complete validation is retained in binding["validation"]["export"].
+            # Delivery consumes that owned tree; the curve and report have
+            # separate mutable consumers and retain their independent copies.
             record = {"trajectory": deepcopy(trajectory), "binding": binding,
-                "report": deepcopy(attempt), "validation": deepcopy(validation),
+                "report": deepcopy(attempt),
                 "scene": bound_scene.describe(), "event_time_checks": deepcopy(diagnostics["event_time_checks"]),
                 "joint_reference": deepcopy(diagnostics.get("joint_reference")),
                 "reference_clock": deepcopy(diagnostics.get("reference_clock")),
                 "qualified_elapsed_seconds": None}
+            # END the delivery record keeps one owned validation representation.
             check()
             record["qualified_elapsed_seconds"] = time.monotonic()-started
             incumbent = record

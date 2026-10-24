@@ -165,6 +165,17 @@ def test_real_candidate_binding_preserves_observed_geometry_and_rejects_mutation
         np.testing.assert_array_equal(restored.values, scene.background.values)
         np.testing.assert_array_equal(restored.observed, scene.background.observed)
         np.testing.assert_array_equal(restored.weights, scene.background.weights)
+        # BEGIN real binding owns evidence after the native arrays are reused.
+        # The binding reads the original validation without changing it, and
+        # its plain export stays accepted when later backend work overwrites
+        # both the original query coordinates and residual values.
+        np.testing.assert_array_equal(native.last_validation["u"], [0., 1.])
+        np.testing.assert_array_equal(native.last_validation["violations"], [0., 0.])
+        validation_snapshot = deepcopy(binding["validation"]["export"])
+        native.last_validation["u"][:] = .5
+        native.last_validation["violations"][:] = 1.
+        assert check_result(result)["validation"]["export"] == validation_snapshot
+        # END later native storage has no ownership of delivered validation.
         result.execution_binding["scene"]["background"]["origin"][0] += .01
         with pytest.raises(ValueError, match="validated input binding"):
             check_result(result)

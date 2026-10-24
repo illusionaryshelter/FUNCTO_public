@@ -155,6 +155,8 @@ trajectory.finger_trajectory.describe
 def bind_candidate(trajectory, *, problem, scene, validation, native_report):
 ```
 
+调用者直接传入当前候选的 validation；本函数同步只读 `u/violations`，随后以 `plain(validation)` 构造独立的 `validation.export`。返回的验证记录与后端数组独立，后端可继续复用原数组。绑定顶层输入与 `validation.inputs` 仍分别持有独立记录，供 `check_result` 检测交付后修改。
+
 实现说明：
 
 > Bind the accepted joint curve and the exact online geometry snapshot.

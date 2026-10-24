@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-代码基线：`be44b54`。本次文档提交回填实际实现引用，生产代码与该实现提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+算法接口基线为 `be44b54`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -163,7 +163,7 @@
 | `SceneMotionBounds.from_scene/partition_times/interval` | 完整关节树、官方实体、TSDF、关系和曲线 | 时间分区与逐实体速度界；区间验收 |
 | `check_interval_geometry` | 原曲线、运动界、几何查询回调、已有完整证据和预算 | 每轮当前缺失端点数组查询；已证明、交叠、未决及实际查询时刻、批大小和完整消耗；候选报告 |
 | `_ConstrainedPlanner.select_candidate/evaluate_candidate/export` | 结果可迭代对象、同一候选评分及原模型验收；select必填on_candidate回调 | 逐结果验收并立即调用请求资格绑定；首个完整合格候选终止生成器推进；失败出口恢复选中失败曲线及其证据；export交付已评价对象 |
-| `plan_trajectory.record_validation_work/qualify_candidate/qualify_native/deliver_incumbent` | 已开始的验证与完成查询、已合格曲线和固定评分 | 即时工作账本与首个完整合格绑定；请求返回 |
+| `plan_trajectory.record_validation_work/qualify_candidate/qualify_native/deliver_incumbent` | 已开始的验证与完成查询、已合格曲线、原 validation 和固定评分 | 即时工作账本与首个完整合格绑定；validation 经 bind_candidate 内 plain 转为独立证据树，随绑定交付 |
 
 中断报告的 `latest_trial/latest_complete_trial` 以自由系数和递增 `trial_index` 标识实际计算，`completed_components` 指明哪些值及导数已完成；其中 `geometry_objective` 与同一系数的目标计算绑定。`last_callback_iterate` 以 `callback_index` 记录库迭代，并在系数相同的条件下记录对应试算编号。`reference_candidate.curve` 保存已检查参考种子的多项式快照，原 `accepted` 与几何验收证据继续属于该曲线。`diagnostic_optimizer_provenance` 保存所导出试算的身份及已有计算证据，`diagnostic_candidate_source` 指明 `diagnostic_optimizer_trial/last_solver_iterate/validated_reference_seed/validated_optimizer_candidate`，`diagnostic_validation_status` 明确完整验收是否完成。完整验收的失败出口另以 `diagnostic_candidate_report` 保存实际该曲线的原 `attempt`，来源由实际曲线身份决定。归档入口 `tests/planning/recorded_task_planning.plan_and_record` 将来源与状态写入候选记录，诊断曲线保留 `rejected_diagnostic_not_executable` 分类。
 
