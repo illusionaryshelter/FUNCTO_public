@@ -42,6 +42,12 @@
 
 ## 2. 结果结构与输入身份
 
+规划报告按实际消费者分为候选验收记录、正式执行绑定和公开诊断。`evaluate_candidate` 的任务残差、场景分项与连续区间证据用于接受判定及失败路径选择；`bind_candidate` 将已接受曲线、原任务、观测场景和完成的验收保存为独立绑定，供 `TrajectoryExecutor.execute → check_result` 核对。`diagnostics.reference_candidate`、`returned_candidate` 和候选汇总提供分析视图，设备逐时刻的控制指令由已绑定曲线及机器人反馈产生。
+
+`qualify_candidate` 在绑定成功后把已完成的 `attempt` 报告直接保存在内部交付记录中。该报告的几何证据已经转为自有 CPU 数值；首个合格候选立即结束选择，后续请求替换 `last_validation` 等引用。内部交付继续读取当前报告，保持原轨迹副本；绑定的 `plain` 转换、公开参考诊断和返回诊断分别构造自己的容器。私有 `last_validation` 与报告中的部分完成几何树共享引用，其生命周期内的生产计算只读这些完成记录。
+
+深复制递归建立嵌套字典、列表和数组的独立容器，用于当前可变接口的所有权隔离。公开诊断修改不改变其他公开视图或正式执行绑定；`check_result` 返回的绑定副本则供执行器及设备重绑定修改自身状态。完整诊断副本服务于结果解释，验收计算服务于规划资格，两者具有不同职责。当前接口在规划返回前同步完成这些内存操作，归档 JSON/NPZ 的文件操作由调用方另行执行。
+
 `PlanningResult` 保存 `success`、`trajectory`、`diagnostics`、`execution_binding`、`request_ledger`。成功结果的 `trajectory` 为 `JointTrajectory`；其具名关节、时间、位置、速度、进度映射、原事件、条件、手指曲线及已满足依赖共同定义可执行内容。失败候选以 `diagnostics.diagnostic_trajectory` 保存，用于解释残差。
 
 `diagnostics.reference_initialization` 保存实际样本拟合及策略，普通参考 IK 查询保留前次状态、实际 dt、原生成功与位姿误差，以及有限返回状态的来源。`last_optimizer_runtime` 保存每个已经开始的约束求解报告，包括状态、迭代、求值次数、原目标、归一化尺度与系数更新。异常路径保存已经完成的诊断，尚未完成的计算保持缺失。

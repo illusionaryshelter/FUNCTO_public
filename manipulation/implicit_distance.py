@@ -72,7 +72,11 @@ def world_bounds(lower, upper, pose):
 def box_distance(a, b):
     gap = np.maximum(0., np.maximum(a[0] - b[1], b[0] - a[1]))
     value = float(np.linalg.norm(gap))
-    error = _GAMMA * (value + float(np.max(np.abs(np.r_[a[0], a[1], b[0], b[1]]))))
+    # BEGIN concatenate the four length-three bounds in their original order.
+    # These binary64 ndarray endpoints need only array joining. The reduction,
+    # round-off allowance and outward rounding retain their original order.
+    error = _GAMMA * (value + float(np.max(np.abs(np.concatenate((a[0], a[1], b[0], b[1]))))))
+    # END array joining preserves the existing geometric lower-bound formula.
     return max(0., float(np.nextafter(value - error, -np.inf)))
 
 

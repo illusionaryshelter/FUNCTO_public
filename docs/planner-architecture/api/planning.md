@@ -1,7 +1,7 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：`efa06ac`。本文所在的后续文档提交仅回填实现引用，生产代码与该实现提交相同。
-职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`当前实现提交；提交后固定实际代码引用`。
+职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
 
@@ -4370,7 +4370,7 @@ torch.stack((exact_terms, left_terms, right_terms)).amax
 
 ## `_scene_boundary_evaluate.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2173)。
+[定义位置](../../../manipulation/planning.py#L2145)。
 
 输入签名：
 
@@ -9698,10 +9698,6 @@ time.monotonic
 def qualify_candidate(trajectory, validation, attempt, *, binding_scene=None):
 ```
 
-该内部回调的前置条件是当前候选已完成原资格检查，`attempt.accepted` 为真且 validation 存在。它将原验证对象同步传给 `bind_candidate`；该函数只读验收数组，再通过 `plain` 建立独立的 `binding.validation.export`。私有交付记录保存该绑定、独立曲线与报告、场景说明和时钟检查；完整 validation 由绑定持有。完成请求预算检查后记录资格时间并设置 incumbent，供 `deliver_incumbent` 返回。
-
-这里的引用传递仅发生在当前串行候选的同步调用中；交付对象中的验证树与后端原数组独立。原输入双份保存、曲线隔离和 `check_result` 的返回副本分别维持输入变更检测与执行者私有记录的职责。
-
 显式输出分支：
 
 ```python
@@ -9746,13 +9742,13 @@ incumbent
 ```python
 ValueError
 bind_candidate
-deepcopy
 any
 event_occurrence_key
 ledger['timing_events'].append
 plain
 set
 binding.update
+deepcopy
 range
 len
 enumerate
@@ -9768,7 +9764,7 @@ mark_wallclock
 
 ## `plan_trajectory.deliver_incumbent`
 
-[定义位置](../../../manipulation/planning.py#L4291)。
+[定义位置](../../../manipulation/planning.py#L4295)。
 
 输入签名：
 
@@ -9811,7 +9807,7 @@ deepcopy
 
 ## `plan_trajectory.qualify_native`
 
-[定义位置](../../../manipulation/planning.py#L4305)。
+[定义位置](../../../manipulation/planning.py#L4309)。
 
 输入签名：
 
@@ -9853,7 +9849,7 @@ qualify_candidate
 
 ## `plan_trajectory.on_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4382)。
+[定义位置](../../../manipulation/planning.py#L4386)。
 
 输入签名：
 
@@ -9889,7 +9885,7 @@ qualify_native
 
 ## `plan_trajectory.select_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4389)。
+[定义位置](../../../manipulation/planning.py#L4393)。
 
 输入签名：
 
@@ -9921,7 +9917,7 @@ planner.select_candidate
 
 ## `plan_trajectory.geometry_failed`
 
-[定义位置](../../../manipulation/planning.py#L4410)。
+[定义位置](../../../manipulation/planning.py#L4414)。
 
 输入签名：
 
@@ -9963,7 +9959,7 @@ candidate_report[name].values
 
 ## `plan_trajectory.search_initializers`
 
-[定义位置](../../../manipulation/planning.py#L4416)。
+[定义位置](../../../manipulation/planning.py#L4420)。
 
 输入签名：
 

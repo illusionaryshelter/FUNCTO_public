@@ -1,6 +1,6 @@
 # `manipulation/implicit_distance.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`当前实现提交；提交后固定实际代码引用`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `transform_points`
@@ -258,7 +258,7 @@ np.linalg.norm
 np.linalg
 np.max
 np.abs
-np.r_
+np.concatenate
 np.nextafter
 np.inf
 ```
@@ -279,13 +279,14 @@ float
 np.linalg.norm
 np.max
 np.abs
+np.concatenate
 max
 np.nextafter
 ```
 
 ## `trilinear`
 
-[定义位置](../../../manipulation/implicit_distance.py#L79)。
+[定义位置](../../../manipulation/implicit_distance.py#L83)。
 
 输入签名：
 
@@ -348,7 +349,7 @@ np.abs
 
 ## `PairPermission`
 
-[定义位置](../../../manipulation/implicit_distance.py#L95)。
+[定义位置](../../../manipulation/implicit_distance.py#L99)。
 
 ```python
 class PairPermission():
@@ -369,7 +370,7 @@ class PairPermission():
 
 ## `PairPermission.__init__`
 
-[定义位置](../../../manipulation/implicit_distance.py#L104)。
+[定义位置](../../../manipulation/implicit_distance.py#L108)。
 
 输入签名：
 
@@ -401,7 +402,7 @@ frozenset
 
 ## `PairPermission.excludes_cells`
 
-[定义位置](../../../manipulation/implicit_distance.py#L111)。
+[定义位置](../../../manipulation/implicit_distance.py#L115)。
 
 输入签名：
 
@@ -431,7 +432,7 @@ self.excluded_second_cells
 
 ## `PairPermission._classify`
 
-[定义位置](../../../manipulation/implicit_distance.py#L115)。
+[定义位置](../../../manipulation/implicit_distance.py#L119)。
 
 输入签名：
 
@@ -492,7 +493,7 @@ np.any
 
 ## `PairPermission.boxes`
 
-[定义位置](../../../manipulation/implicit_distance.py#L130)。
+[定义位置](../../../manipulation/implicit_distance.py#L134)。
 
 输入签名：
 
@@ -532,7 +533,7 @@ self._classify
 
 ## `_Node`
 
-[定义位置](../../../manipulation/implicit_distance.py#L142)。
+[定义位置](../../../manipulation/implicit_distance.py#L146)。
 
 ```python
 class _Node():
@@ -550,7 +551,7 @@ points: object = None
 
 ## `ObservedField`
 
-[定义位置](../../../manipulation/implicit_distance.py#L152)。
+[定义位置](../../../manipulation/implicit_distance.py#L156)。
 
 ```python
 class ObservedField():
@@ -570,7 +571,7 @@ class ObservedField():
 
 ## `ObservedField.__init__`
 
-[定义位置](../../../manipulation/implicit_distance.py#L160)。
+[定义位置](../../../manipulation/implicit_distance.py#L164)。
 
 输入签名：
 
@@ -701,7 +702,7 @@ sum
 
 ## `ObservedField.__init__.build`
 
-[定义位置](../../../manipulation/implicit_distance.py#L205)。
+[定义位置](../../../manipulation/implicit_distance.py#L209)。
 
 输入签名：
 
@@ -762,7 +763,7 @@ tuple
 
 ## `ObservedField._initial_cell_bounds`
 
-[定义位置](../../../manipulation/implicit_distance.py#L238)。
+[定义位置](../../../manipulation/implicit_distance.py#L242)。
 
 输入签名：
 
@@ -871,7 +872,7 @@ np.minimum
 
 ## `ObservedField._initial_occupied_points`
 
-[定义位置](../../../manipulation/implicit_distance.py#L284)。
+[定义位置](../../../manipulation/implicit_distance.py#L288)。
 
 输入签名：
 
@@ -982,7 +983,7 @@ output.append
 
 ## `ObservedField.bounds`
 
-[定义位置](../../../manipulation/implicit_distance.py#L330)。
+[定义位置](../../../manipulation/implicit_distance.py#L334)。
 
 输入签名：
 
@@ -1018,7 +1019,7 @@ root
 
 ## `ObservedField.cell_value`
 
-[定义位置](../../../manipulation/implicit_distance.py#L336)。
+[定义位置](../../../manipulation/implicit_distance.py#L340)。
 
 输入签名：
 
@@ -1074,7 +1075,7 @@ np.sum
 
 ## `ObservedField.sample`
 
-[定义位置](../../../manipulation/implicit_distance.py#L354)。
+[定义位置](../../../manipulation/implicit_distance.py#L358)。
 
 输入签名：
 
@@ -1210,7 +1211,7 @@ error.reshape
 
 ## `ObservedField.node_values`
 
-[定义位置](../../../manipulation/implicit_distance.py#L409)。
+[定义位置](../../../manipulation/implicit_distance.py#L413)。
 
 输入签名：
 
@@ -1246,7 +1247,7 @@ box_corners
 
 ## `ObservedField.tighten`
 
-[定义位置](../../../manipulation/implicit_distance.py#L412)。
+[定义位置](../../../manipulation/implicit_distance.py#L416)。
 
 输入签名：
 
@@ -1338,7 +1339,7 @@ _Node
 
 ## `ObservedField.occupied_points`
 
-[定义位置](../../../manipulation/implicit_distance.py#L442)。
+[定义位置](../../../manipulation/implicit_distance.py#L446)。
 
 输入签名：
 
@@ -1418,7 +1419,7 @@ np.asarray
 
 ## `ObservedField.split`
 
-[定义位置](../../../manipulation/implicit_distance.py#L479)。
+[定义位置](../../../manipulation/implicit_distance.py#L483)。
 
 输入签名：
 
@@ -1490,7 +1491,7 @@ self.tighten
 
 ## `query_distance`
 
-[定义位置](../../../manipulation/implicit_distance.py#L498)。
+[定义位置](../../../manipulation/implicit_distance.py#L502)。
 
 输入签名：
 
@@ -1682,7 +1683,7 @@ witness[1].tolist
 
 ## `query_distance.push`
 
-[定义位置](../../../manipulation/implicit_distance.py#L534)。
+[定义位置](../../../manipulation/implicit_distance.py#L538)。
 
 输入签名：
 

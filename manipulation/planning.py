@@ -4269,15 +4269,19 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             # is recorded afterward and cannot erase this completed record.
             binding["verification_joint_limits"] = deepcopy(diagnostics["verification_joint_limits"])
             # BEGIN complete validation is retained in binding["validation"]["export"].
-            # Delivery consumes that owned tree; the curve and report have
-            # separate mutable consumers and retain their independent copies.
+            # Delivery consumes that owned tree and retains a curve copy for
+            # its mutable consumer. The completed report contains owned CPU
+            # values: first acceptance ends selection, and later requests
+            # replace validation trees rather than modifying this report.
+            # Public reference/returned views and the plain binding retain
+            # their independent containers at their own publication sites.
             record = {"trajectory": deepcopy(trajectory), "binding": binding,
-                "report": deepcopy(attempt),
+                "report": attempt,
                 "scene": bound_scene.describe(), "event_time_checks": deepcopy(diagnostics["event_time_checks"]),
                 "joint_reference": deepcopy(diagnostics.get("joint_reference")),
                 "reference_clock": deepcopy(diagnostics.get("reference_clock")),
                 "qualified_elapsed_seconds": None}
-            # END the delivery record keeps one owned validation representation.
+            # END delivery owns the completed report without another tree copy.
             check()
             record["qualified_elapsed_seconds"] = time.monotonic()-started
             incumbent = record
