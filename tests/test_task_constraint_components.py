@@ -226,3 +226,99 @@ def test_two_turn_event_retains_full_trajectory_lift_and_physical_order():
     assert iq["function_coordinate:0:lower"].item() == pytest.approx(-.01)
     assert iq["function_coordinate:0:upper"].item() == pytest.approx(-.01)
 # END finite-query task constraints do not claim continuous-interval coverage.
+
+
+# BEGIN fixed solver rows are produced beside the original physical conditions.
+@pytest.mark.parametrize("bounded_sides", [(), (0,), (1,), (0, 1)])
+def test_solver_selection_preserves_one_sided_and_unbounded_pose_coordinates(bounded_sides):
+    bounds = np.tile([-np.inf, np.inf], (6, 1))
+    for side in bounded_sides:
+        bounds[:, side] = -.4 if side == 0 else .4
+    relation = replace(full_task().pose_relations[0], start=.25, end=.75, pose_bounds=bounds)
+    problem = task(pose_relations=(relation,))
+    masks = ({}, {})
+    values = problem.constraint_components(**arguments(variables()), solver_rows_out=masks)[1]
+    expected_keys = [f"pose_relation:0:{('lower', 'upper')[side]}" for side in bounded_sides]
+    assert [key for key in values if key.startswith("pose_relation:")] == expected_keys
+    for key in expected_keys:
+        assert values[key].shape == (1, 3, 6)
+        torch.testing.assert_close(masks[1][key],
+            torch.tensor([[[False]*6, [True]*6, [False]*6]]))
+        assert torch.isfinite(values[key]).all()
+
+
+def test_solver_selection_preserves_full_components_and_scoped_direction_rows():
+    original = full_task()
+    mechanism = replace(original.mechanisms[0], start=.25, end=.75,
+        directions=tuple(replace(value, start=.25, end=.75)
+                         for value in original.mechanisms[0].directions))
+    problem = replace(original, mechanisms=(mechanism,),
+        pose_relations=tuple(replace(value, start=.25, end=.75) for value in original.pose_relations),
+        interiors=tuple(replace(value, start=.25, end=.75) for value in original.interiors),
+        coordinate_events=tuple(replace(value, progress=.75, mechanism=mechanism)
+                                for value in original.coordinate_events))
+    inputs = arguments(variables())
+    sample_columns = [0, 1, 1, 1, 2]
+    inputs = {key: value[:, sample_columns] if isinstance(value, torch.Tensor) else value
+              for key, value in inputs.items()}
+    inputs.update(progress=torch.tensor([[0., .25, .5, .75, 1.]], dtype=torch.float64),
+                  trajectory_time=torch.tensor([[0., .4, .8, 1.2, 1.6]], dtype=torch.float64))
+    masks = ({}, {})
+    groups = problem.constraint_components(**inputs, solver_rows_out=masks)
+    complete = problem.constraint_components(**inputs)
+    for group, mask_group, full in zip(groups, masks, complete):
+        assert list(group) == list(mask_group) == list(full)
+        for key, values in group.items():
+            torch.testing.assert_close(values, full[key], rtol=0., atol=0.)
+            assert mask_group[key].shape == values.shape
+            assert mask_group[key].dtype == torch.bool
+            assert bool((values[~mask_group[key]] <= 0.).all())
+    retained = masks[1]
+    assert not retained["progress:lower"].any() and not retained["progress:upper"].any()
+    expected = torch.tensor([[False, True, True, True, False]])
+    torch.testing.assert_close(retained["mechanism:0:position"], expected)
+    torch.testing.assert_close(retained["pose_relation:0:lower"], expected[..., None].expand(1, 5, 6))
+    torch.testing.assert_close(retained["interior:0"], expected[..., None, None].expand(1, 5, 3, 6))
+    for kind, selected in (("net", [False, False, False, True, False]),
+                           ("monotone", [False, False, True, True, False]),
+                           ("local_rate", [False, True, True, True, False])):
+        index = ("net", "monotone", "local_rate").index(kind)
+        torch.testing.assert_close(retained[f"mechanism:0:direction:{index}:{kind}"],
+                                   torch.tensor([selected]))
+    assert retained["support:0:body"].all() and retained["support:0:footprint"].all()
+    assert retained["function_pose:0:yaw"].all() and retained["stop:0:lower"].all()
+    # Changing candidate values cannot change the declaration selection.
+    altered = dict(inputs, position=inputs["position"]+.17,
+                   joint_position=inputs["joint_position"]-.13,
+                   tool_linear_velocity=inputs["tool_linear_velocity"]+.21)
+    changed_masks = ({}, {})
+    problem.constraint_components(**altered, solver_rows_out=changed_masks)
+    for first, second in zip(masks, changed_masks):
+        for key in first:
+            torch.testing.assert_close(first[key], second[key], rtol=0., atol=0.)
+
+
+def test_direction_selection_uses_physical_order_and_retains_missing_net_endpoint():
+    problem = full_task()
+    inputs = arguments(variables())
+    columns = [2, 1, 0, 1, 1]
+    inputs = {key: value[:, columns] if isinstance(value, torch.Tensor) else value
+              for key, value in inputs.items()}
+    inputs.update(progress=torch.tensor([[1., .5, 0., .5, .5]], dtype=torch.float64),
+                  trajectory_time=torch.tensor([[2., 1., 0., 1., .8]], dtype=torch.float64))
+    masks = ({}, {})
+    problem.constraint_components(**inputs, solver_rows_out=masks)
+    torch.testing.assert_close(masks[1]["mechanism:0:direction:0:net"],
+        torch.tensor([[True, False, False, False, False]]))
+    torch.testing.assert_close(masks[1]["mechanism:0:direction:1:monotone"],
+        torch.tensor([[True, True, False, False, True]]))
+    assert masks[1]["mechanism:0:direction:2:local_rate"].all()
+
+    missing = arguments(variables())
+    missing["progress"] = torch.tensor([[0., .5, .75]], dtype=torch.float64)
+    masks = ({}, {})
+    values = problem.constraint_components(**missing, solver_rows_out=masks)[1]
+    key = "mechanism:0:direction:0:net"
+    assert torch.isinf(values[key][0, -1]) and masks[1][key][0, -1]
+    assert int(masks[1][key].sum()) == 1
+# END fixed rows follow declared time layout, including invalid retained conditions.

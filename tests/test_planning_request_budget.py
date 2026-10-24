@@ -146,17 +146,19 @@ class PlanningRequestBudgetTest(unittest.TestCase):
 
     # BEGIN started validations and completed queries consume the original ledger.
     def test_last_admitted_validation_delivers_without_recharging_geometry(self):
-        for solves, seeds in ((1, 2), (2, 1)):
+        for solves, seeds in ((1, 1), (1, 2), (2, 1)):
             with self.subTest(solves=solves, seeds=seeds):
                 native = Native([False, True])
                 select = native.select_candidate
                 query_counts = iter((3, 11))
 
-                def interval_checked(accepted, *, record_work):
-                    candidate, curve, report = select(accepted, record_work=record_work)
+                def interval_checked(accepted, *, record_work, on_candidate):
+                    candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
                     points = next(query_counts)
                     record_work(points=points)
                     report['interval_query_points'] = points
+                    native.delivery_candidate = curve
+                    on_candidate(candidate, report)
                     return candidate, curve, report
 
                 native.select_candidate = interval_checked
@@ -173,28 +175,33 @@ class PlanningRequestBudgetTest(unittest.TestCase):
                 finally:
                     backend.close()
 
-    def test_recovery_validation_cannot_start_after_reference_and_main_use_two_passes(self):
+    def test_late_recovery_validation_fits_the_derived_capacity(self):
         native = Native([False, False, True], collision=True)
         select = native.select_candidate
         completed = []
 
-        def interval_checked(accepted, *, record_work):
-            candidate, curve, report = select(accepted, record_work=record_work)
+        def interval_checked(accepted, *, record_work, on_candidate):
+            candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
             record_work(points=11)
             completed.append(accepted)
             report['interval_query_points'] = 11
+            if len(completed) == 1:
+                # Geometry failure first appears after the main solve, so
+                # the remaining batch receives the one search opportunity.
+                report['collision_residuals'] = {'rollout:scene_collision': 0.}
+            native.delivery_candidate = curve
+            on_candidate(candidate, report)
             return candidate, curve, report
 
         native.select_candidate = interval_checked
         result, backend = run_native(native, budget=replace(self.budget, trajectory_seeds=1))
         try:
-            self.assertFalse(result.success)
-            self.assertEqual(result.diagnostics['failure'], 'cumulative_planning_budget_exhausted')
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 2)
-            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 1 + 22)
-            self.assertEqual(completed, [False, False])
-            self.assertNotIn('export', native.calls)
-            self.assertIsNone(result.execution_binding)
+            self.assertTrue(result.success, result.diagnostics)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_passes'], 3)
+            self.assertEqual(result.request_ledger['consumed_planning']['validation_queries'], 1 + 33)
+            self.assertEqual(completed, [False, False, True])
+            self.assertEqual(native.calls, ['seed', 'reference', 'solve', 'ompl', 'solve', 'export'])
+            self.assertIsNotNone(result.execution_binding)
         finally:
             backend.close()
 
@@ -203,11 +210,13 @@ class PlanningRequestBudgetTest(unittest.TestCase):
         select = native.select_candidate
         completed = []
 
-        def qualified(accepted, *, record_work):
-            candidate, curve, report = select(accepted, record_work=record_work)
+        def qualified(accepted, *, record_work, on_candidate):
+            candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
             record_work(points=7)
             completed.append(accepted)
             report['interval_query_points'] = 7
+            native.delivery_candidate = curve
+            on_candidate(candidate, report)
             return candidate, curve, report
 
         native.select_candidate = qualified
@@ -229,12 +238,14 @@ class PlanningRequestBudgetTest(unittest.TestCase):
                 select = native.select_candidate
                 clock, attempts = [0.], []
 
-                def timed_query(accepted, *, record_work):
-                    candidate, curve, report = select(accepted, record_work=record_work)
+                def timed_query(accepted, *, record_work, on_candidate):
+                    candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
                     attempts.append(accepted)
                     if len(attempts) == 1:
                         record_work(points=7)
                         report['interval_query_points'] = 7
+                        native.delivery_candidate = curve
+                        on_candidate(candidate, report)
                         return candidate, curve, report
                     # The first batch of the second validation completed as
                     # its original wall-time allowance expired. Committing
@@ -271,3 +282,58 @@ class PlanningRequestBudgetTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 # END a planning failure cannot reset the request or turn historical facts into motion permission.
+
+# BEGIN derived validation bounds include both curves admitted per binding.
+def test_validation_caps_follow_binding_and_optimization_batch_arithmetic():
+    import pytest
+    from manipulation.planning import (_check_work_budget, _PLANNING_COUNTS,
+        _PLANNING_SECONDS, PlanningWorkExhausted)
+    for batches in (1, 2):
+        for seeds in (1, 2):
+            budget = PlanningBudget(maximum_trajectory_solves=batches,
+                trajectory_seeds=seeds, ik_seeds=1, max_validation_points=32, max_task_anchors=32)
+            passes = batches*(seeds+2)
+            queries = 32*passes+batches
+            work = dict.fromkeys((*_PLANNING_COUNTS, *_PLANNING_SECONDS), 0)
+            work.update(validation_passes=passes-1, validation_queries=queries)
+            with patch('manipulation.planning.time.monotonic', return_value=0.):
+                _check_work_budget(budget, work, started=0., initial_seconds=0., stage='validation_passes')
+                work['validation_passes'] += 1
+                _check_work_budget(budget, work, started=0., initial_seconds=0.)
+                with pytest.raises(PlanningWorkExhausted, match='validation_passes'):
+                    _check_work_budget(budget, work, started=0., initial_seconds=0., stage='validation_passes')
+                work['validation_queries'] += 1
+                with pytest.raises(PlanningWorkExhausted, match='validation_queries'):
+                    _check_work_budget(budget, work, started=0., initial_seconds=0.)
+
+
+def test_supplied_local_and_main_curves_fit_a_single_seed_single_batch_budget():
+    native = Native([False, True])
+    reference = deepcopy(native.curve)
+    source_scene = Scene()
+    native.bind_reference_candidate = lambda curve: (curve, source_scene, native.progress_map)
+    base_select = native.select_candidate
+
+    def supplied(curve, *, candidate_scene, record_work):
+        _, _, report = base_select(False, record_work=record_work, on_candidate=lambda *_: None)
+        record_work(points=7)
+        return curve, report, 7
+
+    def native_curve(accepted, *, record_work, on_candidate):
+        result, curve, report = base_select(accepted, record_work=record_work, on_candidate=lambda *_: None)
+        record_work(points=7)
+        native.delivery_candidate = curve
+        on_candidate(result, report)
+        return result, curve, report
+
+    native.evaluate_candidate, native.select_candidate = supplied, native_curve
+    result, backend = run_native(native, joint_reference=reference,
+        budget=PlanningBudget(maximum_trajectory_solves=1, trajectory_seeds=1))
+    try:
+        assert result.success, result.diagnostics
+        work = result.request_ledger['consumed_planning']
+        assert work['validation_passes'] == 3 and work['validation_queries'] == 22
+        assert work['trajectory_solves'] == 1
+    finally:
+        backend.close()
+# END public time, seed, point and optimization-batch allowances remain unchanged.

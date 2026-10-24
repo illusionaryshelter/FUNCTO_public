@@ -19,10 +19,6 @@ from .geometry_motion_bound import (
 from .implicit_distance import box_corners
 
 
-def _cpu(value):
-    return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
-
-
 def _polynomial_ranges(curve, start, end, derivative=0):
     """Enclose a cubic or its derivative using Bernstein convex hulls.
 
@@ -95,7 +91,7 @@ class SceneMotionBounds:
             source_radius = max(_norm_up(point) for point in box_corners(*scene._native_local_bounds[name]))
             radius = _add_up(_norm_up(local[:3, 3]),
                 _mul_up(_linear_norm_up(local[:3, :3]), source_radius))
-            bodies.append(SphereBody(f"robot/{name}", frame, [[0., 0., 0., radius]], {}))
+            bodies.append(SphereBody(f"robot/{name}", frame, [[0., 0., 0., radius]]))
         for owner in scene.owners:
             if owner.query.root is None:
                 radius = 0.
@@ -118,13 +114,14 @@ class SceneMotionBounds:
                 name = f"attachment/{owner.owner_id}/{index}"
                 attached_names[(owner.owner_id, index)] = name
                 bodies.append(SphereBody(name, tool_link,
-                    [[0., 0., 0., complete_radius]], {}))
-        params = scene.kinematics.model.config.kinematics_config
-        arguments = {key: _cpu(getattr(params, key)) for key in
-                     ("fixed_transforms", "link_map", "joint_map", "joint_map_type", "joint_offset_map")}
-        robot = build_geometry_motion_bound(**arguments, joint_names=tuple(params.joint_names),
-            joint_position_limits=_cpu(params.joint_limits.position),
-            link_name_to_idx_map=params.link_name_to_idx_map, bodies=bodies, extra_joint_limits={})
+                    [[0., 0., 0., complete_radius]]))
+        # BEGIN use the registered robot tree and its public base calibration.
+        # Official robot entities retain their original fixed configuration;
+        # only their full local covers enter the speed bound. Owner covers
+        # above come from the same observed TSDF, with declared attachments.
+        robot = build_geometry_motion_bound(model=scene.kinematics.model,
+            T_reference_base=scene.robot_validator.T_reference_base, bodies=bodies)
+        # END no duplicate kinematics or task-entity model is introduced.
         return cls(scene, robot, attached_names, radii)
 
     def declaration_times(self, trajectory):

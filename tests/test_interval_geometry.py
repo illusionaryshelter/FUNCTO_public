@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import coal
 import numpy as np
+import pinocchio as pin
 import pytest
 from scipy.interpolate import CubicHermiteSpline
 
@@ -180,10 +181,9 @@ def test_bernstein_derivative_enclosure_covers_all_original_polynomial_pieces():
 
 
 def bound_scene(*, owners=(), nominal=None):
-    metadata = model([0, 0, 1], [-1, 5, 0], [-1, 0, 1], names=("arm", "finger"),
-        limits=[[-2., 0.], [2., .1]])
-    params = SimpleNamespace(**{key: value for key, value in metadata.items() if key != "joint_position_limits"},
-        joint_limits=SimpleNamespace(position=metadata["joint_position_limits"]))
+    # BEGIN bind scene tests to the same native model type as production.
+    native = model([0, 1], [pin.JointModelRZ(), pin.JointModelPX()],
+        names=("arm", "finger"), limits=[[-2., 0.], [2., .1]])
     scene = SimpleNamespace(robot_model=SimpleNamespace(_geometries={
         "body": ("link1", coal.Box(.02, .02, .02), "declared", np.eye(4)),
         "finger": ("link2", coal.Box(.02, .02, .02), "declared", np.eye(4))}),
@@ -191,7 +191,9 @@ def bound_scene(*, owners=(), nominal=None):
         owners=owners, gripper=SimpleNamespace(nominal_finger_trajectory=nominal),
         required_progress_anchors=tuple(value for owner in owners for relation in owner.attachments
                                         for value in relation.interval),
-        kinematics=SimpleNamespace(model=SimpleNamespace(config=SimpleNamespace(kinematics_config=params))))
+        kinematics=SimpleNamespace(model=native),
+        robot_validator=SimpleNamespace(T_reference_base=np.eye(4)))
+    # END full finger motion is carried by the native joint tree.
     return scene
 
 

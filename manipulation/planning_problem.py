@@ -757,7 +757,7 @@ class MechanismRequirement:
     # BEGIN expose the original feasible side of each direction requirement.
     def direction_inequalities(self, position, quaternion, progress, *, trajectory_time,
                             tool_linear_velocity=None, tool_angular_velocity=None, mode="trajectory",
-                            use_tolerance=True):
+                            use_tolerance=True, solver_rows_out=None):
         """Signed values <= 0 at finite ordered physical-time queries.
 
         A geometric OMPL path uses physical-time secants solely to screen a
@@ -765,6 +765,9 @@ class MechanismRequirement:
         Single-state seed membership deliberately proves no path direction.
         Inactive queries have zero values and derivatives. This preserves the
         query layout while exposing feasible slack to a constrained solver.
+        ``solver_rows_out`` optionally receives the retained Boolean rows in
+        that same layout. Their identities depend on declaration scopes and
+        physical time, including the net endpoint and adjacent-time pairs.
         """
         import torch
         if mode not in {"trajectory", "path", "point"}:
@@ -806,9 +809,15 @@ class MechanismRequirement:
                 # does not replay a scope wholly before its actual suffix.
                 error = torch.where(scoped_progress.amin(-1, keepdim=True) > direction.end+1e-7, 0., error)
                 violation = violation.scatter(-1, last, error)
+                # BEGIN the net value and its fixed row identity share this endpoint.
+                if solver_rows_out is not None:
+                    retained = torch.zeros_like(active).scatter(-1, last,
+                        scoped_progress.amin(-1, keepdim=True) <= direction.end+1e-7)
+                # END missing required history stays in the retained error row.
             elif direction.kind == "local_rate" and rates is not None:
                 violation = torch.where(active, direction.minimum-
                     direction.sign*rates[..., direction.coordinate_index]-tolerance, 0.)
+                retained = active
             else:
                 elapsed = times[..., 1:]-times[..., :-1]
                 pair = active[..., 1:] & active[..., :-1] & (elapsed > 0)
@@ -817,7 +826,14 @@ class MechanismRequirement:
                     signed = signed/elapsed.clamp_min(torch.finfo(elapsed.dtype).tiny)
                 error = direction.minimum-signed-tolerance
                 violation = torch.cat((violation[..., :1], torch.where(pair, error, 0.)), -1)
-            result[f"direction:{index}:{direction.kind}"] = torch.gather(violation, -1, restore)
+                if solver_rows_out is not None:
+                    retained = torch.cat((torch.zeros_like(active[..., :1]), pair), -1)
+            # BEGIN the original direction calculation owns its solver selection.
+            name = f"direction:{index}:{direction.kind}"
+            result[name] = torch.gather(violation, -1, restore)
+            if solver_rows_out is not None:
+                solver_rows_out[name] = torch.gather(retained, -1, restore)
+            # END no caller reconstructs direction masks from output names.
         return result
 
     def direction_residuals(self, position, quaternion, progress, *, trajectory_time,
@@ -1573,7 +1589,8 @@ class PlanningProblem:
     # BEGIN complete signed task rows for the single constrained trajectory solve.
     def constraint_components(self, position, quaternion, progress, joint_position=None,
                               joint_names=None, joint_velocity=None, *, trajectory_time,
-                              tool_linear_velocity=None, tool_angular_velocity=None):
+                              tool_linear_velocity=None, tool_angular_velocity=None,
+                              solver_rows_out=None):
         """Return ``(equalities, inequalities)`` with EQ=0 and INEQ<=0.
 
         Inputs are the actual candidate tool pose, joint state and tool twist
@@ -1599,9 +1616,27 @@ class PlanningProblem:
         queries. This method supplies no continuous-interval certificate.
         Scene relations and event clock windows are bound by their existing
         scene/clock consumers before this task computation.
+
+        ``solver_rows_out=(equality_masks, inequality_masks)`` optionally
+        receives Boolean tensors with the same keys, order and shapes. False
+        rows are fixed by progress/time declarations, independent of candidate
+        controls. A solver must check their original finite values against
+        EQ=0 or INEQ<=0 before omitting them. The returned values remain full.
         """
         import torch
         equalities, inequalities = {}, {}
+
+        # BEGIN each condition produces its original value and declaration mask.
+        def add(group, name, value, active=None):
+            (equalities, inequalities)[group][name] = value
+            if solver_rows_out is not None:
+                retained = (torch.ones_like(value, dtype=torch.bool) if active is None
+                    else active[(...,)+(None,)*(value.ndim-active.ndim)].expand_as(value))
+                solver_rows_out[group][name] = retained
+
+        def add_scoped(name, value, mask):
+            add(1, name, scoped(value, mask), mask)
+        # END the complete task output and selected solver rows share one rule.
 
         def scoped(value, mask):
             """Retain the fixed query/point layout with inactive zero rows."""
@@ -1618,8 +1653,9 @@ class PlanningProblem:
         def active_event(requirement):
             return self.start_progress <= requirement.progress <= self.end_progress
 
-        inequalities["progress:lower"] = self.start_progress-progress
-        inequalities["progress:upper"] = progress-self.end_progress
+        fixed_progress = torch.zeros_like(progress, dtype=torch.bool) if solver_rows_out is not None else None
+        add(1, "progress:lower", self.start_progress-progress, fixed_progress)
+        add(1, "progress:upper", progress-self.end_progress, fixed_progress)
         pose_allowance = _tensor([self.numerical.position_m]*3+
                                  [self.numerical.rotation_rad]*3, position)
         for index, requirement in enumerate(self.pose_relations):
@@ -1630,25 +1666,27 @@ class PlanningProblem:
                 if len(columns):
                     bound = _tensor(requirement.pose_bounds[columns, side], position)
                     value = sign*(error[..., columns]-bound)-pose_allowance[columns]
-                    inequalities[f"pose_relation:{index}:{'lower' if side == 0 else 'upper'}"] = scoped(value, mask)
+                    add_scoped(f"pose_relation:{index}:{'lower' if side == 0 else 'upper'}", value, mask)
 
         for index, requirement in enumerate(self.mechanisms):
             mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
             position_error, rotation_error = requirement.errors(position, quaternion)
-            inequalities[f"mechanism:{index}:position"] = scoped(
+            add_scoped(f"mechanism:{index}:position",
                 position_error-requirement.model.position_tolerance-1e-10, mask)
-            inequalities[f"mechanism:{index}:rotation"] = scoped(
+            add_scoped(f"mechanism:{index}:rotation",
                 rotation_error-requirement.model.rotation_tolerance-1e-10, mask)
             if requirement.coordinate_limits is not None:
                 coordinates = requirement.coordinates(position, quaternion, progress,
                                                        trajectory_time=trajectory_time)
                 bounds = _tensor(requirement.coordinate_limits, position)
-                inequalities[f"mechanism_limits:{index}:lower"] = scoped(bounds[:, 0]-coordinates, mask)
-                inequalities[f"mechanism_limits:{index}:upper"] = scoped(coordinates-bounds[:, 1], mask)
+                add_scoped(f"mechanism_limits:{index}:lower", bounds[:, 0]-coordinates, mask)
+                add_scoped(f"mechanism_limits:{index}:upper", coordinates-bounds[:, 1], mask)
+            direction_rows = {} if solver_rows_out is not None else None
             for name, value in requirement.direction_inequalities(position, quaternion, progress,
                     trajectory_time=trajectory_time, tool_linear_velocity=tool_linear_velocity,
-                    tool_angular_velocity=tool_angular_velocity).items():
-                inequalities[f"mechanism:{index}:{name}"] = value
+                    tool_angular_velocity=tool_angular_velocity, solver_rows_out=direction_rows).items():
+                add(1, f"mechanism:{index}:{name}", value,
+                    None if direction_rows is None else direction_rows[name])
 
         for index, requirement in enumerate(self.supports):
             if not active_event(requirement):
@@ -1657,11 +1695,11 @@ class PlanningProblem:
             values = requirement.inequality_components(at_event(position, mask),
                                                        at_event(quaternion, mask), self.numerical)
             for name in requirement.hard_components:
-                inequalities[f"support:{index}:{name}"] = values[name]
+                add(1, f"support:{index}:{name}", values[name])
 
         for index, requirement in enumerate(self.interiors):
             mask = (progress >= requirement.start-1e-7) & (progress <= requirement.end+1e-7)
-            inequalities[f"interior:{index}"] = scoped(
+            add_scoped(f"interior:{index}",
                 requirement.raw_inequalities(position, quaternion, self.numerical), mask)
 
         for index, requirement in enumerate(self.pose_events):
@@ -1672,9 +1710,9 @@ class PlanningProblem:
             for name, bound in requirement.component_tolerances.items():
                 key = f"function_pose:{index}:{name}"
                 if name == "yaw" and bound == 0:
-                    equalities[key] = errors["signed_yaw"]
+                    add(0, key, errors["signed_yaw"])
                 else:
-                    inequalities[key] = errors[name]-bound
+                    add(1, key, errors[name]-bound)
 
         for index, requirement in enumerate(self.coordinate_events):
             if not active_event(requirement):
@@ -1685,21 +1723,21 @@ class PlanningProblem:
             coordinates = requirement.mechanism.coordinates(position, quaternion, progress,
                                                              trajectory_time=trajectory_time)[..., 0]
             difference = at_event(coordinates, mask)-requirement.absolute_target
-            inequalities[f"function_coordinate:{index}:lower"] = -difference-requirement.tolerance
-            inequalities[f"function_coordinate:{index}:upper"] = difference-requirement.tolerance
+            add(1, f"function_coordinate:{index}:lower", -difference-requirement.tolerance)
+            add(1, f"function_coordinate:{index}:upper", difference-requirement.tolerance)
 
         for index, coupling in enumerate(self.couplings):
             columns = [tuple(joint_names).index(name) for name in coupling.joint_names]
             error = (joint_position[..., columns] @ _tensor(coupling.matrix.T, joint_position)
                      -_tensor(coupling.target, joint_position))
-            inequalities[f"coupling:{index}:lower"] = -error-self.numerical.joint
-            inequalities[f"coupling:{index}:upper"] = error-self.numerical.joint
+            add(1, f"coupling:{index}:lower", -error-self.numerical.joint)
+            add(1, f"coupling:{index}:upper", error-self.numerical.joint)
         for index, event in enumerate(self.events):
             if event.stop and active_event(event):
                 mask = _first_event_query(progress, event.progress, trajectory_time)
                 velocity = at_event(joint_velocity, mask)
-                inequalities[f"stop:{index}:lower"] = -velocity-self.numerical.velocity
-                inequalities[f"stop:{index}:upper"] = velocity-self.numerical.velocity
+                add(1, f"stop:{index}:lower", -velocity-self.numerical.velocity)
+                add(1, f"stop:{index}:upper", velocity-self.numerical.velocity)
         return equalities, inequalities
     # END task constraints retain source semantics and differentiable feasible slack.
 
@@ -1755,10 +1793,11 @@ class PlanningProblem:
         for requirement in self.pose_events if phase == "quality" else ():
             errors = requirement.error_components(position, quaternion)
             # BEGIN scale real goal objectives by their declared functional accuracy.
-            # Raw metres/radians squared make a precise goal arbitrarily weak
-            # beside native smoothness costs. This fixed rule changes numerical
-            # conditioning only; residuals and final allowed sets stay in their
-            # original units, and free support/region axes gain no target.
+            # Dividing each bounded coordinate by its own tolerance defines
+            # relative quality weights of 1/tolerance**2. It can change the
+            # preferred point inside the original hard allowed set; it is not
+            # merely a numerical rescaling of the complete objective. Residuals
+            # retain physical units, and free axes gain no centre preference.
             # BEGIN only bounded task coordinates have a nominal-centre preference.
             preference = sum((errors[name]/(bound if bound > 0 else self.numerical.rotation_rad)).square()
                              for name, bound in requirement.component_tolerances.items())

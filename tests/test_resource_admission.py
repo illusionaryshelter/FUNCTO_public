@@ -138,13 +138,13 @@ def test_serial_optimizer_admits_current_pending_geometry_with_each_solve(monkey
     def estimate(actual_scene, metadata, budget, anchors):
         assert actual_scene is scene
         return _PlanningWorkspace(100, 0 if scene.materialized else 17, 23, 0, 0)
-    def solve(computation, initial, *, iterations, check_request, pending_geometry_bytes):
+    def solve(computation, initial, *, iterations, check_request, pending_geometry_bytes, report_out):
         pending.append(pending_geometry_bytes)
         scene.materialized = True
         return SimpleNamespace(report={'iterations': iterations})
     monkeypatch.setattr('manipulation.planning._planning_workspace_bytes', estimate)
     monkeypatch.setattr('manipulation.unified_solver.solve_trajectory', solve)
-    results = planner.optimize(torch.zeros((1, 2, 4, 1)))
+    results = list(planner.optimize(torch.zeros((1, 2, 4, 1))))
     assert len(results) == 2
     assert pending == [17+23, 23]
 # END resident geometry is never charged as a new solver allocation.

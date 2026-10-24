@@ -1,12 +1,6 @@
-"""Numerical tracking selection and the installed native seed allocation.
+"""Installed native seed allocation for the fixed ordinary/functional instances."""
 
-These CPU tests use declared candidate energies and joint states. They check
-the proposal/seed interface, without asserting robot reachability or whole-
-trajectory qualification. GPU pose derivatives are verified separately on
-the production-created native IK instance.
-"""
-
-# BEGIN one tracking candidate preserves pose quality and the fixed exploration budget.
+# BEGIN the maintained SeedManager determines actual solve shape.
 from unittest.mock import Mock
 
 import numpy as np
@@ -15,60 +9,74 @@ import torch
 
 from curobo._src.solver.manager_seed import SeedManager
 from curobo._src.types.device_cfg import DeviceCfg
-from manipulation.planning_ik import select_ik_tracking_candidate
 
 
-# BEGIN native tracking consumes the same complete-query report as chain selection.
-def reports(flags):
-    return [{"native_pose_ik_success": flag, "task_satisfied": flag, "model_valid": flag,
-             "static_model_query": "evaluated" if flag else "not_run_native_reference_ik_failed",
-             "task_violations": {}, "native_violations": {}, "scene_components": {}}
-            for flag in flags]
-# END failed reference queries keep their unqueried static state.
+# BEGIN native decoding may replace the caller's nested dictionaries in place.
+def test_two_solver_construction_separates_raw_configs_before_native_decoding():
+    import ast
+    from copy import deepcopy
+    import inspect
+    from types import SimpleNamespace
+    from manipulation.planning import _ConstrainedPlanner
 
+    tree = ast.parse(inspect.getsource(inspect.getmodule(_ConstrainedPlanner)))
+    planner = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                   and node.name == '_ConstrainedPlanner')
+    initialize = next(node for node in planner.body if isinstance(node, ast.FunctionDef)
+                      and node.name == '_initialize')
+    begin = next(i for i, node in enumerate(initialize.body)
+                 if isinstance(node, ast.FunctionDef) and node.name == 'configuration')
+    end = next(i for i, node in enumerate(initialize.body[begin:], begin)
+               if isinstance(node, ast.Assign) and any(isinstance(target, ast.Attribute)
+                   and target.attr == 'allow_tf32' for target in node.targets))
+    program = ast.fix_missing_locations(ast.Module(body=initialize.body[begin:end], type_ignores=[]))
+    decoded = []
 
-def test_failed_reference_continuity_precedes_pose_energy_within_supplied_proposals():
-    values = np.array([[0., 0.], [1.5, 1.], [.01, .01]])
-    costs = np.array([0., .02, .8])
-    # Row zero is outside the supplied set. The nearer approximate reference
-    # retains its larger residual diagnostic while supplying the warm start.
-    assert select_ik_tracking_candidate(values, [2, 1], costs, [[0., 0.]],
-                                         reports=reports([True, False, False])) == 2
+    def create(**kwargs):
+        optimizer = kwargs['optimizer_configs'][0]
+        # The real decoder mutates its supplied optimizer/metrics structures.
+        # Replacing the dict reproduces the observed construction failure.
+        inputs = [optimizer, kwargs['metrics_rollout']]
+        modes = []
+        for source in inputs:
+            values = source['rollout']['constraint_cfg']
+            modes.append(values.get('process_mode'))
+            source['rollout']['constraint_cfg'] = SimpleNamespace(**values)
+        decoded.append((kwargs, modes))
+        return SimpleNamespace(**kwargs)
 
+    def yaml(_name):
+        return {'optimizer': {}, 'rollout': {'constraint_cfg': {}, 'cost_cfg': {
+            'tool_pose_cfg': {'weight': [10000., 500.]}, 'cspace_cfg': {}}}}
 
-def test_equal_pose_energy_uses_joint_continuity_then_original_index():
-    values = np.array([[.4, .3], [2., 0.], [-.4, -.3]])
-    costs = np.ones(3)
-    assert select_ik_tracking_candidate(values, [1, 2, 0], costs, [[0., 0.]],
-                                         reports=reports([True]*3)) == 0
-    assert select_ik_tracking_candidate(values, [0, 1, 2], costs, [[-.1, -.1]],
-                                         reports=reports([True]*3)) == 2
-
-
-# BEGIN successful native poses use continuity before residual refinement.
-def test_successful_pose_micro_residual_cannot_select_a_distant_posture():
-    values = np.array([[.01], [2.], [0.]])
-    assert select_ik_tracking_candidate(values, [0, 1, 2], [1e-7, 1e-12, 0.], [[0.]],
-                                         reports=reports([True, True, False])) == 0
-
-
-def test_successful_pose_energy_only_breaks_equal_distance_ties():
-    assert select_ik_tracking_candidate([[-1.], [1.]], [0, 1], [.2, .1], [[0.]],
-                                         reports=reports([True, True])) == 1
-# END native success remains part of the same query's original report.
-
-
-def test_empty_proposal_set_has_no_tracking_index():
-    assert select_ik_tracking_candidate(np.empty((0, 2)), [], np.empty(0), [[0., 0.]],
-                                         reports=[]) is None
+    owner = SimpleNamespace(device_cfg=SimpleNamespace(device='cpu'), _manager_type=object())
+    budget = SimpleNamespace(ik_seeds=4, ik_iterations=80, random_seed=123,
+        max_device_used_bytes=10**10, max_host_rss_bytes=12*10**9)
+    scope = dict(self=owner, budget=budget, problem=SimpleNamespace(
+        numerical=SimpleNamespace(position_m=.001, rotation_rad=.01)), robot_dict={},
+        deepcopy=deepcopy, load_yaml=yaml, join_path=lambda root, name: name,
+        get_task_configs_path=lambda: '',
+        InverseKinematicsCfg=SimpleNamespace(create=create),
+        InverseKinematics=lambda config: SimpleNamespace(config=config),
+        require_device_memory=Mock(), _require_planning_host_memory=Mock(),
+        workspace=SimpleNamespace(pending_cpu_bytes=0), torch=torch)
+    exec(compile(program, '<production IK construction>', 'exec'), scope)
+    assert [row[1] for row in decoded] == [['seed_optimizer', 'seed_metrics'], [None, None]]
+    assert owner.ik.config.num_seeds == 4 and owner.reference_ik.config.num_seeds == 1
+    assert owner.reference_ik.config.optimization_dt is None
+    assert owner.reference_ik.config.velocity_regularization_weight == .01
+    assert owner.reference_ik.config.acceleration_regularization_weight == .01
+    assert all(not solver.config.use_lm_seed and not solver.config.exit_early
+               for solver in (owner.ik, owner.reference_ik))
+    scope['require_device_memory'].assert_called_once()
+    scope['_require_planning_host_memory'].assert_called_once()
+# END construction uses two raw configurations rather than decoding a typed one again.
 
 
 @pytest.mark.parametrize("total_slots", [1, 2, 4])
-def test_native_seed_manager_preserves_one_tracking_row_and_fills_only_remaining_slots(total_slots):
+def test_native_seed_manager_preserves_the_supplied_state_and_fills_only_configured_slots(total_slots):
     values = np.array([[-.7, .1], [.4, -.2], [.2, .8]])
-    selected = select_ik_tracking_candidate(values, [0, 1, 2], [.4, .1, .3], [[0., 0.]],
-                                           reports=reports([True]*3))
-    warm = torch.as_tensor(values[[selected]][None], dtype=torch.float32)
+    warm = torch.as_tensor(values[[0]][None], dtype=torch.float32)
     manager = SeedManager(DeviceCfg("cpu"), 2, torch.full((2,), -1.),
                           torch.full((2,), 1.), random_seed=123)
     manager.generate_random_actions = Mock(wraps=manager.generate_random_actions)
@@ -87,4 +95,4 @@ def test_native_seed_manager_preserves_one_tracking_row_and_fills_only_remaining
         assert all(call.args == (1, total_slots-1)
                    for call in manager.generate_random_actions.call_args_list)
         assert not torch.equal(first[1:], second[1:])
-# END no additional seed slot or native solve is created by tracking selection.
+# END one supplied seed only means one native solve when the instance has one slot.

@@ -1,10 +1,10 @@
 # 实现符号索引
 
-代码基线：`fcdaefd`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。 本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **59 个文件、945 个定义**。
+覆盖 **59 个文件、942 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -16,7 +16,7 @@
 | [manipulation/goals.py](api/goals.md) | 14 | [01](01-inputs-and-task-model.md) |
 | [manipulation/grasp.py](api/grasp.md) | 8 | [01](01-inputs-and-task-model.md) |
 | [manipulation/skill.py](api/skill.md) | 13 | [01](01-inputs-and-task-model.md) |
-| [manipulation/planning_problem.py](api/planning_problem.md) | 110 | [01](01-inputs-and-task-model.md) |
+| [manipulation/planning_problem.py](api/planning_problem.md) | 112 | [01](01-inputs-and-task-model.md) |
 | [manipulation/regions.py](api/regions.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/support_grounding.py](api/support_grounding.md) | 4 | [01](01-inputs-and-task-model.md) |
 | [manipulation/pipeline.py](api/pipeline.md) | 10 | [01](01-inputs-and-task-model.md) |
@@ -32,8 +32,8 @@
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/planning.py](api/planning.md) | 161 | [04](04-solver-and-search.md) |
-| [manipulation/planning_ik.py](api/planning_ik.md) | 9 | [04](04-solver-and-search.md) |
+| [manipulation/planning.py](api/planning.md) | 162 | [04](04-solver-and-search.md) |
+| [manipulation/planning_ik.py](api/planning_ik.md) | 5 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 6 | [04](04-solver-and-search.md) |
 | [manipulation/physical_joint_domain.py](api/physical_joint_domain.md) | 10 | [04](04-solver-and-search.md) |
 | [manipulation/optimizer_device_checks.py](api/optimizer_device_checks.md) | 2 | [04](04-solver-and-search.md) |
@@ -59,8 +59,8 @@
 | [tests/planning/robot_fixture.py](api/adapter-robot_fixture.md) | 31 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 6 | [02](02-observation-and-collision.md) |
 | [manipulation/sampled_geometry_objective.py](api/sampled_geometry_objective.md) | 13 | [02](02-observation-and-collision.md) |
-| [manipulation/geometry_motion_bound.py](api/geometry_motion_bound.md) | 14 | [05](05-acceptance-and-execution.md) |
-| [manipulation/interval_geometry.py](api/interval_geometry.md) | 12 | [05](05-acceptance-and-execution.md) |
+| [manipulation/geometry_motion_bound.py](api/geometry_motion_bound.md) | 13 | [05](05-acceptance-and-execution.md) |
+| [manipulation/interval_geometry.py](api/interval_geometry.md) | 11 | [05](05-acceptance-and-execution.md) |
 | [manipulation/timed_reference.py](api/timed_reference.md) | 11 | [01](01-inputs-and-task-model.md) |
 | [manipulation/reference_visualization.py](api/reference_visualization.md) | 3 | [01](01-inputs-and-task-model.md) |
 | [manipulation/unified_solver.py](api/unified_solver.md) | 18 | [04](04-solver-and-search.md) |

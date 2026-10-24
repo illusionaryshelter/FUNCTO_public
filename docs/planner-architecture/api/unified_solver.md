@@ -1,6 +1,6 @@
 # `manipulation/unified_solver.py` 实现契约
 
-代码基线：`39880e5`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `time_mean_weights`
@@ -437,12 +437,16 @@ robot_tool_states
 输入签名：
 
 ```python
-def task(self, controls):
+def task(self, controls, *, solver_rows_out=None):
 ```
 
 实现说明：
 
-> Return the original signed task rows, preserving fixed dictionary order.
+> Return complete signed rows and optionally their declaration selection.
+>
+> ``solver_rows_out`` receives the producing condition's Boolean masks,
+> before the curve-specific fixed entrance equalities are removed. Both
+> values and masks come from this single robot/task evaluation.
 
 显式输出分支：
 
@@ -495,7 +499,7 @@ group.values
 
 ## `TrajectoryComputation.objective_components`
 
-[定义位置](../../../manipulation/unified_solver.py#L166)。
+[定义位置](../../../manipulation/unified_solver.py#L172)。
 
 输入签名：
 
@@ -566,7 +570,7 @@ self.scene.optimization_objective
 
 ## `ConstrainedSolution`
 
-[定义位置](../../../manipulation/unified_solver.py#L185)。
+[定义位置](../../../manipulation/unified_solver.py#L191)。
 
 ```python
 class ConstrainedSolution():
@@ -585,7 +589,7 @@ report: dict
 
 ## `task_jacobian`
 
-[定义位置](../../../manipulation/unified_solver.py#L192)。
+[定义位置](../../../manipulation/unified_solver.py#L198)。
 
 输入签名：
 
@@ -595,7 +599,12 @@ def task_jacobian(values, controls, *, check_request, admit_work):
 
 实现说明：
 
-> Return the complete first derivative using ordinary Torch gradients.
+> Return exact first derivatives using fewer scalar reverse queries.
+>
+> When output rows are fewer than controls, each scalar task row supplies
+> one ordinary reverse gradient. Otherwise control-column queries reuse
+> the reverse graph described below. Both paths use the existing analytic
+> Pinocchio backward; neither differentiates it twice with respect to q.
 >
 > For the original task vector c(x) and an independent covector v, the
 > first reverse pass forms p(x,v)=J_c(x).T @ v. Differentiating each p_i
@@ -603,29 +612,31 @@ def task_jacobian(values, controls, *, check_request, admit_work):
 > that second pass: this requires no second derivative of robot FK with
 > respect to x. Both passes use maintained scalar ``autograd.grad``.
 >
-> The explicit zero dependence gives constant task rows their exact zero
-> Jacobian, including requests containing only fixed progress rows. One
-> covector and one returned column have task-vector size; no task-row
-> identity matrix or batched robot Jacobian is allocated. ``admit_work``
-> accounts for the now-resident first reverse graph before allocating the
-> final dense matrix and running its column queries.
+> Explicit zero dependence gives constant rows their exact zero Jacobian.
+> No output identity matrix or batched robot Jacobian is allocated.
+> ``admit_work`` precedes the final dense allocation. For the column path
+> it follows the first reverse graph, whose storage then belongs to RSS.
 
 显式输出分支：
 
 ```python
+jacobian
 jacobian
 ```
 
 读取的对象属性：
 
 ```python
-torch.zeros_like
 controls.sum
-torch.autograd.grad
-torch.autograd
-np.empty
 values.numel
 controls.numel
+np.empty
+torch.autograd.grad
+torch.autograd
+row.detach().numpy().reshape
+row.detach().numpy
+row.detach
+torch.zeros_like
 product.reshape
 column.detach().numpy
 column.detach
@@ -634,12 +645,14 @@ column.detach
 写入目标：
 
 ```python
-covector
 connected
-product
 jacobian
 index
 value
+row
+jacobian[index]
+covector
+product
 column
 jacobian[:, index]
 ```
@@ -647,23 +660,26 @@ jacobian[:, index]
 直接调用符号：
 
 ```python
-torch.zeros_like
 controls.sum
-torch.autograd.grad
-admit_work
-np.empty
 values.numel
 controls.numel
+admit_work
+np.empty
 enumerate
-product.reshape
 check_request
+torch.autograd.grad
+row.detach().numpy().reshape
+row.detach().numpy
+row.detach
+torch.zeros_like
+product.reshape
 column.detach().numpy
 column.detach
 ```
 
 ## `solver_storage_bytes`
 
-[定义位置](../../../manipulation/unified_solver.py#L223)。
+[定义位置](../../../manipulation/unified_solver.py#L241)。
 
 输入签名：
 
@@ -678,16 +694,16 @@ def solver_storage_bytes(*, variables, task_equalities, task_inequalities, physi
 > The workspace expression is the one in installed scipy.optimize._slsqp_py.
 > Its constraint-normal assembly retains the previous matrix while forming
 > equality/inequality stacks, their combined stack and the augmented matrix.
-> Cached Jacobians are separate. Scalar control-column derivatives avoid
-> the m² identity and batched robot tensors. The first reverse graph is
-> included in measured RSS at the second allocation boundary.
+> Cached Jacobians are separate. Scalar row/column derivatives avoid the
+> m² identity and batched robot tensors. The column path's first reverse
+> graph is included in measured RSS at the second allocation boundary.
 > This count covers these owned dense buffers; current RSS accounts for the
 > already constructed curve, model, observations and forward task tensors.
 
 显式输出分支：
 
 ```python
-{'slsqp_workspaces': 8 * (workspace + mineq) + 4 * mineq, 'cached_constraint_values_and_jacobians': 8 * m * (n + 1), 'constraint_normal_assembly': 8 * (2 * m * n + 2 * la * (n + 1) + la), 'constraint_value_assembly': 8 * 3 * m, 'solver_and_derivative_vectors': 8 * (14 * n + 1 + task), 'task_dual_vectors': 8 * (3 * task + n)}
+{'slsqp_workspaces': 8 * (workspace + mineq) + 4 * mineq, 'cached_constraint_values_and_jacobians': 8 * m * (n + 1), 'constraint_normal_assembly': 8 * (2 * m * n + 2 * la * (n + 1) + la), 'constraint_value_assembly': 8 * 3 * m, 'solver_and_derivative_vectors': 8 * (14 * n + 1 + task), 'task_derivative_vectors': 0 if not task else 8 * (task + n if task < n else 3 * task + n)}
 ```
 
 读取的对象属性：
@@ -716,7 +732,7 @@ max
 
 ## `solve_trajectory`
 
-[定义位置](../../../manipulation/unified_solver.py#L259)。
+[定义位置](../../../manipulation/unified_solver.py#L280)。
 
 输入签名：
 
@@ -760,17 +776,33 @@ torch.tensor
 torch.float64
 computation.task
 value.numel
+torch.cat
+value.reshape
+group.values
+torch.zeros
+torch.bool
+computation.fixed_equality_rows
+value.sum
 initial_task[0][computation.fixed_equality_rows].detach().numpy
 initial_task[0][computation.fixed_equality_rows].detach
-computation.fixed_equality_rows
 computation.equality_keys
-computation.variable_equality_rows
-np.all
+value.detach
+group.items
+layout.numel
+torch.nonzero(~selected[offset:offset + size]).flatten
+torch.nonzero
+values[offset:offset + size][indices].detach().numpy
+values[offset:offset + size][indices].detach
 np.isfinite
+fixed_constraints.append
+indices.tolist
+constant.tolist
+finite.tolist
+feasible.all
 initial.copy
+initial.size
 computation.domain.intervals
 computation.domain
-initial.size
 computation.kinematics.frames
 computation.kinematics
 computation.kinematics.joint_names
@@ -803,20 +835,44 @@ shape
 cache
 cache_x
 counts
+evaluation_seconds
 started
 report
 trial_index
 initial_controls
 counts['task_evaluations']
+declared_rows
+component_started
 initial_task
+evaluation_seconds['task']
 report['completed_evaluations']['task']
 full_eq_count
-inequality_count
+full_inequality_count
 value
+solver_rows
+group
+solver_rows[0][computation.fixed_equality_rows]
+eq_count
+inequality_count
 fixed_values
 fixed_report
 index
-eq_count
+fixed_constraints
+fixed_feasible
+kind
+values
+selected
+offset
+key
+layout
+size
+indices
+constant
+finite
+feasible
+report['fixed_task_constraints']
+task_count
+jacobian_method
 physical_count
 memory
 samples
@@ -847,12 +903,30 @@ torch.tensor
 computation.task
 tuple
 value.numel
+torch.cat
+value.reshape
+group.values
+torch.zeros
+int
+value.sum
 initial_task[0][computation.fixed_equality_rows].detach().numpy
 initial_task[0][computation.fixed_equality_rows].detach
 float
 zip
-np.all
+value.detach
+group.items
+layout.numel
+torch.nonzero(~selected[offset:offset + size]).flatten
+torch.nonzero
+values[offset:offset + size][indices].detach().numpy
+values[offset:offset + size][indices].detach
 np.isfinite
+fixed_constraints.append
+indices.tolist
+constant.tolist
+finite.tolist
+bool
+feasible.all
 ConstrainedSolution
 initial.copy
 solver_storage_bytes
@@ -868,9 +942,7 @@ np.abs(initial_gradient).max
 np.abs
 constraints.append
 minimize
-int
 snapshot_for
-bool
 str
 np.max
 np.array_equal
@@ -883,7 +955,7 @@ type
 
 ## `solve_trajectory.snapshot_for`
 
-[定义位置](../../../manipulation/unified_solver.py#L290)。
+[定义位置](../../../manipulation/unified_solver.py#L313)。
 
 输入签名：
 
@@ -923,7 +995,7 @@ np.asarray
 
 ## `solve_trajectory.callback`
 
-[定义位置](../../../manipulation/unified_solver.py#L297)。
+[定义位置](../../../manipulation/unified_solver.py#L320)。
 
 输入签名：
 
@@ -962,7 +1034,7 @@ check_request
 
 ## `solve_trajectory.admit_task_derivatives`
 
-[定义位置](../../../manipulation/unified_solver.py#L354)。
+[定义位置](../../../manipulation/unified_solver.py#L409)。
 
 输入签名：
 
@@ -985,6 +1057,7 @@ computation.max_host_rss_bytes
 
 ```python
 rows
+returned
 increment
 ```
 
@@ -996,7 +1069,7 @@ require_host_memory
 
 ## `solve_trajectory.evaluate`
 
-[定义位置](../../../manipulation/unified_solver.py#L366)。
+[定义位置](../../../manipulation/unified_solver.py#L422)。
 
 输入签名：
 
@@ -1032,9 +1105,6 @@ gradient.detach().numpy().ravel
 gradient.detach().numpy
 gradient.detach
 computation.task
-computation.variable_equality_rows
-eq.numel
-inequality.numel
 torch.cat
 values.detach().numpy
 values.detach
@@ -1051,16 +1121,17 @@ cache_x
 trial_index
 report['latest_trial']
 counts[kind + '_evaluations']
+component_started
 output
 controls
 components
 value
 gradient
-eq
-inequality
-sizes
+complete
 values
+selected
 jacobian
+evaluation_seconds[kind]
 cache[kind]
 report['completed_evaluations'][kind]
 snapshot
@@ -1077,6 +1148,7 @@ cache.clear
 x.copy
 x.reshape(shape).tolist
 x.reshape
+perf_counter
 computation.domain.signed_constraints
 torch.tensor
 computation.objective_components
@@ -1089,9 +1161,9 @@ gradient.detach().numpy().ravel
 gradient.detach().numpy
 gradient.detach
 computation.task
-eq.numel
-inequality.numel
 torch.cat
+tuple
+zip
 task_jacobian
 values.detach().numpy
 values.detach
@@ -1104,7 +1176,7 @@ required.issubset
 
 ## `solve_trajectory.scaled_objective`
 
-[定义位置](../../../manipulation/unified_solver.py#L420)。
+[定义位置](../../../manipulation/unified_solver.py#L484)。
 
 输入签名：
 

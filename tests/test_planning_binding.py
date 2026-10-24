@@ -195,12 +195,12 @@ class PlanningBindingTest(unittest.TestCase):
         torch.testing.assert_close(planner._functional_goal(goal).position,
                                    torch.tensor([[[[[.4, 0., 0.]]]]]))
 
-    def test_nonfinite_single_ik_seed_does_not_hide_a_valid_success(self):
+    def test_nonfinite_functional_proposal_does_not_hide_a_valid_state(self):
         candidates = np.array([[np.nan, 0.], [1., 2.], [3., 4.]])
         selected = rank_ik_candidates(candidates,
-            [{"task_satisfied": flag, "model_valid": flag, "native_pose_ik_success": flag}
+            [{"task_satisfied": flag, "model_valid": flag}
              for flag in [True, True, False]],
-            np.array([[0., 0.]]), count=1, joint_tolerance=1e-6, query_kind="reference")
+            np.array([[0., 0.]]), count=1, joint_tolerance=1e-6)
         np.testing.assert_array_equal(selected, [1])
 
     def test_dependency_boundary_inside_reference_interval_uses_device_tick(self):
@@ -244,7 +244,8 @@ class PlanningBindingTest(unittest.TestCase):
         planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
         planner.robot_validator = SimpleNamespace(validate_planning_binding=Mock())
         planner.robot_metadata, planner.anchor_capacity = {}, 256
-        planner.torch, planner.device_cfg = torch, SimpleNamespace(device="cpu")
+        planner.torch, planner.device_cfg = torch, SimpleNamespace(device="cpu",
+            to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
         shared_clock = {"obsolete": True}
         planner.formal_clock, planner.joint_names = shared_clock, ("q",)
         planner.JointState = SimpleNamespace(from_numpy=lambda names, positions, *, velocity, device_cfg:
@@ -260,6 +261,15 @@ class PlanningBindingTest(unittest.TestCase):
         resident = SimpleNamespace(reset_seed=Mock(), core=SimpleNamespace(
             goal_registry_manager=registry, get_all_rollout_instances=lambda: (rollout,)))
         planner.ik = resident
+        # BEGIN both fixed solver workspaces rebind independent native goal buffers.
+        local_goal = SimpleNamespace(link_goal_poses=object(), goal_js=object())
+        local_rollout = SimpleNamespace(reset=Mock(), _num_particles_goal=local_goal,
+            _metrics_goal=SimpleNamespace(link_goal_poses=object(), goal_js=object()))
+        local_registry = SimpleNamespace(_goal_buffer=SimpleNamespace(link_goal_poses=object()))
+        local_resident = SimpleNamespace(reset_seed=Mock(), core=SimpleNamespace(
+            goal_registry_manager=local_registry, get_all_rollout_instances=lambda: (local_rollout,)))
+        planner.reference_ik = local_resident
+        # END no ordinary query state is inherited from the previous request.
         identities = {"pose_events": []}
         entrance = np.eye(4); entrance[0, 3] = .1
         with patch("manipulation.planning._planning_workspace_bytes", return_value=SimpleNamespace(pending_cpu_bytes=0)), \
@@ -269,6 +279,7 @@ class PlanningBindingTest(unittest.TestCase):
             result = planner.rebind(problem, scene, PlanningBudget(), goal_identities=identities)
         self.assertIs(result, planner)
         self.assertIs(planner.ik, resident)
+        self.assertIs(planner.reference_ik, local_resident)
         self.assertIs(planner.formal_clock, shared_clock)
         self.assertNotIn("obsolete", shared_clock)
         self.assertEqual(calls, [(shared_clock["duration"], planner.progress_map)])
@@ -288,6 +299,12 @@ class PlanningBindingTest(unittest.TestCase):
         planner._bind_online_robot.assert_called_once()
         planner._bind_physical_domains.assert_called_once()
         resident.reset_seed.assert_called_once()
+        local_resident.reset_seed.assert_called_once()
+        local_rollout.reset.assert_called_once()
+        self.assertIsNone(local_registry._goal_buffer.link_goal_poses)
+        self.assertIsNone(local_goal.link_goal_poses)
+        self.assertIsNone(local_goal.goal_js)
+        self.assertEqual(float(planner.start.dt), 0.)
         rollout.reset.assert_called_once()
         self.assertIsNone(registry._goal_buffer.link_goal_poses)
         self.assertIsNone(old_goal.link_goal_poses)

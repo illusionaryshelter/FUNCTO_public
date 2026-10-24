@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import math
 
 import numpy as np
+import pinocchio as pin
 
 
 def _finite(value):
@@ -54,8 +55,8 @@ def _product_interval(first, second):
 def _linear_norm_up(matrix):
     """Bound ||A||_2 by sqrt(||A.T A||_infinity), with outward arithmetic.
 
-    Native fixed rotations are stored in float32 and need not be exactly
-    orthogonal. Treating their norm as exactly one could underestimate the
+    Pinocchio placements and calibration store binary64 rotations whose
+    entries need not be exactly orthogonal. Assuming norm one can underestimate the
     bound. Signed intervals retain cancellation in the Gram matrix, so this
     remains close to one for rotations instead of multiplying sqrt(3) per link.
     """
@@ -78,28 +79,18 @@ def _linear_norm_up(matrix):
     return 0. if maximum == 0 else _finite(math.nextafter(math.sqrt(maximum), math.inf))
 
 
-def _affine_abs_up(scale, offset, lower, upper):
-    """Maximum |scale*q+offset| over the declared full joint interval."""
-    maximum = 0.
-    for position in (lower, upper):
-        lo, hi = _product_interval(scale, position)
-        lo = _finite(math.nextafter(_finite(lo + offset), -math.inf))
-        hi = _finite(math.nextafter(_finite(hi + offset), math.inf))
-        maximum = max(maximum, abs(lo), abs(hi))
-    return maximum
-
-
-def _array(value, label, *, integer=False):
-    # The caller owns the single explicit device-to-CPU metadata copy. This
-    # helper must not accidentally transfer tensors or initialize a GPU model.
+def _array(value, label):
+    # BEGIN covers and scalar speed inputs use the existing CPU model domain.
+    # Pinocchio owns the robot metadata; this helper validates supplied cover
+    # arrays and speed bounds without moving tensors between devices.
     device = getattr(value, "device", None)
     if device is not None and str(device) != "cpu":
         raise ValueError(f"{label} must already be CPU metadata")
     result = np.asarray(value)
-    if (result.dtype.kind not in ("iu" if integer else "iuf")
-            or not np.isfinite(result).all()):
-        raise ValueError(f"{label} must contain finite {'integer' if integer else 'numeric'} values")
-    return result.astype(np.int64 if integer else np.float64, copy=True)
+    if result.dtype.kind not in "iuf" or not np.isfinite(result).all():
+        raise ValueError(f"{label} must contain finite numeric values")
+    return result.astype(np.float64, copy=True)
+    # END all admitted numerical arrays are explicit binary64 CPU values.
 
 
 def _names(values, label):
@@ -112,20 +103,16 @@ def _names(values, label):
 
 @dataclass(frozen=True)
 class SphereBody:
-    """One complete cover in a named native link frame.
+    """One complete rigid sphere cover in an existing Pinocchio frame.
 
     ``spheres`` has shape [S,4], with local centres and nonnegative radii.
-    ``affine_translation`` explicitly maps each independently moving scalar
-    joint name to [S,3] local centre translations per unit q. Pass {} for a
-    rigid cover. For the existing timed hand, use its TCP-local spheres and
-    ``sphere_joint_translation`` here, rather than its locked native fingers.
-    Already transformed/offset spheres must not be transformed a second time.
+    All robot and finger motion belongs to the same registered joint tree;
+    attached observed fields retain their declared rigid tool relation.
     """
 
     name: str
     link: str
     spheres: object
-    affine_translation: Mapping
 
 
 @dataclass(frozen=True)
@@ -141,13 +128,13 @@ class GeometryMotionBound:
     def speed_bounds(self, joint_speed_upper):
         """Return one m/s bound per body for complete named |dq| bounds.
 
-        Speeds must cover every native and affine coordinate. A missing timed
+        Speeds must cover every registered robot coordinate. A missing timed
         finger or unbound joint is an error, not an inferred zero velocity.
         The declared position ranges used to build L must hold on the interval.
         """
         if (not isinstance(joint_speed_upper, Mapping)
                 or set(joint_speed_upper) != set(self.joint_names)):
-            raise ValueError("Speed bounds must name every native and affine joint exactly")
+            raise ValueError("Speed bounds must name every registered robot joint exactly")
         speeds = _array([joint_speed_upper[name] for name in self.joint_names], "joint speed bounds")
         if speeds.shape != (len(self.joint_names),) or np.any(speeds < 0):
             raise ValueError("Joint speed bounds must be finite nonnegative scalars")
@@ -158,146 +145,81 @@ class GeometryMotionBound:
         return result
 
 
-def build_geometry_motion_bound(*, fixed_transforms, link_map, joint_map,
-                                joint_map_type, joint_offset_map, joint_names,
-                                joint_position_limits, link_name_to_idx_map,
-                                bodies, extra_joint_limits):
-    """Build small CPU coefficients from CuRobo KinematicsParams metadata.
+# BEGIN bind complete-entity motion to the current registered Pinocchio model.
+def build_geometry_motion_bound(*, model, T_reference_base, bodies):
+    """Bound point motion in the calibrated reference frame using Pinocchio.
 
-    Copy the identically named native arrays once after model loading.
-    ``joint_position_limits`` is ``params.joint_limits.position`` [2,J]; the
-    native ``joint_offset_map`` is accepted in its flat [2*N] layout. Parent
-    indices come directly from ``link_map``; no alternate FK/tree is built.
-    Native root index 0 is fixed and its stored base transform is included.
+    ``model`` is the exact fixed-base model admitted by RobotGeometryChecker:
+    independent bounded scalar revolute/prismatic joints and fixed frames.
+    ``T_reference_base`` is that checker's calibration from robot base to the
+    geometry reference frame. ``bodies`` bind full local covers to existing
+    model frames; the native collision entities themselves remain unchanged.
 
-    ``extra_joint_limits`` is mandatory: {} explicitly declares no extra
-    affine coordinates, otherwise name -> (lower, upper) supplies every such
-    coordinate. Affine translation may also use an existing native coordinate.
-    Unmodelled hand motion cannot be represented by silently omitting this
-    declaration. Freely moving scene owners are not part of this fixed-base
-    tree; their independently bounded speeds must enter relative_speed_bound.
+    Pinocchio ``frame.placement`` maps a frame into its parent joint, while
+    ``jointPlacements[j]`` maps joint j's zero pose into its parent joint.
+    ``joint.calc`` supplies each admitted joint's constant motion subspace
+    S=[v;w], with linear rows first. This reads analytic joint metadata at
+    neutral configuration; it does not estimate a velocity maximum by FK
+    samples. For a local full-cover radius r, the joint contributes
+    ||v|| + ||w|| r to its own coordinate. Prismatic motion also increases r
+    by ||v|| max(|q_min|, |q_max|) before the ancestor's lever is bounded.
 
-    The native CUDA forward kernel uses joint types -1 and 0..5 (fixed,
-    xyz-prismatic, xyz-revolute), with negative axes/mimic in scale*q+offset.
-    Legacy negative-axis enum codes 6..11 are rejected rather than assumed to
-    have the same kernel semantics. Locked joints must already be folded into
-    fixed transforms by the existing loader.
-
-    Proof: starting at each body's full local radius, walk toward the base.
-    A rotating edge contributes |scale|*current_radius to its coordinate; a
-    translating edge contributes |scale| and increases the radius by its full
-    interval extension. The fixed linear transform multiplies both bounds by
-    its operator-norm bound and its translation increases radius. Triangle
-    inequalities and addition for repeated mimic coordinates give L. This
-    also covers interior sphere points, not only centres or mesh vertices.
+    Starting with the frame placement, walk these exact parent relations.
+    Each fixed rotation's outward operator-norm bound scales all accumulated
+    coefficients and the radius; its translation enlarges only the radius.
+    The final calibration rotation scales the whole coefficient row. Its
+    fixed translation has no velocity contribution. These triangle-inequality
+    bounds cover every sphere point throughout the declared joint domain.
     """
-    transforms = _array(fixed_transforms, "fixed transforms")
-    if transforms.ndim != 3 or transforms.shape[1:] != (3, 4) or not len(transforms):
-        raise ValueError("Native fixed transforms must have shape [links,3,4]")
-    count = len(transforms)
-    parents = _array(link_map, "link map", integer=True)
-    joints = _array(joint_map, "joint map", integer=True)
-    types = _array(joint_map_type, "joint types", integer=True)
-    offsets = _array(joint_offset_map, "joint offsets")
-    if offsets.shape == (2*count,):
-        offsets = offsets.reshape(count, 2)
-    if (parents.shape != (count,) or joints.shape != (count,) or types.shape != (count,)
-            or offsets.shape != (count, 2) or np.any(parents < 0) or np.any(parents >= count)
-            or parents[0] != 0 or types[0] != -1 or joints[0] != -1
-            or np.any((types < -1) | (types > 5))):
-        raise ValueError("Native tree indices, fixed root or joint type codes are unsupported")
-    names = _names(joint_names, "Native joints")
-    limits = _array(joint_position_limits, "joint position limits")
-    if (limits.shape != (2, len(names)) or np.any(limits[0] > limits[1])
-            or np.any(joints[types == -1] != -1)
-            or np.any(joints[types != -1] < 0) or np.any(joints[types != -1] >= len(names))):
-        raise ValueError("Every moving edge needs a named coordinate and finite ordered position bounds")
-    if not isinstance(link_name_to_idx_map, Mapping):
-        raise ValueError("Native link names must map to their exact indices")
-    links = dict(link_name_to_idx_map)
-    _names(links, "Native links")
-    if (any(isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer))
-            for value in links.values()) or set(links.values()) != set(range(count))
-            or len(links) != count):
-        raise ValueError("Native link names must uniquely cover every tree index")
-    # Check the whole admitted tree once, including branches without a body.
-    for start in range(1, count):
-        seen, link = set(), start
-        while link:
-            if link in seen:
-                raise ValueError("Native parent links contain a cycle")
-            seen.add(link)
-            link = int(parents[link])
-    if not isinstance(extra_joint_limits, Mapping):
-        raise ValueError("Explicit extra affine joint limits are required, including {} when absent")
-    extra_names = _names(extra_joint_limits, "Extra affine joints")
-    if set(names) & set(extra_names):
-        raise ValueError("An affine motion reuses an existing joint's bounds rather than redefining them")
-    if extra_names:
-        extra = _array([extra_joint_limits[name] for name in extra_names], "extra joint limits")
-        if extra.shape != (len(extra_names), 2) or np.any(extra[:, 0] > extra[:, 1]):
-            raise ValueError("Extra affine joints need finite ordered (lower,upper) bounds")
-        limits = np.concatenate((limits, extra.T), axis=1)
-    names = names + extra_names
-    columns = {name: i for i, name in enumerate(names)}
+    names = tuple(str(name) for name in model.names[1:])
+    joints = tuple(model.joints[index] for index in range(1, model.njoints))
+    columns = [int(joint.idx_q) for joint in joints]
+    limits = np.array([model.lowerPositionLimit[columns], model.upperPositionLimit[columns]])
+    neutral = pin.neutral(model)
+    gains = []
+    for joint in joints:
+        data = joint.createData()
+        joint.calc(data, neutral)
+        subspace = np.asarray(data.S).reshape(6)
+        gains.append((_norm_up(subspace[:3]), _norm_up(subspace[3:])))
+    linear = [_linear_norm_up(placement.rotation) for placement in model.jointPlacements]
+    translation = [_norm_up(placement.translation) for placement in model.jointPlacements]
+    base_linear = _linear_norm_up(np.asarray(T_reference_base, float)[:3, :3])
     bodies = tuple(bodies)
-    if not bodies or any(not isinstance(body, SphereBody) for body in bodies):
-        raise ValueError("At least one explicitly bound complete SphereBody is required")
     body_names = _names([body.name for body in bodies], "Collision bodies")
-    linear = [_linear_norm_up(transform[:, :3]) for transform in transforms]
-    translation = [_norm_up(transform[:, 3]) for transform in transforms]
     coefficients = np.zeros((len(bodies), len(names)), dtype=float)
     radii = np.zeros(len(bodies), dtype=float)
-    used_extra = set()
     for body_index, body in enumerate(bodies):
-        if body.link not in links or not isinstance(body.affine_translation, Mapping):
-            raise ValueError("Each body needs a native link and explicit local affine-motion mapping")
+        frame_id = int(model.getFrameId(body.link))
+        if frame_id >= model.nframes:
+            raise ValueError(f"Complete cover needs an existing robot frame: {body.link}")
         spheres = _array(body.spheres, "complete local sphere cover")
         if (spheres.ndim != 2 or spheres.shape[1:] != (4,) or not len(spheres)
                 or np.any(spheres[:, 3] < 0)):
             raise ValueError("A complete active cover requires [S,4] spheres with nonnegative radii")
-        # Negative-radius native attachment slots are inactive, not entities.
-        # The binding must exclude those slots, never discard active spheres.
-        local_radii = np.array([_add_up(_norm_up(row[:3]), float(row[3])) for row in spheres])
-        row = coefficients[body_index]
-        for name, value in body.affine_translation.items():
-            if name not in columns:
-                raise ValueError(f"Affine body motion lacks joint position bounds: {name}")
-            mapping = _array(value, "affine sphere translations")
-            if mapping.shape != (len(spheres), 3):
-                raise ValueError("Affine translations must provide one local 3-vector per cover sphere")
-            column = columns[name]
-            norm = [_norm_up(value) for value in mapping]
-            extent = max(abs(float(limits[0, column])), abs(float(limits[1, column])))
-            for sphere_index, gain in enumerate(norm):
-                local_radii[sphere_index] = _add_up(float(local_radii[sphere_index]), _mul_up(gain, extent))
-            row[column] = max(norm)
-            used_extra.add(name)
-        radius = float(local_radii.max())
+        radius = max(_add_up(_norm_up(sphere[:3]), float(sphere[3])) for sphere in spheres)
         radii[body_index] = radius
-        link = int(links[body.link])
-        while True:
-            kind = int(types[link])
-            if kind != -1:
-                column = int(joints[link])
-                scale, offset = map(float, offsets[link])
-                if kind >= 3:
-                    row[column] = _add_up(float(row[column]), _mul_up(abs(scale), radius))
-                else:
-                    row[column] = _add_up(float(row[column]), abs(scale))
-                    extension = _affine_abs_up(scale, offset, *map(float, limits[:, column]))
-                    radius = _add_up(radius, extension)
-            for column in range(len(names)):
-                row[column] = _mul_up(float(row[column]), linear[link])
-            radius = _add_up(_mul_up(radius, linear[link]), translation[link])
-            if link == 0:
-                break
-            link = int(parents[link])
-    if not set(extra_names) <= used_extra:
-        raise ValueError("Every extra affine joint must be explicitly used by a body's motion mapping")
+        frame = model.frames[frame_id]
+        radius = _add_up(_mul_up(radius, _linear_norm_up(frame.placement.rotation)),
+                         _norm_up(frame.placement.translation))
+        row = coefficients[body_index]
+        joint_id = int(frame.parentJoint)
+        while joint_id:
+            column = joint_id-1
+            linear_gain, angular_gain = gains[column]
+            row[column] = _add_up(linear_gain, _mul_up(angular_gain, radius))
+            extent = max(abs(float(limits[0, column])), abs(float(limits[1, column])))
+            radius = _add_up(radius, _mul_up(linear_gain, extent))
+            for index in range(len(names)):
+                row[index] = _mul_up(float(row[index]), linear[joint_id])
+            radius = _add_up(_mul_up(radius, linear[joint_id]), translation[joint_id])
+            joint_id = int(model.parents[joint_id])
+        for column in range(len(names)):
+            row[column] = _mul_up(float(row[column]), base_linear)
     for value in (coefficients, limits, radii):
         value.setflags(write=False)
     return GeometryMotionBound(body_names, names, coefficients, limits, radii)
+# END native topology and calibration are consumed without a second model.
 
 
 def relative_speed_bound(actor_speed_m_s, *, target_speed_m_s):

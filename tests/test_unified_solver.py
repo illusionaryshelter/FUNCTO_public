@@ -124,8 +124,8 @@ def test_vectorized_task_jacobian_through_pin_matches_scalar_vjp_and_finite_diff
 
 
 # BEGIN ordinary-reference and fixed-entry requests retain exact zero task rows.
-@pytest.mark.parametrize("rows", [0, 3])
-def test_control_column_jacobian_preserves_an_empty_or_constant_vector(rows):
+@pytest.mark.parametrize("rows", [0, 3, 9])
+def test_scalar_jacobian_preserves_an_empty_or_constant_vector(rows):
     controls = torch.arange(6., dtype=torch.float64).reshape(2, 3).requires_grad_()
     values = torch.full((rows,), 2., dtype=controls.dtype)
     admitted = []
@@ -155,7 +155,72 @@ def test_control_column_jacobian_handles_only_constant_task_rows(fixed_entry):
     assert result.report["solver_called"] and result.report["solver_task_equalities"] == 0
     if fixed_entry:
         assert result.report["fixed_entry_equalities"] == {"function_pose:0:yaw": 0.}
+    else:
+        assert result.report["solver_task_inequalities"] == 0
+        assert result.report["task_jacobian_method"] == "none"
 # END constant declarations need no exception handling or alternate algorithm.
+
+
+# BEGIN the numerical interface submits only proven variable declaration rows.
+def test_few_event_rows_use_pin_scalar_vjp_and_cached_original_values(monkeypatch):
+    import manipulation.unified_solver as solver
+    bound, initial = computation(terminal_yaw_tolerance=np.pi)
+    bound.problem = replace(bound.problem, couplings=(), events=())
+    controls = torch.tensor(initial+.03, dtype=torch.float64)
+    first_event_row = 2*len(bound.parameters)
+    original = bound.task(controls)[1][first_event_row:].numpy()
+    derivative = torch.autograd.functional.jacobian(
+        lambda value: bound.task(value)[1][first_event_row:], controls).numpy().reshape(2, -1)
+    report = {}
+
+    def inspect(function, x0, **kwargs):
+        assert len(kwargs["constraints"]) == 2
+        task = kwargs["constraints"][1]
+        np.testing.assert_allclose(task["fun"](x0), -original, rtol=0., atol=0.)
+        np.testing.assert_allclose(task["jac"](x0), -derivative, rtol=2e-13, atol=2e-13)
+        recorded = report["evaluation_seconds"].copy()
+        for _ in range(3):
+            task["fun"](x0)
+            task["jac"](x0)
+            function(x0)
+        assert report["evaluation_seconds"] == recorded
+        return SimpleNamespace(x=x0.copy(), fun=function(x0)[0], success=True,
+                               status=0, message="selected task interface checked", nit=0)
+
+    monkeypatch.setattr(solver, "minimize", inspect)
+    result = solve_trajectory(bound, controls.numpy(), report_out=report, iterations=1,
+        check_request=lambda: None, pending_geometry_bytes=0)
+    assert report["complete_task_inequalities"] == first_event_row+2
+    assert report["solver_task_inequalities"] == 2
+    assert report["task_jacobian_method"] == "scalar_task_rows"
+    assert report["task_evaluations"] == 2 and report["objective_evaluations"] == 1
+    assert report["evaluation_seconds"]["task"] > 0.
+    assert [row["key"] for row in report["fixed_task_constraints"]] == ["progress:lower", "progress:upper"]
+    for row in report["fixed_task_constraints"]:
+        assert row["row_indices"] == list(range(len(bound.parameters)))
+        assert all(row["finite"]) and row["feasible"]
+    np.testing.assert_array_equal(result.controls, controls.numpy())
+
+
+@pytest.mark.parametrize("progress", [-.1, float("nan")])
+def test_invalid_fixed_progress_is_reported_before_the_solver(progress, monkeypatch):
+    import manipulation.unified_solver as solver
+    bound, initial = computation()
+    bound.progress[0, 0] = progress
+    def forbidden_solver(*args, **kwargs):
+        raise AssertionError("A fixed progress violation cannot be changed by controls")
+    monkeypatch.setattr(solver, "minimize", forbidden_solver)
+    result = solve_trajectory(bound, initial, report_out={}, iterations=1,
+        check_request=lambda: None, pending_geometry_bytes=0)
+    assert not result.report["success"] and not result.report["solver_called"]
+    record = next(row for row in result.report["fixed_task_constraints"] if row["key"] == "progress:lower")
+    assert record["row_indices"][0] == 0 and not record["feasible"]
+    assert record["finite"][0] == bool(np.isfinite(progress))
+    if np.isfinite(progress):
+        assert record["values"][0] == pytest.approx(.1)
+    assert result.report["task_evaluations"] == 1 and result.report["objective_evaluations"] == 0
+    np.testing.assert_array_equal(result.controls, initial)
+# END missing/violated fixed inputs keep their original component evidence.
 
 
 def test_full_objective_gradient_and_event_grid_keep_physical_motion_weights():
@@ -190,9 +255,9 @@ def test_budget_interrupt_preserves_evaluated_trial_counts_and_geometry_identity
         bound.geometry_report.update(evaluated_controls=controls.detach().tolist())
         return values
 
-    def task(controls):
+    def task(controls, *, solver_rows_out=None):
         actual["task"] += 1
-        return original_task(controls)
+        return original_task(controls, solver_rows_out=solver_rows_out)
 
     def physical(controls):
         actual["physical"] += 1
@@ -224,17 +289,21 @@ def test_budget_interrupt_preserves_evaluated_trial_counts_and_geometry_identity
     assert trial["geometry_objective"]["evaluated_controls"] != initial.tolist()
 
 
-def test_interrupted_objective_keeps_partial_trial_without_borrowing_previous_geometry():
+def test_interrupted_objective_keeps_partial_trial_without_borrowing_previous_geometry(monkeypatch):
+    import manipulation.unified_solver as solver
     from manipulation.planning import PlanningWorkExhausted
     bound, initial = computation()
     report = {}
     original = bound.objective_components
     error = PlanningWorkExhausted("Budget ended inside an objective evaluation")
     calls = 0
+    clock = [0.]
+    monkeypatch.setattr(solver, "perf_counter", lambda: clock[0])
 
     def objective(controls):
         nonlocal calls
         calls += 1
+        clock[0] += calls
         if calls == 2:
             raise error
         return original(controls)
@@ -245,6 +314,7 @@ def test_interrupted_objective_keeps_partial_trial_without_borrowing_previous_ge
                          pending_geometry_bytes=0, report_out=report)
     assert raised.value is error
     assert report["objective_evaluations"] == 2 and report["completed_evaluations"]["objective"] == 1
+    assert report["evaluation_seconds"]["objective"] == 3.
     assert not np.array_equal(report["latest_trial"]["controls"], initial)
     assert "objective" not in report["latest_trial"]["completed_components"]
     assert "geometry_objective" not in report["latest_trial"]
@@ -449,6 +519,9 @@ def test_a_zero_trial_jacobian_does_not_classify_a_future_equation_as_fixed_entr
     assert not jacobian[1].any()
     np.testing.assert_array_equal(bound.fixed_equality_rows, [0])
     np.testing.assert_array_equal(bound.variable_equality_rows, [1])
+    result = solve_trajectory(bound, initial, report_out={}, iterations=1,
+        check_request=lambda: None, pending_geometry_bytes=0)
+    assert result.report["solver_called"] and result.report["solver_task_equalities"] == 1
 
 
 def test_one_positive_objective_divisor_preserves_values_derivatives_and_order(monkeypatch):

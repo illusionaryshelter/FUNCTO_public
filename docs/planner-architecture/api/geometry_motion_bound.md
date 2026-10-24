@@ -1,11 +1,11 @@
 # `manipulation/geometry_motion_bound.py` 实现契约
 
-代码基线：`39880e5`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_finite`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L18)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L19)。
 
 输入签名：
 
@@ -38,7 +38,7 @@ ValueError
 
 ## `_add_up`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L24)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L25)。
 
 输入签名：
 
@@ -78,7 +78,7 @@ math.nextafter
 
 ## `_mul_up`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L33)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L34)。
 
 输入签名：
 
@@ -113,7 +113,7 @@ math.nextafter
 
 ## `_norm_up`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L39)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L40)。
 
 输入签名：
 
@@ -156,7 +156,7 @@ math.sqrt
 
 ## `_product_interval`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L46)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L47)。
 
 输入签名：
 
@@ -197,7 +197,7 @@ math.nextafter
 
 ## `_linear_norm_up`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L54)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L55)。
 
 输入签名：
 
@@ -209,8 +209,8 @@ def _linear_norm_up(matrix):
 
 > Bound ||A||_2 by sqrt(||A.T A||_infinity), with outward arithmetic.
 >
-> Native fixed rotations are stored in float32 and need not be exactly
-> orthogonal. Treating their norm as exactly one could underestimate the
+> Pinocchio placements and calibration store binary64 rotations whose
+> entries need not be exactly orthogonal. Assuming norm one can underestimate the
 > bound. Signed intervals retain cancellation in the Gram matrix, so this
 > remains close to one for rotations instead of multiplying sqrt(3) per link.
 
@@ -261,66 +261,20 @@ _add_up
 math.sqrt
 ```
 
-## `_affine_abs_up`
-
-[定义位置](../../../manipulation/geometry_motion_bound.py#L81)。
-
-输入签名：
-
-```python
-def _affine_abs_up(scale, offset, lower, upper):
-```
-
-实现说明：
-
-> Maximum |scale*q+offset| over the declared full joint interval.
-
-显式输出分支：
-
-```python
-maximum
-```
-
-读取的对象属性：
-
-```python
-math.nextafter
-math.inf
-```
-
-写入目标：
-
-```python
-maximum
-position
-lo
-hi
-```
-
-直接调用符号：
-
-```python
-_product_interval
-_finite
-math.nextafter
-max
-abs
-```
-
 ## `_array`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L92)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L82)。
 
 输入签名：
 
 ```python
-def _array(value, label, *, integer=False):
+def _array(value, label):
 ```
 
 显式输出分支：
 
 ```python
-result.astype(np.int64 if integer else np.float64, copy=True)
+result.astype(np.float64, copy=True)
 ```
 
 读取的对象属性：
@@ -332,7 +286,6 @@ result.dtype
 np.isfinite(result).all
 np.isfinite
 result.astype
-np.int64
 np.float64
 ```
 
@@ -357,7 +310,7 @@ result.astype
 
 ## `_names`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L105)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L96)。
 
 输入签名：
 
@@ -398,7 +351,7 @@ ValueError
 
 ## `SphereBody`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L114)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L105)。
 
 ```python
 class SphereBody():
@@ -410,23 +363,19 @@ class SphereBody():
 name: str
 link: str
 spheres: object
-affine_translation: Mapping
 ```
 
 实现说明：
 
-> One complete cover in a named native link frame.
+> One complete rigid sphere cover in an existing Pinocchio frame.
 >
 > ``spheres`` has shape [S,4], with local centres and nonnegative radii.
-> ``affine_translation`` explicitly maps each independently moving scalar
-> joint name to [S,3] local centre translations per unit q. Pass {} for a
-> rigid cover. For the existing timed hand, use its TCP-local spheres and
-> ``sphere_joint_translation`` here, rather than its locked native fingers.
-> Already transformed/offset spheres must not be transformed a second time.
+> All robot and finger motion belongs to the same registered joint tree;
+> attached observed fields retain their declared rigid tool relation.
 
 ## `GeometryMotionBound`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L132)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L119)。
 
 ```python
 class GeometryMotionBound():
@@ -448,7 +397,7 @@ local_radius_bounds_m: np.ndarray
 
 ## `GeometryMotionBound.speed_bounds`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L141)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L128)。
 
 输入签名：
 
@@ -460,7 +409,7 @@ def speed_bounds(self, joint_speed_upper):
 
 > Return one m/s bound per body for complete named |dq| bounds.
 >
-> Speeds must cover every native and affine coordinate. A missing timed
+> Speeds must cover every registered robot coordinate. A missing timed
 > finger or unbound joint is an error, not an inferred zero velocity.
 > The declared position ranges used to build L must hold on the interval.
 
@@ -513,44 +462,39 @@ _mul_up
 
 ## `build_geometry_motion_bound`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L161)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L149)。
 
 输入签名：
 
 ```python
-def build_geometry_motion_bound(*, fixed_transforms, link_map, joint_map, joint_map_type, joint_offset_map, joint_names, joint_position_limits, link_name_to_idx_map, bodies, extra_joint_limits):
+def build_geometry_motion_bound(*, model, T_reference_base, bodies):
 ```
 
 实现说明：
 
-> Build small CPU coefficients from CuRobo KinematicsParams metadata.
+> Bound point motion in the calibrated reference frame using Pinocchio.
 >
-> Copy the identically named native arrays once after model loading.
-> ``joint_position_limits`` is ``params.joint_limits.position`` [2,J]; the
-> native ``joint_offset_map`` is accepted in its flat [2*N] layout. Parent
-> indices come directly from ``link_map``; no alternate FK/tree is built.
-> Native root index 0 is fixed and its stored base transform is included.
+> ``model`` is the exact fixed-base model admitted by RobotGeometryChecker:
+> independent bounded scalar revolute/prismatic joints and fixed frames.
+> ``T_reference_base`` is that checker's calibration from robot base to the
+> geometry reference frame. ``bodies`` bind full local covers to existing
+> model frames; the native collision entities themselves remain unchanged.
 >
-> ``extra_joint_limits`` is mandatory: {} explicitly declares no extra
-> affine coordinates, otherwise name -> (lower, upper) supplies every such
-> coordinate. Affine translation may also use an existing native coordinate.
-> Unmodelled hand motion cannot be represented by silently omitting this
-> declaration. Freely moving scene owners are not part of this fixed-base
-> tree; their independently bounded speeds must enter relative_speed_bound.
+> Pinocchio ``frame.placement`` maps a frame into its parent joint, while
+> ``jointPlacements[j]`` maps joint j's zero pose into its parent joint.
+> ``joint.calc`` supplies each admitted joint's constant motion subspace
+> S=[v;w], with linear rows first. This reads analytic joint metadata at
+> neutral configuration; it does not estimate a velocity maximum by FK
+> samples. For a local full-cover radius r, the joint contributes
+> ||v|| + ||w|| r to its own coordinate. Prismatic motion also increases r
+> by ||v|| max(|q_min|, |q_max|) before the ancestor's lever is bounded.
 >
-> The native CUDA forward kernel uses joint types -1 and 0..5 (fixed,
-> xyz-prismatic, xyz-revolute), with negative axes/mimic in scale*q+offset.
-> Legacy negative-axis enum codes 6..11 are rejected rather than assumed to
-> have the same kernel semantics. Locked joints must already be folded into
-> fixed transforms by the existing loader.
->
-> Proof: starting at each body's full local radius, walk toward the base.
-> A rotating edge contributes |scale|*current_radius to its coordinate; a
-> translating edge contributes |scale| and increases the radius by its full
-> interval extension. The fixed linear transform multiplies both bounds by
-> its operator-norm bound and its translation increases radius. Triangle
-> inequalities and addition for repeated mimic coordinates give L. This
-> also covers interior sphere points, not only centres or mesh vertices.
+> Starting with the frame placement, walk these exact parent relations.
+> Each fixed rotation's outward operator-norm bound scales all accumulated
+> coefficients and the radius; its translation enlarges only the radius.
+> The final calibration rotation scales the whole coefficient row. Its
+> fixed translation has no velocity contribution. These triangle-inequality
+> bounds cover every sphere point throughout the declared joint domain.
 
 显式输出分支：
 
@@ -561,128 +505,118 @@ GeometryMotionBound(body_names, names, coefficients, limits, radii)
 读取的对象属性：
 
 ```python
-transforms.ndim
-transforms.shape
-offsets.shape
-offsets.reshape
-parents.shape
-joints.shape
-types.shape
-np.any
-limits.shape
-np.bool_
-np.integer
-links.values
-seen.add
-extra.shape
-np.concatenate
-extra.T
+model.names
+model.joints
+model.njoints
+joint.idx_q
+np.array
+model.lowerPositionLimit
+model.upperPositionLimit
+pin.neutral
+joint.createData
+joint.calc
+np.asarray(data.S).reshape
+np.asarray
+data.S
+gains.append
+placement.rotation
+model.jointPlacements
+placement.translation
 body.name
 np.zeros
+model.getFrameId
 body.link
-body.affine_translation
+model.nframes
 body.spheres
 spheres.ndim
 spheres.shape
-np.array
-body.affine_translation.items
-mapping.shape
-used_extra.add
-local_radii.max
+np.any
+model.frames
+frame.placement.rotation
+frame.placement
+frame.placement.translation
+frame.parentJoint
+model.parents
 value.setflags
 ```
 
 写入目标：
 
 ```python
-transforms
-count
-parents
-joints
-types
-offsets
 names
-limits
-links
-value
-start
-seen
-link
-extra_names
-extra
 name
+joints
+index
 columns
-i
-bodies
-body
-body_names
+joint
+limits
+neutral
+gains
+data
+subspace
 linear
-transform
+placement
 translation
+base_linear
+bodies
+body_names
+body
 coefficients
 radii
-used_extra
 body_index
+frame_id
 spheres
-local_radii
-row
-mapping
-column
-norm
-extent
-sphere_index
-gain
-local_radii[sphere_index]
-row[column]
 radius
+sphere
 radii[body_index]
-kind
-scale
-offset
-extension
+frame
+row
+joint_id
+column
+linear_gain
+angular_gain
+row[column]
+extent
+row[index]
+value
 ```
 
 直接调用符号：
 
 ```python
-_array
-len
-ValueError
-offsets.reshape
-np.any
-_names
-isinstance
-dict
-any
-links.values
-set
-range
-seen.add
-int
-np.concatenate
-enumerate
 tuple
-_linear_norm_up
-_norm_up
-np.zeros
+str
+range
+int
 np.array
+pin.neutral
+joint.createData
+joint.calc
+np.asarray(data.S).reshape
+np.asarray
+gains.append
+_norm_up
+_linear_norm_up
+_names
+np.zeros
+len
+enumerate
+model.getFrameId
+ValueError
+_array
+np.any
+max
 _add_up
 float
-body.affine_translation.items
-max
-abs
 _mul_up
-used_extra.add
-local_radii.max
-map
-_affine_abs_up
+abs
 value.setflags
 GeometryMotionBound
 ```
 
 ## `relative_speed_bound`
 
-[定义位置](../../../manipulation/geometry_motion_bound.py#L303)。
+[定义位置](../../../manipulation/geometry_motion_bound.py#L225)。
 
 输入签名：
 

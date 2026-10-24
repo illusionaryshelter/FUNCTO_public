@@ -53,18 +53,20 @@ class Native:
         self.budget = PlanningBudget()
         core = lambda: SimpleNamespace(optimizers=[])
         self.ik = SimpleNamespace(config=SimpleNamespace(exit_early=False), core=core())
+        self.reference_ik = SimpleNamespace(config=SimpleNamespace(exit_early=False), core=core())
+        self.torch = torch
         self.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
         self.scene_workspace_bytes = self.scene_cpu_workspace_bytes = self.scene_gpu_workspace_bytes = 0
         self.anchor_fk_workspace_bytes = 0
         self.anchor_capacity = 256
         self.validation_storage = {}
         self.route = "constrained"
-        self.reference_ik_distinct_counts = self.reference_ik_queries = self.reference_ik_chains = []
+        self.reference_ik_queries = []
         self.goal_ik_candidates = {}
         self.reference_initialization = {"status": "completed", "scene_constraints": "not_evaluated"}
         self.main_trajectory_iterations = self.budget.trajectory_iterations
         self.joint_reference_report = None
-        self.initial_seed_strategies = self.seed_strategies = ["test", "test"]
+        self.initial_seed_strategies = self.seed_strategies = ["local_reference_ik"]
         self.last_validation = {"u": np.array([0., 1.]), "violations": np.zeros(2)}
         limits = SimpleNamespace(joint_names=["q"], position=torch.tensor([[-1.], [1.]]),
             velocity=torch.tensor([[-1.], [1.]]), acceleration=torch.tensor([[-1.], [1.]]),
@@ -76,7 +78,7 @@ class Native:
         return {"passed": True}
     def reference_seeds(self, joint_reference=None):
         self.calls.append("seed")
-        return torch.zeros((1, 2, 8, 1)), []
+        return torch.zeros((1, 1, 8, 1)), []
     # BEGIN request fixtures use the same terminal-evidence dispatch predicate.
     # END missing terminal evidence preserves the existing qualification route.
     def evaluate_reference(self, seed):
@@ -85,7 +87,7 @@ class Native:
     def optimize(self, seed, *, iterations=None):
         self.calls.append("solve")
         return next(self.outcomes)
-    def select_candidate(self, accepted, *, record_work):
+    def select_candidate(self, accepted, *, record_work, on_candidate):
         # BEGIN even a zero-query fixture starts one formal validation attempt.
         record_work(passes=1)
         # END query counts are charged only by actual completed fixture queries.
@@ -98,7 +100,10 @@ class Native:
                   "coverage_residuals": {"rollout:unknown_forbidden": 0.},
                   "conditional_unknown_residuals": {"rollout:conditional_unknown": 0.}}
                   # END the deterministic fixture supplies explicit query classification.
-        return SimpleNamespace(solution=torch.zeros((1, 1, 8, 1))), self.curve, report
+        result = SimpleNamespace(solution=torch.zeros((1, 1, 8, 1)))
+        self.delivery_candidate = self.curve
+        on_candidate(result, report)
+        return result, self.curve, report
     def ompl_seed(self, seed, trajectory):
         self.calls.append("ompl")
         return (seed if self.ompl_available else None), {"state_queries": 1}
@@ -170,13 +175,14 @@ def test_real_candidate_binding_preserves_observed_geometry_and_rejects_mutation
 
 
 # BEGIN only typed geometric failures may request the bounded second solve.
-def test_failed_main_collision_gets_one_bounded_recovery():
-    native = Native([False, False, True], collision=True)
+def test_initial_collision_searches_before_the_single_main_batch():
+    native = Native([False, True], collision=True)
     result, backend = run(native)
     assert result.success
-    assert native.calls.count("solve") == 2 and native.calls.count("export") == 1
+    assert native.calls.count("solve") == 1 and native.calls.count("export") == 1
     assert native.calls.count("ompl") == 1
-    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
+    assert native.calls.index("ompl") < native.calls.index("solve")
+    assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 1
     backend.close()
 
 
@@ -200,7 +206,7 @@ def test_recovery_failure_returns_no_execution_binding_or_export():
     # BEGIN completed rejection preserves the selected candidate's evidence status.
     assert result.diagnostics["diagnostic_validation_status"] == "completed"
     # END result authorization remains absent regardless of completed validation.
-    assert native.calls.count("solve") == 2 and "export" not in native.calls
+    assert native.calls.count("solve") == 1 and "export" not in native.calls
     backend.close()
 
 
@@ -208,11 +214,13 @@ def test_recovery_failure_returns_no_execution_binding_or_export():
 def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_recovery():
     native = Native([False, False, False])
     select = native.select_candidate
-    def missing_support(accepted, *, record_work):
-        candidate, curve, report = select(accepted, record_work=record_work)
+    def missing_support(accepted, *, record_work, on_candidate):
+        candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         report["residuals"] = {"rollout:process_scene": 400000., "interpolated:process_scene": 500000.}
         report["collision_residuals"] = {"rollout:scene_collision": 0., "interpolated:scene_collision": 0.}
         report["scene_update_residuals"] = {"rollout:scene_update": 400000., "interpolated:scene_update": 500000.}
+        native.delivery_candidate = curve
+        on_candidate(candidate, report)
         return candidate, curve, report
     native.select_candidate = missing_support
     result, backend = run(native)
@@ -231,26 +239,28 @@ def test_positive_scene_support_only_preserves_hard_failure_and_skips_collision_
 # BEGIN forbidden coverage searches a new path without inventing collision evidence.
 @pytest.mark.parametrize("search_succeeds", [False, True])
 def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(search_succeeds):
-    native = Native([False, False, True], ompl=search_succeeds)
+    native = Native([False, search_succeeds], ompl=search_succeeds)
     select = native.select_candidate
-    def covered(accepted, *, record_work):
-        candidate, curve, report = select(accepted, record_work=record_work)
+    def covered(accepted, *, record_work, on_candidate):
+        candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         report["residuals"] = {"interpolated:process_scene": 0. if accepted else 4000.}
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": 0. if accepted else 4000.}
         # BEGIN final policy classification consumes named same-candidate evidence.
         report["scene_components"] = {} if accepted else {"unknown/forbidden/robot": {"maximum": 4000.}}
         # END the aggregate coverage channel alone is insufficient for a policy verdict.
+        native.delivery_candidate = curve
+        on_candidate(candidate, report)
         return candidate, curve, report
     native.select_candidate = covered
     result, backend = run(native)
     try:
         assert result.success is search_succeeds
         assert native.calls.count("ompl") == 1
-        assert native.calls.count("solve") == (2 if search_succeeds else 1)
+        assert native.calls.count("solve") == 1
         assert result.diagnostics["recovery"] == ("ompl" if search_succeeds else "ompl_failed")
         ledger = result.request_ledger
         assert ledger["consumed_planning"]["search_queries"] == 1
-        assert ledger["consumed_planning"]["trajectory_solves"] == (2 if search_succeeds else 1)
+        assert ledger["consumed_planning"]["trajectory_solves"] == 1
         assert ledger["planning_budget"]["maximum_trajectory_solves"] == 2
         assert ledger["planning_budget"]["planning_seconds"] == 120.
         if not search_succeeds:
@@ -264,10 +274,12 @@ def test_forbidden_coverage_uses_one_bounded_search_without_collision_witnesses(
 def test_forbidden_coverage_cannot_replenish_a_zero_search_budget():
     native = Native([False, False])
     select = native.select_candidate
-    def forbidden(accepted, *, record_work):
-        candidate, curve, report = select(accepted, record_work=record_work)
+    def forbidden(accepted, *, record_work, on_candidate):
+        candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         report["residuals"] = {"interpolated:process_scene": 1.}
         report["coverage_residuals"] = {"interpolated:unknown_forbidden": 1.}
+        native.delivery_candidate = curve
+        on_candidate(candidate, report)
         return candidate, curve, report
     native.select_candidate = forbidden
     result, backend = run(native, budget=PlanningBudget(search_seconds=0.))
@@ -285,10 +297,12 @@ def test_forbidden_coverage_cannot_replenish_a_zero_search_budget():
 def test_other_scene_terms_cannot_masquerade_as_forbidden_coverage(component):
     native = Native([False, False])
     select = native.select_candidate
-    def other_scene_failure(accepted, *, record_work):
-        candidate, curve, report = select(accepted, record_work=record_work)
+    def other_scene_failure(accepted, *, record_work, on_candidate):
+        candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         report["residuals"] = {"interpolated:process_scene": 1.}
         report["scene_components"] = {component: {"maximum": 1.}}
+        native.delivery_candidate = curve
+        on_candidate(candidate, report)
         return candidate, curve, report
     native.select_candidate = other_scene_failure
     result, backend = run(native)
@@ -317,13 +331,15 @@ def test_require_observation_stops_at_first_confirmed_coverage_only_candidate(st
         select = native.select_candidate
         selections = []
 
-        def confirmed(accepted, *, record_work):
-            candidate, curve, report = select(accepted, record_work=record_work)
+        def confirmed(accepted, *, record_work, on_candidate):
+            candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
             selections.append(1)
             if stage == "reference" or len(selections) == 2:
                 report.update(residuals={"interpolated:process_scene": .04},
                     coverage_residuals={"interpolated:unknown_forbidden": .04},
                     scene_components=unknown, observed_geometry={"status": "completed"})
+            native.delivery_candidate = curve
+            on_candidate(candidate, report)
             return candidate, curve, report
 
         native.select_candidate = confirmed
@@ -345,13 +361,15 @@ def test_require_observation_does_not_relabel_a_mixed_collision_failure():
     world.unknown_policy = {"outside_regions": "require_observation", "conditional_regions": []}
     select = native.select_candidate
 
-    def mixed(accepted, *, record_work):
-        candidate, curve, report = select(accepted, record_work=record_work)
+    def mixed(accepted, *, record_work, on_candidate):
+        candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         report.update(residuals={"interpolated:process_scene": .05},
             coverage_residuals={"interpolated:unknown_forbidden": .04},
             collision_residuals={"interpolated:scene_collision": .01},
             scene_components={"unknown/forbidden/robot": {"maximum": .04},
                               "collision/robot/background": {"maximum": .01}})
+        native.delivery_candidate = curve
+        on_candidate(candidate, report)
         return candidate, curve, report
 
     native.select_candidate = mixed
@@ -359,7 +377,7 @@ def test_require_observation_does_not_relabel_a_mixed_collision_failure():
     try:
         assert not result.success and result.execution_binding is None
         assert result.diagnostics["failure"] == "no_feasible_solution_found"
-        assert native.calls == ["seed", "reference", "solve", "ompl"]
+        assert native.calls == ["seed", "reference", "ompl", "solve"]
     finally:
         backend.close()
 # END external observation acquisition is not simulated or promised by this status.
@@ -487,18 +505,20 @@ def test_new_motion_allowance_requires_boundary_t_evidence_and_forward_progress(
 # BEGIN support evidence cannot cancel the existing fixed-target finite search.
 @pytest.mark.parametrize("outcomes,collision,expected_solves", [
     ([False, True], False, 1),
-    ([False, False, True], True, 2),
+    ([False, True], True, 1),
 ])
 def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, collision, expected_solves):
     native = Native(outcomes, collision=collision)
     select = native.select_candidate
     source = problem()
     source_positions = source.phases[0].reference.poses.copy()
-    def with_support(accepted, *, record_work):
-        candidate, curve, report = select(accepted, record_work=record_work)
+    def with_support(accepted, *, record_work, on_candidate):
+        candidate, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         gap = 0. if accepted else 100000.
         report["scene_update_residuals"] = {"rollout:scene_update": gap}
         report["residuals"]["rollout:process_scene"] = gap
+        native.delivery_candidate = curve
+        on_candidate(candidate, report)
         return candidate, curve, report
     native.select_candidate = with_support
     backend = MotionBackend({}, robot_validator=object())
@@ -510,7 +530,7 @@ def test_candidate_support_gaps_do_not_early_stop_main_or_recovery(outcomes, col
         assert native.calls.count("solve") == expected_solves
         assert result.diagnostics["reference_candidate"]["scene_update_residuals"] == {"rollout:scene_update": 100000.}
         assert result.diagnostics["scene_update_residuals"] == {"rollout:scene_update": 0.}
-        if expected_solves == 2:
+        if collision:
             assert "ompl" in native.calls
         np.testing.assert_array_equal(source.phases[0].reference.poses, source_positions)
     finally:
@@ -524,12 +544,14 @@ def test_complete_candidates_compare_one_fixed_objective(improved_score, expecte
     native = Native([(True, 1., .1), (True, improved_score, .2)])
     select = native.select_candidate
 
-    def scored(outcome, *, record_work):
+    def scored(outcome, *, record_work, on_candidate):
         accepted, score, end = outcome
         native.curve = JointTrajectory(("q",), np.array([0., 1.]), np.array([[0.], [end]]),
             np.zeros((2, 1)), np.array([0., 1.]), np.array([0., 1.]), (), (), {})
-        result, curve, report = select(accepted, record_work=record_work)
+        result, curve, report = select(accepted, record_work=record_work, on_candidate=lambda *_: None)
         report.update(fixed_objective=score, objective_components={"continuous_reference": score})
+        native.delivery_candidate = curve
+        on_candidate(result, report)
         return result, curve, report
 
     native.select_candidate = scored
@@ -608,12 +630,18 @@ def test_interrupted_solver_exports_unvalidated_trial_and_keeps_seed_evidence(in
     native.optimize = _ConstrainedPlanner.optimize.__get__(native)
     select = native.select_candidate
 
-    def select_reference(value, *, record_work):
-        result, curve, report = select(value, record_work=record_work)
+    def select_reference(value, *, record_work, on_candidate):
+        if value is not False:
+            # The actual optimizer iterator must execute before this fixture
+            # can score its output; this test interrupts its first solve.
+            list(value)
+            pytest.fail("The real solve did not reach its declared interruption")
+        result, curve, report = select(value, record_work=record_work, on_candidate=lambda *_: None)
         # The deterministic validation fixture labels this seed only. Real
         # geometry accuracy is exercised in the native scene contract tests.
         report["geometry_witness_provenance"] = {"position": curve.position.tolist()}
         native.delivery_candidate = curve
+        on_candidate(result, report)
         return result, curve, report
 
     native.select_candidate = select_reference
@@ -668,14 +696,16 @@ def test_cancel_after_main_selection_does_not_label_optimized_curve_as_reference
     select = native.select_candidate
     state = {"selections": 0, "main_selected": False}
 
-    def selected(value, *, record_work):
+    def selected(value, *, record_work, on_candidate):
         state["selections"] += 1
         if state["selections"] == 2:
             native.curve = deepcopy(native.curve)
             native.curve.position[-1, 0] = .2
-        result, curve, report = select(value, record_work=record_work)
+        result, curve, report = select(value, record_work=record_work, on_candidate=lambda *_: None)
         native.delivery_candidate = curve
         state["main_selected"] = state["selections"] == 2
+        native.delivery_candidate = curve
+        on_candidate(result, report)
         return result, curve, report
 
     native.select_candidate = selected
@@ -721,10 +751,104 @@ def test_diagnostic_curve_export_error_preserves_original_solver_exception():
          patch("manipulation.planning._planning_workspace_bytes", return_value=SimpleNamespace(pending_cpu_bytes=0)), \
          np.errstate(over="ignore", invalid="ignore"):
         with pytest.raises(PlanningWorkExhausted) as raised:
-            native.optimize(torch.tensor(initial)[None, None])
+            list(native.optimize(torch.tensor(initial)[None, None]))
     assert raised.value is error
     runtime, = native.last_optimizer_runtime
     assert runtime["latest_trial"]["controls"] == controls.tolist()
     assert runtime["diagnostic_curve_export_error"]["error_type"] == "ValueError"
     assert native.diagnostic_optimizer_candidate is native.diagnostic_optimizer_provenance is None
 # END diagnostic export failure remains evidence, not a new planner outcome.
+
+# BEGIN serial production iteration freezes accepted work before a later interruption.
+@pytest.mark.parametrize('failure', ['budget', 'cancelled', 'deadline_exceeded', 'native'])
+def test_completed_first_optimized_seed_survives_only_budget_exhaustion(failure):
+    from manipulation.planning import PlanningWorkExhausted
+    from manipulation.unified_solver import ConstrainedSolution
+
+    native = Native([])
+    native.scene, native.computation = Scene(), SimpleNamespace(scene=Scene())
+    native.robot_metadata = {}
+    native.evaluate_reference = _ConstrainedPlanner.evaluate_reference.__get__(native)
+    native.optimize = _ConstrainedPlanner.optimize.__get__(native)
+    native.select_candidate = _ConstrainedPlanner.select_candidate.__get__(native)
+    native._candidate_objective = lambda curve, scene: {'fixed_objective': 1.}
+    native._controls_curve = lambda controls: deepcopy(native.curve)
+    evaluations, completed = [], []
+
+    def evaluate(curve, *, record_work, objective):
+        record_work(passes=1)
+        accepted = bool(evaluations)
+        evaluations.append(accepted)
+        report = {'accepted': accepted, **objective, 'residuals': {'scene': float(not accepted)},
+            'collision_residuals': {'scene_collision': float(not accepted)},
+            'coverage_residuals': {}}
+        native.last_validation = {'u': np.array([0., 1.]), 'violations': np.zeros(2)} if accepted else None
+        return curve, report, 0
+
+    native.evaluate_candidate = evaluate
+    error = (PlanningWorkExhausted('second seed exhausted') if failure == 'budget' else
+        RuntimeError('second seed native failure') if failure == 'native' else
+        MotionPlanningError(failure, 'second seed request interruption'))
+
+    def solve(computation, controls, *, report_out, **kwargs):
+        if completed:
+            # The first completed candidate must already own an independent
+            # execution binding when the second solve touches native storage.
+            assert native.calls.count('export') == 1
+            native.curve.position[:] = .8
+            native.last_validation['violations'][:] = 100.
+            raise error
+        completed.append(controls.copy())
+        return ConstrainedSolution(controls.copy(), {'success': True})
+
+    with patch('manipulation.unified_solver.solve_trajectory', side_effect=solve), \
+         patch('manipulation.planning._planning_workspace_bytes', return_value=SimpleNamespace(pending_cpu_bytes=0)):
+        result, backend = run(native)
+    try:
+        assert evaluations == [False, True]
+        assert result.request_ledger['consumed_planning']['trajectory_solves'] == 1
+        assert result.request_ledger['consumed_planning']['validation_passes'] == 2
+        assert len(native.last_optimizer_runtime) == 2
+        assert result.diagnostics['attempts'][0]['selected_seed_index'] == 0
+        assert result.diagnostics['attempts'][0]['seed_provenance'] == 'ompl'
+        if failure == 'budget':
+            assert result.success and result.execution_binding is not None
+            np.testing.assert_array_equal(result.trajectory.position, np.zeros((2, 1)))
+            assert result.diagnostics['returned_candidate']['seed_provenance'] == 'ompl'
+        else:
+            assert not result.success and result.execution_binding is None
+            assert result.diagnostics['failure'] == ('planning_stage_failed' if failure == 'native' else failure)
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize('failure', ['budget', 'cancelled', 'deadline_exceeded', 'native'])
+def test_search_exception_accounts_started_queries_and_elapsed_time_once(failure):
+    from manipulation.planning import PlanningWorkExhausted
+    native, clock = Native([False], collision=True), [0.]
+    error = (PlanningWorkExhausted('search request work exhausted') if failure == 'budget' else
+        RuntimeError('search native failure') if failure == 'native' else
+        MotionPlanningError(failure, 'search request interruption'))
+
+    def search(seed, curve):
+        native.calls.append('ompl')
+        native.last_search_report = {'state_queries': 3, 'success': False}
+        clock[0] = .25
+        raise error
+
+    native.ompl_seed = search
+    with patch('manipulation.planning.time.monotonic', side_effect=lambda: clock[0]):
+        result, backend = run(native)
+    try:
+        work = result.request_ledger['consumed_planning']
+        assert not result.success and result.execution_binding is None
+        assert work['search_queries'] == 3 and work['search_seconds'] == .25
+        assert work['trajectory_solves'] == 0 and native.calls.count('ompl') == 1
+        assert result.diagnostics['ompl']['state_queries'] == 3
+        assert result.diagnostics['ompl']['elapsed_seconds'] == .25
+        assert result.diagnostics['used_ompl']
+        assert result.diagnostics['failure'] == ('cumulative_planning_budget_exhausted' if failure == 'budget'
+            else 'planning_stage_failed' if failure == 'native' else failure)
+    finally:
+        backend.close()
+# END only the original cumulative-work exception can preserve a qualified incumbent.

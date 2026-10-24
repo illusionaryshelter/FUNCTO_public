@@ -1,50 +1,11 @@
 # `manipulation/interval_geometry.py` 实现契约
 
-代码基线：`39880e5`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
-
-## `_cpu`
-
-[定义位置](../../../manipulation/interval_geometry.py#L22)。
-
-输入签名：
-
-```python
-def _cpu(value):
-```
-
-显式输出分支：
-
-```python
-value.detach().cpu().numpy() if hasattr(value, 'detach') else np.asarray(value)
-```
-
-读取的对象属性：
-
-```python
-value.detach().cpu().numpy
-value.detach().cpu
-value.detach
-np.asarray
-```
-
-写入目标：
-
-无显式条目。
-
-直接调用符号：
-
-```python
-hasattr
-value.detach().cpu().numpy
-value.detach().cpu
-value.detach
-np.asarray
-```
 
 ## `_polynomial_ranges`
 
-[定义位置](../../../manipulation/interval_geometry.py#L26)。
+[定义位置](../../../manipulation/interval_geometry.py#L22)。
 
 输入签名：
 
@@ -154,7 +115,7 @@ np.maximum
 
 ## `_progress_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L65)。
+[定义位置](../../../manipulation/interval_geometry.py#L61)。
 
 输入签名：
 
@@ -210,7 +171,7 @@ float
 
 ## `SceneMotionBounds`
 
-[定义位置](../../../manipulation/interval_geometry.py#L79)。
+[定义位置](../../../manipulation/interval_geometry.py#L75)。
 
 ```python
 class SceneMotionBounds():
@@ -235,7 +196,7 @@ owner_radii: dict
 
 ## `SceneMotionBounds.from_scene`
 
-[定义位置](../../../manipulation/interval_geometry.py#L92)。
+[定义位置](../../../manipulation/interval_geometry.py#L88)。
 
 输入签名：
 
@@ -272,14 +233,10 @@ Rotation.from_quat
 np.asarray
 relation.quaternion_tool_owner
 relation.position_tool_owner
-scene.kinematics.model.config.kinematics_config
-scene.kinematics.model.config
 scene.kinematics.model
 scene.kinematics
-params.joint_names
-params.joint_limits.position
-params.joint_limits
-params.link_name_to_idx_map
+scene.robot_validator.T_reference_base
+scene.robot_validator
 ```
 
 写入目标：
@@ -307,9 +264,6 @@ local_radius
 tool
 complete_radius
 attached_names[owner.owner_id, index]
-params
-arguments
-key
 robot
 ```
 
@@ -331,16 +285,13 @@ np.eye
 Rotation.from_quat(np.asarray(relation.quaternion_tool_owner)[[1, 2, 3, 0]]).as_matrix
 Rotation.from_quat
 np.asarray
-_cpu
-getattr
 build_geometry_motion_bound
-tuple
 cls
 ```
 
 ## `SceneMotionBounds.declaration_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L130)。
+[定义位置](../../../manipulation/interval_geometry.py#L127)。
 
 输入签名：
 
@@ -396,7 +347,7 @@ result.setdefault(last, set()).add
 
 ## `SceneMotionBounds.partition_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L148)。
+[定义位置](../../../manipulation/interval_geometry.py#L145)。
 
 输入签名：
 
@@ -455,7 +406,7 @@ np.unique
 
 ## `SceneMotionBounds._owner_speed`
 
-[定义位置](../../../manipulation/interval_geometry.py#L162)。
+[定义位置](../../../manipulation/interval_geometry.py#L159)。
 
 输入签名：
 
@@ -558,7 +509,7 @@ max
 
 ## `SceneMotionBounds.interval`
 
-[定义位置](../../../manipulation/interval_geometry.py#L204)。
+[定义位置](../../../manipulation/interval_geometry.py#L201)。
 
 输入签名：
 
@@ -661,7 +612,7 @@ unavailable.pop
 
 ## `check_interval_geometry`
 
-[定义位置](../../../manipulation/interval_geometry.py#L252)。
+[定义位置](../../../manipulation/interval_geometry.py#L249)。
 
 输入签名：
 
@@ -797,7 +748,7 @@ pending.appendleft
 
 ## `check_interval_geometry.retain`
 
-[定义位置](../../../manipulation/interval_geometry.py#L273)。
+[定义位置](../../../manipulation/interval_geometry.py#L270)。
 
 输入签名：
 
@@ -838,7 +789,7 @@ intersections.append
 
 ## `check_interval_geometry.get_states`
 
-[定义位置](../../../manipulation/interval_geometry.py#L290)。
+[定义位置](../../../manipulation/interval_geometry.py#L287)。
 
 输入签名：
 

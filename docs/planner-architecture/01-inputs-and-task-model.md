@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`fcdaefd`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 
 ## 1. 输入的来源与相互依赖
 
@@ -124,7 +124,7 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `_functional_events` 保留事件的轴与容差，`_material_pose_requirement` 用当前材料变换和功能目标构造上述要求。`_object_reference` 在入口以及参考功能点上使用同一分解；同刻事件的矛盾检查使用包含完整 yaw 范围的旋转球上界。`build_planning_problem` 从原事件复制轴与容差，保留 C* 的局部坐标语义。有限支撑声明由 `SupportRequirement` 独立表达；需要同时表达姿态集合时，调用者另行传入 `PoseEventRequirement`。
 
-当前连续参考适配器 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 的 `reference_inputs()` 读取完整技能表示、迁移功能坐标、声明关系 J/A 和冻结机器人反馈，调用 `generate_reference` 得到 `object_path/eef_path`。`build_problem()` 在交互进度和受控参考终点建立两个材料姿态要求。目标为 `object_path.sample_numpy(s)`，轴为 `R_W_C*ᵀ n_W`，其中 `n_W` 是观测支撑面的世界法向。三个容差直接读取 [scene.json](../../../sim-version-plans/2026-10-19-put-planner-audit/prepared-inputs/scene.json) 的 `pose_event_tolerances`：当前位置 0.002 m、剩余倾斜 π/180 rad、yaw π rad。该 1°衡量相对参考的倾斜；支撑面的法向与接触间距仍使用独立支撑声明。源时间、交互和释放事件继续决定查询进度。
+当前实验入口以明确参考目录调用连续参考适配器 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 的 `reference_inputs()` 读取完整技能表示、迁移功能坐标、声明关系 J/A 和冻结机器人反馈，调用 `generate_reference` 得到 `object_path/eef_path`。`build_problem()` 在交互进度和受控参考终点建立两个材料姿态要求。目标为 `object_path.sample_numpy(s)`，轴为 `R_W_C*ᵀ n_W`，其中 `n_W` 是观测支撑面的世界法向。三个容差直接读取 [scene.json](../../../sim-version-plans/2026-10-19-put-planner-audit/prepared-inputs/scene.json) 的 `pose_event_tolerances`：当前位置 0.002 m、剩余倾斜 π/180 rad、yaw π rad。该 1°衡量相对参考的倾斜；支撑面的法向与接触间距仍使用独立支撑声明。源时间、交互和释放事件继续决定查询进度。
 
 ## 5. PlanningProblem 的运行接口
 
@@ -138,17 +138,19 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 ### 5.2 完整有符号任务条件
 
-`constraint_components(position, quaternion, progress, joint_position=None, joint_names=None, joint_velocity=None, *, trajectory_time, tool_linear_velocity=None, tool_angular_velocity=None)` 返回 `(equalities, inequalities)`。两者均为名称到 Torch 张量的字典，分别表达 `value=0` 和 `value<=0`。输入姿态分别为 `[...,3]` 和 `[...,4]`，进度和实际时间具有相同的批量/查询维度。给定声明与固定查询布局后，字典顺序和每组张量形状保持固定；对值展平并拼接即可构成数值求解器的条件向量，Torch 自动求导保留它们对候选状态的 Jacobian。
+`constraint_components(position, quaternion, progress, joint_position=None, joint_names=None, joint_velocity=None, *, trajectory_time, tool_linear_velocity=None, tool_angular_velocity=None, solver_rows_out=None)` 返回 `(equalities, inequalities)`。两者均为名称到 Torch 张量的字典，分别表达 `value=0` 和 `value<=0`。输入姿态分别为 `[...,3]` 和 `[...,4]`，进度和实际时间具有相同的批量/查询维度。给定声明与固定查询布局后，字典顺序和每组张量形状保持固定；对值展平并拼接即可构成数值求解器的条件向量，Torch 自动求导保留它们对候选状态的 Jacobian。
 
-生产调用关系是 `planning._ConstrainedPlanner._bind_computation` → `unified_solver.TrajectoryComputation` → `PlanningProblem.constraint_components`。前者合并普通物理积分查询、任务锚点和场景锚点，按实际时间排序，随后一次校验 `verification_issues`。`TrajectoryComputation.states` 用同一固定物理时钟的三次曲线系数生成 `q/dq/ddq/jerk`。`robot_tool_states` 补齐场景声明的名义手指坐标，交给 `PinKinematics.states` 计算参考坐标中的工具连杆位姿和速度，再组合固定工具变换；工具线速度包含角速度与固定杆臂的叉积。`task` 将完整任务字典按插入顺序展平，`solve_trajectory` 调用 `task_jacobian`，在同一次任务求值图上逐列计算对自由曲线系数的导数，交给 SciPy SLSQP。令 `c(x)` 为原任务行向量、`x` 为自由系数、`J=∂c/∂x`，一次反向传播建立 `p(x,v)=Jᵀv`，其中 `v` 是与 `c` 等长的独立权向量。随后仅对 `v` 求每个 `p_i` 的导数，得到 `J` 的第 `i` 列；该计算使用机器人运动学的一阶导数。
+生产调用关系是 `planning._ConstrainedPlanner._bind_computation` → `unified_solver.TrajectoryComputation` → `PlanningProblem.constraint_components`。前者合并普通物理积分查询、任务锚点和场景锚点，按实际时间排序，随后一次校验 `verification_issues`。`TrajectoryComputation.states` 用固定物理时钟的三次系数生成 q/dq/ddq/jerk；`robot_tool_states` 补齐名义手指状态，通过 Pinocchio 计算参考坐标中的连杆位姿和速度，再组合固定工具变换及线速度杆臂项。`task` 始终展平完整原条件。初始求值可通过 `solver_rows_out` 同时接收条件生产处的布尔布局，求解回调按一次绑定的布局选择实际提交行。结构选择与原值来自同次任务计算。
+
+`task_jacobian` 在实际任务行数 m 小于自由系数数 n 时逐行反向，否则先建立 `p(x,v)=J(x)ᵀv`，再仅对独立权向量 v 求导得到 J 的各列。这里 x 为自由系数、J 为所提交原任务行对 x 的一阶导数。两种路径都使用既有 Pinocchio 一阶运动学接口和 Torch 标量反向传播。
 
 `TrajectoryComputation.objective_components` 在同一候选上计算三部分：普通积分查询上的 STATE 关节运动质量、`optimizer_preferences(phase="quality")` 的声明任务偏好、场景已观测几何的搜索目标。STATE 的权重、激活距离与物理时间因子来自既有 cuRobo 配置，梯形积分按物理时长归一化；补入事件查询不会改变普通运动质量的积分权重。工具和物体的几何允许条件仍由对应原任务行及场景验收计算确定。候选保存后的复核调用同一 `robot_tool_states`，输入为保存曲线自身的时间、关节状态和技能进度。
 
-数值求解器从完整任务值确定等式与不等式行数，然后根据 SciPy 密集工作区、约束 Jacobian、矩阵拼接和运动学反向传播的同时存活数组进行主机内存准入。调用方在每个串行候选求解前重新计算场景的待分配固定材料样本与一次几何/FK 临时图，作为 `solve_trajectory` 的必需参数 `pending_geometry_bytes`；求解器将该项与自身增量合并，在任何导数分配前检查主机预算。`task_jacobian` 建立第一次反向图后再次检查主机预算，此时新增量只有最终任务 Jacobian、单个返回列与 Pinocchio 求导临时缓冲；原任务值、独立权向量、第一次反向图以及已分配的求解器和场景数组由当前 RSS 计入。`solver_storage_bytes` 的入口总预算还计入原任务连接向量和自由系数空间中的反向积。每次候选系数改变时，目标、任务与关节约束缓存同步清空。求解器报告分别保留库终止原因、实际系数变化和各部分数组容量，最终接受由原约束与保存曲线的复核决定。
+数值求解器在核对声明常量后确定实际提交的任务行数，并据此计算 SciPy 密集工作区、约束 Jacobian、矩阵拼接和反向传播的同时存活数组。每个串行候选开始前，调用方重算场景待分配固定材料和一次几何/FK 临时图，以 `pending_geometry_bytes` 传入。第一次主机准入位于 SLSQP 工作区、密集任务 Jacobian 和标量反向求导之前；初始任务求值中已分配的 Pinocchio 原生 Jacobian/速度导数由 RSS 计入。`task_jacobian` 的第二次准入在行路径首行求导前、列路径建立第一次反向图之后，分别考虑新密集矩阵、一个返回行或列及 Pinocchio 临时反向缓冲。列路径的独立权向量和第一次反向图此时属于 RSS，行路径没有这两项。每次系数改变时，目标、任务与连续关节约束缓存同步清空。求解器报告保留库终止原因、系数变化及各部分内存需求，最终接受由原条件的保存曲线复核决定。
 
-固定查询绑定同时确定等式对自由曲线系数的结构依赖。现有零宽偏航等式在声明事件首次物理时间为零、且该时刻三次曲线的系数行恒为零、仿射偏置恰为 `start_q` 时，属于固定入口条件。`fixed_equality_rows` 记录这些原行，`variable_equality_rows` 记录其余行。求解前按原零宽条件核对固定行；非零或非有限值返回 `solver_called=false` 的入口不可行记录。满足的固定行从提交 SLSQP 的向量中消去，完整 `task` 和保存候选验收仍返回原行。这一消元由事件时间和曲线表示确定，当前某行导数恰为零不构成消元依据。
+固定查询绑定同时确定与候选系数无关的行。固定进度界、声明作用域外零行、方向历史中的固定首项由产生条件的同一代码写入 `solver_rows_out`；位于曲线固定入口的零宽偏航另由 `fixed_equality_rows` 表达。求解器先逐组记录被消去行的键、组内行索引和原值，要求所有值有限且满足 EQ=0 或 INEQ≤0；否则返回 `solver_called=false` 的固定条件失败。剩余行数决定 Jacobian 方向和密集内存需求。完整 `task` 及候选验收仍返回所有原条件，某行在一次试算中具有零导数不构成消元依据。
 
-求解器向 SLSQP 提交 `f(x)/α` 及 `∇f(x)/α`，其中 `x` 是同一曲线自由系数，`f` 是上述三部分原目标之和，`α=max(1,|f(x₀)|,‖∇f(x₀)‖∞)` 在该次求解开始时确定并固定。由于 `α>0`，任意两个可行候选的目标大小关系与原目标一致，最优解集合相同；所有任务和物理约束保持原值。`objective_scale`、`normalized_objective`、`objective` 分别记录该常数、归一化目标和原目标。SLSQP 的 `ftol=1e-9` 是归一化数值问题的停止设置，候选排序使用原目标，候选接受使用原任务和几何验收。库的成功终止及近零等式残差各自记录其数值含义。
+求解器向 SLSQP 提交 `f(x)/α` 及 `∇f(x)/α`，其中 `x` 是同一曲线自由系数，`f` 是上述三部分原目标之和，`α=max(1,|f(x₀)|,‖∇f(x₀)‖∞)` 在该次求解开始时确定并固定。由于 `α>0`，任意两个可行候选的目标大小关系与原目标一致，最优解集合相同；所有任务和物理约束保持原值。有限迭代路径与停止结果受归一化后的数值判据影响，精确最优解等价不表示有限预算求解等价。`objective_scale`、`normalized_objective`、`objective` 分别记录该常数、归一化目标和原目标。SLSQP 的 `ftol=1e-9` 是归一化数值问题的停止设置，报告保存包含三项的原求解目标 f；跨候选固定评分使用运动质量和任务质量两项的原单位之和，候选接受使用完整任务和几何验收。库的成功终止及近零等式残差各自记录其数值含义。
 
 
 各行保留原物理单位和原允许范围。过程位姿的每个有限上下界分别成为有符号行，平移分量使用米、旋转向量分量使用弧度，并保留 `NumericalTolerance` 的分量 allowance。机构流形继续使用原位置范数和旋转范数容差；坐标限位使用每个原生坐标的上下界。关节耦合对每条 `Aq-b` 方程保留原 `numerical.joint` 双边区间；停止事件对每个关节速度保留原 `numerical.velocity` 双边区间。

@@ -50,6 +50,8 @@ class PlanningPrecisionTests(unittest.TestCase):
                     planner.ik = Mock()
                     planner.ik.destroy.side_effect = lambda: self.assertFalse(
                         torch.backends.cuda.matmul.allow_tf32)
+                    planner.reference_ik = Mock()
+                    planner.reference_ik.destroy.side_effect = planner.ik.destroy.side_effect
 
                 with patch.object(_ConstrainedPlanner, "_initialize", autospec=True,
                                   side_effect=initialize):
@@ -81,10 +83,34 @@ class PlanningPrecisionTests(unittest.TestCase):
         torch.backends.cudnn.allow_tf32 = False
         with patch.object(_ConstrainedPlanner, "_initialize"):
             planner = _ConstrainedPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
-        planner.ik = SimpleNamespace(destroy=Mock(side_effect=RuntimeError("destroy failed")))
+        # BEGIN both native destructors run even when the first raises.
+        first = RuntimeError("destroy failed")
+        local = SimpleNamespace(destroy=Mock(side_effect=first))
+        functional = SimpleNamespace(destroy=Mock(side_effect=ValueError("second cleanup failure")))
+        planner.reference_ik, planner.ik = local, functional
         with self.assertRaisesRegex(RuntimeError, "destroy failed"):
             planner.close()
+        local.destroy.assert_called_once()
+        functional.destroy.assert_called_once()
+        self.assertIsNone(planner.reference_ik)
+        self.assertIsNone(planner.ik)
+        self.assertEqual(str(first.__cause__), "second cleanup failure")
+        planner.close()
         self.assertEqual(self.flags(), (True, False))
+        # END no stale solver reference remains after failed cleanup.
+
+    def test_partial_construction_preserves_original_failure_after_cleanup_failure(self):
+        failure = ValueError("second workspace construction failed")
+        functional = SimpleNamespace(destroy=Mock(side_effect=RuntimeError("cleanup failed")))
+        def initialize(planner, *_args, **_kwargs):
+            planner.ik = functional
+            raise failure
+        with patch.object(_ConstrainedPlanner, "_initialize", autospec=True, side_effect=initialize):
+            with self.assertRaises(ValueError) as raised:
+                _ConstrainedPlanner(None, None, None, None, "cpu", robot_validator=self.robot_validator)
+        self.assertIs(raised.exception, failure)
+        functional.destroy.assert_called_once()
+        self.assertEqual(str(failure.__cause__), "cleanup failed")
 
     def test_diagnostic_failure_closes_the_real_request_scope(self):
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -98,7 +124,7 @@ class PlanningPrecisionTests(unittest.TestCase):
             from manipulation.planning import PlanningBudget
             planner.budget = PlanningBudget()
             planner.ik = SimpleNamespace(core=SimpleNamespace(optimizers=[]), destroy=Mock())
-            planner.trajopt = SimpleNamespace(core=SimpleNamespace(optimizers=[]), destroy=Mock())
+            planner.reference_ik = SimpleNamespace(config=SimpleNamespace(exit_early=False), destroy=Mock())
             planner.scene_workspace_bytes = 0
             planner.scene_cpu_workspace_bytes = planner.scene_gpu_workspace_bytes = 0
             planner.anchor_fk_workspace_bytes = 0

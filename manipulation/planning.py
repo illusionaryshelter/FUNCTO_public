@@ -157,7 +157,8 @@ class PlanningBudget:
     random_seed: int = 123
 
     def __post_init__(self):
-        if (not 1 <= self.trajectory_seeds <= 2 or not self.trajectory_seeds <= self.ik_seeds <= 8
+        # BEGIN ordinary reference IK has one seed independently of functional IK.
+        if (not 1 <= self.trajectory_seeds <= 2 or not 1 <= self.ik_seeds <= 8
                 or not 6 <= self.knots <= 24 or not 1 <= self.interpolation_steps <= 8
                 or not 1 <= self.ik_iterations <= 200 or not 1 <= self.trajectory_iterations <= 300
                 # BEGIN admit bounded complete-volume robot cover refinement.
@@ -171,6 +172,7 @@ class PlanningBudget:
                 or not 32 <= self.max_validation_points <= 65536
                 or not 1 <= self.maximum_trajectory_solves <= 2):
             raise ValueError("Planning budget exceeds the bounded local single-batch configuration")
+        # END trajectory_seeds bounds actual proposals, without requiring padding.
         # BEGIN semantic anchors have one fixed resident capacity.
         if (type(self.max_task_anchors) is not int
                 or not 2 <= self.max_task_anchors <= self.max_validation_points):
@@ -1063,8 +1065,12 @@ def _check_work_budget(budget, consumed, *, started, initial_seconds, stage=None
     stage_caps = {"binding_attempts": cap, "initializations": cap, "ik_batches": cap,
         "ik_queries": budget.max_validation_points*budget.ik_seeds*cap,
         "trajectory_solves": cap,
-        "validation_passes": cap*budget.trajectory_seeds,
-        "validation_queries": budget.max_validation_points*cap*budget.trajectory_seeds+cap,
+        # BEGIN each binding admits one supplied curve and one local initializer.
+        # With B bindings and S optimization batches, V <= 2B + K*S.
+        # B,S <= M therefore gives V <= M*(K+2); the entrance adds B queries.
+        "validation_passes": cap*(budget.trajectory_seeds+2),
+        "validation_queries": budget.max_validation_points*cap*(budget.trajectory_seeds+2)+cap,
+        # END these capacities derive from the unchanged M/K/P public limits.
         "search_queries": budget.max_validation_points*cap}
     for name, limit in stage_caps.items():
         if consumed[name] > limit or (stage == name and consumed[name] >= limit):
@@ -2449,7 +2455,9 @@ class _ConstrainedPlanner:
 
     # BEGIN every planner binds one explicit source geometry and pair policy.
     def __init__(self, problem, scene, robot, budget, device, *, robot_validator, continuation=None, goal_identities=None):
-        self.ik = None
+        # BEGIN both fixed IK workspaces belong to this lifecycle, even on partial construction.
+        self.ik = self.reference_ik = None
+        # END close() can release either successfully constructed solver.
         self.check_request = lambda: None
         # BEGIN keep full float32 geometry through the complete native request.
         # TF32 truncates even an identity matrix product, so its coordinate
@@ -2465,10 +2473,13 @@ class _ConstrainedPlanner:
         try:
             self._initialize(problem, scene, robot, budget, device,
                              robot_validator=robot_validator, continuation=continuation, goal_identities=goal_identities)
-        except BaseException:
+        except BaseException as error:
             # A later native configuration failure must release an IK solver
             # already created in this process before propagating the error.
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
             raise
 
     def _initialize(self, problem, scene, robot, budget, device, *, robot_validator, continuation=None, goal_identities=None):
@@ -2578,7 +2589,6 @@ class _ConstrainedPlanner:
         self.scene_workspace_bytes = workspace.total_bytes
         self.scene_cpu_workspace_bytes, self.scene_gpu_workspace_bytes = workspace.cpu_bytes, workspace.gpu_bytes
         self.scene_cpu_live_bytes, self.anchor_fk_workspace_bytes = workspace.cpu_live_bytes, workspace.anchor_fk_bytes
-        self.ik = None
         self.anchors, self.robot_dict = anchors, robot_dict
         self.seed_parameter = self.device_cfg.to_device([[0.]])
         self.formal_clock = dict(initial_clock)
@@ -2591,15 +2601,16 @@ class _ConstrainedPlanner:
         self.diagnostic_optimizer_candidate = self.diagnostic_optimizer_provenance = None
         # END an interrupted solver cannot replace a candidate's completed verdict.
         self.reference_initialization = {'status': 'not_started'}
-        self.reference_ik_queries, self.reference_ik_chains, self.initial_seed_strategies = [], [], []
+        self.reference_ik_queries, self.initial_seed_strategies = [], []
         self.route = 'unified_constrained'
 
-        def configuration(name, mode):
+        def configuration(name, mode=None):
             data = deepcopy(load_yaml(join_path(get_task_configs_path(), name)))
             constraint = data['rollout'].setdefault('constraint_cfg', {})
             constraint.pop('scene_collision_cfg', None)
             constraint.pop('self_collision_cfg', None)
-            constraint['process_mode'] = mode
+            if mode is not None:
+                constraint['process_mode'] = mode
             return data
 
         ik_optimizer = configuration('ik/lbfgs_ik.yml', 'seed_optimizer')
@@ -2610,12 +2621,15 @@ class _ConstrainedPlanner:
         ik_optimizer['optimizer']['inner_iters'] = 1
         # END grouping changes neither the budget nor the native solve loop.
         pose_cost = ik_optimizer['rollout']['cost_cfg']['tool_pose_cfg']
-        self.reference_ik_pose_weights = tuple(pose_cost['weight'])
         pose_cost.update(use_lie_group=True, _terminal_pose_axes_weight_factor=[1.]*6,
                          _non_terminal_pose_axes_weight_factor=[1.]*6)
         pose_cost['weight'][1] *= 4.
         self.motion_configuration = deepcopy(load_yaml(join_path(get_task_configs_path(),
             'trajopt/lbfgs_bspline_trajopt.yml'))['rollout']['cost_cfg']['cspace_cfg'])
+        # Native config decoding replaces dictionaries with typed config objects.
+        # Separate ordinary inputs before either decoder can mutate its input.
+        reference_optimizer = deepcopy(ik_optimizer)
+        reference_optimizer['rollout']['constraint_cfg'].pop('process_mode')
         ik_cfg = InverseKinematicsCfg.create(robot=deepcopy(robot_dict), optimizer_configs=[ik_optimizer],
             metrics_rollout=configuration('metrics_base.yml', 'seed_metrics'), device_cfg=self.device_cfg,
             self_collision_check=False, num_seeds=budget.ik_seeds, seed_solver_num_seeds=budget.ik_seeds,
@@ -2623,10 +2637,27 @@ class _ConstrainedPlanner:
             position_tolerance=problem.numerical.position_m, orientation_tolerance=problem.numerical.rotation_rad,
             cost_manager_config_instance_type=self._manager_type,
             override_optimizer_num_iters={'lbfgs': budget.ik_iterations}, random_seed=budget.random_seed)
+        # BEGIN fixed native instances separate approximate references from event allowed sets.
         ik_cfg.use_lm_seed = False
-        if budget.ik_seeds > 1:
-            ik_cfg.exit_early = False
+        ik_cfg.exit_early = False
         self.ik = InverseKinematics(ik_cfg)
+        reference_cfg = InverseKinematicsCfg.create(robot=deepcopy(robot_dict),
+            optimizer_configs=[reference_optimizer],
+            metrics_rollout=configuration('metrics_base.yml'), device_cfg=self.device_cfg,
+            self_collision_check=False, num_seeds=1, seed_solver_num_seeds=1,
+            max_batch_size=1, max_goalset=1, use_cuda_graph=False,
+            position_tolerance=problem.numerical.position_m, orientation_tolerance=problem.numerical.rotation_rad,
+            optimization_dt=None, velocity_regularization_weight=.01, acceleration_regularization_weight=.01,
+            override_optimizer_num_iters={'lbfgs': budget.ik_iterations}, random_seed=budget.random_seed)
+        reference_cfg.use_lm_seed = reference_cfg.exit_early = False
+        self.reference_ik = InverseKinematics(reference_cfg)
+        # Native allocation is now resident; enforce the original physical caps
+        # against measured usage, without charging the admission allowance twice.
+        require_device_memory(torch, self.device_cfg.device, native_bytes=0,
+                              max_device_used_bytes=budget.max_device_used_bytes)
+        _require_planning_host_memory(workspace.pending_cpu_bytes, encoded_record_bytes_upper=0,
+                                     max_host_rss_bytes=budget.max_host_rss_bytes)
+        # END the ordinary solver uses the library cost manager and has one seed.
         # cuRobo sets precision flags during construction. Own and restore
         # that request-local change without altering the caller's cuDNN policy.
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -2638,6 +2669,7 @@ class _ConstrainedPlanner:
         columns = [problem.joint_names.index(name) for name in self.joint_names]
         self.start = JointState.from_numpy(list(self.joint_names), problem.start_q[columns][None],
             velocity=problem.start_dq[columns][None], device_cfg=self.device_cfg)
+        self.start.dt = self.device_cfg.to_device([0.])
         self._bind_online_robot()
         self._verification_fk = Kinematics(self.ik.kinematics.config, compute_jacobian=True)
         self._orientation_vjp, self._native_layout = _orientation_vjp_type(), _native_gradient_layout_type()
@@ -2688,6 +2720,7 @@ class _ConstrainedPlanner:
         columns = [problem.joint_names.index(name) for name in self.joint_names]
         self.start = self.JointState.from_numpy(list(self.joint_names), problem.start_q[columns][None],
             velocity=problem.start_dq[columns][None], device_cfg=self.device_cfg)
+        self.start.dt = self.device_cfg.to_device([0.])
         self._bind_online_robot()
         from .timed_reference import BoundToolReference
         entrance_pose, entrance_twist = _reference_entrance(problem, scene, self.robot_validator)
@@ -2703,17 +2736,20 @@ class _ConstrainedPlanner:
         self.diagnostic_optimizer_candidate = self.diagnostic_optimizer_provenance = None
         # END no trial survives a request rebind.
         self.reference_initialization = {'status': 'not_started'}
-        self.reference_ik_queries, self.reference_ik_chains, self.initial_seed_strategies = [], [], []
-        self.ik.reset_seed()
-        manager = self.ik.core.goal_registry_manager
-        if manager._goal_buffer is not None:
-            manager._goal_buffer.link_goal_poses = None
-        for rollout in self.ik.core.get_all_rollout_instances():
-            rollout.reset()
-            for name in ('_num_particles_goal', '_metrics_goal'):
-                goal = getattr(rollout, name, None)
-                if goal is not None:
-                    goal.link_goal_poses = goal.goal_js = None
+        self.reference_ik_queries, self.initial_seed_strategies = [], []
+        # BEGIN rebind both fixed workspaces before the next measured entrance.
+        for solver in (self.ik, self.reference_ik):
+            solver.reset_seed()
+            manager = solver.core.goal_registry_manager
+            if manager._goal_buffer is not None:
+                manager._goal_buffer.link_goal_poses = None
+            for rollout in solver.core.get_all_rollout_instances():
+                rollout.reset()
+                for name in ('_num_particles_goal', '_metrics_goal'):
+                    goal = getattr(rollout, name, None)
+                    if goal is not None:
+                        goal.link_goal_poses = goal.goal_js = None
+        # END each ordinary sequence reconstructs q/dq/time from this request.
         self._bind_physical_domains()
         return self
     # END a request replaces numerical values without another solver backend.
@@ -2816,27 +2852,31 @@ class _ConstrainedPlanner:
     # END reject an immutable infeasible entrance before running native IK.
 
     def close(self):
-        # BEGIN release native callback cycles at the request lifecycle boundary.
-        # Native destroy() resets its owned resources. GradientOptCore also
-        # retain each other through bound callbacks, so drop every solver
-        # reference before collecting their now-unreachable tensor workspaces.
-        # BEGIN restore caller precision even if native destruction raises.
+        # BEGIN each native workspace is released once, preserving the first failure.
+        failure = None
         try:
-            for name in ("ik",):
+            for name in ("reference_ik", "ik"):
                 solver = getattr(self, name)
-                if solver is not None:
-                    solver.destroy()
                 setattr(self, name, None)
+                if solver is not None:
+                    try:
+                        solver.destroy()
+                    except BaseException as error:
+                        if failure is None:
+                            failure = error
+                        else:
+                            failure.__cause__ = error
             del solver
-            gc.collect()
         finally:
-            prior = getattr(self, "_caller_precision", None)
+            gc.collect()
+            prior = self._caller_precision
             if prior is not None:
                 self._precision_torch.backends.cuda.matmul.allow_tf32 = prior[0]
                 self._precision_torch.backends.cudnn.allow_tf32 = prior[1]
                 self._caller_precision = None
-        # END repeated close() cannot overwrite a later caller setting.
-        # END release native callback cycles at the request lifecycle boundary.
+        if failure is not None:
+            raise failure
+        # END repeated close() owns neither native buffers nor caller precision.
 
     def _goal(self, time_s):
         """Create native link goals from the same physical-time TCP reference."""
@@ -2846,47 +2886,44 @@ class _ConstrainedPlanner:
                                  position=position[:, :, None, None].contiguous(),
                                  quaternion=quaternion[:, :, None, None].contiguous())
 
-    # BEGIN whole-chain proposals and complete tool-reference optimization.
-    def _seed_velocity_bounds(self):
-        """Read existing physical speed bounds in the action's named joint order."""
-        limits = self._verification_native.get_cost("cspace").config.joint_limits
-        columns = [limits.joint_names.index(name) for name in self.joint_names]
-        return limits.velocity.detach().cpu().numpy()[:, columns]
+    # BEGIN fixed native workspaces share one cumulative candidate ledger.
+    def _solve_ik(self, goal, seeds, *, solver, current_state):
+        """Submit the configured number of candidates using the supplied q/dq/dt.
 
-    # BEGIN every native IK submission consumes the original request ledger.
-    def _solve_ik(self, goal, seeds):
-        """Submit a bounded IK batch and retain work even if native code fails.
-
-        ``seeds`` is [batch, supplied_seed, named_joint]. Native SeedManager
-        fills each batch to the request's fixed ``ik_seeds``. The ledger unit
-        is one submitted candidate solve, including unsuccessful candidates.
-        ``request_work`` is the public request's cumulative ledger, bound
-        before either reference initialization or event search is entered.
+        Each ordinary query uses one preceding numerical state. Event queries
+        use the measured entrance with explicit zero dt and retain their fixed
+        multi-seed budget. Return count never changes native optimizer shape.
         """
         self.check_request()
-        amount = int(seeds.shape[0])*self.budget.ik_seeds
+        count = solver.config.num_seeds
+        amount = int(seeds.shape[0])*count
         limit = (self.budget.max_validation_points*self.budget.ik_seeds
                  * self.budget.maximum_trajectory_solves)
-        if self.request_work["ik_queries"] + amount > limit:
+        used = self.request_work["ik_queries"]-self.request_work_baseline["ik_queries"]
+        if used + amount > limit:
             raise PlanningWorkExhausted("The original cumulative ik_queries budget is exhausted")
         self.request_work["ik_queries"] += amount
-        return self.ik.solve_pose(goal, current_state=self.start,
-                                  seed_config=seeds, return_seeds=self.budget.ik_seeds)
-    # END query purpose does not reset the cumulative candidate count.
+        result = solver.solve_pose(goal, current_state=current_state,
+                                   seed_config=seeds, return_seeds=count)
+        return result
+    # END unsuccessful native submissions remain charged to their actual shape.
 
-    # BEGIN ordinary references supply sample values for one coefficient fit.
+    # BEGIN one ordinary reference supplies one unconstrained coefficient fit.
     def reference_seeds(self, joint_reference=None):
-        """Construct numerical starts without treating references as constraints."""
+        """Return [1,1,control,joint] coefficients from one numerical sample sequence.
+
+        q0/dq0 are measured feedback. Later ordinary q/dq values are numerical
+        approximations, not task constraints or observations. Native failure
+        flags retain their finite samples; nonfinite states cannot define the
+        next native current_state or a real-valued polynomial.
+        """
         self.joint_reference_report = None
-        self.reference_ik_queries, self.reference_ik_distinct_counts, self.reference_ik_chains = [], [], []
-        count = self.budget.trajectory_seeds
+        self.reference_ik_queries = []
         parameters = self.physical_domain._curve_map.reference_parameters
-        targets, strategies = [], []
         if joint_reference is not None:
             if not isinstance(joint_reference, JointTrajectory) or set(joint_reference.joint_names) != set(self.joint_names):
                 raise MotionPlanningError('unsupported_reference', 'Joint reference must name all active joints')
             source_map = _ProgressMap(joint_reference.progress_u, joint_reference.progress_s)
-            # BEGIN distinguish original reference pauses from the scheduling prior.
             if self.reference_time_map is None:
                 source_parameters = _phase_aligned_parameters(self.progress_map, source_map, parameters)
             else:
@@ -2894,145 +2931,67 @@ class _ConstrainedPlanner:
                     self.reference_time_map.u, self.reference_time_map.s)
                 source_parameters = _phase_aligned_parameters(self.source_progress_map,
                     source_map, original_parameters)
-            # END the original joint curve supplies only this one coefficient fit.
             columns = [joint_reference.joint_names.index(name) for name in self.joint_names]
             source_times = source_parameters*joint_reference.duration
             values = joint_reference.sample(source_times)[0][:, columns]
-            targets = [values]*count
-            strategies = ['recorded_joint_samples']*count
+            strategy = 'recorded_joint_samples'
             self.joint_reference_report = {'source_curve_preserved': False,
                 'source_duration_s': joint_reference.duration, 'bound_duration_s': self.formal_clock['duration'],
                 'source_sample_times_s': source_times.tolist(), 'scope': 'One unconstrained coefficient fit'}
         else:
-            previous = self.start.position[:, None].clone()
-            source = {'query_index': None, 'candidate_index': None, 'kind': 'measured_entrance'}
-            layers = {}
+            position, velocity = self.start.position.clone(), self.start.velocity.clone()
+            previous_time, samples = 0., []
             for parameter in parameters:
-                layer = self._reference_ik_query(float(parameter), previous, warm_start_source=source)
-                layers[float(parameter)] = layer
-                tracking = layer['tracking']
-                if tracking is not None:
-                    previous = self.device_cfg.to_device(layer['values'][tracking:tracking+1][None]).contiguous()
-                    source = {'query_index': layer['query_index'], 'candidate_index': tracking,
-                              'kind': 'previous_tracking_state'}
-            self.reference_ik_chains = self._select_reference_chains(layers)
-            for chain in self.reference_ik_chains:
-                targets.append(np.asarray(chain['joint_positions']))
-                strategies.append('reference_ik_samples')
-            while len(targets) < count:
-                targets.append(np.repeat(self.physical_domain._curve_map.start_q[None], len(parameters), axis=0))
-                strategies.append('measured_joint_samples')
-        controls, reports = [], []
-        for target in targets:
-            fitted, report = self.physical_domain.fit_samples(parameters, target)
-            controls.append(fitted)
-            reports.append(report)
-        self.initial_seed_strategies = self.seed_strategies = strategies
-        self.reference_initialization = {'status': 'sample_fits_completed', 'fits': reports,
-            'scope': 'Reference samples generate coefficients; the unified solve owns all constraints'}
-        seeds = self.torch.as_tensor(np.stack(controls), dtype=self.torch.float64)[None]
+                moment = float(parameter*self.formal_clock['duration'])
+                dt = moment-previous_time
+                current = self.JointState(position=position, velocity=velocity,
+                    dt=self.device_cfg.to_device([dt]), joint_names=list(self.joint_names))
+                following = self._reference_ik_query(float(parameter), current)
+                # The native velocity output is not recomputed when
+                # optimization_dt=None. Propagate the actual numerical secant.
+                velocity = (following-position)/dt
+                position, previous_time = following, moment
+                samples.append(position[0].detach().cpu().numpy().copy())
+            values, strategy = np.stack(samples), 'local_reference_ik'
+        fitted, report = self.physical_domain.fit_samples(parameters, values)
+        self.initial_seed_strategies = self.seed_strategies = [strategy]
+        self.reference_initialization = {'status': 'sample_fits_completed', 'fits': [report],
+            'scope': 'One reference sample sequence initializes the original constrained problem'}
+        seeds = self.torch.as_tensor(fitted, dtype=self.torch.float64)[None, None]
         self.initialization_candidate = self._controls_curve(seeds[0, 0])
         return seeds, [row['native_success_count'] for row in self.reference_ik_queries]
-    # END no ordinary reference refinement or physical pre-solve is retained.
 
-    def _reference_ik_query(self, u, previous, *, warm_start_source):
-        """Keep one native query's original candidate and static evidence identity.
-
-        ``u`` is normalized physical time; ``previous[1,1,D]`` is the declared
-        warm start in active-joint order. Each query uses the full tool
-        reference, static checks and fixed native seed cap.
-        The execution log is append-only; time-ordered pool views are separate.
-        """
-        from .planning_ik import select_ik_tracking_candidate
-        position_limits = np.stack((self.position_domain.lower.detach().cpu().numpy(),
-                                    self.position_domain.upper.detach().cpu().numpy()))
-        query_index = len(self.reference_ik_queries)
-        self.seed_parameter.fill_(float(u))
-        result = self._solve_ik(self._goal(u*self.formal_clock["duration"]), previous)
-        values = self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy()
-        flags = result.success[0].detach().cpu().numpy()
-        success_count = int((flags & np.isfinite(values).all(-1)).sum())
-        ranked, reports = self._rank_ik_candidates(values, flags,
-            previous[0].detach().cpu().numpy(), float(u))
-        # BEGIN proposal admission must not confuse missing observations with failed IK.
-        # The diagnostic name refers to native pose-IK solver
-        # success and native joint constraints. Task and online
-        # scene results remain independent evidence for ranking and for
-        # the final complete-curve checks; neither authorizes this seed.
-        legal = (np.isfinite(values).all(-1) & (values >= position_limits[0]).all(-1)
-                 & (values <= position_limits[1]).all(-1))
-        qualified = [int(index) for index in ranked if legal[index] and reports[index]["native_pose_ik_success"]]
-        self.reference_ik_distinct_counts.append(len(qualified))
-        for index, report in enumerate(reports):
-            report["reference_status"] = ("SOLVED" if np.isfinite(values[index]).all()
-                and report["native_pose_ik_success"]
-                else "FAILED_REFERENCE")
-        # Native result errors describe convergence to the nominal pose;
-        # static task and geometry evidence above remain independent.
-        residuals = {}
+    def _reference_ik_query(self, u, current_state):
+        """Solve one pose with one seed, recording its original numerical status."""
+        result = self._solve_ik(self._goal(u*self.formal_clock["duration"]),
+            current_state.position[:, None].contiguous(),
+            solver=self.reference_ik, current_state=current_state)
+        # Results can alias native buffers reused by the following solve.
+        position = self.reference_ik.get_active_js(result.js_solution).position[:, 0].detach().clone()
+        values = position[0].cpu().numpy()
+        finite = bool(np.isfinite(values).all())
+        solved = bool(result.success[0, 0].item()) and finite
+        errors = {}
         for attribute, name in (("position_error", "nominal_position_error_m"),
                                 ("rotation_error", "nominal_rotation_error_rad")):
-            errors = getattr(result, attribute)[0].detach().cpu().numpy().reshape(-1)
-            if errors.shape != (len(reports),):
-                raise ValueError("Native IK convergence errors must align with returned candidates")
-            residuals[attribute] = errors
-            for report, error in zip(reports, errors):
-                report[name] = float(error) if np.isfinite(error) else None
-        # BEGIN original convergence separates solved and approximate tracking states.
-        # True-angle metrics reconstruct the untruncated energy; the cost
-        # kernel's tiny energy dead zone does not change convergence flags.
-        wp, wr = self.reference_ik_pose_weights
-        with np.errstate(over="ignore", invalid="ignore"):
-            energy = .5*wp*residuals["position_error"]**2+wr*residuals["rotation_error"]**2
-        proposals = [int(index) for index in ranked if legal[index] and np.isfinite(energy[index])]
-        tracking = select_ik_tracking_candidate(values, proposals, energy,
-            previous[0].detach().cpu().numpy(), reports=reports)
-        for index, report in enumerate(reports):
-            report["position_domain_valid"] = bool(legal[index])
-            report["quadratic_pose_energy"] = float(energy[index]) if np.isfinite(energy[index]) else None
-        # END approximate states keep their original failed-pose evidence.
-        for index, report in enumerate(reports):
-            report.update(source_query_index=query_index, source_candidate_index=index)
-        self.reference_ik_queries.append({"u": float(u),
-            "time_s": float(u*self.formal_clock["duration"]),
-            "reference_status": "SOLVED" if qualified else "FAILED_REFERENCE",
-            "seed_status": "SOLVED" if qualified else "APPROXIMATE_PROPOSAL" if proposals else "NO_LEGAL_PROPOSAL",
-            "qualified_candidate_indices": qualified,
-            "native_success_count": success_count,
-            "proposal_candidate_indices": proposals,
-            "query_index": query_index,
-            "warm_start_from_query": warm_start_source["query_index"],
-            "warm_start_source": warm_start_source,
-            "warm_start_count": int(previous.shape[1]),
-            "generated_seed_count": self.budget.ik_seeds-int(previous.shape[1]),
-            "tracking_candidate_index": tracking,
-            "candidates": [{"joint_position": [float(value) if np.isfinite(value) else None
-                                                for value in row], "report": report}
-                           for row, report in zip(values, reports)]})
-
-        return {"values": values, "reports": reports, "energies": energy,
-                "tracking": tracking, "success_count": success_count, "query_index": query_index}
-
-    def _select_reference_chains(self, layers):
-        """Select complete numerical chains from the time-ordered pool view."""
-        from .planning_ik import select_ik_chains
-        parameters = sorted(layers)
-        rows = [layers[u] for u in parameters]
-        chains = select_ik_chains([row["values"] for row in rows], [row["reports"] for row in rows],
-            self.start.position.detach().cpu().numpy(),
-            np.asarray(parameters)*self.formal_clock["duration"], self._seed_velocity_bounds(),
-            count=self.budget.trajectory_seeds,
-            position_limits=np.stack((self.position_domain.lower.detach().cpu().numpy(),
-                                      self.position_domain.upper.detach().cpu().numpy())),
-            pose_costs_by_query=[row["energies"] for row in rows],
-            joint_tolerance=self.problem.numerical.joint)
-        for chain in chains:
-            chain["query_parameters"] = parameters
-            chain["candidate_sources"] = [None if index is None else {
-                "query_index": row["reports"][index]["source_query_index"],
-                "candidate_index": row["reports"][index]["source_candidate_index"]}
-                for row, index in zip(rows, chain["candidate_indices"])]
-        return chains
+            error = float(getattr(result, attribute)[0, 0].item())
+            errors[name] = error if np.isfinite(error) else None
+        record = {"query_index": len(self.reference_ik_queries), "u": u,
+            "time_s": u*self.formal_clock["duration"], "dt_s": float(current_state.dt.item()),
+            "previous_joint_position": current_state.position[0].detach().cpu().tolist(),
+            "previous_joint_velocity": current_state.velocity[0].detach().cpu().tolist(),
+            "joint_position": [float(value) if np.isfinite(value) else None for value in values],
+            "native_success_count": int(solved),
+            "reference_status": "SOLVED" if solved else "APPROXIMATE_PROPOSAL" if finite else "NONFINITE_STATE",
+            **errors}
+        self.reference_ik_queries.append(record)
+        if not finite:
+            self.reference_initialization = {'status': 'nonfinite_native_state', 'query_index': record['query_index']}
+            raise MotionPlanningError('reference_initialization_failed',
+                                      'Native local IK returned a nonfinite joint state')
+        self.check_request()
+        return position
+    # END no candidate pool, chain selection, interpolation or duplicate fill remains.
 
     def ompl_seed(self, initial_seed, candidate_trajectory):
         """Return a spatial initializer and evidence; never produce a new clock.
@@ -3051,7 +3010,11 @@ class _ConstrainedPlanner:
         deadline = search_started+self.budget.search_seconds
         # END later charts and alternate proposals never replenish search time.
         report = {"branches": [], "success": False, "state": "q,u=t/T",
-                  "budget_seconds": self.budget.search_seconds, "clock_changed": False}
+                  "budget_seconds": self.budget.search_seconds, "clock_changed": False,
+                  "state_queries": 0}
+        # BEGIN the request owner can account started queries after any exception.
+        self.last_search_report = report
+        # END one shared report survives cancellation, deadlines and native errors.
         lower = self.position_domain.lower.cpu().numpy().reshape(-1)
         upper = self.position_domain.upper.cpu().numpy().reshape(-1)
         tolerance = _projection_tolerance(self.problem)
@@ -3087,7 +3050,7 @@ class _ConstrainedPlanner:
             boundary_times.extend(self.progress_map.anchor_parameters(scene_anchors)[:, 0])
         boundaries = np.unique(boundary_times)
         report["chart_times"] = boundaries.tolist()
-        work = {"state_queries": 0}
+        work = report
         rng = np.random.default_rng(self.budget.random_seed)
         source_controls = initial_seed[0].detach().cpu().numpy()
         invalid_states = []
@@ -3188,10 +3151,13 @@ class _ConstrainedPlanner:
 
         # BEGIN a two-attempt boundary budget includes a non-reference posture.
         def proposals(begin, parameter):
-            # BEGIN choose alternatives only within the statically qualified IK pool.
+            # BEGIN task-valid proposals retain their original pre-prefix evidence.
+            # The selected search prefix may establish an earlier release pose.
+            # Its current frame scene, used by projection and valid(), owns the
+            # scene verdict; the precomputed model_valid flag cannot reject it.
             entry = self.goal_ik_candidates.get(float(parameter))
             qualified = ([] if entry is None else [(index, row) for index, row in enumerate(entry["candidates"])
-                if row["report"]["task_satisfied"] and row["report"]["model_valid"]
+                if row["report"]["task_satisfied"]
                 and np.isfinite(row["joint_position"]).all()])
             if qualified:
                 # The first ranked qualified event state is this search's
@@ -3371,8 +3337,8 @@ class _ConstrainedPlanner:
             quaternion=quaternion[:, None, None].contiguous())
         # END the buffer preserves the declaration's complete frame relation.
 
-    def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids=()):
-        """Rank bounded IK proposals with the same online geometry as trajectory metrics."""
+    def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids):
+        """Rank functional proposals; the current search branch rechecks geometry."""
         from .planning_ik import rank_ik_candidates
         values, flags = np.asarray(candidates), np.asarray(success, bool)
         phase = float(np.interp(u, self.progress_map.u, self.progress_map.s))
@@ -3380,7 +3346,7 @@ class _ConstrainedPlanner:
         # BEGIN static IK qualification uses the same discrete collision model.
         # END this local scope retains no evidence across a different query/scene.
         for index, row in enumerate(values):
-            report = {"native_pose_ik_success": bool(flags[index]), "candidate_source": "native_ik",
+            report = {"allowed_set_ik_success": bool(flags[index]), "candidate_source": "event_allowed_set_ik",
                       "task_satisfied": False, "model_valid": False}
             reports.append(report)
             if not np.isfinite(row).all():
@@ -3388,15 +3354,9 @@ class _ConstrainedPlanner:
                 report["invalid_joint_indices"] = np.flatnonzero(~np.isfinite(row)).tolist()
                 # END non-finite joints never enter FK or acquire scene evidence.
                 continue
-            # BEGIN failed reference IK rows retain numerical proposal status.
-            # Their nominal failure skips this static query. Legal finite
-            # rows can still initialize a curve; event allowed-set proposals
-            # receive their own task/model query before entering search.
-            if not goal_ids and not flags[index]:
-                report["static_model_query"] = "not_run_native_reference_ik_failed"
-                continue
+            # BEGIN finite event proposals use their original allowed-set evidence.
             report["static_model_query"] = "evaluated"
-            # END source reference failures remain in the diagnostic inventory.
+            # END nominal pose-centre convergence has no functional veto.
             with self.torch.no_grad():
                 q = self.device_cfg.to_device(row[None, None]).contiguous()
                 zero = self.torch.zeros_like(q)
@@ -3438,7 +3398,7 @@ class _ConstrainedPlanner:
                     scene_components=scene_components)
                 # END conditional scene entries retain their names and have no veto.
         ranked = rank_ik_candidates(values, reports, np.asarray(previous), count=self.budget.ik_seeds,
-            joint_tolerance=self.problem.numerical.joint, query_kind="functional" if goal_ids else "reference")
+            joint_tolerance=self.problem.numerical.joint)
         return ranked, reports
 
     def _build_goal_ik_candidates(self, reference_seeds, *, check_search):
@@ -3470,7 +3430,8 @@ class _ConstrainedPlanner:
             self.ik.disable_tool_pose_tracking()
             try:
                 result = self._solve_ik(native_goal,
-                    self.device_cfg.to_device(previous[None]).contiguous())
+                    self.device_cfg.to_device(previous[None]).contiguous(),
+                    solver=self.ik, current_state=self.start)
             finally:
                 self._manager_type.bind_ik_goals(())
                 self.ik.enable_tool_pose_tracking()
@@ -3478,9 +3439,7 @@ class _ConstrainedPlanner:
             candidates = self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy()
             success = result.success[0].detach().cpu().numpy()
             # An allowed-set solve does not claim convergence to a pose centre.
-            selected, reports = self._rank_ik_candidates(candidates, np.zeros_like(success), previous, u, goal_ids)
-            for index, report in enumerate(reports):
-                report.update(candidate_source="event_allowed_set_ik", allowed_set_ik_success=bool(success[index]))
+            selected, reports = self._rank_ik_candidates(candidates, success, previous, u, goal_ids)
             self.goal_ik_candidates[u] = {"progress": float(progress), "u": u,
                 "time_s": u*self.formal_clock["duration"], "goal_ids": [list(value) for value in goal_ids],
                 "candidates": [{"joint_position": candidates[index].tolist(), "report": reports[index]}
@@ -3730,8 +3689,8 @@ class _ConstrainedPlanner:
 
     # BEGIN each seed is solved serially by the same constrained library routine.
     def optimize(self, seed, *, iterations=None):
+        """Yield each completed solve before starting the next original seed."""
         from .unified_solver import solve_trajectory
-        results = []
         self.last_optimizer_diagnostics, self.last_optimizer_runtime = [], []
         # BEGIN retain one diagnostic curve from the actual serial solve.
         self.diagnostic_optimizer_candidate = self.diagnostic_optimizer_provenance = None
@@ -3776,16 +3735,24 @@ class _ConstrainedPlanner:
                             "error_type": type(export_error).__name__, "reason": str(export_error)}
                 raise
             # END RSS retains already allocated fields, samples and earlier results.
-            results.append(result)
             # Each completed solve owns its report even when a later seed
             # reaches the shared request deadline before returning a result.
             self.last_optimizer_diagnostics.append(result.report)
+            # BEGIN return control for validation and freezing before the next solve.
+            yield result
+            # END iteration preserves the actual input seed order and identity.
         # END report_out survives the original exception without qualifying a curve.
-        return results
 
-    def select_candidate(self, results, *, record_work):
-        """Score proposed curves, then verify each on the common exact-curve boundary."""
-        proposals, reports = [], []
+    def select_candidate(self, results, *, record_work, on_candidate):
+        """Validate each completed result and publish it before advancing its iterator.
+
+        The callback receives the current saved curve and its exact validation
+        while they still own the native delivery buffers. The caller freezes a
+        qualified incumbent there. Result order is the original seed order;
+        fixed_objective compares completed accepted curves in common units.
+        """
+        # BEGIN selection consumes a serial result stream, retaining original indices.
+        reports, selected, selected_key, query_points = [], None, None, 0
         for index, result in enumerate(results):
             provenance = {'seed_index': index, 'seed_provenance': self.seed_strategies[index],
                           'optimizer': deepcopy(result.report)}
@@ -3794,27 +3761,27 @@ class _ConstrainedPlanner:
                 continue
             trajectory = self._controls_curve(result.controls)
             objective = self._candidate_objective(trajectory, self.scene)
-            proposals.append((index, result, trajectory, objective, provenance))
-        if not proposals:
-            raise MotionPlanningError('nonfinite_candidate', 'Constrained search returned no finite controls')
-        proposals.sort(key=lambda row: (row[3]['fixed_objective'], row[0]))
-        selected, selected_key, query_points = None, None, 0
-        for index, result, trajectory, objective, provenance in proposals:
             trajectory, report, points = self.evaluate_candidate(trajectory, record_work=record_work, objective=objective)
             report.update(provenance)
             reports.append(report)
             query_points += points
+            current = {**report, 'selected_seed_index': index, 'candidates': deepcopy(reports),
+                'validation_query_points': query_points, 'evaluated_candidate_count': len(reports)}
+            self.delivery_candidate = trajectory
+            on_candidate(result, current)
             values = list(report['residuals'].values())
             severity = sum(max(0., value) for value in values) if np.isfinite(values).all() else float('inf')
             key = (not report['accepted'], report['fixed_objective'] if report['accepted'] else severity, index)
             if selected_key is None or key < selected_key:
-                selected, selected_key = (index, result, trajectory, report), key
-            if report['accepted']:
-                break
-        index, result, trajectory, report = selected
+                selected = (index, result, trajectory, report, deepcopy(self.last_validation))
+                selected_key = key
+        if selected is None:
+            raise MotionPlanningError('nonfinite_candidate', 'Constrained search returned no finite controls')
+        index, result, trajectory, report, self.last_validation = selected
         self.delivery_candidate = trajectory
         return result, trajectory, {**report, 'selected_seed_index': index, 'candidates': reports,
             'validation_query_points': query_points, 'evaluated_candidate_count': len(reports)}
+        # END later rejected candidates cannot detach a selected curve from its evidence.
     # END library status is reported independently of physical/task/scene acceptance.
 
     def _controls_curve(self, actions):
@@ -4184,6 +4151,9 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         planner.check_request = check
         # BEGIN native reference and event IK share actual submitted work.
         planner.request_work = consumed
+        # BEGIN absolute request counters retain the active motion-block baseline.
+        planner.request_work_baseline = motion_baseline
+        # END native query admission uses the same verified boundary as this ledger.
         def remaining_request_seconds():
             check()
             remaining = original_budget.planning_seconds-(consumed["planning_seconds"]
@@ -4364,16 +4334,22 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
         seeds, ik_success = planner.reference_seeds(joint_reference=joint_reference)
         check()
         diagnostics.update(reference_ik_success_counts=ik_success,
-            ik_exit_early=bool(planner.ik.config.exit_early),
-            reference_ik_distinct_counts=planner.reference_ik_distinct_counts,
+            ik_exit_early=bool(planner.reference_ik.config.exit_early),
             initial_seed_strategies=planner.initial_seed_strategies,
-            reference_ik_queries=deepcopy(planner.reference_ik_queries),
-            reference_ik_chains=deepcopy(planner.reference_ik_chains))
+            reference_ik_queries=deepcopy(planner.reference_ik_queries))
         diagnostics["functional_ik_candidates"] = deepcopy(getattr(planner, "goal_ik_candidates", {}))
         diagnostics["joint_reference"] = deepcopy(planner.joint_reference_report)
-        # BEGIN one reference verdict, one main solve and one mutually exclusive recovery.
+        # BEGIN every completed candidate is frozen before another solve or query.
+        def on_candidate(result, candidate_report):
+            nonlocal trajectory, attempt
+            trajectory, attempt = planner.delivery_candidate, candidate_report
+            if stage in {"main_solve", "recovery_solve"}:
+                diagnostics["attempts"].append(deepcopy(candidate_report))
+            qualify_native(result, candidate_report)
+
         def select_candidate(result):
-            return planner.select_candidate(result, record_work=record_validation_work)
+            return planner.select_candidate(result, record_work=record_validation_work,
+                                            on_candidate=on_candidate)
 
         reference_result = planner.evaluate_reference(seeds)
         native_result, trajectory, attempt = select_candidate(reference_result)
@@ -4384,55 +4360,70 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
             **deepcopy(attempt), "source": "validated_reference_seed", "validation_status": "completed",
             "curve": curve_snapshot(trajectory)}
         # END later numerical trials have separate geometry and validation status.
-        qualify_native(native_result, attempt)
         observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == 'needs_observation'
         recovery = None
-        # BEGIN observation policy stops only when completed evidence isolates coverage.
+        search_used = False
+
+        def geometry_failed(candidate_report):
+            """Search only from explicit collision or forbidden-coverage residuals."""
+            return any(np.isfinite(value) and value > 0
+                for name in ("collision_residuals", "coverage_residuals")
+                for value in candidate_report[name].values())
+
+        def search_initializers(candidate):
+            """Spend the single search opportunity and preserve the original local seed."""
+            nonlocal recovery, search_used, stage
+            search_used, recovery, stage = True, "ompl", "bounded_seed_search"
+            planner.last_search_report = {}
+            diagnostics["used_ompl"] = True
+            search_started = time.monotonic()
+            try:
+                recovered, report = planner.ompl_seed(seeds, candidate)
+                planner.last_search_report = report
+            finally:
+                # Every started state query and all elapsed search work is
+                # committed exactly once, including cancellation and errors.
+                report = planner.last_search_report
+                elapsed = time.monotonic()-search_started
+                consumed["search_seconds"] += elapsed
+                consumed["search_queries"] += report.get("state_queries", 0)
+                diagnostics["ompl"] = {**deepcopy(report), "elapsed_seconds": elapsed}
+            check()
+            if recovered is None:
+                recovery = "ompl_failed"
+                return seeds
+            # Search is the priority proposal; K bounds actual distinct sources.
+            # The local curve remains the second source only when K permits it.
+            count = budget.trajectory_seeds
+            planner.seed_strategies = (["ompl"]+list(planner.initial_seed_strategies))[:count]
+            return planner.torch.cat((recovered.to(seeds), seeds), dim=1)[:, :count]
+
+        # Initial geometry evidence uses search before the main optimization.
+        # A failed connection leaves the same local proposal and solve allowance.
         if not observation_required:
+            if geometry_failed(attempt) and budget.search_seconds > 0:
+                seeds = search_initializers(trajectory)
             check()
             check("trajectory_solves")
             consumed["trajectory_solves"] += 1
             stage = "main_solve"
             native_result, trajectory, attempt = select_candidate(planner.optimize(
                 seeds, iterations=planner.main_trajectory_iterations))
-            # END the main constrained solve consumes its declared iteration budget.
-            diagnostics["attempts"].append(deepcopy(attempt))
-            qualify_native(native_result, attempt)
             check()
             observation_required = _unknown_policy_failure(attempt, scene.unknown_policy) == "needs_observation"
-            if (incumbent is None and not attempt["accepted"] and not observation_required
+            if (incumbent is None and not attempt["accepted"] and not observation_required and not search_used
                     and consumed["trajectory_solves"]-motion_baseline.get("trajectory_solves", 0) < original_budget.maximum_trajectory_solves):
-                # BEGIN mixed scene support/contact failures cannot consume collision recovery.
-                collision_failed = any(value > 0 for value in attempt["collision_residuals"].values())
-                # END all original hard residuals still reject the candidate above.
-                # BEGIN forbidden space can be avoided without changing observation policy.
-                coverage_failed = any(np.isfinite(value) and value > 0
-                    for value in attempt["coverage_residuals"].values())
-                # END missing map support/contact/controller terms do not trigger this route.
-                # BEGIN the existing bounded spatial search proposes one new start.
-                if (collision_failed or coverage_failed) and budget.search_seconds > 0:
-                    recovery, stage = "ompl", "bounded_seed_search"
-                    search_started = time.monotonic()
-                    recovered, report = planner.ompl_seed(seeds, trajectory)
-                    consumed["search_seconds"] += time.monotonic()-search_started
-                    consumed["search_queries"] += report.get("state_queries", 0)
-                    diagnostics["ompl"] = report
-                    if recovered is not None:
-                        seeds = recovered
-                        planner.seed_strategies = ["ompl"]*seeds.shape[1]
-                    else:
-                        recovery = "ompl_failed"
-                # END no new observations, permissions or request time are granted.
-                # BEGIN a completed OMPL proposal uses the remaining constrained-solve slot.
-                if recovery == "ompl":
-                    check("trajectory_solves")
-                    consumed["trajectory_solves"] += 1
-                    native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
-                    diagnostics["attempts"].append(deepcopy(attempt))
-                    qualify_native(native_result, attempt)
-                    check()
-                # END the recovery candidate uses the same declared problem and checks.
-        # END mixed failures retain ordinary optimization and recovery.
+                # Newly discovered geometry failure can use the still-unspent
+                # search and optimization batch. Failed search adds no batch.
+                if geometry_failed(attempt) and budget.search_seconds > 0:
+                    seeds = search_initializers(trajectory)
+                    if recovery == "ompl":
+                        check("trajectory_solves")
+                        consumed["trajectory_solves"] += 1
+                        stage = "recovery_solve"
+                        native_result, trajectory, attempt = select_candidate(planner.optimize(seeds))
+                        check()
+        # END task, contact, unknown-space and continuous-domain checks are unchanged.
         diagnostics.update(attempt, route=planner.route, recovery=recovery, used_ompl=recovery in {"ompl", "ompl_failed"})
         if incumbent is not None:
             return deliver_incumbent()
@@ -4493,7 +4484,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
     finally:
         # BEGIN interrupted initialization retains its completed actual coefficients.
         if planner is not None:
-            for name in ("reference_initialization", "reference_ik_queries", "reference_ik_chains",
+            for name in ("reference_initialization", "reference_ik_queries",
                          "initial_seed_strategies", "last_optimizer_runtime"):
                 if hasattr(planner, name):
                     diagnostics[name] = deepcopy(getattr(planner, name))

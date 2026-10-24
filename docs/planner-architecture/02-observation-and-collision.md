@@ -1,6 +1,6 @@
 # 观测与碰撞模型
 
-代码基线：`39880e5`；本次文档提交同步该实现的基线标记与索引，规划器代码内容与该代码提交相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 
 ## 1. 两种实体来源
 
@@ -107,3 +107,6 @@
 `build_scene_from_rgbd → integrate_entity → freeze_mapper` 建立本次新任务场；已有场直接进入 `OnlinePlanningScene`。已知机器人由 `RobotGeometryChecker` 注册，规划器绑定完整 FK 后，在原状态检查和验收中调用同一场景；统一约束求解器向有限目标显式传入相同标定的 `robot_link_poses`，由场景乘固定组件变换并预测所有者关系。
 
 `to_execution_binding` 输出 `native_robot_observed_scene_v1`，保存机器人原形状、基座、标定、完整配对、固定角色、`tool_geometry_names` ，同时保存任务场样本、运动关系、有限任务接触与自由格。任务单场通过 `FrozenObservedField.from_record` 恢复；场景快照用于输入来源和身份交接，执行曲线恢复不等于重新构造可查询场景。
+
+
+完整实体随曲线运动的区间界由 `interval_geometry.SceneMotionBounds` 从同一已注册 Pinocchio 模型、验证器基座标定、官方实体局部范围和观测 TSDF 范围建立。局部包围球在这里仅提供点速度系数，实体碰撞继续由原形状计算。固定 frame、完整手指和附着关系的输入输出与推导见[候选验收](05-acceptance-and-execution.md)。

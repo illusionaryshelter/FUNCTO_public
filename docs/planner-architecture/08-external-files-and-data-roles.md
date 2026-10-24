@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`fcdaefd`。本次仅文档提交回填实际实现提交号，代码内容与该基线相同。阶段实验与计划对照位于项目外 `sim-version-plans`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 
 ## 1. 技能表示与运行环境状态
 
@@ -67,12 +67,12 @@
 
 ### 4.1 已生成参考到规划要求的实际文件路径
 
-当前 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 通过 `reference_inputs()` 调用 `generate_reference`，随后由 `build_problem()` 直接构造 `PlanningProblem`。该路线使用源技能包中的 `representation`，名义工具、物体运动及目标取样共用返回的连续组合路径对象；显式工具边界经 `reference_phase` 进入阶段元数据，在规划物理时钟上由 `BoundToolReference` 生成实际工具参考。具体职责如下。
+当前实验入口 [run_integration.py](../../../sim-version-plans/2026-10-24-planner-integration/run_integration.py) 通过既有 `run_replanning.build_problem` 为 [put_prepare.py](../../../sim-version-plans/2026-10-18-shared-scene-toward-base/put_prepare.py) 绑定明确参考目录；该工厂的 `reference_inputs()` 调用 `generate_reference`，`build_problem()` 构造 `PlanningProblem`。该路线使用源技能包中的 `representation`，名义工具、物体运动及目标取样共用返回的连续组合路径对象；显式工具边界经 `reference_phase` 进入阶段元数据，在规划物理时钟上由 `BoundToolReference` 生成实际工具参考。具体职责如下。
 
 | 文件或任务声明 | 内容与含义 | 直接消费与输出 |
 |---|---|---|
 | `2026-10-18-shared-scene-toward-base/skills/put_mug_on_shelf` | 源运动、功能坐标和交互/释放时刻 | `load_grounding_skill` → `generate_reference`；交互时刻另用于位姿要求和支撑要求的进度 |
-| `2026-10-18-shared-scene-toward-base/put-grounding-001/report.json` | 当前迁移得到的 `functional_frame.T_world_region` | `reference_inputs` → `generate_reference(T_world_function=...)` |
+| `2026-10-23-initial-relative-rotation/grounding-region-center/report.json` | 当前迁移得到的 `functional_frame.T_world_region` | `reference_inputs` → `generate_reference(T_world_function=...)` |
 | `2026-10-19-put-planner-audit/prepared-inputs/relations.json` | 当前到源物体坐标对应 `J`、声明的 TCP 到物体变换 `A` | `generate_reference` 生成刚性一致的参考；`PoseEventRequirement.tool_from_function` 使用同一 `A` |
 | 同一 `prepared-inputs/feedback.json` | 从已保存抓取末态接续的机器人 `q/dq`、标定 TCP 位姿及具名关节 | 参考入口、`PlanningProblem.start_q/start_dq` 与坐标标定 |
 | 同一 `prepared-inputs/scene.json` | 支撑平面、有限边界、源任务点、接触面及其原容差 | `SupportRequirement` 与附着条件 |
@@ -80,7 +80,7 @@
 
 表中目录均相对工作区 `sim-version-plans`。两个位姿目标来自 `object_path.sample_numpy(s)`：一个在源交互进度，另一个在受控参考终点进度 1，当前对应释放边界。被比较的候选是物体表示坐标系 `C` 在规划世界 `W` 中的位姿 `T_W_E(q)A`，其中 `E` 是 TCP，`A=T_E_C`；C 的原点由实体表示坐标确定，坐标与误差定义见[输入与任务模型](01-inputs-and-task-model.md#41-目标坐标中的可设置-yaw-容差)。原 `SupportRequirement` 与这两个要求分别保存，`hard_components` 默认 body/footprint，gap/normal 按原阈值提供 `quality` 阶段偏好；当前统一目标调用 `optimizer_preferences(..., phase="quality")`，硬条件另由原有符号约束接口提供。
 
-`prepared-inputs/reference.npz` 保存参考采样及来源记录；当前目标构造实际查询内存中的连续 `object_path`。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点和实际曲线终点按各自定义记录。
+`grounding-region-center/reference.npz` 保存当前参考采样；目标构造实际查询内存中的连续 `object_path`。工厂输出的顶层来源与两个事件的 `source.saved_reference_artifact/functional_frame_input` 指向这一参考及对应功能坐标文件，数值条件沿原生成函数计算。`source.reference_scope` 分别记录 `interaction` 和 `controlled_reference_endpoint`，`source.target_source` 记录连续路径及事件进度这一计算来源。事件进度通过规划器的固定时钟映到精确查询时刻，受控参考终点和实际曲线终点按各自定义记录。
 
 ## 5. 输出、执行与评价
 
@@ -88,9 +88,9 @@
 
 `planning-report.json`、场景快照 NPZ、自过滤与分区文件记录计算结果。场景绑定中的 owner query 保存用于复现的几何及坐标；某文件以后被显式加载时，它同时成为该后续阶段的输入。来源路径和实际文件读取须分别说明。
 
-任务快照中的支持要求保存 `hard_components`，续规划义务记录保留同一字段。`reference_ik_queries` 保存普通参考 IK 的原成功标志、原生连杆位置与真实转角误差、位置域资格、二次位姿能量，以及下一查询的跟踪来源。`warm_start_count/generated_seed_count` 表达固定种子总槽位中的实际分配；`proposal_candidate_indices` 与 `qualified_candidate_indices` 分别表示数值提议和原生收敛候选。`reference_ik_chains` 保存完整数值链、原候选索引、生产查询及 `SOLVED/APPROXIMATE_PROPOSAL/INTERPOLATED_PROPOSAL` 身份。链中的有限状态共同形成自由系数提议，`initial_seed_strategies` 保存其来源。
+任务快照中的支持要求保存 `hard_components`，续规划义务保留同一字段。`reference_ik_queries` 保存普通单 seed IK 的物理时刻、dt、同时作为唯一 warm seed 的前次 q、前次数值 dq、返回状态、原生成功及位置/完整转角误差。有限近似值的身份为 `SOLVED` 或 `APPROXIMATE_PROPOSAL`；非有限状态记录 `NONFINITE_STATE` 并结束初始化。`reference_initialization` 保存 `sample_fits_completed` 和一次样本拟合；并列的 `initial_seed_strategies` 保存 `local_reference_ik/recorded_joint_samples` 来源。拟合后的第一条曲线在后续求解未返回时也可作为诊断保存，其完整验收单独记录。
 
-`reference_initialization` 保存 `sample_fits_completed` 状态、每条样本拟合和原种子策略。拟合后的第一条曲线可在后续求解尚未产生结果时作为诊断输入保存，其执行资格仍由正式验收提供。`last_optimizer_runtime` 保存实际完成的 `scipy.optimize.SLSQP` 调用，含库状态、迭代次数、任务和物理求值次数、原目标、固定目标归一化尺度、系数更新以及内存准入量。每个种子串行求解，独立保存其报告。
+`last_optimizer_runtime` 保存各个已开始的 `scipy.optimize.SLSQP` 调用，包含状态、迭代和求值开始/完成计数、原目标、固定目标归一化尺度、系数更新及内存量。`evaluation_seconds` 记录 objective/task/physical 的累计实际计算时间，包含中断计算且排除缓存命中。`complete_task_equalities/complete_task_inequalities` 为原任务行数，`solver_task_equalities/solver_task_inequalities` 为已核对常量后实际提交的行数，`fixed_task_constraints` 保存被省去行的原键、组内索引、数值与判定。每个候选串行求解并立即验收，原 seed 索引和实际来源随结果保存。
 
 事件 IK 由 OMPL 实际调用时，`functional_ik_candidates` 保存原目标身份、物理时刻、候选关节状态及任务/场景结论，作为搜索边界提议。候选 `fixed_objective/objective_components` 保存运动成本和声明任务质量；`returned_candidate` 指向实际返回曲线的完整验收。`qualified_candidate_elapsed_seconds` 表示完成验收和执行绑定的时刻，`elapsed_seconds` 是整次请求耗时。改善预算耗尽时 `improvement_end` 保存停止阶段，已完成资格的记录仍保持原绑定。累计工作由 `request_ledger.consumed_planning` 保存。
 

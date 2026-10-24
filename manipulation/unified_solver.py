@@ -153,12 +153,18 @@ class TrajectoryComputation:
         return robot_tool_states(problem=self.problem, scene=self.scene, kinematics=self.kinematics,
             q=q, dq=dq, joint_names=self.joint_names, progress=self.progress, times=self.times)
 
-    def task(self, controls):
-        """Return the original signed task rows, preserving fixed dictionary order."""
+    def task(self, controls, *, solver_rows_out=None):
+        """Return complete signed rows and optionally their declaration selection.
+
+        ``solver_rows_out`` receives the producing condition's Boolean masks,
+        before the curve-specific fixed entrance equalities are removed. Both
+        values and masks come from this single robot/task evaluation.
+        """
         q, dq, _, _ = self.states(controls)
         q, dq, names, _, tool, twist = self.robot_states(q, dq)
         groups = self.problem.constraint_components(*tool, self.progress, q, names, dq,
-            trajectory_time=self.times, tool_linear_velocity=twist[0], tool_angular_velocity=twist[1])
+            trajectory_time=self.times, tool_linear_velocity=twist[0], tool_angular_velocity=twist[1],
+            solver_rows_out=solver_rows_out)
         empty = controls.reshape(-1)[:0]
         return tuple(torch.cat([value.reshape(-1) for value in group.values()]) if group else empty
                      for group in groups)
@@ -188,9 +194,14 @@ class ConstrainedSolution:
     report: dict
 
 
-# BEGIN scalar control-column JVPs reuse one reverse graph for all task rows.
+# BEGIN choose a scalar reverse direction from the fixed submitted matrix shape.
 def task_jacobian(values, controls, *, check_request, admit_work):
-    """Return the complete first derivative using ordinary Torch gradients.
+    """Return exact first derivatives using fewer scalar reverse queries.
+
+    When output rows are fewer than controls, each scalar task row supplies
+    one ordinary reverse gradient. Otherwise control-column queries reuse
+    the reverse graph described below. Both paths use the existing analytic
+    Pinocchio backward; neither differentiates it twice with respect to q.
 
     For the original task vector c(x) and an independent covector v, the
     first reverse pass forms p(x,v)=J_c(x).T @ v. Differentiating each p_i
@@ -198,15 +209,22 @@ def task_jacobian(values, controls, *, check_request, admit_work):
     that second pass: this requires no second derivative of robot FK with
     respect to x. Both passes use maintained scalar ``autograd.grad``.
 
-    The explicit zero dependence gives constant task rows their exact zero
-    Jacobian, including requests containing only fixed progress rows. One
-    covector and one returned column have task-vector size; no task-row
-    identity matrix or batched robot Jacobian is allocated. ``admit_work``
-    accounts for the now-resident first reverse graph before allocating the
-    final dense matrix and running its column queries.
+    Explicit zero dependence gives constant rows their exact zero Jacobian.
+    No output identity matrix or batched robot Jacobian is allocated.
+    ``admit_work`` precedes the final dense allocation. For the column path
+    it follows the first reverse graph, whose storage then belongs to RSS.
     """
-    covector = torch.zeros_like(values, requires_grad=True)
     connected = values + controls.sum()*0.
+    if values.numel() < controls.numel():
+        admit_work()
+        jacobian = np.empty((values.numel(), controls.numel()))
+        for index, value in enumerate(connected):
+            check_request()
+            row, = torch.autograd.grad(value, controls, retain_graph=index+1 < values.numel())
+            jacobian[index] = row.detach().numpy().reshape(-1)
+            del row
+        return jacobian
+    covector = torch.zeros_like(values, requires_grad=True)
     product, = torch.autograd.grad(connected, controls, grad_outputs=covector, create_graph=True)
     admit_work()
     jacobian = np.empty((values.numel(), controls.numel()))
@@ -216,7 +234,7 @@ def task_jacobian(values, controls, *, check_request, admit_work):
         jacobian[:, index] = column.detach().numpy()
         del column
     return jacobian
-# END the numerical problem retains every original row and physical unit.
+# END row selection changes work, while retained values keep their physical units.
 
 
 # BEGIN capacity follows the installed dense solver and serial reverse derivative.
@@ -226,9 +244,9 @@ def solver_storage_bytes(*, variables, task_equalities, task_inequalities, physi
     The workspace expression is the one in installed scipy.optimize._slsqp_py.
     Its constraint-normal assembly retains the previous matrix while forming
     equality/inequality stacks, their combined stack and the augmented matrix.
-    Cached Jacobians are separate. Scalar control-column derivatives avoid
-    the m² identity and batched robot tensors. The first reverse graph is
-    included in measured RSS at the second allocation boundary.
+    Cached Jacobians are separate. Scalar row/column derivatives avoid the
+    m² identity and batched robot tensors. The column path's first reverse
+    graph is included in measured RSS at the second allocation boundary.
     This count covers these owned dense buffers; current RSS accounts for the
     already constructed curve, model, observations and forward task tensors.
     """
@@ -249,9 +267,12 @@ def solver_storage_bytes(*, variables, task_equalities, task_inequalities, physi
         # MemoizeJac x/g; wrapped gradient plus terminal zero; controls and VJP;
         # retained initial objective gradient and its scaled callback result.
         "solver_and_derivative_vectors": 8*(14*n+1+task),
-        # Independent task covector, connected original task vector, returned
-        # task column, and the first reverse product in control coordinates.
-        "task_dual_vectors": 8*(3*task+n),
+        # A row query holds the connected task vector and one control gradient.
+        # A column query also holds a task covector, a returned task column and
+        # the first reverse product in control coordinates. Empty tasks are
+        # checked once at binding and never submitted to a derivative callback.
+        "task_derivative_vectors": (0 if not task else
+            8*(task+n if task < n else 3*task+n)),
     }
 # END no output-space standard basis is allocated for task derivatives.
 
@@ -278,12 +299,14 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
     cache = {}
     cache_x = None
     counts = {"objective_evaluations": 0, "task_evaluations": 0, "physical_evaluations": 0}
+    evaluation_seconds = {"objective": 0., "task": 0., "physical": 0.}
     started = perf_counter()
     # BEGIN retain bounded, same-control evidence across a native interruption.
     report = report_out
     report.update(backend="scipy.optimize.SLSQP", state="running", solver_called=False,
                   task_query_count=len(computation.parameters), completed_evaluations={
                       "objective": 0, "task": 0, "physical": 0}, callback_iterations=0,
+                  evaluation_seconds=evaluation_seconds,
                   latest_trial=None, latest_complete_trial=None, last_callback_iterate=None)
     trial_index = 0
 
@@ -312,23 +335,55 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
         check_request()
         initial_controls = torch.tensor(initial, dtype=torch.float64, requires_grad=True)
         counts["task_evaluations"] += 1
-        initial_task = computation.task(initial_controls)
+        # BEGIN bind row identity using the same complete task/FK evaluation.
+        declared_rows = ({}, {})
+        component_started = perf_counter()
+        try:
+            initial_task = computation.task(initial_controls, solver_rows_out=declared_rows)
+        finally:
+            evaluation_seconds["task"] += perf_counter()-component_started
         report["completed_evaluations"]["task"] += 1
-        full_eq_count, inequality_count = tuple(value.numel() for value in initial_task)
+        full_eq_count, full_inequality_count = tuple(value.numel() for value in initial_task)
+        solver_rows = tuple(torch.cat([value.reshape(-1) for value in group.values()])
+            if group else torch.zeros(0, dtype=torch.bool) for group in declared_rows)
+        solver_rows[0][computation.fixed_equality_rows] = False
+        eq_count, inequality_count = tuple(int(value.sum()) for value in solver_rows)
         fixed_values = initial_task[0][computation.fixed_equality_rows].detach().numpy()
         fixed_report = {computation.equality_keys[index]: float(value)
             for index, value in zip(computation.fixed_equality_rows, fixed_values)}
         report.update(complete_task_equalities=full_eq_count, fixed_entry_equalities=fixed_report,
-                      solver_task_equalities=len(computation.variable_equality_rows))
-        # An immutable violated equality makes this original request infeasible.
-        # Verify its original zero-width set before removing its constant solver
-        # row. No angular allowance or numerical-Jacobian rank rule is introduced.
-        if not np.all(np.isfinite(fixed_values) & (fixed_values == 0.)):
-            report.update(state="completed", success=False, status=None, message="Fixed entry task equalities are infeasible",
+                      complete_task_inequalities=full_inequality_count,
+                      solver_task_equalities=eq_count, solver_task_inequalities=inequality_count)
+        fixed_constraints, fixed_feasible = [], True
+        for kind, values, selected, group in zip(("equality", "inequality"),
+                                                (value.detach() for value in initial_task),
+                                                solver_rows, declared_rows):
+            offset = 0
+            for key, layout in group.items():
+                size = layout.numel()
+                indices = torch.nonzero(~selected[offset:offset+size]).flatten()
+                constant = values[offset:offset+size][indices].detach().numpy()
+                if len(indices):
+                    finite = np.isfinite(constant)
+                    feasible = finite & (constant == 0. if kind == "equality" else constant <= 0.)
+                    fixed_constraints.append({"kind": kind, "key": key,
+                        "row_indices": indices.tolist(), "values": constant.tolist(),
+                        "finite": finite.tolist(), "feasible": bool(feasible.all())})
+                    fixed_feasible = fixed_feasible and bool(feasible.all())
+                offset += size
+        report["fixed_task_constraints"] = fixed_constraints
+        # A fixed violation cannot be changed by controls. Keep its original
+        # key, flattened component-row index and value as the failure evidence.
+        # Complete task() and final candidate acceptance retain all conditions.
+        if not fixed_feasible:
+            report.update(state="completed", success=False, status=None, message="Fixed task constraints are infeasible",
                 solver_called=False, iterations=0, objective=None, elapsed_seconds=perf_counter()-started,
                 maximum_control_update=0., unchanged_from_seed=True, **counts)
             return ConstrainedSolution(initial.copy(), report)
-        eq_count = len(computation.variable_equality_rows)
+        task_count = eq_count+inequality_count
+        jacobian_method = ("none" if not task_count else "scalar_task_rows" if task_count < initial.size
+                           else "scalar_control_columns_from_covector_reverse_graph")
+        # END declarations, fixed entrance and the submitted matrix share one layout.
         physical_count = 10*computation.domain.intervals*shape[1]
         memory = solver_storage_bytes(variables=initial.size, task_equalities=eq_count,
             task_inequalities=inequality_count, physical_inequalities=physical_count)
@@ -347,21 +402,22 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
         # separate admissible increments do not bound their simultaneous peak.
         memory["pending_geometry_bytes"] = pending_geometry_bytes
         report.update(solver_storage_bytes=memory,
-            task_jacobian_method="scalar_control_columns_from_covector_reverse_graph")
+            task_jacobian_method=jacobian_method)
         require_host_memory(sum(memory.values()), pending_existing_bytes=0,
                             max_rss_bytes=computation.max_host_rss_bytes)
 
         def admit_task_derivatives():
-            # The task values, independent covector and first reverse graph now
-            # belong to measured RSS. Later callbacks also retain the allocated
+            # Task values and, for columns, the independent covector and first
+            # reverse graph now belong to RSS. Later callbacks also retain the allocated
             # SLSQP workspace and constructed scene samples. Only the new dense
-            # matrix, one returned column and Pin reverse temporaries are pending.
+            # matrix, one returned row/column and Pin reverse temporaries are pending.
             rows = eq_count + inequality_count
-            increment = 8*rows*(initial.size+1) + memory["pinocchio_reverse_buffers"]
+            returned = initial.size if rows < initial.size else rows
+            increment = 8*(rows*initial.size+returned) + memory["pinocchio_reverse_buffers"]
             require_host_memory(increment, pending_existing_bytes=0,
                                 max_rss_bytes=computation.max_host_rss_bytes)
         # END resident source geometry is counted by RSS, never added again here.
-        del initial_task, initial_controls
+        del initial_task, initial_controls, declared_rows
 
         def evaluate(kind, x):
             nonlocal cache_x, trial_index
@@ -375,23 +431,28 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
             if kind in cache:
                 return cache[kind]
             counts[kind + "_evaluations"] += 1
-            if kind == "physical":
-                output = computation.domain.signed_constraints(x.reshape(shape))
-            else:
-                controls = torch.tensor(x.reshape(shape), dtype=torch.float64, requires_grad=True)
-                if kind == "objective":
-                    components = computation.objective_components(controls)
-                    value = sum(components.values())
-                    gradient, = torch.autograd.grad(value, controls)
-                    output = (float(value.detach()), gradient.detach().numpy().ravel())
+            # BEGIN actual evaluation time includes interrupted work, not cache hits.
+            component_started = perf_counter()
+            try:
+                if kind == "physical":
+                    output = computation.domain.signed_constraints(x.reshape(shape))
                 else:
-                    eq, inequality = computation.task(controls)
-                    eq = eq[computation.variable_equality_rows]
-                    sizes = (eq.numel(), inequality.numel())
-                    values = torch.cat((eq, inequality))
-                    jacobian = task_jacobian(values, controls, check_request=check_request,
-                                             admit_work=admit_task_derivatives)
-                    output = (values.detach().numpy(), jacobian, sizes)
+                    controls = torch.tensor(x.reshape(shape), dtype=torch.float64, requires_grad=True)
+                    if kind == "objective":
+                        components = computation.objective_components(controls)
+                        value = sum(components.values())
+                        gradient, = torch.autograd.grad(value, controls)
+                        output = (float(value.detach()), gradient.detach().numpy().ravel())
+                    else:
+                        complete = computation.task(controls)
+                        values = torch.cat(tuple(value[selected]
+                            for value, selected in zip(complete, solver_rows)))
+                        jacobian = task_jacobian(values, controls, check_request=check_request,
+                                                 admit_work=admit_task_derivatives)
+                        output = (values.detach().numpy(), jacobian, (eq_count, inequality_count))
+            finally:
+                evaluation_seconds[kind] += perf_counter()-component_started
+            # END each started component contributes its consumed wall time once.
             cache[kind] = output
             # BEGIN completion and geometry evidence belong to this exact x only.
             report["completed_evaluations"][kind] += 1
@@ -411,7 +472,10 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
         # Production task weights can make the initial gradient O(1e10), which
         # destabilizes SLSQP's first quadratic subproblem. Fix this divisor once;
         # every trial value and derivative use the same factor, while reporting
-        # and candidate ranking retain the original physical objective.
+        # and candidate ranking retain the original physical objective. A fixed
+        # positive divisor preserves exact minimizers, but SLSQP's fixed ftol
+        # jointly checks objective, gradient and original constraint values;
+        # finite-budget iterates and stopping are not invariant to this scale.
         initial_value, initial_gradient = evaluate("objective", x0)
         objective_scale = max(1., abs(initial_value), float(np.abs(initial_gradient).max()))
         report.update(objective_scale=objective_scale, initial_objective=initial_value,
@@ -444,7 +508,7 @@ def solve_trajectory(computation, initial, *, iterations, check_request, pending
                   "maximum_control_update": float(np.max(np.abs(result.x - x0))),
                   "unchanged_from_seed": bool(np.array_equal(result.x, x0)),
                   "solver_storage_bytes": memory,
-                  "task_jacobian_method": "scalar_control_columns_from_covector_reverse_graph",
+                  "task_jacobian_method": jacobian_method,
                   "geometry_objective": ({} if matched is None else deepcopy(matched.get("geometry_objective", {}))),
                   "geometry_trial_index": None if matched is None else matched["trial_index"]})
         return ConstrainedSolution(result.x.reshape(shape).copy(), report)

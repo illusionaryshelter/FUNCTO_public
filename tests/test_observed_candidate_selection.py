@@ -32,7 +32,7 @@ def candidate_fixture(*, scene, task=(0.,0.), flags=(False,False)):
 
 def test_observed_collision_rejection_keeps_selected_curve_evidence():
     planner,solutions = candidate_fixture(scene=(.003,.001))
-    _,curve,report = planner.select_candidate(solutions,record_work=Mock())
+    _,curve,report = planner.select_candidate(solutions,record_work=Mock(), on_candidate=Mock())
     assert not report['accepted'] and curve.seed_index == 1
     assert report['residuals']['process_scene'] == pytest.approx(.001)
     assert report['collision_residuals'] == {'collision':.001}
@@ -43,7 +43,7 @@ def test_observed_collision_rejection_keeps_selected_curve_evidence():
 
 def test_formally_feasible_solution_can_be_selected_after_solver_failure():
     planner,solutions = candidate_fixture(scene=(.001,0.),flags=(True,False))
-    _,curve,report = planner.select_candidate(solutions,record_work=Mock())
+    _,curve,report = planner.select_candidate(solutions,record_work=Mock(), on_candidate=Mock())
     assert report['accepted'] and curve.seed_index == 1
     assert not report['optimizer']['success']
     assert planner._candidate_metrics.call_count == 2
@@ -52,7 +52,7 @@ def test_formally_feasible_solution_can_be_selected_after_solver_failure():
 @pytest.mark.parametrize('value',[float('nan'),float('inf'),float('-inf'),.00001])
 def test_solver_success_cannot_override_invalid_saved_curve_residual(value):
     planner,solutions = candidate_fixture(scene=(value,.01),flags=(True,False))
-    _,_,report = planner.select_candidate(solutions,record_work=Mock())
+    _,_,report = planner.select_candidate(solutions,record_work=Mock(), on_candidate=Mock())
     assert not report['accepted'] and planner._candidate_metrics.call_count == 2
 
 
@@ -62,7 +62,7 @@ def test_selected_interval_categories_preserve_unknown_and_collision_meanings():
         {'query_points':2,'hard_scene_residual':.001,'scene_categories':{'coverage':.001,'conditional_unknown':.2},
          'scene_components':{'unknown/forbidden/robot':{'maximum':.001,'time_s':.5,'progress':.5}}},
         {'query_points':2,'hard_scene_residual':0.,'scene_categories':{'conditional_unknown':.4},'scene_components':{}}]
-    _,curve,report = planner.select_candidate(solutions,record_work=Mock())
+    _,curve,report = planner.select_candidate(solutions,record_work=Mock(), on_candidate=Mock())
     assert report['accepted'] and curve.seed_index == 1
     first = report['candidates'][0]
     assert first['coverage_residuals']['interval:unknown_forbidden'] == .001

@@ -122,32 +122,6 @@ def export_fixture(problem, progress_map, position, velocity, dt):
     return planner, ConstrainedSolution(actions, {'success': True, 'backend': 'declared CPU fixture'})
 
 
-def bind_analytic_ik_screening(planner, report_for=None):
-    """Declare candidate static facts while production code owns sample fitting."""
-    from manipulation.planning_ik import rank_ik_candidates
-    def rank(candidates, success, previous, parameter, goal_ids=()):
-        reports = []
-        for row, flag in zip(candidates, success):
-            evaluated = bool(np.isfinite(row).all() and (flag or goal_ids))
-            evidence = {'task_satisfied': evaluated, 'model_valid': evaluated,
-                'native_pose_ik_success': bool(flag), 'candidate_source': 'native_ik',
-                'static_model_query': 'evaluated' if evaluated else 'not_run_native_reference_ik_failed',
-                'task_violations': {}, 'native_violations': {}, 'scene_components': {},
-                'environment_clearance_m': 1., 'self_clearance_m': 1., 'joint_limit_margin_fraction': .5}
-            if report_for is not None:
-                evidence.update(report_for(row, bool(flag), parameter))
-            reports.append(evidence)
-        indices = rank_ik_candidates(candidates, reports, previous, count=planner.budget.ik_seeds,
-            joint_tolerance=planner.problem.numerical.joint, query_kind='functional' if goal_ids else 'reference')
-        return indices, reports
-    planner._rank_ik_candidates = Mock(side_effect=rank)
-    planner.request_work = {'ik_queries': 0}
-    planner.reference_ik_pose_weights = (10000., 500.)
-    planner.device_cfg = SimpleNamespace(to_device=lambda values: torch.as_tensor(values, dtype=torch.float64))
-    dimensions = len(planner.joint_names)
-    limits = SimpleNamespace(joint_names=list(planner.joint_names),
-        velocity=torch.tensor([[-2.]*dimensions, [2.]*dimensions], dtype=torch.float64))
-    planner._verification_native = SimpleNamespace(get_cost=lambda name: SimpleNamespace(config=SimpleNamespace(joint_limits=limits)))
 
 
 class PlannerCalculusTests(unittest.TestCase):
@@ -265,241 +239,99 @@ class PlannerCalculusTests(unittest.TestCase):
 
 
 
-class ReferenceSeedDiversityTests(unittest.TestCase):
-    @staticmethod
-    def planner_for(pools, flags, *, seed_count=2, joint_tolerance=1e-5, report_for=None):
-        horizon, candidates = len(pools), len(pools[0])
-        planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
-        planner.check_request, planner.torch = Mock(), torch
-        planner.budget = PlanningBudget(knots=horizon, ik_seeds=candidates, trajectory_seeds=seed_count)
-        planner.problem = cartesian_problem((MotionPhase('reference', constant_path()),))
-        planner.problem.numerical = type(planner.problem.numerical)(joint=joint_tolerance)
-        planner.problem.start_dq = np.array([.1, -.2, .3])
-        planner.joint_names = planner.problem.joint_names
-        planner.start = SimpleNamespace(position=torch.tensor(planner.problem.start_q)[None],
-            velocity=torch.tensor(planner.problem.start_dq)[None])
-        planner.seed_parameter = torch.zeros((1, 1), dtype=torch.float64)
-        planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
-        # BEGIN this fixture explicitly binds an unwarped reference clock.
-        planner.source_progress_map, planner.reference_time_map = planner.progress_map, None
-        # END tests may replace it with the independent scheduling prior.
-        planner.action_horizon = horizon
-        planner.formal_clock = {'knot_dt': .2, 'duration': .2*(horizon-1)}
-        planner.finger_trajectory = None
-        warm_starts = []
-        def solve(goal, **kwargs):
-            index = len(warm_starts)
-            # BEGIN the native query follows the shared cubic observation times.
-            parameter = planner.physical_domain._curve_map.reference_parameters[index]
-            np.testing.assert_allclose(planner.seed_parameter.numpy(), [[parameter]], atol=2e-16)
-            # END the fixture does not impose a separate uniform sample clock.
-            warm_starts.append(kwargs['seed_config'].clone())
-            return SimpleNamespace(js_solution=SimpleNamespace(position=torch.tensor(pools[index][None], dtype=torch.float64)),
-                success=torch.tensor(flags[index][None], dtype=torch.bool),
-                position_error=torch.as_tensor(np.where(flags[index][None], 1e-6, .02), dtype=torch.float64),
-                rotation_error=torch.as_tensor(np.where(flags[index][None], 1e-5, .1), dtype=torch.float64))
-        planner.ik = SimpleNamespace(solve_pose=solve, get_active_js=lambda state: state)
-        planner._goal = lambda time: time
-        bind_analytic_ik_screening(planner, report_for)
-        bounds = torch.tensor([[-2., 2.], [-2., 2.], [-20., 20.], [-100., 100.]], dtype=torch.float64)[:, :, None].repeat(1, 1, 3)
-        planner.physical_domain = CubicJointDomain(bounds, planner.start.position, planner.start.velocity, .2, horizon)
-        planner.position_domain = JointPositionDomain(bounds[0, 0], bounds[0, 1])
-        fitting = Mock(wraps=planner.physical_domain.fit_samples)
-        planner.physical_domain.fit_samples = fitting
-        return planner, fitting, warm_starts
-
-    @staticmethod
-    def two_tracks():
-        primary = np.array([[.1+.01*index, .02*index, 0.] for index in range(6)])
-        alternative = np.array([[1.5+.02*index, .2+.01*index, 0.] for index in range(6)])
-        pools, flags = [], []
-        for index, (a, b) in enumerate(zip(primary, alternative)):
-            # The third successful candidate is close to the primary. The
-            # fourth is invalid and much farther away than any usable seed.
-            values = np.stack((a, a+[.15, 0., 0.], b, [-100., 0., 0.]))
-            success = np.array([True, True, True, False])
-            order = np.array([0, 1, 2, 3] if index % 2 == 0 else [2, 3, 1, 0])
-            pools.append(values[order])
-            flags.append(success[order])
-        return primary, alternative, pools, flags
+# BEGIN the fixture models one reused native output buffer and explicit predecessor state.
+def local_reference_fixture(samples=None, flags=None):
+    """Bind real sample fitting around one native-shaped local solver."""
+    samples = (np.array([[.1+.01*i, .02*i, -.01*i] for i in range(6)])
+               if samples is None else np.asarray(samples, dtype=float))
+    flags = np.ones(len(samples), dtype=bool) if flags is None else np.asarray(flags, dtype=bool)
+    planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
+    planner.check_request, planner.torch, planner.JointState = Mock(), torch, SimpleNamespace
+    planner.budget = PlanningBudget(knots=len(samples), ik_seeds=4, trajectory_seeds=2)
+    planner.problem = cartesian_problem((MotionPhase('reference', constant_path()),))
+    planner.problem.start_dq = np.array([.1, -.2, .3])
+    planner.joint_names = planner.problem.joint_names
+    planner.start = SimpleNamespace(position=torch.tensor(planner.problem.start_q)[None],
+        velocity=torch.tensor(planner.problem.start_dq)[None], dt=torch.tensor([0.]))
+    planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
+    planner.source_progress_map, planner.reference_time_map = planner.progress_map, None
+    planner.formal_clock = {'knot_dt': .2, 'duration': .2*(len(samples)-1)}
+    planner.action_horizon = len(samples)
+    planner.finger_trajectory = None
+    planner.request_work = {'ik_queries': 0}
+    planner.request_work_baseline = {'ik_queries': 0}
+    planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.as_tensor(value, dtype=torch.float64))
+    planner._goal = lambda time: time
+    calls, buffer = [], torch.zeros((1, 1, 3), dtype=torch.float64)
+    def solve(goal, *, current_state, seed_config, return_seeds):
+        index = len(calls) % len(samples)
+        calls.append({'time_s': goal, 'q': current_state.position.clone(),
+            'dq': current_state.velocity.clone(), 'dt': current_state.dt.clone(),
+            'seed': seed_config.clone(), 'return_seeds': return_seeds})
+        buffer.copy_(torch.tensor(samples[index])[None, None])
+        return SimpleNamespace(js_solution=SimpleNamespace(position=buffer,
+            velocity=torch.full_like(buffer, 999.)),
+            success=torch.tensor([[flags[index]]]),
+            position_error=torch.tensor([[1e-6 if flags[index] else .02]]),
+            rotation_error=torch.tensor([[1e-5 if flags[index] else .1]]))
+    planner.reference_ik = SimpleNamespace(config=SimpleNamespace(num_seeds=1),
+        solve_pose=solve, get_active_js=lambda state: state)
+    planner.ik = SimpleNamespace(config=SimpleNamespace(num_seeds=4), solve_pose=Mock())
+    bounds = torch.tensor([[-2., 2.], [-2., 2.], [-20., 20.], [-100., 100.]],
+        dtype=torch.float64)[:, :, None].repeat(1, 1, 3)
+    planner.physical_domain = CubicJointDomain(bounds, planner.start.position, planner.start.velocity,
+        .2, len(samples))
+    fitting = Mock(wraps=planner.physical_domain.fit_samples)
+    planner.physical_domain.fit_samples = fitting
+    return planner, fitting, calls
 
 
-    def test_whole_chain_continuity_retains_successes_despite_result_order_changes(self):
-        primary, alternative, pools, flags = self.two_tracks()
-        planner, fitting, warm_starts = self.planner_for(pools, flags)
-        measured_q, measured_dq = planner.start.position.clone(), planner.start.velocity.clone()
+class LocalReferenceInitializationTests(unittest.TestCase):
+    def test_one_fit_and_one_actual_seed_preserve_original_measured_entry(self):
+        planner, fitting, calls = local_reference_fixture()
+        q0, dq0 = planner.start.position.clone(), planner.start.velocity.clone()
         seeds, success = planner.reference_seeds()
-        chains = planner.reference_ik_chains
-        np.testing.assert_allclose(chains[0]["joint_positions"], primary, atol=1e-14)
-        self.assertEqual(len(chains), 2)
-        self.assertGreater(float(np.max(np.abs(np.asarray(chains[0]["joint_positions"])
-                                              -np.asarray(chains[1]["joint_positions"])))),
-                           planner.problem.numerical.joint)
-        for chain in chains:
-            self.assertTrue(chain["reference_success"])
-            for query, index in enumerate(chain["candidate_indices"]):
-                self.assertTrue(flags[query][index])
-                np.testing.assert_array_equal(chain["joint_positions"][query], pools[query][index])
-        self.assertEqual(success, [3]*6)
-        self.assertEqual(planner.reference_ik_distinct_counts, [3]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_samples"]*2)
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-        self.assertEqual(tuple(warm_starts[0].shape), (1, 1, 3))
-        for index in range(1, 6):
-            self.assertEqual(tuple(warm_starts[index].shape), (1, 1, 3))
-            np.testing.assert_array_equal(warm_starts[index].numpy()[0, 0], primary[index-1])
-            self.assertEqual(planner.reference_ik_queries[index]["generated_seed_count"], 3)
-        torch.testing.assert_close(planner.start.position, measured_q, rtol=0, atol=0)
-        torch.testing.assert_close(planner.start.velocity, measured_dq, rtol=0, atol=0)
-        self.assertTrue(seeds.is_contiguous())
+        self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
+        self.assertEqual(success, [1]*6)
+        self.assertEqual(planner.seed_strategies, ['local_reference_ik'])
+        fitting.assert_called_once()
+        np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0, 0], [0.])[0], q0[0])
+        np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0, 0], [0.], 1)[0], dq0[0], atol=1e-14)
+        torch.testing.assert_close(planner.start.position, q0, rtol=0, atol=0)
+        torch.testing.assert_close(planner.start.velocity, dq0, rtol=0, atol=0)
+        self.assertEqual(planner.request_work['ik_queries'], 6)
+        planner.ik.solve_pose.assert_not_called()
 
-
-    def test_a_single_success_can_merge_traces_and_later_successes_split_them_again(self):
-        primary = np.array([[.1, 0., 0.], [.5, .1, 0.], [.4, .1, 0.],
-                            [.42, .1, 0.], [.6, .1, 0.], [.5, .1, 0.]])
-        alternative = np.array([[1.5, .2, 0.], [.5, .1, 0.], [.8, .2, 0.],
-                                [.82, .2, 0.], [.6, .1, 0.], [.9, .2, 0.]])
-        pools, flags = [], []
-        for index, (a, b) in enumerate(zip(primary, alternative)):
-            values = np.stack((a, b, [-50., 0., 0.], [50., 0., 0.]))
-            success = np.array([True, index not in (1, 4), False, False])
-            order = np.arange(4) if index % 2 == 0 else np.arange(3, -1, -1)
-            pools.append(values[order])
-            flags.append(success[order])
-        planner, fitting, _ = self.planner_for(pools, flags)
-        seeds, success = planner.reference_seeds()
-        chains = planner.reference_ik_chains
-        self.assertEqual(len(chains), 2)
-        for chain in chains:
-            for query, index in enumerate(chain["candidate_indices"]):
-                self.assertTrue(flags[query][index])
-            np.testing.assert_array_equal(np.asarray(chain["joint_positions"])[[1, 4]], primary[[1, 4]])
-        self.assertFalse(np.array_equal(chains[0]["joint_positions"], chains[1]["joint_positions"]))
-        self.assertEqual(success, [2, 1, 2, 2, 1, 2])
-        self.assertEqual(planner.reference_ik_distinct_counts, success)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_samples"]*2)
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-
-
-    def test_failed_control_pose_keeps_finite_approximate_nodes_and_original_flag(self):
-        _, _, pools, flags = self.two_tracks()
-        flags[2] = np.zeros(4, dtype=bool)
-        planner, fitting, _ = self.planner_for(pools, flags)
-        seeds, success = planner.reference_seeds()
-        self.assertEqual(success, [3, 3, 0, 3, 3, 3])
-        self.assertEqual(planner.reference_ik_distinct_counts, [3, 3, 0, 3, 3, 3])
-        self.assertEqual(planner.initial_seed_strategies,
-                         ["reference_ik_samples"]*2)
-        self.assertEqual(planner.reference_ik_chains[0]["interpolated_queries"], [])
-        self.assertTrue(bool(torch.isfinite(seeds).all()))
-        self.assertGreater(float(seeds[0, 0].abs().max()), 0.)
-        self.assertEqual(len(planner.reference_ik_chains), 2)
-        self.assertTrue(all(chain["candidate_indices"][2] is not None for chain in planner.reference_ik_chains))
-        self.assertTrue(all(chain["query_statuses"][2] == "APPROXIMATE_PROPOSAL"
-                            and not chain["reference_success"] for chain in planner.reference_ik_chains))
-        self.assertTrue(all(not candidate["report"]["native_pose_ik_success"]
-                            for candidate in planner.reference_ik_queries[2]["candidates"]))
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-
-
-    def test_numerically_duplicate_native_results_do_not_claim_a_second_reference_trace(self):
-        tolerance = 1e-5
-        pools = [np.array([[.3+.01*index, 0., 0.], [.3+.01*index+.25*tolerance, 0., 0.]])
-                 for index in range(6)]
-        planner, fitting, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
-        seeds, success = planner.reference_seeds()
-        self.assertEqual(success, [2]*6)
-        self.assertEqual(planner.reference_ik_distinct_counts, [1]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_samples", "measured_joint_samples"])
-        np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0, 1], planner.physical_domain._curve_map.reference_parameters), np.zeros((6, 3)), atol=2e-15)
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-
-
-    def test_distinction_uses_declared_joint_numerics_without_an_extra_branch_threshold(self):
-        tolerance = 1e-5
-        pools = [np.array([[.3+.01*index, 0., 0.], [.3+.01*index+4*tolerance, 0., 0.]])
-                 for index in range(6)]
-        planner, fitting, _ = self.planner_for(pools, [np.ones(2, dtype=bool)]*6, joint_tolerance=tolerance)
+    def test_predecessor_velocity_and_real_nonuniform_dt_survive_native_buffer_reuse(self):
+        planner, fitting, calls = local_reference_fixture()
         seeds, _ = planner.reference_seeds()
-        self.assertEqual(planner.reference_ik_distinct_counts, [2]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_samples"]*2)
-        selected = np.asarray([row["joint_positions"] for row in planner.reference_ik_chains])
-        self.assertGreater(float(np.max(np.abs(selected[1]-selected[0]))), tolerance)
-        self.assertLessEqual(float(np.max(np.abs(selected[1]-selected[0]))), 4*tolerance+1e-14)
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
+        samples = fitting.call_args.args[1]
+        times = planner.physical_domain._curve_map.reference_parameters*planner.formal_clock['duration']
+        previous = planner.start.position.numpy()[0]
+        velocity = planner.start.velocity.numpy()[0]
+        last_time = 0.
+        for index, call in enumerate(calls):
+            interval = times[index]-last_time
+            np.testing.assert_allclose(call['q'][0], previous)
+            np.testing.assert_allclose(call['dq'][0], velocity)
+            np.testing.assert_allclose(call['dt'], [interval])
+            np.testing.assert_allclose(call['seed'][0, 0], previous)
+            self.assertEqual(call['return_seeds'], 1)
+            velocity = (samples[index]-previous)/interval
+            previous, last_time = samples[index], times[index]
+        self.assertNotEqual(float(calls[0]['dt']), float(calls[-1]['dt']))
+        np.testing.assert_allclose(planner.physical_domain.evaluate(seeds[0, 0],
+            planner.physical_domain._curve_map.reference_parameters), samples, atol=2e-14)
 
-
-    def test_single_trajectory_seed_budget_keeps_its_best_complete_coarse_path(self):
-        primary, _, pools, flags = self.two_tracks()
-        planner, fitting, _ = self.planner_for(pools, flags, seed_count=1)
-        seeds, success = planner.reference_seeds()
-        self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
-        np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
-        # BEGIN IK values propose coefficients without imposing interpolation.
-        np.testing.assert_array_equal(fitting.call_args_list[0].args[1], primary)
-        # END complete tool optimization receives the resulting physical curve.
-        self.assertEqual(success, [3]*6)
-        self.assertEqual(planner.initial_seed_strategies, ["reference_ik_samples"])
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-
-
-    def test_reference_seed_chooses_a_complete_chain_before_physical_initialization(self):
-        pools = [np.array([[0., 0., 0.], [.4, 0., 0.]])]
-        pools.extend(np.array([[.5, 0., 0.], [.5, 0., 0.]]) for _ in range(5))
-        planner, fitting, warm_starts = self.planner_for(pools, [np.ones(2, bool)]*6, seed_count=1)
-        seeds, _ = planner.reference_seeds()
-        selected = np.asarray(planner.reference_ik_chains[0]["joint_positions"])
-        self.assertEqual(selected[0, 0], .4)
-        np.testing.assert_array_equal(selected[1:, 0], np.full(5, .5))
-        self.assertEqual(tuple(warm_starts[1].shape), (1, 1, 3))
-        # One local tracking seed does not delete the alternative that the
-        # complete coarse graph selects after seeing later reference nodes.
-        np.testing.assert_array_equal(warm_starts[1].numpy()[0, 0], [0., 0., 0.])
-        self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
-        np.testing.assert_array_equal(fitting.call_args_list[0].args[1],
-                                      planner.reference_ik_chains[0]["joint_positions"])
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-
-
-    def test_extra_clearance_does_not_override_qualified_whole_chain_continuity(self):
-        primary, _, pools, flags = self.two_tracks()
-
-        def report(row, success, parameter):
-            return {"task_satisfied": success, "model_valid": success,
-                    "environment_clearance_m": .002 if row[0] > 1. else .0001,
-                    "self_clearance_m": 1., "joint_limit_margin_fraction": .5}
-
-        planner, fitting, warm_starts = self.planner_for(pools, flags, seed_count=1, report_for=report)
-        seeds, success = planner.reference_seeds()
-        np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
-        self.assertEqual(success, [3]*6)
-        self.assertEqual(len(warm_starts), 6)
-        self.assertEqual(tuple(seeds.shape), (1, 1, 6, 3))
-        self.assertEqual(planner._rank_ik_candidates.call_count, 6)
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
-
-
-    def test_reference_native_success_survives_static_task_and_scene_failures(self):
-        primary, _, pools, flags = self.two_tracks()
-        planner, fitting, warm_starts = self.planner_for(pools, flags, seed_count=1,
-            report_for=lambda row, success, parameter: {"task_satisfied": False, "model_valid": False})
-        before_q, before_dq = planner.start.position.clone(), planner.start.velocity.clone()
-        seeds, success = planner.reference_seeds()
-        np.testing.assert_allclose(planner.reference_ik_chains[0]["joint_positions"], primary, atol=1e-14)
-        self.assertEqual(success, [3]*6)
-        self.assertEqual(planner.reference_ik_distinct_counts, [3]*6)
-        self.assertTrue(all(row["reference_status"] == "SOLVED" for row in planner.reference_ik_queries))
-        self.assertTrue(all(not candidate["report"]["model_valid"] and not candidate["report"]["task_satisfied"]
-                            for query in planner.reference_ik_queries for candidate in query["candidates"]))
-        self.assertEqual(tuple(warm_starts[1].shape), (1, 1, 3))
-        cost = planner.reference_ik_chains[0]["selection_cost"]
-        self.assertEqual((cost["static_task_not_established_count"], cost["static_model_not_established_count"]), (6, 6))
-        np.testing.assert_array_equal(fitting.call_args_list[0].args[1],
-                                      planner.reference_ik_chains[0]["joint_positions"])
-        torch.testing.assert_close(planner.start.position, before_q, rtol=0, atol=0)
-        torch.testing.assert_close(planner.start.velocity, before_dq, rtol=0, atol=0)
-        self.assertTrue(torch.isfinite(seeds).all())
-        self.assertEqual(fitting.call_count, planner.budget.trajectory_seeds)
+    def test_new_sequence_uses_measured_entry_after_previous_sequence_completed(self):
+        planner, _, calls = local_reference_fixture()
+        first, _ = planner.reference_seeds()
+        second, _ = planner.reference_seeds()
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        torch.testing.assert_close(calls[6]['q'], planner.start.position)
+        torch.testing.assert_close(calls[6]['dq'], planner.start.velocity)
+        self.assertEqual(len(planner.reference_ik_queries), 6)
+# END native flags and finite approximations do not select or duplicate ordinary branches.
 
 
 
@@ -913,6 +745,7 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
     def test_library_failure_still_receives_saved_curve_qualification(self):
         planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
         planner.seed_strategies, planner.scene = ['reference', 'alternate'], object()
+        planner.last_validation = None
         planner._controls_curve = Mock(side_effect=lambda controls: float(controls[0, 0]))
         planner._candidate_objective = Mock(side_effect=lambda curve, scene: {'fixed_objective': curve})
         def qualify(curve, *, record_work, objective):
@@ -921,14 +754,14 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
             return curve, {'accepted': True, 'residuals': {}, **objective}, 3
         planner.evaluate_candidate = Mock(side_effect=qualify)
         work = Mock()
-        selected, curve, report = planner.select_candidate(self.solutions(), record_work=work)
+        selected, curve, report = planner.select_candidate(self.solutions(), record_work=work, on_candidate=Mock())
         self.assertEqual(curve, 1.)
         self.assertTrue(report['accepted'])
         self.assertFalse(report['optimizer']['success'])
         self.assertEqual(report['selected_seed_index'], 0)
         self.assertEqual(planner._controls_curve.call_count, 2)
-        planner.evaluate_candidate.assert_called_once()
-        self.assertEqual(work.call_args_list, [unittest.mock.call(passes=1), unittest.mock.call(points=3)])
+        self.assertEqual(planner.evaluate_candidate.call_count, 2)
+        self.assertEqual(work.call_args_list, [unittest.mock.call(passes=1), unittest.mock.call(points=3)]*2)
         self.assertIs(planner.delivery_candidate, curve)
         np.testing.assert_array_equal(selected.controls, np.ones((4, 3)))
 
@@ -946,7 +779,7 @@ class PlannerCandidateSelectionTests(unittest.TestCase):
         candidates = self.solutions()
         candidates[0].controls[0, 0] = np.nan
         planner = selection_fixture([0., 1.], [0., 0.])
-        _, curve, report = planner.select_candidate(candidates, record_work=Mock())
+        _, curve, report = planner.select_candidate(candidates, record_work=Mock(), on_candidate=Mock())
         self.assertEqual(curve, 1)
         self.assertTrue(report['accepted'])
         self.assertFalse(report['candidates'][0]['accepted'])
@@ -1049,14 +882,19 @@ class SerialAllocationTests(unittest.TestCase):
                 destroyed.append('ik')
         planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
         planner.ik = CyclicSolver()
+        planner.reference_ik = CyclicSolver()
+        planner._caller_precision = None
         reference = weakref.ref(planner.ik)
+        local_reference = weakref.ref(planner.reference_ik)
         with patch('manipulation.planning.gc.collect', wraps=gc.collect) as collect:
             planner.close()
             self.assertIsNone(reference())
+            self.assertIsNone(local_reference())
             self.assertIsNone(planner.ik)
+            self.assertIsNone(planner.reference_ik)
             collect.assert_called_once_with()
             planner.close()
-        self.assertEqual(destroyed, ['ik'])
+        self.assertEqual(destroyed, ['ik', 'ik'])
 
 
 class InitialStatePreflightTests(unittest.TestCase):

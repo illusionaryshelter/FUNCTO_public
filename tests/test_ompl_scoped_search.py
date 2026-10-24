@@ -8,7 +8,8 @@ production IK backend or evidence about a physical robot's dynamics.
 # BEGIN scoped manifolds and true allowed-goal search regressions.
 from types import SimpleNamespace
 from dataclasses import replace
-from copy import copy
+from pathlib import Path
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -22,92 +23,103 @@ from manipulation.goals import SupportSurface
 from manipulation.motion import MotionModel
 from manipulation.planning_problem import (MotionPhase, PlanningProblem,
     CoordinateEventRequirement, MechanismRequirement, PoseEventRequirement, PoseProcessRequirement,
-    SupportRequirement)
-from manipulation.online_geometry import OnlinePlanningScene, FrozenPrimitives
-from tests.test_manipulation_planning_scene import (Attachment, CollisionOwner,
-                                                    SphereQuery, pose_path, scene)
+    SupportRequirement, PosePath)
+from manipulation.online_geometry import OnlinePlanningScene
+from manipulation.observed_mapping import FrozenObservedField
+from manipulation.planning_scene import Attachment, CollisionOwner, ObservedSpace
+from manipulation.robot_geometry_check import NativePrimitive, PairQuery, RobotGeometryChecker
 
 
-# BEGIN Cartesian tests use the same registered-sphere online cost model.
-class CartesianSphereScene(OnlinePlanningScene):
-    """Convert test-only analytic spheres into the production online primitive.
+# BEGIN synthetic task observations use the same raw trilinear field interface.
+def pose_path(position=(0., 0., 0.)):
+    poses = np.repeat(np.eye(4)[None], 2, axis=0)
+    poses[:, :3, 3] = position
+    return PosePath(np.array([0., 1.]), poses, source={'kind': 'synthetic_test'})
 
-    These synthetic bodies are exact spheres, not mesh proxies. Explicit
-    robot pairs enter the same components() query as world geometry; there
-    is no independent source-self or source-world acceptance hook.
+
+def observed_sphere(name, center=(8., 0., 0.), radius=.1):
+    """Sample a small analytic field to test the observation representation.
+
+    Task geometry is supplied as values/support/weights, with no task CAD or
+    primitive query. These analytic samples are test inputs, not sensor claims.
     """
-    # BEGIN exact synthetic spheres have no separate registered native solids.
-    @property
-    def native_world_collision_components(self):
-        return frozenset()
-
-    @property
-    def native_collision_components(self):
-        # This fixture's robot shapes are the exact spheres themselves;
-        # no separate CAD channel is declared for either self or world.
-        return self.native_world_collision_components
-
-    @property
-    def native_world_collision_pairs(self):
-        return {}
-    # END explicit fixture contract, not a production-schema fallback.
-
-    def __init__(self, source, fixed_self_sphere=None):
-        if source.gripper is not None or source.contacts or any(type(query) is not SphereQuery
-                for query in (source.background,*(owner.query for owner in source.owners))):
-            raise ValueError('Cartesian fixture requires its declared exact sphere bodies')
-        def convert(query):
-            return FrozenPrimitives(primitives=[{'kind':'sphere','dimensions':[query.radius],
-                'pose':[*query.center,1.,0.,0.,0.]}],owner_ids=query.owner_ids,source=query.source)
-        owners=tuple(copy(owner) for owner in source.owners)
-        for owner in owners:
-            owner.query=convert(owner.query)
-        count=1 if fixed_self_sphere is None else 2
-        super().__init__(background=convert(source.background),owners=owners,coverage=source.coverage,
-            reference_frame=source.reference_frame,robot_sphere_materials=(None,)*count,
-            robot_geometry_source='declared Cartesian sphere robot',has_gripper=False,
-            unknown_policy={'outside_regions':'forbid','conditional_regions':[{
-                'lower_m':[-3.]*3,'upper_m':[3.]*3,'source':'bounded synthetic joint workspace'}]})
-        geometry=[{'link_name':'Cartesian_tool','sphere_indices':[0],
-            'centers_local':[[0.,0.,0.]],'radii':[.01]}]
-        if fixed_self_sphere is not None:
-            geometry.append({'link_name':'fixed_robot_base','sphere_indices':[1],
-                'centers_local':[list(fixed_self_sphere[:3])],'radii':[fixed_self_sphere[3]]})
-        self.bind_online_robot(robot_sphere_geometry=geometry,
-            robot_self_collision_pairs=[] if count==1 else [[0,1]])
-# END selected prefixes share immutable geometry and own their release history.
+    step = radius/4
+    origin = np.asarray(center)-5*step
+    grid = np.moveaxis(np.indices((11, 11, 11)), 0, -1)*step+origin
+    values = np.linalg.norm(grid-np.asarray(center), axis=-1)-radius
+    return FrozenObservedField(values, np.ones(values.shape, bool), weights=np.ones(values.shape),
+        origin=origin, voxel_size=step, name=name, source='synthetic sampled observation fixture')
 
 
-def cartesian_planner(problem, world=None, *, fixed_self_sphere=None):
-    """Three named translation joints with a fixed tool orientation."""
+def scene(owners=(), *, background=None):
+    coverage = ObservedSpace(np.ones((41, 41, 41), bool), origin=[-2.]*3, voxel_size=.1,
+        observation_ids=['synthetic_view'], reference_frame='world')
+    return SimpleNamespace(owners=owners, background=observed_sphere('background') if background is None else background,
+        coverage=coverage, _fixed_release_poses={})
+
+
+def cartesian_planner(problem, world=None, *, fixed_self_box=None):
+    """Native Cartesian robot solids and observed task fields, all on CPU.
+
+    Only the robot receives registered native boxes. Its complete named
+    joints and link transforms also drive the production scene's Pinocchio FK.
+    """
     planner = _ConstrainedPlanner.__new__(_ConstrainedPlanner)
     planner.torch, planner.problem = torch, problem
     planner.progress_map = _ProgressMap(np.array([0., 1.]), np.array([0., 1.]))
     planner.budget = PlanningBudget(search_seconds=3., validation_joint_step=.08)
     planner.joint_names = problem.joint_names
-    planner.scene=CartesianSphereScene(scene() if world is None else world,fixed_self_sphere)
-    # A CPU test has no external scene epoch or cancellation sender. Production
-    # installs this request checker when binding the resident backend.
-    planner.check_request=lambda:None
-    planner.goal_ik_candidates={}
+    source = scene() if world is None else world
+    dof = len(problem.joint_names)
+    links, joints, parent = ['<link name="base"/>'], [], 'base'
+    for index, name in enumerate(problem.joint_names):
+        child = 'tool' if index == dof-1 else f'axis_{index}'
+        links.append(f'<link name="{child}"/>')
+        axis = ('1 0 0', '0 1 0', '0 0 1', '0 0 1')[index]
+        kind = 'revolute' if index == 3 else 'prismatic'
+        joints.append(f'<joint name="{name}" type="{kind}"><parent link="{parent}"/>'
+            f'<child link="{child}"/><axis xyz="{axis}"/>'
+            '<limit lower="-20" upper="20" effort="10" velocity="20"/></joint>')
+        parent = child
+    geometry = [NativePrimitive('tool_body', 'tool', 'box', (.02,)*3, np.eye(4), 'declared test robot model')]
+    if fixed_self_box is not None:
+        local = np.eye(4); local[:3, 3] = fixed_self_box[:3]
+        geometry.append(NativePrimitive('base_body', 'base', 'box', (2*fixed_self_box[3],)*3,
+            local, 'declared fixed test robot model'))
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory)/'cartesian.urdf'
+        path.write_text('<robot name="cartesian">'+''.join(links+joints)+'</robot>')
+        checker = RobotGeometryChecker(path, base_frame='base', geometries=geometry)
+    planner.scene = OnlinePlanningScene(background=source.background, owners=source.owners,
+        coverage=source.coverage, reference_frame='world', robot_model=checker,
+        fixed_geometry_names=() if fixed_self_box is None else ('base_body',),
+        tool_geometry_names=('tool_body',), has_gripper=False,
+        unknown_policy={'outside_regions':'forbid','conditional_regions':[]})
+    pairs = () if fixed_self_box is None else (PairQuery('tool_body', 'base_body', 'required', 'test independent robot links'),)
+    planner.robot_validator = SimpleNamespace(checker=checker, pairs=pairs, required_pairs=pairs,
+        T_reference_base=np.eye(4))
+    planner.check_request = lambda: None
+    planner.scene.bind_online_robot(validator=planner.robot_validator, check_request=planner.check_request)
+    planner.goal_ik_candidates = {}
+    # Functional IK construction has its own CPU/native contracts. This fixture
+    # injects explicit candidates to isolate production search consumption.
+    planner._build_goal_ik_candidates = lambda reference_seeds, check_search: check_search()
     planner.anchors = np.unique(np.r_[problem.anchors, planner.scene.required_progress_anchors])
     planner.device_cfg = SimpleNamespace(to_device=lambda value: torch.tensor(value, dtype=torch.float64))
     planner.start = SimpleNamespace(position=torch.tensor(problem.start_q[None], dtype=torch.float64))
-    dof = len(problem.joint_names)
-    planner.trajopt = SimpleNamespace(action_horizon=8, transition_model=SimpleNamespace(
-        action_bound_lows=torch.full((dof,), -2.), action_bound_highs=torch.full((dof,), 2.)))
-    planner.formal_clock, planner.finger_trajectory = {"duration": 1.}, None
-    def fit_test_initializer(parameters,positions,*,prior_controls):
-        # The fixture has Cartesian sample controls, not a native GPU spline.
-        # This resampling only packages the geometrically checked OMPL path;
-        # physical native spline fitting has its own representation tests.
-        values=positions.detach().cpu().numpy()
-        output=np.column_stack([np.interp(np.linspace(0.,1.,len(prior_controls)),
-            parameters,values[:,joint]) for joint in range(values.shape[-1])])
-        return positions.new_tensor(output),{'model':'test Cartesian sample initializer'}
-    planner.physical_domain=SimpleNamespace(initialize=lambda values:values,fit_reference=fit_test_initializer,
-        evaluate=lambda controls,parameters:np.column_stack([
-            np.interp(parameters,np.linspace(0.,1.,len(controls)),controls[:,j])
+    planner.position_domain = SimpleNamespace(lower=torch.full((dof,), -2.), upper=torch.full((dof,), 2.))
+    planner.formal_clock, planner.finger_trajectory = {'duration': 1.}, None
+
+    def fit_test_initializer(parameters, positions, *, prior_controls):
+        # Spatial fitting is isolated from physical spline acceptance here;
+        # the production continuous-domain tests own that later boundary.
+        output = np.column_stack([np.interp(np.linspace(0., 1., len(prior_controls)),
+            parameters, positions[:, joint]) for joint in range(positions.shape[-1])])
+        return output, {'model': 'test Cartesian sampled initializer'}
+
+    planner.physical_domain = SimpleNamespace(fit_samples=fit_test_initializer,
+        evaluate=lambda controls, parameters: np.column_stack([
+            np.interp(parameters, np.linspace(0., 1., len(controls)), controls[:, j])
             for j in range(controls.shape[-1])]))
     planner.JointState, planner._RobotState = SimpleNamespace, SimpleNamespace
 
@@ -119,23 +131,20 @@ def cartesian_planner(problem, world=None, *, fixed_self_sphere=None):
             orientation[..., 0, 0] = torch.cos(q[..., 3]/2)
             orientation[..., 0, 3] = torch.sin(q[..., 3]/2)
             jacobian[..., 0, 5, 3] = 1.
-        # A small attached test proxy, with a known finite collision model.
-        spheres = torch.cat((q[..., :3], q.new_full((*q.shape[:2], 1), .01)), -1)[:, :, None]
-        if fixed_self_sphere is not None:
-            fixed=q.new_tensor(fixed_self_sphere).expand(*q.shape[:2],1,4)
-            spheres=torch.cat((spheres,fixed),dim=-2)
         return SimpleNamespace(tool_poses=SimpleNamespace(tool_frames=[problem.tool_link],
-            position=q[:, :, None, :3], quaternion=orientation), robot_spheres=spheres,
-            tool_jacobians=jacobian)
+            position=q[:, :, None, :3], quaternion=orientation),
+            robot_spheres=q.new_empty((*q.shape[:2], 0, 4)), tool_jacobians=jacobian)
+
     planner._verification_fk = SimpleNamespace(compute_kinematics=fk)
     planner._orientation_vjp = _orientation_vjp_type()
     planner._native_layout = SimpleNamespace(apply=lambda value: value)
-    limits=SimpleNamespace(joint_names=planner.joint_names,
-        velocity=torch.tensor([[-20.]*dof,[20.]*dof],dtype=torch.float64))
-    cspace=SimpleNamespace(config=SimpleNamespace(joint_limits=limits))
-    planner._verification_native = SimpleNamespace(get_cost=lambda name: cspace if name=='cspace' else None,
+    limits = SimpleNamespace(joint_names=planner.joint_names,
+        velocity=torch.tensor([[-20.]*dof, [20.]*dof], dtype=torch.float64))
+    cspace = SimpleNamespace(config=SimpleNamespace(joint_limits=limits))
+    planner._verification_native = SimpleNamespace(get_cost=lambda name: cspace if name == 'cspace' else None,
         compute_costs=lambda state: SimpleNamespace(names=(), values=()))
     return planner
+# END all task objects retain observed fields and branch-local release histories.
 
 
 def problem(**requirements):
@@ -154,132 +163,21 @@ class ScopedOmplSearchTest(unittest.TestCase):
         return planner.ompl_seed(torch.zeros((1, 1, 8, len(planner.joint_names)), dtype=torch.float64),
                                 SimpleNamespace(duration=1., _curve=curve))
 
-    # BEGIN discrete search must honor the existing native-confirmation boundary.
-    def _confirmation_probe(self, planner, curve, *, clear=True, clock=None):
-        """Script narrow-phase answers, retaining real OMPL and scene aggregation.
-
-        Native geometry correctness has independent confirmation tests. Here
-        the synthetic sphere is explicitly a broad-phase proposal, and the
-        controlled callback isolates caller lifetime, scope and deadline use.
-        """
-        instances = []
-        planner.robot_validator = object()
-
-        class Confirmation:
-            def __init__(self, validator, branch_scene, check_request):
-                self.scene, self.check_request, self.calls = branch_scene, check_request, 0
-                self.release_keys = tuple(branch_scene._fixed_release_poses)
-                instances.append(self)
-
-            def __call__(self, costs, evidence):
-                self.calls += 1
-                if clock is not None:
-                    clock[0] = planner.budget.search_seconds+1.
-                self.check_request()
-                result = dict(costs)
-                if clear:
-                    for key in evidence['targets']:
-                        result[key] = torch.zeros_like(costs[key])
-                return result
-
-        inventory = property(lambda scene: frozenset({'collision/robot/background'}))
-        with patch.object(CartesianSphereScene, 'native_world_collision_components', inventory), \
-                patch('manipulation.online_native_confirmation.OnlineCollisionConfirmation', Confirmation):
-            seed, report = self.search(planner, curve)
-        return seed, report, instances
-
-    def test_search_confirms_proxy_collision_but_retains_positive_native_verdict(self):
-        world = scene(background=SphereQuery(('background',), center=(0., 0., 0.), radius=.03))
-        for clear in (True, False):
-            with self.subTest(clear=clear):
-                planner = cartesian_planner(problem(), world)
-                seed, report, instances = self._confirmation_probe(
-                    planner, lambda t: np.array([.2*t, 0., 0.]), clear=clear)
-                self.assertEqual(len(instances), 1)
-                self.assertGreater(instances[0].calls, 0)
-                self.assertIsNot(instances[0].scene, planner.scene)
-                if clear:
-                    self.assertIsNotNone(seed, report)
-                    self.assertGreater(instances[0].calls, 1)
-                else:
-                    self.assertIsNone(seed)
-                    self.assertEqual(report['branches'][0]['boundary'], 'start')
-                    self.assertEqual(report['branches'][0]['failure'], 'boundary_candidate_not_feasible')
-
-    def test_native_clear_does_not_clear_unknown_contact_or_task_terms(self):
-        original_components = OnlinePlanningScene.components
-        for family in ('unknown', 'contact', 'task'):
-            with self.subTest(family=family):
-                request = problem(pose_events=(pose_goal(0., [.5, 0., 0.]),)) if family == 'task' else problem()
-                planner = cartesian_planner(request)
-                if family == 'unknown':
-                    planner.scene._unknown = lambda spheres, uncertain=None: (
-                        spheres.new_ones(spheres.shape[:2]), spheres.new_zeros(spheres.shape[:2]))
-
-                def components(bound_scene, *args, **kwargs):
-                    values = original_components(bound_scene, *args, **kwargs)
-                    if family == 'contact':
-                        # A positive contact requirement remains in the same
-                        # scene sum after the confirmer clears only its keys.
-                        values['contact/gap/test_required_material'] = torch.ones_like(next(iter(values.values())))
-                    return values
-
-                with patch.object(OnlinePlanningScene, 'components', components):
-                    seed, report, _ = self._confirmation_probe(planner, lambda t: np.array([.2*t, 0., 0.]))
-                self.assertIsNone(seed)
-                self.assertEqual(report['branches'][0]['boundary'], 'start')
-
-    def test_confirmation_callback_consumes_original_search_deadline(self):
-        planner, clock = cartesian_planner(problem()), [0.]
-        with patch('manipulation.planning.time', SimpleNamespace(monotonic=lambda: clock[0])):
-            seed, report, instances = self._confirmation_probe(
-                planner, lambda t: np.array([.2*t, 0., 0.]), clock=clock)
-        self.assertIsNone(seed)
-        self.assertEqual(report['branches'][0]['failure'], 'whole_search_time_budget_exhausted')
-        self.assertGreaterEqual(report['elapsed_seconds'], planner.budget.search_seconds)
-        self.assertEqual(len(instances), 1)
-        self.assertEqual(instances[0].calls, 1)
-
-    def test_confirmation_instances_follow_selected_release_prefix(self):
-        attachment = Attachment((0., .4), [.3, 0., 0.], [1., 0., 0., 0.],
-                                'current holding', 'actual release event')
-        owner = CollisionOwner('payload', SphereQuery(('payload',), center=(0., 0., 0.), radius=.02),
-            pose_path((.3, 0., 0.)), 'observed payload', True,
-            local_spheres=[[0., 0., 0., .02]], attachments=(attachment,))
-        planner = cartesian_planner(problem(pose_events=(pose_goal(.4, [.4, 0., 0.]),)), scene((owner,)))
-        seed, report, instances = self._confirmation_probe(
-            planner, lambda t: np.array([min(t, .8-t), 0., 0.]))
-        self.assertIsNotNone(seed, report)
-        self.assertEqual(len(instances), 2)
-        self.assertFalse(instances[0].release_keys)
-        self.assertTrue(instances[1].release_keys)
-        self.assertIsNot(instances[0].scene, instances[1].scene)
-        self.assertFalse(planner.scene._fixed_release_poses)
-        self.assertTrue(all(value.calls > 1 for value in instances))
-
-    def test_native_cost_receives_timed_state_without_replacing_scene_fk(self):
+    # BEGIN native self costs receive the same named state used for scene FK.
+    def test_native_cost_receives_current_named_joint_state(self):
         planner = cartesian_planner(problem())
-        times, received = [], []
-
-        def timed(state, request, branch_scene, names, trajectory_time, *, sphere_padding):
-            self.assertIs(request, planner.problem)
-            self.assertEqual(tuple(names), planner.joint_names)
-            times.extend(trajectory_time.reshape(-1).tolist())
-            return SimpleNamespace(timed_marker=True)
-
+        received = []
         def costs(state):
-            received.append(state.timed_marker)
+            received.append(state.joint_state.position.detach().clone())
+            self.assertEqual(tuple(state.joint_state.joint_names), planner.joint_names)
+            self.assertEqual(state.cuda_robot_model_state.robot_spheres.shape[-2], 0)
             return SimpleNamespace(names=(), values=())
-
         planner._verification_native.compute_costs = costs
-        with patch('manipulation.planning._timed_native_state', side_effect=timed):
-            seed, report = self.search(planner, lambda t: np.array([.2*t, 0., 0.]))
+        seed, report = self.search(planner, lambda t: np.array([.2*t, 0., 0.]))
         self.assertIsNotNone(seed, report)
         self.assertTrue(received)
-        self.assertEqual(len(received), len(times))
-        self.assertIn(0., times)
-        self.assertIn(1., times)
-    # END geometry semantics remain owned by the existing production confirmer.
+        self.assertTrue(any(torch.allclose(row[0, 0], torch.tensor([.2, 0., 0.], dtype=row.dtype)) for row in received))
+    # END the original robot scene and native state are both evaluated.
 
     # BEGIN required connections share one deadline without an artificial chart quota.
     def _search_with_charged_clock(self, cost_per_query, *, attempts=1):
@@ -342,11 +240,11 @@ class ScopedOmplSearchTest(unittest.TestCase):
 
     # BEGIN failed alternative IK cannot consume the only qualified boundary attempt.
     def test_functional_boundary_uses_qualified_indices_before_preferring_an_alternative(self):
-        good = {"task_satisfied": True, "model_valid": True, "native_pose_ik_success": True}
-        failed = {"task_satisfied": False, "model_valid": False, "native_pose_ik_success": False}
+        good = {"task_satisfied": True, "model_valid": True, "allowed_set_ik_success": True}
+        failed = {"task_satisfied": False, "model_valid": False, "allowed_set_ik_success": False}
         cases = (
             ([([.5, 0., 0.], good), ([1.8, 1.8, 1.8], failed)], 0, [.5, 0., 0.]),
-            ([([.5, 0., 0.], good), ([1.8, 1.8, 1.8], failed), ([.51, 0., 0.], good)], 2, [.51, 0., 0.]),
+            ([([.5, 0., 0.], good), ([1.8, 1.8, 1.8], failed), ([.51, 0., 0.], good)], 0, [.5, 0., 0.]),
             ([([float("nan"), 0., 0.], good), ([1.8, 1.8, 1.8], failed)], None, [.5, 0., 0.]),
         )
         for candidates, index, expected in cases:
@@ -369,10 +267,10 @@ class ScopedOmplSearchTest(unittest.TestCase):
                     self.assertEqual(first["functional_ik_report"], good)
     # END native OMPL projection and scene/connection validation remain active.
 
-    # BEGIN registered sphere pairs constrain every OMPL goal proposal.
+    # BEGIN registered robot pairs constrain every OMPL goal proposal.
     def test_registered_robot_self_pair_rejects_an_otherwise_free_boundary(self):
         request=problem(pose_events=(pose_goal(1.,[.5,0.,0.],tolerance=.001),))
-        planner=cartesian_planner(request,fixed_self_sphere=(.5,0.,0.,.1))
+        planner=cartesian_planner(request,fixed_self_box=(.5,0.,0.,.1))
         planner.budget=replace(planner.budget,ik_seeds=2,trajectory_seeds=1)
         seed,report=self.search(planner,lambda t:np.array([.5*t,0.,0.]))
         self.assertIsNone(seed)
@@ -431,7 +329,10 @@ class ScopedOmplSearchTest(unittest.TestCase):
         support = SupportSurface(np.zeros(3), np.eye(3)[:, :2], [0., 0., 1.],
                                  [[-1., -1.], [1., -1.], [1., 1.], [-1., 1.]])
         return SupportRequirement(.5, np.eye(4), [[0., 0., 0.]], [[0., 0., 0.]],
-                                  [0., 0., -1.], support, .001, .01, 0., "true finite support")
+            [0., 0., -1.], support, .001, .01, 0., "declared finite support",
+            # These projection tests explicitly exercise all four components;
+            # the production task declaration decides its own hard subset.
+            hard_components=("gap", "body", "footprint", "normal"))
 
     def test_support_projection_keeps_tangential_member_and_searches_it(self):
         planner = cartesian_planner(problem(supports=(self.support_goal(),)))
@@ -605,7 +506,7 @@ class ScopedOmplSearchTest(unittest.TestCase):
                 # larger alternative also blocks the projected random goal,
                 # while leaving the measured start free in both cases.
                 center, radius = ((.565, -.5, 0.), .57) if block_random else ((.4, 0., 0.), .08)
-                world = scene(background=SphereQuery(("background",), center=center, radius=radius))
+                world = scene(background=observed_sphere("background", center=center, radius=radius))
                 support = replace(self.support_goal(), progress=1.)
                 planner = cartesian_planner(problem(supports=(support,)), world)
                 planner.budget = replace(planner.budget, ik_seeds=2, trajectory_seeds=1)
@@ -685,9 +586,9 @@ class ScopedOmplSearchTest(unittest.TestCase):
     def test_postrelease_queries_use_selected_prefix_and_keep_original_scene_unbound(self):
         attachment = Attachment((0., .4), [.3, 0., 0.], [1., 0., 0., 0.],
                                 "current holding", "actual release event")
-        owner = CollisionOwner("payload", SphereQuery(("payload",), center=(0., 0., 0.), radius=.02),
+        owner = CollisionOwner("payload", observed_sphere("payload", center=(0., 0., 0.), radius=.02),
             pose_path((.3, 0., 0.)), "observed payload", True,
-            local_spheres=[[0., 0., 0., .02]], attachments=(attachment,))
+            attachments=(attachment,))
         world = scene((owner,))
         planner = cartesian_planner(problem(pose_events=(pose_goal(.4, [.4, 0., 0.]),)), world)
         seed, report = self.search(planner, lambda t: np.array([min(t, .8-t), 0., 0.]))
@@ -708,8 +609,8 @@ class ScopedOmplSearchTest(unittest.TestCase):
             tool_transform=np.eye(4), phases=(MotionPhase("zero-turn reference", pose_path()),),
             mechanisms=(mechanism,), coordinate_events=(goal,))
         planner = cartesian_planner(request)
-        planner.trajopt.transition_model.action_bound_lows[-1] = 0.
-        planner.trajopt.transition_model.action_bound_highs[-1] = 4*np.pi+.1
+        planner.position_domain.lower[-1] = 0.
+        planner.position_domain.upper[-1] = 4*np.pi+.1
         seed, report = self.search(planner, lambda t: np.array([0., 0., 0., 4*np.pi*t]))
         self.assertIsNotNone(seed, report)
         self.assertEqual(report["branches"][0]["space"], "projected")
@@ -725,3 +626,32 @@ class ScopedOmplSearchTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 # END these CPU searches make no native GPU or robot execution claim.
+
+# BEGIN task-valid functional proposals receive the selected prefix's scene verdict.
+def test_later_functional_proposal_uses_current_release_history_and_keeps_collision_checks():
+    attachment = Attachment((0., .4), [.3, 0., 0.], [1., 0., 0., 0.],
+        'declared rigid relationship', 'declared release event')
+    owner = CollisionOwner('payload', observed_sphere('payload', center=(0., 0., 0.), radius=.02),
+        pose_path((.3, 0., 0.)), 'observed task field', attachments=(attachment,))
+    for later_x, succeeds in ((.2, True), (.7, False)):
+        planner = cartesian_planner(problem(pose_events=(
+            pose_goal(.4, [.4, 0., 0.], tolerance=.001),
+            pose_goal(.8, [later_x, 0., 0.], tolerance=.001))), scene((owner,)))
+        planner.budget = replace(planner.budget, ik_seeds=1, trajectory_seeds=1)
+        previous_evidence = {'task_satisfied': True, 'model_valid': False,
+            'scene_components': {'relationship/missing_release/payload/0': {'maximum': 1.}}}
+        planner.goal_ik_candidates = {.8: {'candidates': [
+            {'joint_position': [later_x, 0., 0.], 'report': previous_evidence}]}}
+        seed, report = planner.ompl_seed(torch.zeros((1, 1, 8, 3), dtype=torch.float64),
+            SimpleNamespace(duration=1., _curve=lambda t: np.array([min(t, .8-t), 0., 0.])))
+        later = next(row for row in report['branches'] if row['chart'] == 1)
+        assert later['proposal_source'] == 'ranked_functional_ik'
+        assert later['functional_ik_report']['model_valid'] is False
+        assert not planner.scene._fixed_release_poses
+        assert (seed is not None) is succeeds, report
+        if succeeds:
+            assert 'failure' not in later
+        else:
+            assert later['failure'] == 'boundary_candidate_not_feasible'
+            assert later['first_invalid_states'][0]['terms']['scene'] > 0
+# END a missing old prefix cannot veto a proposal or authorize a current collision.

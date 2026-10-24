@@ -1,6 +1,6 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：`39880e5`。
+代码基线：本次实现提交同步更新正文和源码；前置代码检查点为 `759d89b`。实际实现提交号由紧随的文档引用提交回填。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
@@ -237,7 +237,7 @@ _derived_spline_grid
 
 ## `JointTrajectory`
 
-[定义位置](../../../manipulation/planning.py#L212)。
+[定义位置](../../../manipulation/planning.py#L214)。
 
 ```python
 class JointTrajectory():
@@ -271,7 +271,7 @@ _curve: CubicHermiteSpline = field(init=False, repr=False)
 
 ## `JointTrajectory.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L236)。
+[定义位置](../../../manipulation/planning.py#L238)。
 
 输入签名：
 
@@ -305,7 +305,7 @@ CubicHermiteSpline
 
 ## `JointTrajectory.duration`
 
-[定义位置](../../../manipulation/planning.py#L240)。
+[定义位置](../../../manipulation/planning.py#L242)。
 
 输入签名：
 
@@ -337,7 +337,7 @@ float
 
 ## `JointTrajectory.next_verification`
 
-[定义位置](../../../manipulation/planning.py#L244)。
+[定义位置](../../../manipulation/planning.py#L246)。
 
 输入签名：
 
@@ -379,7 +379,7 @@ min
 
 ## `JointTrajectory.executable_until`
 
-[定义位置](../../../manipulation/planning.py#L252)。
+[定义位置](../../../manipulation/planning.py#L254)。
 
 输入签名：
 
@@ -418,7 +418,7 @@ float
 
 ## `JointTrajectory.sample`
 
-[定义位置](../../../manipulation/planning.py#L257)。
+[定义位置](../../../manipulation/planning.py#L259)。
 
 输入签名：
 
@@ -476,7 +476,7 @@ np.interp
 
 ## `cubic_derivative_report`
 
-[定义位置](../../../manipulation/planning.py#L276)。
+[定义位置](../../../manipulation/planning.py#L278)。
 
 输入签名：
 
@@ -662,7 +662,7 @@ upper_excess.tolist
 
 ## `PlanningResult`
 
-[定义位置](../../../manipulation/planning.py#L379)。
+[定义位置](../../../manipulation/planning.py#L381)。
 
 ```python
 class PlanningResult():
@@ -680,7 +680,7 @@ request_ledger: dict | None = None
 
 ## `_anchor_capacity`
 
-[定义位置](../../../manipulation/planning.py#L392)。
+[定义位置](../../../manipulation/planning.py#L394)。
 
 输入签名：
 
@@ -721,7 +721,7 @@ MotionPlanningError
 
 ## `_PlanningWorkspace`
 
-[定义位置](../../../manipulation/planning.py#L402)。
+[定义位置](../../../manipulation/planning.py#L404)。
 
 ```python
 class _PlanningWorkspace():
@@ -743,7 +743,7 @@ anchor_fk_bytes: int
 
 ## `_PlanningWorkspace.cpu_bytes`
 
-[定义位置](../../../manipulation/planning.py#L412)。
+[定义位置](../../../manipulation/planning.py#L414)。
 
 输入签名：
 
@@ -774,7 +774,7 @@ self.pending_cpu_bytes
 
 ## `_PlanningWorkspace.pending_cpu_bytes`
 
-[定义位置](../../../manipulation/planning.py#L416)。
+[定义位置](../../../manipulation/planning.py#L418)。
 
 输入签名：
 
@@ -809,7 +809,7 @@ self.cpu_live_bytes
 
 ## `_PlanningWorkspace.total_bytes`
 
-[定义位置](../../../manipulation/planning.py#L421)。
+[定义位置](../../../manipulation/planning.py#L423)。
 
 输入签名：
 
@@ -844,7 +844,7 @@ self.gpu_bytes
 
 ## `_planning_workspace_bytes`
 
-[定义位置](../../../manipulation/planning.py#L428)。
+[定义位置](../../../manipulation/planning.py#L430)。
 
 输入签名：
 
@@ -909,7 +909,7 @@ _PlanningWorkspace
 
 ## `_require_planning_host_memory`
 
-[定义位置](../../../manipulation/planning.py#L456)。
+[定义位置](../../../manipulation/planning.py#L458)。
 
 输入签名：
 
@@ -947,7 +947,7 @@ require_host_memory
 
 ## `_require_planning_memory`
 
-[定义位置](../../../manipulation/planning.py#L472)。
+[定义位置](../../../manipulation/planning.py#L474)。
 
 输入签名：
 
@@ -993,7 +993,7 @@ require_device_memory
 
 ## `_bounded_robot_configuration`
 
-[定义位置](../../../manipulation/planning.py#L493)。
+[定义位置](../../../manipulation/planning.py#L495)。
 
 输入签名：
 
@@ -1064,7 +1064,7 @@ sorted
 
 ## `_ProgressMap`
 
-[定义位置](../../../manipulation/planning.py#L529)。
+[定义位置](../../../manipulation/planning.py#L531)。
 
 ```python
 class _ProgressMap():
@@ -1084,7 +1084,7 @@ event_clock: dict = field(default_factory=dict, compare=False)
 
 ## `_ProgressMap.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L538)。
+[定义位置](../../../manipulation/planning.py#L540)。
 
 输入签名：
 
@@ -1132,7 +1132,7 @@ ValueError
 
 ## `_ProgressMap.anchor_parameters`
 
-[定义位置](../../../manipulation/planning.py#L546)。
+[定义位置](../../../manipulation/planning.py#L548)。
 
 输入签名：
 
@@ -1197,7 +1197,7 @@ pairs[:, column].astype
 
 ## `_phase_aligned_parameters`
 
-[定义位置](../../../manipulation/planning.py#L572)。
+[定义位置](../../../manipulation/planning.py#L574)。
 
 输入签名：
 
@@ -1260,7 +1260,7 @@ result.append
 
 ## `_candidate_sample_times`
 
-[定义位置](../../../manipulation/planning.py#L596)。
+[定义位置](../../../manipulation/planning.py#L598)。
 
 输入签名：
 
@@ -1326,7 +1326,7 @@ zip
 
 ## `_reference_clock_issues`
 
-[定义位置](../../../manipulation/planning.py#L606)。
+[定义位置](../../../manipulation/planning.py#L608)。
 
 输入签名：
 
@@ -1392,7 +1392,7 @@ issues.append
 
 ## `_initial_timing`
 
-[定义位置](../../../manipulation/planning.py#L636)。
+[定义位置](../../../manipulation/planning.py#L638)。
 
 输入签名：
 
@@ -1479,7 +1479,7 @@ progress.copy
 
 ## `_bind_event_clock`
 
-[定义位置](../../../manipulation/planning.py#L685)。
+[定义位置](../../../manipulation/planning.py#L687)。
 
 输入签名：
 
@@ -1603,7 +1603,7 @@ record.update
 
 ## `_validate_bound_event_times`
 
-[定义位置](../../../manipulation/planning.py#L763)。
+[定义位置](../../../manipulation/planning.py#L765)。
 
 输入签名：
 
@@ -1716,7 +1716,7 @@ resolve_event_window
 
 ## `_validate_bound_event_times.past_pose_timing`
 
-[定义位置](../../../manipulation/planning.py#L783)。
+[定义位置](../../../manipulation/planning.py#L785)。
 
 输入签名：
 
@@ -1755,7 +1755,7 @@ any
 
 ## `_validate_bound_event_times.candidate_fact`
 
-[定义位置](../../../manipulation/planning.py#L797)。
+[定义位置](../../../manipulation/planning.py#L799)。
 
 输入签名：
 
@@ -1785,7 +1785,7 @@ predicted.append
 
 ## `ContinuationBindingError`
 
-[定义位置](../../../manipulation/planning.py#L880)。
+[定义位置](../../../manipulation/planning.py#L882)。
 
 ```python
 class ContinuationBindingError(ValueError):
@@ -1801,7 +1801,7 @@ class ContinuationBindingError(ValueError):
 
 ## `_obligation_contract`
 
-[定义位置](../../../manipulation/planning.py#L890)。
+[定义位置](../../../manipulation/planning.py#L892)。
 
 输入签名：
 
@@ -1872,7 +1872,7 @@ phase.metadata.get
 
 ## `_restore_original_direction_origins`
 
-[定义位置](../../../manipulation/planning.py#L931)。
+[定义位置](../../../manipulation/planning.py#L933)。
 
 输入签名：
 
@@ -1948,7 +1948,7 @@ tuple
 
 ## `PlanningWorkExhausted`
 
-[定义位置](../../../manipulation/planning.py#L964)。
+[定义位置](../../../manipulation/planning.py#L966)。
 
 ```python
 class PlanningWorkExhausted(ValueError):
@@ -1964,7 +1964,7 @@ class PlanningWorkExhausted(ValueError):
 
 ## `_planning_work_budget`
 
-[定义位置](../../../manipulation/planning.py#L973)。
+[定义位置](../../../manipulation/planning.py#L975)。
 
 输入签名：
 
@@ -2003,7 +2003,7 @@ values.items
 
 ## `_request_work_ledger`
 
-[定义位置](../../../manipulation/planning.py#L979)。
+[定义位置](../../../manipulation/planning.py#L981)。
 
 输入签名：
 
@@ -2084,7 +2084,7 @@ ledger['effects'].update
 
 ## `_check_work_budget`
 
-[定义位置](../../../manipulation/planning.py#L1057)。
+[定义位置](../../../manipulation/planning.py#L1059)。
 
 输入签名：
 
@@ -2132,7 +2132,7 @@ stage_caps.items
 
 ## `_prepare_continuation`
 
-[定义位置](../../../manipulation/planning.py#L1075)。
+[定义位置](../../../manipulation/planning.py#L1081)。
 
 输入签名：
 
@@ -2418,7 +2418,7 @@ int
 
 ## `_continuation_timing`
 
-[定义位置](../../../manipulation/planning.py#L1429)。
+[定义位置](../../../manipulation/planning.py#L1435)。
 
 输入签名：
 
@@ -2522,7 +2522,7 @@ _ProgressMap
 
 ## `reference_progress_clock`
 
-[定义位置](../../../manipulation/planning.py#L1506)。
+[定义位置](../../../manipulation/planning.py#L1512)。
 
 输入签名：
 
@@ -2695,7 +2695,7 @@ warp.u.copy
 
 ## `_torch_interpolate`
 
-[定义位置](../../../manipulation/planning.py#L1611)。
+[定义位置](../../../manipulation/planning.py#L1617)。
 
 输入签名：
 
@@ -2741,7 +2741,7 @@ len
 
 ## `_projection_tolerance`
 
-[定义位置](../../../manipulation/planning.py#L1623)。
+[定义位置](../../../manipulation/planning.py#L1629)。
 
 输入签名：
 
@@ -2790,7 +2790,7 @@ min
 
 ## `_ompl_terms_accepted`
 
-[定义位置](../../../manipulation/planning.py#L1634)。
+[定义位置](../../../manipulation/planning.py#L1640)。
 
 输入签名：
 
@@ -2849,7 +2849,7 @@ torch.stack
 
 ## `_ompl_stage`
 
-[定义位置](../../../manipulation/planning.py#L1650)。
+[定义位置](../../../manipulation/planning.py#L1656)。
 
 输入签名：
 
@@ -3035,7 +3035,7 @@ np.array_equal
 
 ## `_ompl_stage.ProcessConstraint`
 
-[定义位置](../../../manipulation/planning.py#L1675)。
+[定义位置](../../../manipulation/planning.py#L1681)。
 
 ```python
 class ProcessConstraint(ob.Constraint):
@@ -3047,7 +3047,7 @@ class ProcessConstraint(ob.Constraint):
 
 ## `_ompl_stage.ProcessConstraint.__init__`
 
-[定义位置](../../../manipulation/planning.py#L1676)。
+[定义位置](../../../manipulation/planning.py#L1682)。
 
 输入签名：
 
@@ -3078,7 +3078,7 @@ super
 
 ## `_ompl_stage.ProcessConstraint.function`
 
-[定义位置](../../../manipulation/planning.py#L1679)。
+[定义位置](../../../manipulation/planning.py#L1685)。
 
 输入签名：
 
@@ -3111,7 +3111,7 @@ np.asarray
 
 ## `_ompl_stage.ProcessConstraint.jacobian`
 
-[定义位置](../../../manipulation/planning.py#L1682)。
+[定义位置](../../../manipulation/planning.py#L1688)。
 
 输入签名：
 
@@ -3144,7 +3144,7 @@ np.asarray
 
 ## `_ompl_stage.vector`
 
-[定义位置](../../../manipulation/planning.py#L1707)。
+[定义位置](../../../manipulation/planning.py#L1713)。
 
 输入签名：
 
@@ -3179,7 +3179,7 @@ range
 
 ## `_ompl_stage.valid_array`
 
-[定义位置](../../../manipulation/planning.py#L1710)。
+[定义位置](../../../manipulation/planning.py#L1716)。
 
 输入签名：
 
@@ -3241,7 +3241,7 @@ report['rejections'].get
 
 ## `_ompl_stage.edge_key`
 
-[定义位置](../../../manipulation/planning.py#L1741)。
+[定义位置](../../../manipulation/planning.py#L1747)。
 
 输入签名：
 
@@ -3275,7 +3275,7 @@ last.tobytes
 
 ## `_ompl_stage.checked_edge`
 
-[定义位置](../../../manipulation/planning.py#L1744)。
+[定义位置](../../../manipulation/planning.py#L1750)。
 
 输入签名：
 
@@ -3375,7 +3375,7 @@ iter
 
 ## `_ompl_stage.ForwardValidator`
 
-[定义位置](../../../manipulation/planning.py#L1800)。
+[定义位置](../../../manipulation/planning.py#L1806)。
 
 ```python
 class ForwardValidator(ob.MotionValidator):
@@ -3387,7 +3387,7 @@ class ForwardValidator(ob.MotionValidator):
 
 ## `_ompl_stage.ForwardValidator.__init__`
 
-[定义位置](../../../manipulation/planning.py#L1801)。
+[定义位置](../../../manipulation/planning.py#L1807)。
 
 输入签名：
 
@@ -3418,7 +3418,7 @@ super
 
 ## `_ompl_stage.ForwardValidator.checkMotion`
 
-[定义位置](../../../manipulation/planning.py#L1804)。
+[定义位置](../../../manipulation/planning.py#L1810)。
 
 输入签名：
 
@@ -3450,7 +3450,7 @@ checked_edge
 
 ## `_independent_projection`
 
-[定义位置](../../../manipulation/planning.py#L1865)。
+[定义位置](../../../manipulation/planning.py#L1871)。
 
 输入签名：
 
@@ -3514,7 +3514,7 @@ np.sort
 
 ## `_project_allowed_boundary`
 
-[定义位置](../../../manipulation/planning.py#L1888)。
+[定义位置](../../../manipulation/planning.py#L1894)。
 
 输入签名：
 
@@ -3621,7 +3621,7 @@ allowed
 
 ## `_project_allowed_boundary.allowed`
 
-[定义位置](../../../manipulation/planning.py#L1911)。
+[定义位置](../../../manipulation/planning.py#L1917)。
 
 输入签名：
 
@@ -3671,7 +3671,7 @@ np.abs
 
 ## `_project_allowed_boundary.AllowedBoundary`
 
-[定义位置](../../../manipulation/planning.py#L1944)。
+[定义位置](../../../manipulation/planning.py#L1950)。
 
 ```python
 class AllowedBoundary(ob.Constraint):
@@ -3683,7 +3683,7 @@ class AllowedBoundary(ob.Constraint):
 
 ## `_project_allowed_boundary.AllowedBoundary.__init__`
 
-[定义位置](../../../manipulation/planning.py#L1945)。
+[定义位置](../../../manipulation/planning.py#L1951)。
 
 输入签名：
 
@@ -3719,7 +3719,7 @@ self.setMaxIterations
 
 ## `_project_allowed_boundary.AllowedBoundary.function`
 
-[定义位置](../../../manipulation/planning.py#L1955)。
+[定义位置](../../../manipulation/planning.py#L1961)。
 
 输入签名：
 
@@ -3752,7 +3752,7 @@ np.asarray
 
 ## `_project_allowed_boundary.AllowedBoundary.jacobian`
 
-[定义位置](../../../manipulation/planning.py#L1958)。
+[定义位置](../../../manipulation/planning.py#L1964)。
 
 输入签名：
 
@@ -3789,7 +3789,7 @@ np.asarray
 
 ## `_project_boundary`
 
-[定义位置](../../../manipulation/planning.py#L1984)。
+[定义位置](../../../manipulation/planning.py#L1990)。
 
 输入签名：
 
@@ -3855,7 +3855,7 @@ np.isfinite
 
 ## `_project_boundary.BoundaryConstraint`
 
-[定义位置](../../../manipulation/planning.py#L1998)。
+[定义位置](../../../manipulation/planning.py#L2004)。
 
 ```python
 class BoundaryConstraint(ob.Constraint):
@@ -3867,7 +3867,7 @@ class BoundaryConstraint(ob.Constraint):
 
 ## `_project_boundary.BoundaryConstraint.__init__`
 
-[定义位置](../../../manipulation/planning.py#L1999)。
+[定义位置](../../../manipulation/planning.py#L2005)。
 
 输入签名：
 
@@ -3898,7 +3898,7 @@ super
 
 ## `_project_boundary.BoundaryConstraint.function`
 
-[定义位置](../../../manipulation/planning.py#L2002)。
+[定义位置](../../../manipulation/planning.py#L2008)。
 
 输入签名：
 
@@ -3931,7 +3931,7 @@ np.asarray
 
 ## `_project_boundary.BoundaryConstraint.jacobian`
 
-[定义位置](../../../manipulation/planning.py#L2005)。
+[定义位置](../../../manipulation/planning.py#L2011)。
 
 输入签名：
 
@@ -3964,7 +3964,7 @@ np.asarray
 
 ## `_orientation_vjp_type`
 
-[定义位置](../../../manipulation/planning.py#L2021)。
+[定义位置](../../../manipulation/planning.py#L2027)。
 
 输入签名：
 
@@ -4006,7 +4006,7 @@ WorldQuaternionVJP
 
 ## `_orientation_vjp_type.WorldQuaternionVJP`
 
-[定义位置](../../../manipulation/planning.py#L2036)。
+[定义位置](../../../manipulation/planning.py#L2042)。
 
 ```python
 class WorldQuaternionVJP(torch.autograd.Function):
@@ -4018,7 +4018,7 @@ class WorldQuaternionVJP(torch.autograd.Function):
 
 ## `_orientation_vjp_type.WorldQuaternionVJP.forward`
 
-[定义位置](../../../manipulation/planning.py#L2038)。
+[定义位置](../../../manipulation/planning.py#L2044)。
 
 输入签名：
 
@@ -4056,7 +4056,7 @@ quaternion.clone
 
 ## `_orientation_vjp_type.WorldQuaternionVJP.backward`
 
-[定义位置](../../../manipulation/planning.py#L2046)。
+[定义位置](../../../manipulation/planning.py#L2052)。
 
 输入签名：
 
@@ -4104,7 +4104,7 @@ torch.einsum
 
 ## `_native_gradient_layout_type`
 
-[定义位置](../../../manipulation/planning.py#L2062)。
+[定义位置](../../../manipulation/planning.py#L2068)。
 
 输入签名：
 
@@ -4141,7 +4141,7 @@ NativeGradientLayout
 
 ## `_native_gradient_layout_type.NativeGradientLayout`
 
-[定义位置](../../../manipulation/planning.py#L2072)。
+[定义位置](../../../manipulation/planning.py#L2078)。
 
 ```python
 class NativeGradientLayout(torch.autograd.Function):
@@ -4153,7 +4153,7 @@ class NativeGradientLayout(torch.autograd.Function):
 
 ## `_native_gradient_layout_type.NativeGradientLayout.forward`
 
-[定义位置](../../../manipulation/planning.py#L2074)。
+[定义位置](../../../manipulation/planning.py#L2080)。
 
 输入签名：
 
@@ -4181,7 +4181,7 @@ value
 
 ## `_native_gradient_layout_type.NativeGradientLayout.backward`
 
-[定义位置](../../../manipulation/planning.py#L2078)。
+[定义位置](../../../manipulation/planning.py#L2084)。
 
 输入签名：
 
@@ -4213,7 +4213,7 @@ gradient.contiguous
 
 ## `_scene_boundary_evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2097)。
+[定义位置](../../../manipulation/planning.py#L2103)。
 
 输入签名：
 
@@ -4362,7 +4362,7 @@ torch.stack((exact_terms, left_terms, right_terms)).amax
 
 ## `_scene_boundary_evaluate.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2113)。
+[定义位置](../../../manipulation/planning.py#L2119)。
 
 输入签名：
 
@@ -4394,7 +4394,7 @@ scene.evaluate
 
 ## `_scene_boundary_evaluate.retain_pair_evidence`
 
-[定义位置](../../../manipulation/planning.py#L2117)。
+[定义位置](../../../manipulation/planning.py#L2123)。
 
 输入签名：
 
@@ -4435,7 +4435,7 @@ geometry_evidence_out.append
 
 ## `_scene_boundary_evaluate.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L2141)。
+[定义位置](../../../manipulation/planning.py#L2147)。
 
 输入签名：
 
@@ -4520,7 +4520,7 @@ args[3].detach
 
 ## `_scene_boundary_evaluate.expanded`
 
-[定义位置](../../../manipulation/planning.py#L2217)。
+[定义位置](../../../manipulation/planning.py#L2223)。
 
 输入签名：
 
@@ -4554,7 +4554,7 @@ value.index_select
 
 ## `_ik_manager_type`
 
-[定义位置](../../../manipulation/planning.py#L2261)。
+[定义位置](../../../manipulation/planning.py#L2267)。
 
 输入签名：
 
@@ -4601,7 +4601,7 @@ staticmethod
 
 ## `_ik_manager_type.IKCostManager`
 
-[定义位置](../../../manipulation/planning.py#L2275)。
+[定义位置](../../../manipulation/planning.py#L2281)。
 
 ```python
 class IKCostManager(RobotCostManager):
@@ -4613,7 +4613,7 @@ class IKCostManager(RobotCostManager):
 
 ## `_ik_manager_type.IKCostManager.initialize_from_config`
 
-[定义位置](../../../manipulation/planning.py#L2276)。
+[定义位置](../../../manipulation/planning.py#L2282)。
 
 输入签名：
 
@@ -4658,7 +4658,7 @@ transition_model.robot_model.tool_frames.index
 
 ## `_ik_manager_type.IKCostManager.compute_costs`
 
-[定义位置](../../../manipulation/planning.py#L2283)。
+[定义位置](../../../manipulation/planning.py#L2289)。
 
 输入签名：
 
@@ -4758,7 +4758,7 @@ collection.add
 
 ## `_ik_manager_type.IKCostManagerCfg`
 
-[定义位置](../../../manipulation/planning.py#L2309)。
+[定义位置](../../../manipulation/planning.py#L2315)。
 
 ```python
 class IKCostManagerCfg(RobotCostManagerCfg):
@@ -4772,7 +4772,7 @@ process_mode: str = ''
 
 ## `_ik_manager_type.IKCostManagerCfg.__post_init__`
 
-[定义位置](../../../manipulation/planning.py#L2312)。
+[定义位置](../../../manipulation/planning.py#L2318)。
 
 输入签名：
 
@@ -4805,7 +4805,7 @@ super
 
 ## `_ik_manager_type.IKCostManagerCfg.create`
 
-[定义位置](../../../manipulation/planning.py#L2317)。
+[定义位置](../../../manipulation/planning.py#L2323)。
 
 输入签名：
 
@@ -4847,7 +4847,7 @@ data_dict.get
 
 ## `_ik_manager_type.bind_request`
 
-[定义位置](../../../manipulation/planning.py#L2322)。
+[定义位置](../../../manipulation/planning.py#L2328)。
 
 输入签名：
 
@@ -4877,7 +4877,7 @@ ik_goal_ids
 
 ## `_ik_manager_type.bind_ik_goals`
 
-[定义位置](../../../manipulation/planning.py#L2325)。
+[定义位置](../../../manipulation/planning.py#L2331)。
 
 输入签名：
 
@@ -4916,7 +4916,7 @@ ValueError
 
 ## `_unknown_policy_failure`
 
-[定义位置](../../../manipulation/planning.py#L2358)。
+[定义位置](../../../manipulation/planning.py#L2364)。
 
 输入签名：
 
@@ -4982,7 +4982,7 @@ name.endswith
 
 ## `_reference_entrance`
 
-[定义位置](../../../manipulation/planning.py#L2409)。
+[定义位置](../../../manipulation/planning.py#L2415)。
 
 输入签名：
 
@@ -5089,7 +5089,7 @@ np.cross
 
 ## `_ConstrainedPlanner`
 
-[定义位置](../../../manipulation/planning.py#L2447)。
+[定义位置](../../../manipulation/planning.py#L2453)。
 
 ```python
 class _ConstrainedPlanner():
@@ -5105,7 +5105,7 @@ class _ConstrainedPlanner():
 
 ## `_ConstrainedPlanner.__init__`
 
-[定义位置](../../../manipulation/planning.py#L2451)。
+[定义位置](../../../manipulation/planning.py#L2457)。
 
 输入签名：
 
@@ -5134,6 +5134,7 @@ self.close
 
 ```python
 self.ik
+self.reference_ik
 self.check_request
 self._precision_torch
 self._caller_precision
@@ -5149,7 +5150,7 @@ self.close
 
 ## `_ConstrainedPlanner._initialize`
 
-[定义位置](../../../manipulation/planning.py#L2474)。
+[定义位置](../../../manipulation/planning.py#L2485)。
 
 输入签名：
 
@@ -5230,6 +5231,7 @@ self.device_cfg.to_device
 self.formal_clock
 self.seed_parameter
 pose_cost.update
+reference_optimizer['rollout']['constraint_cfg'].pop
 InverseKinematicsCfg.create
 budget.ik_seeds
 problem.numerical.position_m
@@ -5253,6 +5255,7 @@ problem.joint_names
 JointState.from_numpy
 problem.start_q
 problem.start_dq
+self.start
 self._bind_online_robot
 self.ik.kinematics.config
 scene.clone_for_rollout
@@ -5303,7 +5306,6 @@ self.scene_cpu_workspace_bytes
 self.scene_gpu_workspace_bytes
 self.scene_cpu_live_bytes
 self.anchor_fk_workspace_bytes
-self.ik
 self.anchors
 self.robot_dict
 self.seed_parameter
@@ -5318,23 +5320,28 @@ self.diagnostic_optimizer_candidate
 self.diagnostic_optimizer_provenance
 self.reference_initialization
 self.reference_ik_queries
-self.reference_ik_chains
 self.initial_seed_strategies
 self.route
 ik_optimizer
 ik_optimizer['optimizer']['inner_iters']
 pose_cost
-self.reference_ik_pose_weights
 pose_cost['weight'][1]
 self.motion_configuration
+reference_optimizer
 ik_cfg
 ik_cfg.use_lm_seed
 ik_cfg.exit_early
+self.ik
+reference_cfg
+reference_cfg.use_lm_seed
+reference_cfg.exit_early
+self.reference_ik
 torch.backends.cuda.matmul.allow_tf32
 torch.backends.cudnn.allow_tf32
 self.joint_names
 columns
 self.start
+self.start.dt
 self._verification_fk
 self._orientation_vjp
 self._native_layout
@@ -5389,14 +5396,16 @@ _require_planning_memory
 self.device_cfg.to_device
 _ik_manager_type
 configuration
-tuple
 pose_cost.update
 deepcopy
 load_yaml
 join_path
 get_task_configs_path
+reference_optimizer['rollout']['constraint_cfg'].pop
 InverseKinematicsCfg.create
 InverseKinematics
+require_device_memory
+tuple
 RuntimeError
 problem.joint_names.index
 JointState.from_numpy
@@ -5412,12 +5421,12 @@ self._bind_physical_domains
 
 ## `_ConstrainedPlanner._initialize.configuration`
 
-[定义位置](../../../manipulation/planning.py#L2597)。
+[定义位置](../../../manipulation/planning.py#L2607)。
 
 输入签名：
 
 ```python
-def configuration(name, mode):
+def configuration(name, mode=None):
 ```
 
 显式输出分支：
@@ -5454,7 +5463,7 @@ constraint.pop
 
 ## `_ConstrainedPlanner._bind_online_robot`
 
-[定义位置](../../../manipulation/planning.py#L2650)。
+[定义位置](../../../manipulation/planning.py#L2682)。
 
 输入签名：
 
@@ -5488,7 +5497,7 @@ self.check_request
 
 ## `_ConstrainedPlanner.rebind`
 
-[定义位置](../../../manipulation/planning.py#L2654)。
+[定义位置](../../../manipulation/planning.py#L2686)。
 
 输入签名：
 
@@ -5548,6 +5557,8 @@ self.JointState.from_numpy
 self.JointState
 problem.start_q
 problem.start_dq
+self.start
+self.device_cfg.to_device
 self._bind_online_robot
 mapping.u
 mapping.s
@@ -5556,12 +5567,13 @@ self._manager_type
 scene.clone_for_rollout
 self.seed_parameter.zero_
 self.seed_parameter
-self.ik.reset_seed
 self.ik
-self.ik.core.goal_registry_manager
-self.ik.core
+self.reference_ik
+solver.reset_seed
+solver.core.goal_registry_manager
+solver.core
 manager._goal_buffer
-self.ik.core.get_all_rollout_instances
+solver.core.get_all_rollout_instances
 rollout.reset
 self._bind_physical_domains
 ```
@@ -5586,6 +5598,7 @@ self.finger_trajectory
 columns
 name
 self.start
+self.start.dt
 entrance_pose
 entrance_twist
 self.bound_reference
@@ -5600,8 +5613,8 @@ self.diagnostic_optimizer_candidate
 self.diagnostic_optimizer_provenance
 self.reference_initialization
 self.reference_ik_queries
-self.reference_ik_chains
 self.initial_seed_strategies
+solver
 manager
 manager._goal_buffer.link_goal_poses
 rollout
@@ -5633,14 +5646,15 @@ self.formal_clock.update
 problem.joint_names.index
 self.JointState.from_numpy
 list
+self.device_cfg.to_device
 self._bind_online_robot
 _reference_entrance
 BoundToolReference
 self._manager_type.bind_request
 scene.clone_for_rollout
 self.seed_parameter.zero_
-self.ik.reset_seed
-self.ik.core.get_all_rollout_instances
+solver.reset_seed
+solver.core.get_all_rollout_instances
 rollout.reset
 getattr
 self._bind_physical_domains
@@ -5648,7 +5662,7 @@ self._bind_physical_domains
 
 ## `_ConstrainedPlanner._seed_u`
 
-[定义位置](../../../manipulation/planning.py#L2721)。
+[定义位置](../../../manipulation/planning.py#L2757)。
 
 输入签名：
 
@@ -5693,7 +5707,7 @@ np.interp
 
 ## `_ConstrainedPlanner._initialize_verification_constraints`
 
-[定义位置](../../../manipulation/planning.py#L2731)。
+[定义位置](../../../manipulation/planning.py#L2767)。
 
 输入签名：
 
@@ -5735,7 +5749,7 @@ deepcopy
 
 ## `_ConstrainedPlanner._bind_physical_domains`
 
-[定义位置](../../../manipulation/planning.py#L2744)。
+[定义位置](../../../manipulation/planning.py#L2780)。
 
 输入签名：
 
@@ -5825,7 +5839,7 @@ self._bind_computation
 
 ## `_ConstrainedPlanner._bind_computation`
 
-[定义位置](../../../manipulation/planning.py#L2763)。
+[定义位置](../../../manipulation/planning.py#L2799)。
 
 输入签名：
 
@@ -5895,7 +5909,7 @@ TrajectoryComputation
 
 ## `_ConstrainedPlanner.initial_state_diagnostics`
 
-[定义位置](../../../manipulation/planning.py#L2781)。
+[定义位置](../../../manipulation/planning.py#L2817)。
 
 输入签名：
 
@@ -5988,7 +6002,7 @@ deepcopy
 
 ## `_ConstrainedPlanner.close`
 
-[定义位置](../../../manipulation/planning.py#L2818)。
+[定义位置](../../../manipulation/planning.py#L2854)。
 
 输入签名：
 
@@ -6005,6 +6019,7 @@ def close(self):
 ```python
 solver.destroy
 gc.collect
+self._caller_precision
 self._precision_torch.backends.cuda.matmul
 self._precision_torch.backends.cuda
 self._precision_torch.backends
@@ -6015,8 +6030,10 @@ self._precision_torch.backends.cudnn
 写入目标：
 
 ```python
+failure
 name
 solver
+failure.__cause__
 prior
 self._precision_torch.backends.cuda.matmul.allow_tf32
 self._precision_torch.backends.cudnn.allow_tf32
@@ -6027,14 +6044,14 @@ self._caller_precision
 
 ```python
 getattr
-solver.destroy
 setattr
+solver.destroy
 gc.collect
 ```
 
 ## `_ConstrainedPlanner._goal`
 
-[定义位置](../../../manipulation/planning.py#L2841)。
+[定义位置](../../../manipulation/planning.py#L2881)。
 
 输入签名：
 
@@ -6087,107 +6104,55 @@ position[:, :, None, None].contiguous
 quaternion[:, :, None, None].contiguous
 ```
 
-## `_ConstrainedPlanner._seed_velocity_bounds`
-
-[定义位置](../../../manipulation/planning.py#L2850)。
-
-输入签名：
-
-```python
-def _seed_velocity_bounds(self):
-```
-
-实现说明：
-
-> Read existing physical speed bounds in the action's named joint order.
-
-显式输出分支：
-
-```python
-limits.velocity.detach().cpu().numpy()[:, columns]
-```
-
-读取的对象属性：
-
-```python
-self._verification_native.get_cost('cspace').config.joint_limits
-self._verification_native.get_cost('cspace').config
-self._verification_native.get_cost
-self._verification_native
-limits.joint_names.index
-limits.joint_names
-self.joint_names
-limits.velocity.detach().cpu().numpy
-limits.velocity.detach().cpu
-limits.velocity.detach
-limits.velocity
-```
-
-写入目标：
-
-```python
-limits
-columns
-name
-```
-
-直接调用符号：
-
-```python
-self._verification_native.get_cost
-limits.joint_names.index
-limits.velocity.detach().cpu().numpy
-limits.velocity.detach().cpu
-limits.velocity.detach
-```
-
 ## `_ConstrainedPlanner._solve_ik`
 
-[定义位置](../../../manipulation/planning.py#L2857)。
+[定义位置](../../../manipulation/planning.py#L2890)。
 
 输入签名：
 
 ```python
-def _solve_ik(self, goal, seeds):
+def _solve_ik(self, goal, seeds, *, solver, current_state):
 ```
 
 实现说明：
 
-> Submit a bounded IK batch and retain work even if native code fails.
+> Submit the configured number of candidates using the supplied q/dq/dt.
 >
-> ``seeds`` is [batch, supplied_seed, named_joint]. Native SeedManager
-> fills each batch to the request's fixed ``ik_seeds``. The ledger unit
-> is one submitted candidate solve, including unsuccessful candidates.
-> ``request_work`` is the public request's cumulative ledger, bound
-> before either reference initialization or event search is entered.
+> Each ordinary query uses one preceding numerical state. Event queries
+> use the measured entrance with explicit zero dt and retain their fixed
+> multi-seed budget. Return count never changes native optimizer shape.
 
 显式输出分支：
 
 ```python
-self.ik.solve_pose(goal, current_state=self.start, seed_config=seeds, return_seeds=self.budget.ik_seeds)
+result
 ```
 
 读取的对象属性：
 
 ```python
 self.check_request
+solver.config.num_seeds
+solver.config
 seeds.shape
-self.budget.ik_seeds
-self.budget
 self.budget.max_validation_points
+self.budget
+self.budget.ik_seeds
 self.budget.maximum_trajectory_solves
 self.request_work
-self.ik.solve_pose
-self.ik
-self.start
+self.request_work_baseline
+solver.solve_pose
 ```
 
 写入目标：
 
 ```python
+count
 amount
 limit
+used
 self.request_work['ik_queries']
+result
 ```
 
 直接调用符号：
@@ -6196,12 +6161,12 @@ self.request_work['ik_queries']
 self.check_request
 int
 PlanningWorkExhausted
-self.ik.solve_pose
+solver.solve_pose
 ```
 
 ## `_ConstrainedPlanner.reference_seeds`
 
-[定义位置](../../../manipulation/planning.py#L2878)。
+[定义位置](../../../manipulation/planning.py#L2912)。
 
 输入签名：
 
@@ -6211,7 +6176,12 @@ def reference_seeds(self, joint_reference=None):
 
 实现说明：
 
-> Construct numerical starts without treating references as constraints.
+> Return [1,1,control,joint] coefficients from one numerical sample sequence.
+>
+> q0/dq0 are measured feedback. Later ordinary q/dq values are numerical
+> approximations, not task constraints or observations. Native failure
+> flags retain their finite samples; nonfinite states cannot define the
+> next native current_state or a real-valued polynomial.
 
 显式输出分支：
 
@@ -6222,8 +6192,6 @@ def reference_seeds(self, joint_reference=None):
 读取的对象属性：
 
 ```python
-self.budget.trajectory_seeds
-self.budget
 self.physical_domain._curve_map.reference_parameters
 self.physical_domain._curve_map
 self.physical_domain
@@ -6242,26 +6210,24 @@ joint_reference.duration
 joint_reference.sample
 self.formal_clock
 source_times.tolist
-self.start.position[:, None].clone
+self.start.position.clone
 self.start.position
 self.start
-self._reference_ik_query
-self.device_cfg.to_device(layer['values'][tracking:tracking + 1][None]).contiguous
+self.start.velocity.clone
+self.start.velocity
+self.JointState
 self.device_cfg.to_device
 self.device_cfg
-self._select_reference_chains
-self.reference_ik_chains
-targets.append
-np.asarray
-strategies.append
-np.repeat
-self.physical_domain._curve_map.start_q
+self._reference_ik_query
+samples.append
+position[0].detach().cpu().numpy().copy
+position[0].detach().cpu().numpy
+position[0].detach().cpu
+position[0].detach
+np.stack
 self.physical_domain.fit_samples
-controls.append
-reports.append
 self.torch.as_tensor
 self.torch
-np.stack
 self.torch.float64
 self._controls_curve
 self.reference_ik_queries
@@ -6272,12 +6238,7 @@ self.reference_ik_queries
 ```python
 self.joint_reference_report
 self.reference_ik_queries
-self.reference_ik_distinct_counts
-self.reference_ik_chains
-count
 parameters
-targets
-strategies
 source_map
 source_parameters
 original_parameters
@@ -6285,17 +6246,16 @@ columns
 name
 source_times
 values
-previous
-source
-layers
+strategy
+position
+velocity
+previous_time
+samples
 parameter
-layer
-layers[float(parameter)]
-tracking
-chain
-controls
-reports
-target
+moment
+dt
+current
+following
 fitted
 report
 self.initial_seed_strategies
@@ -6318,274 +6278,132 @@ np.interp
 joint_reference.joint_names.index
 joint_reference.sample
 source_times.tolist
-self.start.position[:, None].clone
-self._reference_ik_query
+self.start.position.clone
+self.start.velocity.clone
 float
-self.device_cfg.to_device(layer['values'][tracking:tracking + 1][None]).contiguous
+self.JointState
 self.device_cfg.to_device
-self._select_reference_chains
-targets.append
-np.asarray
-strategies.append
-len
-np.repeat
-self.physical_domain.fit_samples
-controls.append
-reports.append
-self.torch.as_tensor
+list
+self._reference_ik_query
+samples.append
+position[0].detach().cpu().numpy().copy
+position[0].detach().cpu().numpy
+position[0].detach().cpu
+position[0].detach
 np.stack
+self.physical_domain.fit_samples
+self.torch.as_tensor
 self._controls_curve
 ```
 
 ## `_ConstrainedPlanner._reference_ik_query`
 
-[定义位置](../../../manipulation/planning.py#L2938)。
+[定义位置](../../../manipulation/planning.py#L2964)。
 
 输入签名：
 
 ```python
-def _reference_ik_query(self, u, previous, *, warm_start_source):
+def _reference_ik_query(self, u, current_state):
 ```
 
 实现说明：
 
-> Keep one native query's original candidate and static evidence identity.
->
-> ``u`` is normalized physical time; ``previous[1,1,D]`` is the declared
-> warm start in active-joint order. Each query uses the full tool
-> reference, static checks and fixed native seed cap.
-> The execution log is append-only; time-ordered pool views are separate.
+> Solve one pose with one seed, recording its original numerical status.
 
 显式输出分支：
 
 ```python
-{'values': values, 'reports': reports, 'energies': energy, 'tracking': tracking, 'success_count': success_count, 'query_index': query_index}
+position
 ```
 
 读取的对象属性：
 
 ```python
-np.stack
-self.position_domain.lower.detach().cpu().numpy
-self.position_domain.lower.detach().cpu
-self.position_domain.lower.detach
-self.position_domain.lower
-self.position_domain
-self.position_domain.upper.detach().cpu().numpy
-self.position_domain.upper.detach().cpu
-self.position_domain.upper.detach
-self.position_domain.upper
-self.reference_ik_queries
-self.seed_parameter.fill_
-self.seed_parameter
 self._solve_ik
 self._goal
 self.formal_clock
-self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy
-self.ik.get_active_js(result.js_solution).position[0].detach().cpu
-self.ik.get_active_js(result.js_solution).position[0].detach
-self.ik.get_active_js(result.js_solution).position
-self.ik.get_active_js
-self.ik
+current_state.position[:, None].contiguous
+current_state.position
+self.reference_ik
+self.reference_ik.get_active_js(result.js_solution).position[:, 0].detach().clone
+self.reference_ik.get_active_js(result.js_solution).position[:, 0].detach
+self.reference_ik.get_active_js(result.js_solution).position
+self.reference_ik.get_active_js
 result.js_solution
-result.success[0].detach().cpu().numpy
-result.success[0].detach().cpu
-result.success[0].detach
-result.success
-(flags & np.isfinite(values).all(-1)).sum
+position[0].cpu().numpy
+position[0].cpu
 np.isfinite(values).all
 np.isfinite
-self._rank_ik_candidates
-previous[0].detach().cpu().numpy
-previous[0].detach().cpu
-previous[0].detach
-(values >= position_limits[0]).all
-(values <= position_limits[1]).all
-self.reference_ik_distinct_counts.append
-self.reference_ik_distinct_counts
-np.isfinite(values[index]).all
-getattr(result, attribute)[0].detach().cpu().numpy().reshape
-getattr(result, attribute)[0].detach().cpu().numpy
-getattr(result, attribute)[0].detach().cpu
-getattr(result, attribute)[0].detach
-errors.shape
-self.reference_ik_pose_weights
-np.errstate
-report.update
+result.success[0, 0].item
+result.success
+getattr(result, attribute)[0, 0].item
+self.reference_ik_queries
+current_state.dt.item
+current_state.dt
+current_state.position[0].detach().cpu().tolist
+current_state.position[0].detach().cpu
+current_state.position[0].detach
+current_state.velocity[0].detach().cpu().tolist
+current_state.velocity[0].detach().cpu
+current_state.velocity[0].detach
+current_state.velocity
 self.reference_ik_queries.append
-previous.shape
-self.budget.ik_seeds
-self.budget
+self.check_request
 ```
 
 写入目标：
 
 ```python
-position_limits
-query_index
 result
+position
 values
-flags
-success_count
-ranked
-reports
-legal
-qualified
-index
-report
-report['reference_status']
-residuals
+finite
+solved
+errors
 attribute
 name
-errors
-residuals[attribute]
 error
-report[name]
-wp
-wr
-energy
-proposals
-tracking
-report['position_domain_valid']
-report['quadratic_pose_energy']
+errors[name]
+record
 value
-row
+self.reference_initialization
 ```
 
 直接调用符号：
 
 ```python
-np.stack
-self.position_domain.lower.detach().cpu().numpy
-self.position_domain.lower.detach().cpu
-self.position_domain.lower.detach
-self.position_domain.upper.detach().cpu().numpy
-self.position_domain.upper.detach().cpu
-self.position_domain.upper.detach
-len
-self.seed_parameter.fill_
-float
 self._solve_ik
 self._goal
-self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy
-self.ik.get_active_js(result.js_solution).position[0].detach().cpu
-self.ik.get_active_js(result.js_solution).position[0].detach
-self.ik.get_active_js
-result.success[0].detach().cpu().numpy
-result.success[0].detach().cpu
-result.success[0].detach
-int
-(flags & np.isfinite(values).all(-1)).sum
+current_state.position[:, None].contiguous
+self.reference_ik.get_active_js(result.js_solution).position[:, 0].detach().clone
+self.reference_ik.get_active_js(result.js_solution).position[:, 0].detach
+self.reference_ik.get_active_js
+position[0].cpu().numpy
+position[0].cpu
+bool
 np.isfinite(values).all
 np.isfinite
-self._rank_ik_candidates
-previous[0].detach().cpu().numpy
-previous[0].detach().cpu
-previous[0].detach
-(values >= position_limits[0]).all
-(values <= position_limits[1]).all
-self.reference_ik_distinct_counts.append
-enumerate
-np.isfinite(values[index]).all
-getattr(result, attribute)[0].detach().cpu().numpy().reshape
-getattr(result, attribute)[0].detach().cpu().numpy
-getattr(result, attribute)[0].detach().cpu
-getattr(result, attribute)[0].detach
+result.success[0, 0].item
+float
+getattr(result, attribute)[0, 0].item
 getattr
-ValueError
-zip
-np.errstate
-select_ik_tracking_candidate
-bool
-report.update
+len
+current_state.dt.item
+current_state.position[0].detach().cpu().tolist
+current_state.position[0].detach().cpu
+current_state.position[0].detach
+current_state.velocity[0].detach().cpu().tolist
+current_state.velocity[0].detach().cpu
+current_state.velocity[0].detach
+int
 self.reference_ik_queries.append
-```
-
-## `_ConstrainedPlanner._select_reference_chains`
-
-[定义位置](../../../manipulation/planning.py#L3016)。
-
-输入签名：
-
-```python
-def _select_reference_chains(self, layers):
-```
-
-实现说明：
-
-> Select complete numerical chains from the time-ordered pool view.
-
-显式输出分支：
-
-```python
-chains
-```
-
-读取的对象属性：
-
-```python
-self.start.position.detach().cpu().numpy
-self.start.position.detach().cpu
-self.start.position.detach
-self.start.position
-self.start
-np.asarray
-self.formal_clock
-self._seed_velocity_bounds
-self.budget.trajectory_seeds
-self.budget
-np.stack
-self.position_domain.lower.detach().cpu().numpy
-self.position_domain.lower.detach().cpu
-self.position_domain.lower.detach
-self.position_domain.lower
-self.position_domain
-self.position_domain.upper.detach().cpu().numpy
-self.position_domain.upper.detach().cpu
-self.position_domain.upper.detach
-self.position_domain.upper
-self.problem.numerical.joint
-self.problem.numerical
-self.problem
-```
-
-写入目标：
-
-```python
-parameters
-rows
-u
-chains
-row
-chain
-chain['query_parameters']
-chain['candidate_sources']
-index
-```
-
-直接调用符号：
-
-```python
-sorted
-select_ik_chains
-self.start.position.detach().cpu().numpy
-self.start.position.detach().cpu
-self.start.position.detach
-np.asarray
-self._seed_velocity_bounds
-np.stack
-self.position_domain.lower.detach().cpu().numpy
-self.position_domain.lower.detach().cpu
-self.position_domain.lower.detach
-self.position_domain.upper.detach().cpu().numpy
-self.position_domain.upper.detach().cpu
-self.position_domain.upper.detach
-zip
+MotionPlanningError
+self.check_request
 ```
 
 ## `_ConstrainedPlanner.ompl_seed`
 
-[定义位置](../../../manipulation/planning.py#L3037)。
+[定义位置](../../../manipulation/planning.py#L2996)。
 
 输入签名：
 
@@ -6712,6 +6530,7 @@ torch
 search_started
 deadline
 report
+self.last_search_report
 lower
 upper
 tolerance
@@ -6875,7 +6694,7 @@ self.torch.as_tensor
 
 ## `_ConstrainedPlanner.ompl_seed.goals_at_time`
 
-[定义位置](../../../manipulation/planning.py#L3095)。
+[定义位置](../../../manipulation/planning.py#L3058)。
 
 输入签名：
 
@@ -6909,7 +6728,7 @@ float
 
 ## `_ConstrainedPlanner.ompl_seed.check_search`
 
-[定义位置](../../../manipulation/planning.py#L3099)。
+[定义位置](../../../manipulation/planning.py#L3062)。
 
 输入签名：
 
@@ -6942,7 +6761,7 @@ TimeoutError
 
 ## `_ConstrainedPlanner.ompl_seed.state_parts`
 
-[定义位置](../../../manipulation/planning.py#L3105)。
+[定义位置](../../../manipulation/planning.py#L3068)。
 
 输入签名：
 
@@ -7031,7 +6850,7 @@ _torch_interpolate
 
 ## `_ConstrainedPlanner.ompl_seed.equations`
 
-[定义位置](../../../manipulation/planning.py#L3124)。
+[定义位置](../../../manipulation/planning.py#L3087)。
 
 输入签名：
 
@@ -7061,7 +6880,7 @@ cache
 
 ## `_ConstrainedPlanner.ompl_seed.equations.residual_function`
 
-[定义位置](../../../manipulation/planning.py#L3126)。
+[定义位置](../../../manipulation/planning.py#L3089)。
 
 输入签名：
 
@@ -7116,7 +6935,7 @@ torch.cat
 
 ## `_ConstrainedPlanner.ompl_seed.equations.evaluate`
 
-[定义位置](../../../manipulation/planning.py#L3134)。
+[定义位置](../../../manipulation/planning.py#L3097)。
 
 输入签名：
 
@@ -7186,7 +7005,7 @@ min
 
 ## `_ConstrainedPlanner.ompl_seed.valid`
 
-[定义位置](../../../manipulation/planning.py#L3158)。
+[定义位置](../../../manipulation/planning.py#L3121)。
 
 输入签名：
 
@@ -7274,7 +7093,7 @@ terms.items
 
 ## `_ConstrainedPlanner.ompl_seed.proposals`
 
-[定义位置](../../../manipulation/planning.py#L3190)。
+[定义位置](../../../manipulation/planning.py#L3153)。
 
 输入签名：
 
@@ -7336,7 +7155,7 @@ np.asarray
 
 ## `_ConstrainedPlanner.ompl_seed.search_frame`
 
-[定义位置](../../../manipulation/planning.py#L3226)。
+[定义位置](../../../manipulation/planning.py#L3192)。
 
 输入签名：
 
@@ -7368,7 +7187,7 @@ proposals
 
 ## `_ConstrainedPlanner.ompl_seed.stage_valid`
 
-[定义位置](../../../manipulation/planning.py#L3282)。
+[定义位置](../../../manipulation/planning.py#L3248)。
 
 输入签名：
 
@@ -7406,7 +7225,7 @@ valid
 
 ## `_ConstrainedPlanner._functional_goal`
 
-[定义位置](../../../manipulation/planning.py#L3354)。
+[定义位置](../../../manipulation/planning.py#L3320)。
 
 输入签名：
 
@@ -7470,17 +7289,17 @@ quaternion[:, None, None].contiguous
 
 ## `_ConstrainedPlanner._rank_ik_candidates`
 
-[定义位置](../../../manipulation/planning.py#L3374)。
+[定义位置](../../../manipulation/planning.py#L3340)。
 
 输入签名：
 
 ```python
-def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids=()):
+def _rank_ik_candidates(self, candidates, success, previous, u, goal_ids):
 ```
 
 实现说明：
 
-> Rank bounded IK proposals with the same online geometry as trajectory metrics.
+> Rank functional proposals; the current search branch rechecks geometry.
 
 显式输出分支：
 
@@ -7612,7 +7431,7 @@ rank_ik_candidates
 
 ## `_ConstrainedPlanner._rank_ik_candidates.failures`
 
-[定义位置](../../../manipulation/planning.py#L3428)。
+[定义位置](../../../manipulation/planning.py#L3388)。
 
 输入签名：
 
@@ -7671,7 +7490,7 @@ np.isfinite
 
 ## `_ConstrainedPlanner._build_goal_ik_candidates`
 
-[定义位置](../../../manipulation/planning.py#L3444)。
+[定义位置](../../../manipulation/planning.py#L3404)。
 
 输入签名：
 
@@ -7726,6 +7545,7 @@ self._solve_ik
 self.device_cfg.to_device(previous[None]).contiguous
 self.device_cfg.to_device
 self.device_cfg
+self.start
 self.ik.enable_tool_pose_tracking
 self.ik.get_active_js(result.js_solution).position[0].detach().cpu().numpy
 self.ik.get_active_js(result.js_solution).position[0].detach().cpu
@@ -7738,8 +7558,6 @@ result.success[0].detach().cpu
 result.success[0].detach
 result.success
 self._rank_ik_candidates
-np.zeros_like
-report.update
 self.goal_ik_candidates
 candidates[index].tolist
 ```
@@ -7765,7 +7583,6 @@ candidates
 success
 selected
 reports
-report
 self.goal_ik_candidates[u]
 value
 ```
@@ -7806,16 +7623,13 @@ result.success[0].detach().cpu().numpy
 result.success[0].detach().cpu
 result.success[0].detach
 self._rank_ik_candidates
-np.zeros_like
-report.update
-bool
 list
 candidates[index].tolist
 ```
 
 ## `_ConstrainedPlanner.evaluate_reference`
 
-[定义位置](../../../manipulation/planning.py#L3498)。
+[定义位置](../../../manipulation/planning.py#L3457)。
 
 输入签名：
 
@@ -7856,7 +7670,7 @@ row.detach
 
 ## `_ConstrainedPlanner.bind_reference_candidate`
 
-[定义位置](../../../manipulation/planning.py#L3505)。
+[定义位置](../../../manipulation/planning.py#L3464)。
 
 输入签名：
 
@@ -7953,7 +7767,7 @@ getattr
 
 ## `_ConstrainedPlanner._candidate_queries`
 
-[定义位置](../../../manipulation/planning.py#L3534)。
+[定义位置](../../../manipulation/planning.py#L3493)。
 
 输入签名：
 
@@ -8005,7 +7819,7 @@ np.searchsorted
 
 ## `_ConstrainedPlanner._candidate_robot_state`
 
-[定义位置](../../../manipulation/planning.py#L3542)。
+[定义位置](../../../manipulation/planning.py#L3501)。
 
 输入签名：
 
@@ -8054,7 +7868,7 @@ robot_tool_states
 
 ## `_ConstrainedPlanner._candidate_objective`
 
-[定义位置](../../../manipulation/planning.py#L3552)。
+[定义位置](../../../manipulation/planning.py#L3511)。
 
 输入签名：
 
@@ -8135,7 +7949,7 @@ components.values
 
 ## `_ConstrainedPlanner._candidate_metrics`
 
-[定义位置](../../../manipulation/planning.py#L3570)。
+[定义位置](../../../manipulation/planning.py#L3529)。
 
 输入签名：
 
@@ -8238,7 +8052,7 @@ deepcopy
 
 ## `_ConstrainedPlanner._candidate_metrics.maximum`
 
-[定义位置](../../../manipulation/planning.py#L3591)。
+[定义位置](../../../manipulation/planning.py#L3550)。
 
 输入签名：
 
@@ -8277,7 +8091,7 @@ value.max
 
 ## `_ConstrainedPlanner._candidate_geometry`
 
-[定义位置](../../../manipulation/planning.py#L3606)。
+[定义位置](../../../manipulation/planning.py#L3565)。
 
 输入签名：
 
@@ -8365,7 +8179,7 @@ float
 
 ## `_ConstrainedPlanner._candidate_geometry.query`
 
-[定义位置](../../../manipulation/planning.py#L3627)。
+[定义位置](../../../manipulation/planning.py#L3586)。
 
 输入签名：
 
@@ -8497,7 +8311,7 @@ states.values
 
 ## `_ConstrainedPlanner.evaluate_candidate`
 
-[定义位置](../../../manipulation/planning.py#L3691)。
+[定义位置](../../../manipulation/planning.py#L3650)。
 
 输入签名：
 
@@ -8588,7 +8402,7 @@ max
 
 ## `_ConstrainedPlanner.optimize`
 
-[定义位置](../../../manipulation/planning.py#L3732)。
+[定义位置](../../../manipulation/planning.py#L3691)。
 
 输入签名：
 
@@ -8596,10 +8410,14 @@ max
 def optimize(self, seed, *, iterations=None):
 ```
 
+实现说明：
+
+> Yield each completed solve before starting the next original seed.
+
 显式输出分支：
 
 ```python
-results
+result
 ```
 
 读取的对象属性：
@@ -8624,7 +8442,6 @@ np.isfinite
 self._controls_curve
 np.asarray
 type(export_error).__name__
-results.append
 self.last_optimizer_diagnostics.append
 self.last_optimizer_diagnostics
 result.report
@@ -8633,7 +8450,6 @@ result.report
 写入目标：
 
 ```python
-results
 self.last_optimizer_diagnostics
 self.last_optimizer_runtime
 self.diagnostic_optimizer_candidate
@@ -8668,23 +8484,27 @@ np.asarray
 deepcopy
 type
 str
-results.append
 self.last_optimizer_diagnostics.append
 ```
 
 ## `_ConstrainedPlanner.select_candidate`
 
-[定义位置](../../../manipulation/planning.py#L3786)。
+[定义位置](../../../manipulation/planning.py#L3746)。
 
 输入签名：
 
 ```python
-def select_candidate(self, results, *, record_work):
+def select_candidate(self, results, *, record_work, on_candidate):
 ```
 
 实现说明：
 
-> Score proposed curves, then verify each on the common exact-curve boundary.
+> Validate each completed result and publish it before advancing its iterator.
+>
+> The callback receives the current saved curve and its exact validation
+> while they still own the native delivery buffers. The caller freezes a
+> qualified incumbent there. Result order is the original seed order;
+> fixed_objective compares completed accepted curves in common units.
 
 显式输出分支：
 
@@ -8704,34 +8524,34 @@ reports.append
 self._controls_curve
 self._candidate_objective
 self.scene
-proposals.append
-proposals.sort
 self.evaluate_candidate
 report.update
 report['residuals'].values
 np.isfinite(values).all
+self.last_validation
 ```
 
 写入目标：
 
 ```python
-proposals
 reports
+selected
+selected_key
+query_points
 index
 result
 provenance
 trajectory
 objective
-selected
-selected_key
-query_points
 report
 points
+current
+self.delivery_candidate
 values
 severity
 value
 key
-self.delivery_candidate
+self.last_validation
 ```
 
 直接调用符号：
@@ -8745,22 +8565,21 @@ reports.append
 float
 self._controls_curve
 self._candidate_objective
-proposals.append
-MotionPlanningError
-proposals.sort
 self.evaluate_candidate
 report.update
+len
+on_candidate
 list
 report['residuals'].values
 np.isfinite(values).all
 sum
 max
-len
+MotionPlanningError
 ```
 
 ## `_ConstrainedPlanner._controls_curve`
 
-[定义位置](../../../manipulation/planning.py#L3820)。
+[定义位置](../../../manipulation/planning.py#L3787)。
 
 输入签名：
 
@@ -8854,7 +8673,7 @@ getattr
 
 ## `_ConstrainedPlanner._candidate_domain_validation`
 
-[定义位置](../../../manipulation/planning.py#L3845)。
+[定义位置](../../../manipulation/planning.py#L3812)。
 
 输入签名：
 
@@ -8969,7 +8788,7 @@ asdict
 
 ## `_ConstrainedPlanner.export`
 
-[定义位置](../../../manipulation/planning.py#L3876)。
+[定义位置](../../../manipulation/planning.py#L3843)。
 
 输入签名：
 
@@ -9006,7 +8825,7 @@ MotionPlanningError
 
 ## `_verified_dependency_outcomes`
 
-[定义位置](../../../manipulation/planning.py#L3886)。
+[定义位置](../../../manipulation/planning.py#L3853)。
 
 输入签名：
 
@@ -9067,7 +8886,7 @@ satisfied.add
 
 ## `_bind_motion_work_ledger`
 
-[定义位置](../../../manipulation/planning.py#L3908)。
+[定义位置](../../../manipulation/planning.py#L3875)。
 
 输入签名：
 
@@ -9121,7 +8940,7 @@ deepcopy
 
 ## `MotionPlanningError`
 
-[定义位置](../../../manipulation/planning.py#L3927)。
+[定义位置](../../../manipulation/planning.py#L3894)。
 
 ```python
 class MotionPlanningError(ValueError):
@@ -9137,7 +8956,7 @@ class MotionPlanningError(ValueError):
 
 ## `MotionPlanningError.__init__`
 
-[定义位置](../../../manipulation/planning.py#L3929)。
+[定义位置](../../../manipulation/planning.py#L3896)。
 
 输入签名：
 
@@ -9170,7 +8989,7 @@ super
 
 ## `MotionBackend`
 
-[定义位置](../../../manipulation/planning.py#L3934)。
+[定义位置](../../../manipulation/planning.py#L3901)。
 
 ```python
 class MotionBackend():
@@ -9190,7 +9009,7 @@ class MotionBackend():
 
 ## `MotionBackend.__init__`
 
-[定义位置](../../../manipulation/planning.py#L3941)。
+[定义位置](../../../manipulation/planning.py#L3908)。
 
 输入签名：
 
@@ -9229,7 +9048,7 @@ Lock
 
 ## `MotionBackend._claim`
 
-[定义位置](../../../manipulation/planning.py#L3949)。
+[定义位置](../../../manipulation/planning.py#L3916)。
 
 输入签名：
 
@@ -9264,7 +9083,7 @@ get_ident
 
 ## `MotionBackend._release`
 
-[定义位置](../../../manipulation/planning.py#L3954)。
+[定义位置](../../../manipulation/planning.py#L3921)。
 
 输入签名：
 
@@ -9300,7 +9119,7 @@ self._busy.release
 
 ## `MotionBackend.bind_request`
 
-[定义位置](../../../manipulation/planning.py#L3960)。
+[定义位置](../../../manipulation/planning.py#L3927)。
 
 输入签名：
 
@@ -9346,7 +9165,7 @@ self._planner.rebind
 
 ## `MotionBackend.plan`
 
-[定义位置](../../../manipulation/planning.py#L3976)。
+[定义位置](../../../manipulation/planning.py#L3943)。
 
 输入签名：
 
@@ -9381,7 +9200,7 @@ plan_trajectory
 
 ## `MotionBackend.close`
 
-[定义位置](../../../manipulation/planning.py#L3983)。
+[定义位置](../../../manipulation/planning.py#L3950)。
 
 输入签名：
 
@@ -9419,7 +9238,7 @@ self._release
 
 ## `plan_trajectory`
 
-[定义位置](../../../manipulation/planning.py#L3996)。
+[定义位置](../../../manipulation/planning.py#L3963)。
 
 输入签名：
 
@@ -9511,25 +9330,17 @@ planner.budget.interpolation_dt
 problem.source_time_map
 planner.progress_map
 planner.reference_seeds
-planner.ik.config.exit_early
-planner.ik.config
-planner.ik
-planner.reference_ik_distinct_counts
+planner.reference_ik.config.exit_early
+planner.reference_ik.config
+planner.reference_ik
 planner.initial_seed_strategies
 planner.reference_ik_queries
-planner.reference_ik_chains
 planner.joint_reference_report
 planner.evaluate_reference
+budget.search_seconds
 planner.optimize
 planner.main_trajectory_iterations
-diagnostics['attempts'].append
 original_budget.maximum_trajectory_solves
-attempt['collision_residuals'].values
-attempt['coverage_residuals'].values
-budget.search_seconds
-planner.ompl_seed
-report.get
-seeds.shape
 planner.route
 error.reason
 type(error).__name__
@@ -9596,6 +9407,7 @@ scene.gripper.commands
 row
 planner.check_request
 planner.request_work
+planner.request_work_baseline
 planner.remaining_request_seconds
 planner.satisfied_dependencies
 diagnostics['joint_state_computation']
@@ -9629,16 +9441,8 @@ attempt
 diagnostics['reference_candidate']
 observation_required
 recovery
+search_used
 consumed['trajectory_solves']
-collision_failed
-coverage_failed
-search_started
-recovered
-report
-consumed['search_seconds']
-consumed['search_queries']
-diagnostics['ompl']
-planner.seed_strategies
 candidate_source
 diagnostics['improvement_end']
 provenance
@@ -9724,13 +9528,9 @@ bool
 planner.evaluate_reference
 select_candidate
 curve_snapshot
-qualify_native
+geometry_failed
+search_initializers
 planner.optimize
-diagnostics['attempts'].append
-attempt['collision_residuals'].values
-attempt['coverage_residuals'].values
-planner.ompl_seed
-report.get
 deliver_incumbent
 type
 traceback.format_exc
@@ -9744,7 +9544,7 @@ diagnostics.get
 
 ## `plan_trajectory.mark_wallclock`
 
-[定义位置](../../../manipulation/planning.py#L4024)。
+[定义位置](../../../manipulation/planning.py#L3991)。
 
 输入签名：
 
@@ -9778,7 +9578,7 @@ time.monotonic
 
 ## `plan_trajectory.check`
 
-[定义位置](../../../manipulation/planning.py#L4068)。
+[定义位置](../../../manipulation/planning.py#L4035)。
 
 输入签名：
 
@@ -9820,7 +9620,7 @@ _check_work_budget
 
 ## `plan_trajectory.record_validation_work`
 
-[定义位置](../../../manipulation/planning.py#L4079)。
+[定义位置](../../../manipulation/planning.py#L4046)。
 
 输入签名：
 
@@ -9851,7 +9651,7 @@ check
 
 ## `plan_trajectory.remaining_request_seconds`
 
-[定义位置](../../../manipulation/planning.py#L4187)。
+[定义位置](../../../manipulation/planning.py#L4157)。
 
 输入签名：
 
@@ -9891,7 +9691,7 @@ time.monotonic
 
 ## `plan_trajectory.qualify_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4225)。
+[定义位置](../../../manipulation/planning.py#L4195)。
 
 输入签名：
 
@@ -9966,7 +9766,7 @@ mark_wallclock
 
 ## `plan_trajectory.deliver_incumbent`
 
-[定义位置](../../../manipulation/planning.py#L4284)。
+[定义位置](../../../manipulation/planning.py#L4254)。
 
 输入签名：
 
@@ -10009,7 +9809,7 @@ deepcopy
 
 ## `plan_trajectory.qualify_native`
 
-[定义位置](../../../manipulation/planning.py#L4298)。
+[定义位置](../../../manipulation/planning.py#L4268)。
 
 输入签名：
 
@@ -10049,9 +9849,45 @@ planner.export
 qualify_candidate
 ```
 
+## `plan_trajectory.on_candidate`
+
+[定义位置](../../../manipulation/planning.py#L4343)。
+
+输入签名：
+
+```python
+def on_candidate(result, candidate_report):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+planner.delivery_candidate
+diagnostics['attempts'].append
+```
+
+写入目标：
+
+```python
+trajectory
+attempt
+```
+
+直接调用符号：
+
+```python
+diagnostics['attempts'].append
+deepcopy
+qualify_native
+```
+
 ## `plan_trajectory.select_candidate`
 
-[定义位置](../../../manipulation/planning.py#L4375)。
+[定义位置](../../../manipulation/planning.py#L4350)。
 
 输入签名：
 
@@ -10062,7 +9898,7 @@ def select_candidate(result):
 显式输出分支：
 
 ```python
-planner.select_candidate(result, record_work=record_validation_work)
+planner.select_candidate(result, record_work=record_validation_work, on_candidate=on_candidate)
 ```
 
 读取的对象属性：
@@ -10079,4 +9915,113 @@ planner.select_candidate
 
 ```python
 planner.select_candidate
+```
+
+## `plan_trajectory.geometry_failed`
+
+[定义位置](../../../manipulation/planning.py#L4367)。
+
+输入签名：
+
+```python
+def geometry_failed(candidate_report):
+```
+
+实现说明：
+
+> Search only from explicit collision or forbidden-coverage residuals.
+
+显式输出分支：
+
+```python
+any((np.isfinite(value) and value > 0 for name in ('collision_residuals', 'coverage_residuals') for value in candidate_report[name].values()))
+```
+
+读取的对象属性：
+
+```python
+np.isfinite
+candidate_report[name].values
+```
+
+写入目标：
+
+```python
+name
+value
+```
+
+直接调用符号：
+
+```python
+any
+np.isfinite
+candidate_report[name].values
+```
+
+## `plan_trajectory.search_initializers`
+
+[定义位置](../../../manipulation/planning.py#L4373)。
+
+输入签名：
+
+```python
+def search_initializers(candidate):
+```
+
+实现说明：
+
+> Spend the single search opportunity and preserve the original local seed.
+
+显式输出分支：
+
+```python
+seeds
+planner.torch.cat((recovered.to(seeds), seeds), dim=1)[:, :count]
+```
+
+读取的对象属性：
+
+```python
+time.monotonic
+planner.ompl_seed
+planner.last_search_report
+report.get
+budget.trajectory_seeds
+planner.initial_seed_strategies
+planner.torch.cat
+planner.torch
+recovered.to
+```
+
+写入目标：
+
+```python
+search_used
+recovery
+stage
+planner.last_search_report
+diagnostics['used_ompl']
+search_started
+recovered
+report
+elapsed
+consumed['search_seconds']
+consumed['search_queries']
+diagnostics['ompl']
+count
+planner.seed_strategies
+```
+
+直接调用符号：
+
+```python
+time.monotonic
+planner.ompl_seed
+report.get
+deepcopy
+check
+list
+planner.torch.cat
+recovered.to
 ```
