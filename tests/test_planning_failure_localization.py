@@ -65,13 +65,15 @@ def test_native_pair_failures_keep_candidate_time_and_mode_on_a_progress_plateau
     quaternion = q.new_zeros((2, 2, 4)); quaternion[..., 0] = 1.
     evidence, diagnostics, counts = [], {}, {}
     # BEGIN full evidence is compared with its own original Coal query.
-    native_results, original_query = [], original.robot_model.query
+    native_results, original_query = [], original.robot_model.query_pair_batches
     def capture_native(*args, **kwargs):
-        result = original_query(*args, **kwargs)
-        native_results.append(result)
-        return result
+        # BEGIN retain the actual numeric rows before scene evidence assembly.
+        for batch in original_query(*args, **kwargs):
+            native_results.extend(batch)
+            yield batch
+        # END state-major rows retain their original expanded time index.
     with patch.object(original, "evaluate", wraps=original.evaluate) as evaluate, \
-         patch.object(original.robot_model, "query", side_effect=capture_native) as native:
+         patch.object(original.robot_model, "query_pair_batches", side_effect=capture_native) as native:
         scene.evaluate = evaluate
         residual = _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.),
             mapping, q.new_empty((2, 2, 0, 4)), q.new_zeros((2, 2, 3)), quaternion,
@@ -79,7 +81,8 @@ def test_native_pair_failures_keep_candidate_time_and_mode_on_a_progress_plateau
             normalized_time=parameters, component_diagnostics=diagnostics,
             geometry_evidence_out=evidence, geometry_scope="robot", query_counts=counts)
     np.testing.assert_allclose(residual.numpy(), [[0., .008], [.005, 0.]], atol=1e-10)
-    assert evaluate.call_count == 1 and native.call_count == 8
+    assert evaluate.call_count == 1 and native.call_count == 1
+    assert len(native_results) == 8
     assert counts == {"exact_states": 4, "left_states": 2, "right_states": 2, "evaluated_states": 8}
     failures = [row for row in evidence if row["status"] == "intersection"]
     assert {(tuple(row["query_index"]), row["side"], row["time_s"]) for row in failures} == {
@@ -96,10 +99,12 @@ def test_native_pair_failures_keep_candidate_time_and_mode_on_a_progress_plateau
         # Original Coal witness points reach the report unchanged. Their
         # signed separation along the reported normal explains the rejection.
         native_index = np.ravel_multi_index(tuple(row["state_index"]), expanded_shape)
-        saved = native_results[native_index]["pairs"][0]
-        assert row["signed_distance_m"] == saved["signed_distance_m"]
-        for key in ("witness_first", "witness_second", "normal_first_to_second"):
-            np.testing.assert_array_equal(row[key], saved[key])
+        saved = native_results[native_index][0]
+        assert row["signed_distance_m"] == saved[0]
+        for key, columns in (("witness_first", slice(1, 4)),
+                             ("witness_second", slice(4, 7)),
+                             ("normal_first_to_second", slice(7, 10))):
+            np.testing.assert_array_equal(row[key], saved[columns])
         signed = np.dot(np.asarray(row["witness_second"])-row["witness_first"],
                         row["normal_first_to_second"])
         assert signed == pytest.approx(row["signed_distance_m"], abs=1e-10)

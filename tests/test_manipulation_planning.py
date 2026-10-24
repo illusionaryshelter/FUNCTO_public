@@ -857,7 +857,8 @@ class SerialAllocationTests(unittest.TestCase):
         world.owners = tuple(SimpleNamespace(query=world.background, owner_id=f'owner{i}',
             pose_path=SimpleNamespace(progress=(0., 1.))) for i in range(2))
         world.robot_model = SimpleNamespace(geometry_names=('body','tool'), joint_names=('a','b'),
-            native_query_storage_nbytes=131072, _native_distance_batches=None)
+            native_query_storage_nbytes=131072, native_query_resident_nbytes=0,
+            native_query_temporary_nbytes=262144, _native_pair_table=None)
         budget = PlanningBudget()
         metadata = {'active_joint_names': ('a','b'), 'links': 4, 'spheres': 0}
         initialized = torch.cuda.is_initialized()

@@ -2,6 +2,7 @@
 
 # BEGIN exact floating-point and lifecycle checks for native many-pair queries.
 from contextlib import contextmanager
+from copy import deepcopy
 from itertools import combinations
 from pathlib import Path
 import struct
@@ -45,20 +46,45 @@ def assert_bits_equal(expected, actual):
         assert actual == expected
 
 
-def scalar_distances(checker, pairs, poses):
-    """Independent reference uses Coal's original per-call fresh solver API."""
-    transforms = {name: coal.Transform3s(pose[:3, :3], pose[:3, 3]) for name, pose in poses.items()}
-    for pair in pairs:
-        result = coal.DistanceResult()
-        coal.distance(checker._geometries[pair.first][1], transforms[pair.first],
-                      checker._geometries[pair.second][1], transforms[pair.second], checker._request, result)
-        yield result
+# BEGIN one scalar library reference checks both public and compact consumers.
+class ScalarPairTable:
+    """Independent cold Coal calls implement only the distance output contract.
+
+    Projection bounds have separate high-precision tests. These comparisons
+    disable their mask so that they isolate distance, witness and report
+    preservation across the C++ boundary.
+    """
+
+    def __init__(self, shapes, indices):
+        self.shapes, self.indices = tuple(shapes), np.array(indices, copy=True)
+
+    def query(self, poses, mask, request):
+        assert not np.asarray(mask).any()
+        output = np.zeros((len(poses), len(self.indices), 12))
+        for state, matrices in enumerate(poses):
+            transforms = [coal.Transform3s(pose[:3, :3], pose[:3, 3]) for pose in matrices]
+            for index, (first, second) in enumerate(self.indices):
+                result = coal.DistanceResult()
+                coal.distance(self.shapes[first], transforms[first], self.shapes[second],
+                              transforms[second], request, result)
+                a, b, normal = (np.asarray(value, dtype=float) for value in
+                    (result.getNearestPoint1(), result.getNearestPoint2(), result.normal))
+                output[state, index, :10] = np.r_[result.min_distance, a, b, normal]
+                output[state, index, 10] = np.linalg.norm(b-a-result.min_distance*normal)
+        return output
 
 
 @contextmanager
-def scalar_reference():
-    with patch.object(RobotGeometryChecker, "_native_pair_distances", scalar_distances):
-        yield
+def scalar_reference(checker):
+    """Replace only this call's table, restoring the real cached native owner."""
+    native = checker._native_pair_table
+    checker._native_pair_table = None
+    try:
+        with patch.object(module, "NativePairTable", ScalarPairTable):
+            yield
+    finally:
+        checker._native_pair_table = native
+# END independent distances do not reuse production solver histories.
 
 
 def make_checker(tmp_path, extra=()):
@@ -81,7 +107,7 @@ def query(checker, q, pairs=None):
                          if pairs is None else pairs)
 
 
-def test_pristine_history_keeps_all_report_words_under_repeated_and_reversed_states(tmp_path):
+def test_cold_queries_keep_all_report_words_under_repeated_and_reversed_states(tmp_path):
     checker = make_checker(tmp_path)
     rng = np.random.default_rng(202610041)
     states = []
@@ -93,7 +119,7 @@ def test_pristine_history_keeps_all_report_words_under_repeated_and_reversed_sta
     states += [np.asarray([0., 0., value]) for value in
                (1., np.nextafter(1., 0.), np.nextafter(1., 2.), -0.)]
     for state in states + states[::-1]:
-        with scalar_reference():
+        with scalar_reference(checker):
             expected = query(checker, state)
         assert_bits_equal(expected, query(checker, state))
 
@@ -110,12 +136,13 @@ def test_pair_orientation_policy_empty_queries_and_rebinding_preserve_reports(tm
          PairQuery("box", "prism", "diagnostic", "reversed witnesses")),
         (), (PairQuery("prism", "box", "required", "first"),)]
     for pairs in tables:
-        with scalar_reference():
+        with scalar_reference(checker):
             expected = query(checker, [.1, -.2, 1.2], pairs)
         assert_bits_equal(expected, query(checker, [.1, -.2, 1.2], pairs))
 
 
-def test_more_than_one_bounded_block_preserves_original_pair_order(tmp_path, monkeypatch):
+# BEGIN compact batches preserve explicit state/pair order and table ownership.
+def test_multiple_chunks_preserve_pair_order_and_share_the_public_query_table(tmp_path):
     extra = []
     for index in range(17):
         local = np.eye(4)
@@ -124,51 +151,93 @@ def test_more_than_one_bounded_block_preserves_original_pair_order(tmp_path, mon
     checker = make_checker(tmp_path, extra)
     pairs = tuple(PairQuery(first, second, "diagnostic", "complete explicit pair table")
                   for first, second in combinations(checker.geometry_names, 2))
-    with scalar_reference():
+    with scalar_reference(checker):
         expected = query(checker, [0., .1, 1.5], pairs)
-    sizes = []
-    original = module.pin.computeDistances
-
-    def recorded(model, data):
-        sizes.append(len(model.collisionPairs))
-        return original(model, data)
-
-    monkeypatch.setattr(module.pin, "computeDistances", recorded)
     assert_bits_equal(expected, query(checker, [0., .1, 1.5], pairs))
-    assert sizes == [128, len(pairs)-128]
-    schema = checker._native_distance_batches
-    assert [len(block[1].collisionPairs) for block in schema[1]] == sizes
-    # All blocks survive a second state; only their mutable solvers are reset.
-    old_models = [block[1] for block in schema[1]]
-    query(checker, [0., .2, 1.4], pairs)
-    assert all(before is after[1] for before, after in zip(old_models, checker._native_distance_batches[1]))
-    assert checker.native_query_storage_nbytes > sum(block[1].collisionPairMapping.nbytes for block in schema[1])
+    table = checker._native_pair_table[2]
+    # 171 pairs cross the declared 4096-query chunk at 24 states. Each
+    # output row belongs to the original state and supplied endpoint order.
+    states = np.asarray([[0., .1+.001*index, 1.5] for index in range(49)])
+    batches = list(checker.query_pair_batches(joint_names=("qx", "qy", "qz"),
+        joint_positions=states, T_reference_base=np.eye(4), pairs=pairs,
+        projection_mask=np.zeros((len(states), len(pairs)), dtype=bool)))
+    assert [len(batch) for batch in batches] == [23, 23, 3]
+    assert checker._native_pair_table[2] is table
+    flattened = [state for batch in batches for state in batch]
+    for index in (0, 22, 23, 45, 46, 48):
+        with scalar_reference(checker):
+            reference = query(checker, states[index], pairs)
+        for actual, row in zip(flattened[index], reference["pairs"]):
+            np.testing.assert_array_equal(actual[:10], [row["signed_distance_m"],
+                *row["witness_first"], *row["witness_second"], *row["normal_first_to_second"]])
+    # Policies belong to the report. Reusing exactly these oriented endpoints
+    # with different explicit policy metadata does not rebuild native shapes.
+    changed = tuple(PairQuery(pair.first, pair.second, "excluded", "changed declaration") for pair in pairs)
+    result = query(checker, states[0], changed)
+    assert checker._native_pair_table[2] is table
+    assert all(row["policy"] == "excluded" for row in result["pairs"])
+    saved = deepcopy(batches)
+    query(checker, states[-1], tuple(reversed(pairs)))
+    assert checker._native_pair_table[2] is not table
+    assert_bits_equal(saved, batches)
+# END numeric results outlive table replacement and subsequent queries.
 
 
-def test_native_exception_and_nonfinite_evidence_never_return_a_success(tmp_path, monkeypatch):
+# BEGIN native failures and cancellation cannot deliver a completed report.
+def test_native_exception_and_nonfinite_input_never_return_a_success(tmp_path, monkeypatch):
     checker = make_checker(tmp_path)
-    original = module.pin.computeDistances
+    original = module.NativePairTable
 
-    def failed(*unused):
-        raise RuntimeError("native query failure with pair context")
+    class FailedTable:
+        def __init__(self, *args):
+            pass
 
-    monkeypatch.setattr(module.pin, "computeDistances", failed)
+        def query(self, *args):
+            raise RuntimeError("native query failure at state 0 pair 0")
+
+    monkeypatch.setattr(module, "NativePairTable", FailedTable)
     with pytest.raises(RuntimeError, match="native query failure"):
         query(checker, [0., 0., 2.])
     # Input errors remain before the native routine, regardless of its failure.
     with pytest.raises(ValueError, match="finite"):
         query(checker, [0., 0., np.nan])
 
-    def nonfinite(model, data):
-        value = original(model, data)
-        data.distanceResults[0].min_distance = np.nan
-        return value
-
-    monkeypatch.setattr(module.pin, "computeDistances", nonfinite)
-    with pytest.raises(RuntimeError, match="nonfinite geometry evidence for prism, box"):
-        query(checker, [0., 0., 2.])
-    monkeypatch.setattr(module.pin, "computeDistances", original)
-    with scalar_reference():
+    monkeypatch.setattr(module, "NativePairTable", original)
+    checker._native_pair_table = None
+    with scalar_reference(checker):
         expected = query(checker, [0., 0., 2.])
     assert_bits_equal(expected, query(checker, [0., 0., 2.]))
+    table = checker._native_pair_table[2]
+    poses = np.broadcast_to(np.eye(4), (1, 2, 4, 4)).copy()
+    poses[0, 0, 0, 3] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        table.query(poses, np.zeros((1, 1), bool), checker._request)
+
+
+def test_cancellation_after_native_chunk_precedes_its_first_delivered_state(tmp_path, monkeypatch):
+    checker = make_checker(tmp_path)
+    original = module.NativePairTable
+    calls = []
+
+    class RecordedTable:
+        def __init__(self, *args):
+            self.native = original(*args)
+
+        def query(self, poses, mask, request):
+            result = self.native.query(poses, mask, request)
+            calls.append(len(poses))
+            return result
+
+    monkeypatch.setattr(module, "NativePairTable", RecordedTable)
+    pairs = (PairQuery("prism", "box", "required", "explicit pair"),)
+    def check():
+        if calls:
+            raise TimeoutError("declared request deadline")
+    batches = checker.query_pair_batches(joint_names=("qx", "qy", "qz"),
+        joint_positions=np.tile([0., 0., 2.], (3, 1)), T_reference_base=np.eye(4),
+        pairs=pairs, projection_mask=np.zeros((3, 1), dtype=bool), check_request=check)
+    with pytest.raises(TimeoutError, match="request deadline"):
+        next(batches)
+    assert calls == [3]
+# END no candidate can consume numeric evidence after its cancellation check.
 # END no tolerance, sampling reduction, GPU or simulation participates.

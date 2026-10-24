@@ -29,24 +29,6 @@ def _native_bounds(geometry, transform):
     return np.asarray(intervals, dtype=float).T
 
 
-# BEGIN full native-entity separation from certified support projections.
-def native_pair_lower_bound(first, first_pose, second, second_pose, direction):
-    """Return a whole-entity distance lower bound along a proposed direction.
-
-    The direction may come from a numerical distance solver. Its quality can
-    affect tightness only: both support intervals retain their outward error.
-    """
-    direction = np.asarray(direction, float)
-    length = float(np.linalg.norm(direction))
-    if length == 0.:
-        return 0.
-    a = native_projection_bounds(first, _transform(first_pose), direction)
-    b = native_projection_bounds(second, _transform(second_pose), direction)
-    gap = max(0., float(b[0] - a[1]), float(a[0] - b[1]))
-    error = _GAMMA * sum(abs(float(value)) for value in (*a, *b))
-    return max(0., float(np.nextafter((gap-error)/(length*(1+_GAMMA)), -np.inf)))
-# END no overlap of projection intervals is interpreted as penetration.
-
 
 def _projection_gap(geometry, transform, box):
     """Certify a lower bound using a direction proposed by Coal.

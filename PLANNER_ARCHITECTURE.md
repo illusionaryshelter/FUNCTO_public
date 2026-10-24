@@ -1,6 +1,6 @@
 # FUNCTO 运动规划器架构
 
-求解与几何算法基线为 `be44b54`；候选交付及执行绑定数据转换分别以 [planning API](docs/planner-architecture/api/planning.md) 和 [execution_binding API](docs/planner-architecture/api/execution_binding.md) 所列代码提交为准。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+求解与观测场算法基线为 `be44b54`，官方机器人距离批处理基线为 `NATIVE_IMPLEMENTATION_COMMIT`；候选交付及执行绑定数据转换分别以 [planning API](docs/planner-architecture/api/planning.md) 和 [execution_binding API](docs/planner-architecture/api/execution_binding.md) 所列代码提交为准。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 系统将完整技能表示、标定 RGB-D 观测场、具名机器人反馈、固定机器人官方模型和任务声明转化为关节曲线及模型验收报告。规划、设备执行和仿真事后评价分别处理名义模型、机器人反馈和实际任务效果。
 

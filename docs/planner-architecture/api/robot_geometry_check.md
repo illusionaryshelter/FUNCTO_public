@@ -1,11 +1,11 @@
 # `manipulation/robot_geometry_check.py` 实现契约
 
-代码基线：`be44b54`。
-职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`NATIVE_IMPLEMENTATION_COMMIT`。
+职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_name`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L29)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L31)。
 
 输入签名：
 
@@ -39,7 +39,7 @@ ValueError
 
 ## `_rigid_pose`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L35)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L37)。
 
 输入签名：
 
@@ -93,7 +93,7 @@ pose.astype
 
 ## `NativeSolid`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L47)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L49)。
 
 ```python
 class NativeSolid():
@@ -120,7 +120,7 @@ source: str
 
 ## `PairQuery`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L64)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L66)。
 
 ```python
 class PairQuery():
@@ -147,7 +147,7 @@ source: str
 
 ## `NativePrimitive`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L81)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L83)。
 
 ```python
 class NativePrimitive():
@@ -175,7 +175,7 @@ source: str
 
 ## `_convex_solid`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L98)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L100)。
 
 输入签名：
 
@@ -233,7 +233,7 @@ coal.ConvexBase.convexHull
 
 ## `RobotGeometryChecker`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L112)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L114)。
 
 ```python
 class RobotGeometryChecker():
@@ -249,7 +249,7 @@ class RobotGeometryChecker():
 
 ## `RobotGeometryChecker.__init__`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L115)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L117)。
 
 输入签名：
 
@@ -321,7 +321,6 @@ coal.DistanceRequest
 self._request
 self._request.gjk_tolerance
 self._request.epa_tolerance
-name.encode
 self._request.epa_max_iterations
 ```
 
@@ -362,12 +361,11 @@ identity
 self._request
 self._request.enable_signed_distance
 self.numerics
-self._native_distance_batches
+self._native_pair_table
 self._query_schema
 pair_count
-block_geometries
-name_bytes
 self.native_query_storage_nbytes
+self.native_query_temporary_nbytes
 ```
 
 直接调用符号：
@@ -414,14 +412,12 @@ list
 local_pose.tolist
 self._geometry_model.append
 coal.DistanceRequest
-min
-sum
-name.encode
+max
 ```
 
 ## `RobotGeometryChecker._frame_id`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L222)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L219)。
 
 输入签名：
 
@@ -460,7 +456,7 @@ ValueError
 
 ## `RobotGeometryChecker.geometry_names`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L230)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L227)。
 
 输入签名：
 
@@ -496,7 +492,7 @@ tuple
 
 ## `RobotGeometryChecker.geometry_sources`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L235)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L232)。
 
 输入签名：
 
@@ -532,7 +528,7 @@ self._geometries.items
 
 ## `RobotGeometryChecker.model_record`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L238)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L235)。
 
 输入签名：
 
@@ -569,7 +565,7 @@ deepcopy
 
 ## `RobotGeometryChecker.geometry_depending_on`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L242)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L239)。
 
 输入签名：
 
@@ -622,29 +618,24 @@ result.append
 tuple
 ```
 
-## `RobotGeometryChecker.query`
+## `RobotGeometryChecker._prepare_query`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L256)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L254)。
 
 输入签名：
 
 ```python
-def query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(), check_request=None):
+def _prepare_query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(), check_request=None):
 ```
 
 实现说明：
 
-> Return JSON-ready FK, raw signed distances, witnesses and limits.
->
-> Only the explicitly requested pairs are queried. This function reports
-> numerical geometry relations without an overall collision-valid flag:
-> policy exclusions, unknown space and continuous motion belong to the
-> original caller, and no inferred ignore can enter this diagnostic.
+> Validate one complete named state and compute its float64 FK poses.
 
 显式输出分支：
 
 ```python
-{'joint_names': list(names), 'joint_positions': values.astype(float).tolist(), 'joint_limit_violations': violations, 'frame_poses': {name: pose.tolist() for (name, pose) in poses.items()}, 'geometry_poses': {name: pose.tolist() for (name, pose) in geometry_poses.items()}, 'geometry_sources': {name: value[2] for (name, value) in self._geometries.items()}, 'numerics': dict(self.numerics), 'pairs': rows}
+(names, values, violations, poses, geometry_poses, pair_list)
 ```
 
 读取的对象属性：
@@ -679,25 +670,6 @@ self._data.oMf[index].homogeneous
 self._data.oMf
 frame_ids.items
 self._geometries.items
-self._native_pair_distances
-self.numerics
-result.min_distance
-result.getNearestPoint1
-result.getNearestPoint2
-result.normal
-np.isfinite(np.concatenate(([distance], first, second, normal))).all
-np.concatenate
-rows.append
-first.tolist
-second.tolist
-normal.tolist
-np.linalg.norm
-np.linalg
-values.astype(float).tolist
-values.astype
-pose.tolist
-poses.items
-geometry_poses.items
 ```
 
 写入目标：
@@ -733,16 +705,6 @@ geometry_poses
 frame
 _
 local
-distances
-rows
-boundary
-result
-distance
-first
-second
-normal
-relation
-pose
 ```
 
 直接调用符号：
@@ -772,60 +734,26 @@ pin.forwardKinematics
 pin.updateFramePlacements
 frame_ids.items
 self._geometries.items
-self._native_pair_distances
-max
-result.getNearestPoint1
-result.getNearestPoint2
-np.isfinite(np.concatenate(([distance], first, second, normal))).all
-np.concatenate
-RuntimeError
-rows.append
-first.tolist
-second.tolist
-normal.tolist
-np.linalg.norm
-list
-values.astype(float).tolist
-values.astype
-pose.tolist
-poses.items
-geometry_poses.items
-dict
 ```
 
-## `RobotGeometryChecker._native_pair_distances`
+## `RobotGeometryChecker._pair_table`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L358)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L315)。
 
 输入签名：
 
 ```python
-def _native_pair_distances(self, pairs, poses):
+def _pair_table(self, pairs):
 ```
 
 实现说明：
 
-> Yield original-order results without retaining warm solver state.
->
-> Pinocchio's geometry model has a dense geometry-to-pair map. Limiting
-> each workspace to 128 pairs (at most 256 geometries) bounds that map to
-> 256 by 256 integer entries even for a large, sparse pair list. Every block
-> of the most recent complete pair schema is retained, so larger fixed
-> schemas do not rebuild blocks on every state. Changing pair order
-> releases the old schema before allocating its replacement.
-> All shape allocations finish before functors retain GeometryObject
-> addresses. The geometry model outlives both the working and pristine
-> functor vectors.
->
-> A batch may perform later independent distance work before Python checks
-> an earlier result. Every nonfinite result still rejects the whole call;
-> native exceptions propagate with Pinocchio's pair context and no partial
-> report is returned. This interface never owns scene contact permissions.
+> Return the fixed table after _prepare_query validates the pair schema.
 
 显式输出分支：
 
 ```python
-data.distanceResults[index]
+(schema[1], schema[2])
 ```
 
 读取的对象属性：
@@ -833,26 +761,12 @@ data.distanceResults[index]
 ```python
 pair.first
 pair.second
-self._native_distance_batches
+self._native_pair_table
 dict.fromkeys
-pin.GeometryModel
-model.addGeometryObject
-pin.GeometryObject
-pin.SE3.Identity
-pin.SE3
+np.asarray([(columns[a], columns[b]) for (a, b) in identities], dtype=np.intp).reshape
+np.asarray
+np.intp
 self._geometries
-model.addCollisionPair
-pin.CollisionPair
-pin.GeometryData
-data.distanceRequests
-self._request
-data.distance_functors.copy
-data.distance_functors
-blocks.append
-data.oMg
-pin.computeDistances
-model.collisionPairs
-data.distanceResults
 ```
 
 写入目标：
@@ -861,42 +775,308 @@ data.distanceResults
 identities
 pair
 schema
-self._native_distance_batches
-blocks
-start
-block_pairs
+self._native_pair_table
 names
 name
 columns
 index
-model
-first
-second
-data
-data.distanceRequests[index]
-pristine
-data.distance_functors
-pose
-data.oMg[index]
+indices
+a
+b
+table
 ```
 
 直接调用符号：
 
 ```python
 tuple
-range
-len
 dict.fromkeys
 enumerate
-pin.GeometryModel
-model.addGeometryObject
-pin.GeometryObject
-pin.SE3.Identity
-model.addCollisionPair
-pin.CollisionPair
-pin.GeometryData
-data.distance_functors.copy
-blocks.append
-pin.SE3
-pin.computeDistances
+np.asarray([(columns[a], columns[b]) for (a, b) in identities], dtype=np.intp).reshape
+np.asarray
+NativePairTable
+```
+
+## `RobotGeometryChecker.native_query_resident_nbytes`
+
+[定义位置](../../../manipulation/robot_geometry_check.py#L333)。
+
+输入签名：
+
+```python
+def native_query_resident_nbytes(self):
+```
+
+实现说明：
+
+> Current table storage; model-owned shapes and transient arrays are separate.
+
+显式输出分支：
+
+```python
+0
+int(schema[2].storage_nbytes) + 256 + len(schema[0]) * 80 + len(schema[1]) * 16
+```
+
+读取的对象属性：
+
+```python
+self._native_pair_table
+schema[2].storage_nbytes
+```
+
+写入目标：
+
+```python
+schema
+```
+
+直接调用符号：
+
+```python
+int
+len
+```
+
+## `RobotGeometryChecker.pair_evidence`
+
+[定义位置](../../../manipulation/robot_geometry_check.py#L340)。
+
+输入签名：
+
+```python
+def pair_evidence(self, pair, row):
+```
+
+实现说明：
+
+> Attach declared identity and numerical relation to an owned numeric row.
+>
+> Columns are distance, first/second witness xyz, normal xyz, witness
+> identity error, and an optional full-entity separation lower bound.
+> Distances and witnesses are metres in the calibrated reference frame;
+> Coal's unit direction is dimensionless. Policy remains caller-owned.
+
+显式输出分支：
+
+```python
+{'first': pair.first, 'second': pair.second, 'policy': pair.policy, 'policy_source': pair.source, 'signed_distance_m': distance, 'relation': relation, 'witness_first': row[1:4], 'witness_second': row[4:7], 'normal_first_to_second': row[7:10], 'witness_identity_error_m': row[10]}
+```
+
+读取的对象属性：
+
+```python
+self.numerics
+pair.first
+pair.second
+pair.policy
+pair.source
+```
+
+写入目标：
+
+```python
+boundary
+distance
+relation
+```
+
+直接调用符号：
+
+```python
+max
+```
+
+## `RobotGeometryChecker.query`
+
+[定义位置](../../../manipulation/robot_geometry_check.py#L358)。
+
+输入签名：
+
+```python
+def query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(), check_request=None):
+```
+
+实现说明：
+
+> Return JSON-ready FK, limits and raw distances for explicit model pairs.
+>
+> This complete report serves robot validation and execution preflight.
+> Pair policy and unknown motion are interpreted by those consumers.
+
+显式输出分支：
+
+```python
+{'joint_names': list(names), 'joint_positions': values.astype(float).tolist(), 'joint_limit_violations': violations, 'frame_poses': {name: pose.tolist() for (name, pose) in poses.items()}, 'geometry_poses': {name: pose.tolist() for (name, pose) in geometry_poses.items()}, 'geometry_sources': {name: value[2] for (name, value) in self._geometries.items()}, 'numerics': dict(self.numerics), 'pairs': rows}
+```
+
+读取的对象属性：
+
+```python
+self._prepare_query
+self._pair_table
+np.asarray([[geometry_poses[name] for name in geometry_names]], dtype=np.float64).reshape
+np.asarray
+np.float64
+table.query(matrices, np.zeros((1, len(pairs)), bool), self._request)[0].tolist
+table.query
+np.zeros
+self._request
+rows.append
+self.pair_evidence
+values.astype(float).tolist
+values.astype
+pose.tolist
+poses.items
+geometry_poses.items
+self._geometries.items
+self._geometries
+self.numerics
+```
+
+写入目标：
+
+```python
+names
+values
+violations
+poses
+geometry_poses
+pairs
+geometry_names
+table
+matrices
+name
+numeric
+rows
+pair
+row
+pose
+value
+```
+
+直接调用符号：
+
+```python
+self._prepare_query
+self._pair_table
+np.asarray([[geometry_poses[name] for name in geometry_names]], dtype=np.float64).reshape
+np.asarray
+len
+check_request
+table.query(matrices, np.zeros((1, len(pairs)), bool), self._request)[0].tolist
+table.query
+np.zeros
+zip
+rows.append
+self.pair_evidence
+list
+values.astype(float).tolist
+values.astype
+pose.tolist
+poses.items
+geometry_poses.items
+self._geometries.items
+dict
+```
+
+## `RobotGeometryChecker.query_pair_batches`
+
+[定义位置](../../../manipulation/robot_geometry_check.py#L389)。
+
+输入签名：
+
+```python
+def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base, pairs, projection_mask, check_request=None):
+```
+
+实现说明：
+
+> Yield owned numeric rows [state, pair, 12] in input order.
+>
+> Every state uses _prepare_query's original float64 FK and matrix
+> products. Projection bounds are computed only at true mask entries.
+> The scene consumes Python floats/lists directly for its retained JSON
+> evidence. Each chunk has at most MAX_BATCH_SIZE pair evaluations,
+> except that a larger single state remains one complete query.
+> Cancellation is checked during state preparation, before/after each
+> native call, and by the scene while consuming each pair. Errors within
+> a native chunk reject it as a whole, with state and pair indices.
+
+显式输出分支：
+
+```python
+numeric.tolist()
+```
+
+读取的对象属性：
+
+```python
+np.asarray
+positions.ndim
+positions.shape
+positions.dtype.kind
+positions.dtype
+np.isfinite(positions).all
+np.isfinite
+mask.dtype
+np.bool_
+mask.shape
+dict.fromkeys
+pair.first
+pair.second
+np.empty
+np.float64
+self._prepare_query
+self._pair_table
+table.query
+self._request
+numeric.tolist
+```
+
+写入目标：
+
+```python
+joint_names
+pairs
+positions
+mask
+state_count
+geometry_names
+pair
+name
+begin
+end
+matrices
+offset
+position
+_
+geometry_poses
+column
+matrices[offset, column]
+table
+numeric
+```
+
+直接调用符号：
+
+```python
+tuple
+np.asarray
+len
+np.isfinite(positions).all
+np.isfinite
+ValueError
+max
+dict.fromkeys
+range
+min
+np.empty
+enumerate
+self._prepare_query
+self._pair_table
+check_request
+table.query
+RuntimeError
+numeric.tolist
 ```

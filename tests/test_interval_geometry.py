@@ -336,7 +336,17 @@ def test_scene_output_contains_complete_pair_records_through_evaluate(tmp_path):
         geometry_evidence_out=evidence)
     assert len(evidence) == 3
     native = next(row for row in evidence if row["component"] == "collision/robot/self")
-    assert 0 < native["lower_m"] <= .001
+    # BEGIN compare the certificate with the exact stored robot geometry.
+    # The fixture stores float(.02 + .001), whose represented separation is
+    # slightly larger than float(.001). Rational arithmetic uses those exact
+    # binary64 coordinates and half lengths, without a test-only clearance.
+    from fractions import Fraction
+    _, first, _, first_pose = scene.robot_model._geometries["first"]
+    _, second, _, second_pose = scene.robot_model._geometries["second"]
+    exact_gap = (Fraction(float(second_pose[0, 3])) - Fraction(float(first_pose[0, 3]))
+                 - Fraction(float(first.halfSide[0])) - Fraction(float(second.halfSide[0])))
+    assert 0 < Fraction(native["lower_m"]) <= exact_gap
+    # END the bound is checked against the represented entities themselves.
     assert native["distance_scope"] == "full_entities"
     assert all("permission_kind" in row and "state_index" in row for row in evidence)
 

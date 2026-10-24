@@ -208,18 +208,20 @@ def test_fixed_installation_still_constrains_a_moving_observed_owner(tmp_path):
 @pytest.mark.parametrize("policy", ["required", "excluded", "mechanical_contact"])
 def test_scene_queries_only_required_pairs_and_serializes_complete_policy(tmp_path, monkeypatch, policy):
     scene = make_scene(tmp_path, policy=policy)
-    query = scene.robot_model.query
+    # BEGIN inspect the numeric pair request consumed by this scene query.
+    query = scene.robot_model.query_pair_batches
     submitted = []
 
     def inspect(**kwargs):
         submitted.append(kwargs["pairs"])
         return query(**kwargs)
 
-    monkeypatch.setattr(scene.robot_model, "query", inspect)
+    monkeypatch.setattr(scene.robot_model, "query_pair_batches", inspect)
     evaluate(scene)
     assert submitted == [scene.robot_validator.required_pairs]
     assert len(submitted[0]) == int(policy == "required")
     assert scene.to_execution_binding()["robot_model"]["pairs"][0]["policy"] == policy
+    # END compact execution preserves the complete serialized pair policy.
 
 
 def test_scene_shares_batch_zero_across_pairs_and_retains_all_position_gradients(tmp_path, monkeypatch):

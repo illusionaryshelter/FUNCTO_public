@@ -1,6 +1,6 @@
 # 实现符号索引
 
-代码基线：`be44b54`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
+未变组件代码基线：`be44b54`；官方机器人距离批处理的当前代码基线：`NATIVE_IMPLEMENTATION_COMMIT`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
@@ -43,7 +43,7 @@
 | [manipulation/execution.py](api/execution.md) | 44 | [05](05-acceptance-and-execution.md) |
 | [manipulation/execution_binding.py](api/execution_binding.md) | 9 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robot_validation.py](api/robot_validation.md) | 11 | [05](05-acceptance-and-execution.md) |
-| [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 15 | [05](05-acceptance-and-execution.md) |
+| [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 19 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 26 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 5 | [05](05-acceptance-and-execution.md) |
@@ -54,7 +54,7 @@
 | [manipulation/observed_coverage.py](api/observed_coverage.md) | 4 | [02](02-observation-and-collision.md) |
 | [tests/planning/observed_robot_fixture.py](api/adapter-observed_robot_fixture.md) | 2 | [05](05-acceptance-and-execution.md) |
 | [manipulation/grasp_region.py](api/grasp_region.md) | 4 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/native_field_distance.py](api/native_field_distance.md) | 8 | [02](02-observation-and-collision.md) |
+| [manipulation/native_field_distance.py](api/native_field_distance.md) | 7 | [02](02-observation-and-collision.md) |
 | [manipulation/tool_geometry.py](api/tool_geometry.md) | 11 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_fixture.py](api/adapter-robot_fixture.md) | 31 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 6 | [02](02-observation-and-collision.md) |
@@ -68,3 +68,5 @@
 | [manipulation/pin_kinematics.py](api/pin_kinematics.md) | 13 | [04](04-solver-and-search.md) |
 | [config/ground_skill.py](api/adapter-ground_skill.md) | 4 | [01](01-inputs-and-task-model.md) |
 | [manipulation/progress_clock.py](api/progress_clock.md) | 6 | [05](05-acceptance-and-execution.md) |
+
+原生固定配对数值接口与舍入语义见 [NativePairTable](api/native_pair_table.md)，实现位于 `manipulation/_coal_scene_batch.cpp`。

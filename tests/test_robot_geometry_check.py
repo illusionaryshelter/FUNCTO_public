@@ -188,7 +188,8 @@ def test_repeated_schema_reuses_names_and_frames_but_queries_each_new_state(urdf
     first = query(model, check_request=guard)
     schema = model._query_schema
     assert frames.call_count > 0 and names.call_count > 0
-    assert guard.call_count == 1 + len(first["pairs"])
+    # BEGIN preparation and native boundaries precede each report-row check.
+    assert guard.call_count == 3 + len(first["pairs"])
     frames.reset_mock(); names.reset_mock(); guard.reset_mock()
 
     # query() constructs new equal PairQuery records and a new frame list.
@@ -197,7 +198,8 @@ def test_repeated_schema_reuses_names_and_frames_but_queries_each_new_state(urdf
     assert model._query_schema is schema
     frames.assert_not_called()
     names.assert_not_called()
-    assert guard.call_count == 1 + len(second["pairs"])
+    assert guard.call_count == 3 + len(second["pairs"])
+    # END metadata reuse does not remove state or cancellation checks.
     assert second["joint_positions"] == [.08, -.03]
     assert second["geometry_poses"] != first["geometry_poses"]
     assert second["pairs"] != first["pairs"]

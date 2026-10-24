@@ -25,6 +25,8 @@ import coal
 import numpy as np
 import pinocchio as pin
 
+from ._coal_scene_batch import NativePairTable, MAX_BATCH_SIZE
+
 
 def _name(value, label):
     if not isinstance(value, str) or not value.strip():
@@ -194,30 +196,25 @@ class RobotGeometryChecker:
                          "epa_tolerance": float(self._request.epa_tolerance),
                          "enable_signed_distance": True,
                          "tolerance_is_error_bound": False}
-        # BEGIN retain one pair schema in bounded native blocks, with cold solvers.
-        # This workspace is used only by query(), whose explicit native pairs
-        # all require raw evidence regardless of their acceptance policy.
-        self._native_distance_batches = None
-        # BEGIN retain one validated request layout for this fixed robot model.
-        # Joint names, requested frames and frozen PairQuery records identify
-        # only read-only model relationships. A changed layout is validated
-        # before replacing this entry. Numerical states, calibration, FK,
-        # distance results and native solver histories remain query-local.
+        # BEGIN shared fixed pair table and independently budgeted transient queries.
+        # Both public reports and planning batches use the same cold Coal kernel.
+        # Cached data identifies model relationships only, never past evidence.
+        self._native_pair_table = None
         self._query_schema = None
-        # END repeated states reuse metadata, never geometric evidence.
-        # Reserve before any lazy query allocation. Each unordered native pair
-        # can occur once. A block has at most 256 unique geometries; its dense
-        # Pinocchio pair map therefore cannot grow quadratically with the full
-        # robot inventory. At default EPA=64, 64 KiB/pair covers the working and
-        # pristine distance solvers, GeometryData's other functors/results,
-        # the working EPA's 68 vertices/132 faces, and allocation overhead.
         count = len(self._geometries)
-        pair_count = count * (count-1) // 2
-        block_geometries = min(count, 256)
-        name_bytes = sum(len(name.encode("utf-8")) for name in self._geometries)
-        self.native_query_storage_nbytes = (
-            pair_count * (32768 + 512 * int(self._request.epa_max_iterations))
-            + ((pair_count+127)//128) * (4096 + block_geometries*4096 + 8*block_geometries**2 + 2*name_bytes))
+        pair_count = count * (count - 1) // 2
+        # Table: native owners/indices plus Python identity tuples and names.
+        self.native_query_storage_nbytes = 4096 + count * 128 + pair_count * 128
+        # For P>0, S=floor(MAX_BATCH_SIZE/P) gives S*G<=2*MAX_BATCH_SIZE.
+        # A single larger state uses at most the full model inventory. Two
+        # chunks can coexist while a generator resumes: matrices, native
+        # transform copies, float lists and output arrays are counted here.
+        # The last term covers one live cold GJK/EPA solver, not one per pair.
+        self.native_query_temporary_nbytes = (
+            2 * (max(2 * MAX_BATCH_SIZE, count) * 512
+                 + max(MAX_BATCH_SIZE, pair_count) * 512)
+            + 32768 + 512 * int(self._request.epa_max_iterations))
+        # END temporary buffers remain live-query work even after table creation.
 
     def _frame_id(self, name):
         _name(name, "frame")
@@ -253,15 +250,10 @@ class RobotGeometryChecker:
                 joint = int(self.model.parents[joint])
         return tuple(result)
 
-    def query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(),
-              check_request=None):
-        """Return JSON-ready FK, raw signed distances, witnesses and limits.
-
-        Only the explicitly requested pairs are queried. This function reports
-        numerical geometry relations without an overall collision-valid flag:
-        policy exclusions, unknown space and continuous motion belong to the
-        original caller, and no inferred ignore can enter this diagnostic.
-        """
+    # BEGIN report and numeric batch interfaces share preparation and one distance kernel.
+    def _prepare_query(self, *, joint_names, joint_positions, T_reference_base,
+                       pairs, frames=(), check_request=None):
+        """Validate one complete named state and compute its float64 FK poses."""
         if check_request is not None:
             check_request()
         names = tuple(joint_names)
@@ -312,42 +304,81 @@ class RobotGeometryChecker:
                       "frames": requested_frames, "frame_ids": frame_ids, "pairs": pair_list}
             self._query_schema = schema
         frame_ids = schema["frame_ids"]
-        # END FK, pair order and cold native distance queries keep their original path.
+        # END metadata reuse leaves each state and calibration independently evaluated.
         pin.forwardKinematics(self.model, self._data, q)
         pin.updateFramePlacements(self.model, self._data)
         poses = {name: world_base @ self._data.oMf[index].homogeneous
                  for name, index in frame_ids.items()}
         geometry_poses = {name: poses[frame] @ local for name, (frame, _, _, local) in self._geometries.items()}
-        # BEGIN run independent native pairs in C++, retaining their exact order.
-        # FK and the two matrix multiplications above deliberately stay in their
-        # original NumPy/Pinocchio order; only prepared rigid matrices are copied
-        # into the many-pair distance workspace below.
-        distances = self._native_pair_distances(pair_list, geometry_poses)
-        # END finite input validation precedes all native distance work.
-        rows = []
+        return names, values, violations, poses, geometry_poses, pair_list
+
+    def _pair_table(self, pairs):
+        """Return the fixed table after _prepare_query validates the pair schema."""
+        identities = tuple((pair.first, pair.second) for pair in pairs)
+        schema = self._native_pair_table
+        if schema is None or schema[0] != identities:
+            # Release the replaced table before allocating its successor.
+            self._native_pair_table = None
+            schema = None
+            names = tuple(dict.fromkeys(name for pair in identities for name in pair))
+            columns = {name: index for index, name in enumerate(names)}
+            indices = np.asarray([(columns[a], columns[b]) for a, b in identities],
+                                 dtype=np.intp).reshape(-1, 2)
+            table = NativePairTable([self._geometries[name][1] for name in names], indices)
+            schema = (identities, names, table)
+            self._native_pair_table = schema
+        return schema[1], schema[2]
+
+    @property
+    def native_query_resident_nbytes(self):
+        """Current table storage; model-owned shapes and transient arrays are separate."""
+        schema = self._native_pair_table
+        if schema is None:
+            return 0
+        return int(schema[2].storage_nbytes) + 256 + len(schema[0]) * 80 + len(schema[1]) * 16
+
+    def pair_evidence(self, pair, row):
+        """Attach declared identity and numerical relation to an owned numeric row.
+
+        Columns are distance, first/second witness xyz, normal xyz, witness
+        identity error, and an optional full-entity separation lower bound.
+        Distances and witnesses are metres in the calibrated reference frame;
+        Coal's unit direction is dimensionless. Policy remains caller-owned.
+        """
         boundary = max(self.numerics["gjk_tolerance"], self.numerics["epa_tolerance"])
-        # BEGIN inspect every original pair's fresh result, including exclusions.
-        for pair, result in zip(pair_list, distances):
+        distance = row[0]
+        relation = ("separated" if distance > boundary else "penetrating"
+                    if distance < -boundary else "numerical_boundary")
+        return {"first": pair.first, "second": pair.second,
+                "policy": pair.policy, "policy_source": pair.source,
+                "signed_distance_m": distance, "relation": relation,
+                "witness_first": row[1:4], "witness_second": row[4:7],
+                "normal_first_to_second": row[7:10], "witness_identity_error_m": row[10]}
+
+    def query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(),
+              check_request=None):
+        """Return JSON-ready FK, limits and raw distances for explicit model pairs.
+
+        This complete report serves robot validation and execution preflight.
+        Pair policy and unknown motion are interpreted by those consumers.
+        """
+        names, values, violations, poses, geometry_poses, pairs = self._prepare_query(
+            joint_names=joint_names, joint_positions=joint_positions,
+            T_reference_base=T_reference_base, pairs=pairs, frames=frames,
+            check_request=check_request)
+        geometry_names, table = self._pair_table(pairs)
+        matrices = np.asarray([[geometry_poses[name] for name in geometry_names]],
+                              dtype=np.float64).reshape(1, len(geometry_names), 4, 4)
+        if check_request is not None:
+            check_request()
+        numeric = table.query(matrices, np.zeros((1, len(pairs)), bool), self._request)[0].tolist()
+        if check_request is not None:
+            check_request()
+        rows = []
+        for pair, row in zip(pairs, numeric):
             if check_request is not None:
                 check_request()
-            # Pinocchio clears each DistanceResult before its native query.
-            # _native_pair_distances additionally resets the entire solver;
-            # default GJK direction alone does not reset its support hint.
-            distance = float(result.min_distance)
-            # END report construction and nonfinite rejection retain their order.
-            first = np.asarray(result.getNearestPoint1(), dtype=float)
-            second = np.asarray(result.getNearestPoint2(), dtype=float)
-            normal = np.asarray(result.normal, dtype=float)
-            if not np.isfinite(np.concatenate(([distance], first, second, normal))).all():
-                raise RuntimeError(f"Coal returned nonfinite geometry evidence for {pair.first}, {pair.second}")
-            relation = ("separated" if distance > boundary else "penetrating"
-                        if distance < -boundary else "numerical_boundary")
-            rows.append({"first": pair.first, "second": pair.second,
-                         "policy": pair.policy, "policy_source": pair.source,
-                         "signed_distance_m": distance, "relation": relation,
-                         "witness_first": first.tolist(), "witness_second": second.tolist(),
-                         "normal_first_to_second": normal.tolist(),
-                         "witness_identity_error_m": float(np.linalg.norm(second-first-distance*normal))})
+            rows.append(self.pair_evidence(pair, row))
         return {"joint_names": list(names), "joint_positions": values.astype(float).tolist(),
                 "joint_limit_violations": violations,
                 "frame_poses": {name: pose.tolist() for name, pose in poses.items()},
@@ -355,61 +386,48 @@ class RobotGeometryChecker:
                 "geometry_sources": {name: value[2] for name, value in self._geometries.items()},
                 "numerics": dict(self.numerics), "pairs": rows}
 
-    def _native_pair_distances(self, pairs, poses):
-        """Yield original-order results without retaining warm solver state.
+    def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base,
+                           pairs, projection_mask, check_request=None):
+        """Yield owned numeric rows [state, pair, 12] in input order.
 
-        Pinocchio's geometry model has a dense geometry-to-pair map. Limiting
-        each workspace to 128 pairs (at most 256 geometries) bounds that map to
-        256 by 256 integer entries even for a large, sparse pair list. Every block
-        of the most recent complete pair schema is retained, so larger fixed
-        schemas do not rebuild blocks on every state. Changing pair order
-        releases the old schema before allocating its replacement.
-        All shape allocations finish before functors retain GeometryObject
-        addresses. The geometry model outlives both the working and pristine
-        functor vectors.
-
-        A batch may perform later independent distance work before Python checks
-        an earlier result. Every nonfinite result still rejects the whole call;
-        native exceptions propagate with Pinocchio's pair context and no partial
-        report is returned. This interface never owns scene contact permissions.
+        Every state uses _prepare_query's original float64 FK and matrix
+        products. Projection bounds are computed only at true mask entries.
+        The scene consumes Python floats/lists directly for its retained JSON
+        evidence. Each chunk has at most MAX_BATCH_SIZE pair evaluations,
+        except that a larger single state remains one complete query.
+        Cancellation is checked during state preparation, before/after each
+        native call, and by the scene while consuming each pair. Errors within
+        a native chunk reject it as a whole, with state and pair indices.
         """
-        identities = tuple((pair.first, pair.second) for pair in pairs)
-        schema = self._native_distance_batches
-        if schema is None or schema[0] != identities:
-            # Drop both old references before construction, including when the
-            # new schema is empty or construction raises. No stale or partially
-            # configured workspace can serve the following query.
-            self._native_distance_batches = None
-            schema = None
-            blocks = []
-            for start in range(0, len(identities), 128):
-                block_pairs = identities[start:start+128]
-                names = tuple(dict.fromkeys(name for pair in block_pairs for name in pair))
-                columns = {name: index for index, name in enumerate(names)}
-                model = pin.GeometryModel()
-                for name in names:
-                    model.addGeometryObject(pin.GeometryObject(
-                        name, 0, pin.SE3.Identity(), self._geometries[name][1]))
-                for first, second in block_pairs:
-                    model.addCollisionPair(pin.CollisionPair(columns[first], columns[second]))
-                data = pin.GeometryData(model)
-                for index in range(len(block_pairs)):
-                    data.distanceRequests[index] = self._request
-                # Value-copy the never-evaluated solver vector. Restoring this
-                # vector resets GJK/EPA/support hints, including the history
-                # that Coal retains even with gjk_initial_guess=DefaultGuess.
-                pristine = data.distance_functors.copy()
-                blocks.append((names, model, data, pristine))
-            schema = (identities, tuple(blocks))
-            self._native_distance_batches = schema
-        for names, model, data, pristine in schema[1]:
-            data.distance_functors = pristine
-            for index, name in enumerate(names):
-                pose = poses[name]
-                data.oMg[index] = pin.SE3(pose[:3, :3], pose[:3, 3])
-            # Returned minimum index is intentionally ignored: all pairs and
-            # their signed distances/witnesses/normals remain separately read.
-            pin.computeDistances(model, data)
-            for index in range(len(model.collisionPairs)):
-                yield data.distanceResults[index]
+        joint_names, pairs = tuple(joint_names), tuple(pairs)
+        positions = np.asarray(joint_positions)
+        if (positions.ndim != 2 or positions.shape[1] != len(joint_names)
+                or positions.dtype.kind not in "iuf" or not np.isfinite(positions).all()):
+            raise ValueError("joint_positions must be finite named state rows")
+        mask = np.asarray(projection_mask)
+        if mask.dtype != np.bool_ or mask.shape != (len(positions), len(pairs)):
+            raise ValueError("projection_mask must have one Boolean per state and declared pair")
+        state_count = max(1, MAX_BATCH_SIZE // max(1, len(pairs)))
+        geometry_names = tuple(dict.fromkeys(name for pair in pairs for name in (pair.first, pair.second)))
+        for begin in range(0, len(positions), state_count):
+            end = min(begin + state_count, len(positions))
+            matrices = np.empty((end - begin, len(geometry_names), 4, 4), dtype=np.float64)
+            for offset, position in enumerate(positions[begin:end]):
+                _, _, _, _, geometry_poses, _ = self._prepare_query(
+                    joint_names=joint_names, joint_positions=position,
+                    T_reference_base=T_reference_base, pairs=pairs,
+                    check_request=check_request)
+                for column, name in enumerate(geometry_names):
+                    matrices[offset, column] = geometry_poses[name]
+            _, table = self._pair_table(pairs)
+            if check_request is not None:
+                check_request()
+            try:
+                numeric = table.query(matrices, mask[begin:end], self._request)
+            except RuntimeError as error:
+                raise RuntimeError(f"Robot pair batch states [{begin}, {end}): {error}") from error
+            if check_request is not None:
+                check_request()
+            yield numeric.tolist()
+    # END no native solver history or duplicate distance backend is retained.
 # END known robot geometry remains separate from observed task fields.

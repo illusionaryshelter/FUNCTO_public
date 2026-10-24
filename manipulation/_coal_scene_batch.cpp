@@ -29,6 +29,7 @@
 #include <memory>
 #include <queue>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1435,6 +1436,153 @@ bp::tuple floating_point_mode_key() {
   return bp::make_tuple(rounding, controls);
 }
 // END prepared data never caches distances, search certificates or contact policy.
+// BEGIN one cold numeric kernel for fixed official-robot pair consumers.
+// This table owns shapes and indices only. FK matrices belong to each query;
+// no distance, support hint or GJK/EPA history survives a call.
+class NativePairTable {
+ public:
+  NativePairTable(const bp::object& shapes, const bp::object& indices) {
+    const Py_ssize_t count = PySequence_Size(shapes.ptr());
+    if (count < 0) bp::throw_error_already_set();
+    owners_.reserve(count);
+    shapes_.reserve(count);
+    for (Py_ssize_t i = 0; i < count; ++i) {
+      owners_.push_back(shapes[i]);
+      shapes_.push_back(&bp::extract<const coal::CollisionGeometry&>(owners_.back())());
+    }
+    auto* array = checked_array(indices, NPY_INTP, 2, "Pair indices require intp[P,2]");
+    if (PyArray_DIM(array, 1) != 2)
+      throw std::invalid_argument("Pair indices require two columns");
+    pairs_.reserve(PyArray_DIM(array, 0));
+    for (npy_intp i = 0; i < PyArray_DIM(array, 0); ++i) {
+      std::array<npy_intp, 2> pair;
+      for (int j = 0; j < 2; ++j) {
+        pair[j] = array_value<npy_intp>(array, i, j);
+        if (pair[j] < 0 || pair[j] >= count)
+          throw std::invalid_argument("Pair index outside geometry table");
+      }
+      pairs_.push_back(pair);
+    }
+  }
+
+  bp::object query(const bp::object& pose_object, const bp::object& mask_object,
+                   const coal::DistanceRequest& request) const {
+    auto* poses = checked_array(pose_object, NPY_DOUBLE, 4, "Poses require float64[S,G,4,4]");
+    auto* mask = checked_array(mask_object, NPY_BOOL, 2, "Projection mask requires bool[S,P]");
+    const npy_intp states = PyArray_DIM(poses, 0);
+    const npy_intp geometries = static_cast<npy_intp>(shapes_.size());
+    const npy_intp pairs = static_cast<npy_intp>(pairs_.size());
+    if (PyArray_DIM(poses, 1) != geometries || PyArray_DIM(poses, 2) != 4
+        || PyArray_DIM(poses, 3) != 4 || PyArray_DIM(mask, 0) != states
+        || PyArray_DIM(mask, 1) != pairs)
+      throw std::invalid_argument("Pose, mask and fixed pair schemas disagree");
+    COAL_COMPILER_DIAGNOSTIC_PUSH
+    COAL_COMPILER_DIAGNOSTIC_IGNORED_DEPRECECATED_DECLARATIONS
+    const bool stateful = request.gjk_initial_guess == coal::GJKInitialGuess::CachedGuess
+        || request.enable_cached_gjk_guess;
+    COAL_COMPILER_DIAGNOSTIC_POP
+    if (stateful)
+      throw std::invalid_argument("Independent native pairs require cold GJK requests");
+
+    // Copy strided NumPy inputs and request while holding the GIL. The native
+    // loop reads no Python-owned numeric storage and writes an owned output.
+    std::vector<coal::Transform3s> transforms(static_cast<std::size_t>(states * geometries));
+    std::vector<npy_bool> selected(static_cast<std::size_t>(states * pairs));
+    for (npy_intp state = 0; state < states; ++state) {
+      for (npy_intp shape = 0; shape < geometries; ++shape) {
+        coal::Matrix3s rotation;
+        coal::Vec3s translation;
+        for (int row = 0; row < 3; ++row) {
+          for (int col = 0; col < 4; ++col) {
+            double value;
+            const char* address = PyArray_BYTES(poses) + state * PyArray_STRIDE(poses, 0)
+                + shape * PyArray_STRIDE(poses, 1) + row * PyArray_STRIDE(poses, 2)
+                + col * PyArray_STRIDE(poses, 3);
+            std::memcpy(&value, address, sizeof(value));
+            if (!std::isfinite(value))
+              throw std::invalid_argument("Native FK poses must be finite");
+            if (col < 3) rotation(row, col) = value;
+            else translation[row] = value;
+          }
+        }
+        transforms[state * geometries + shape] = coal::Transform3s(rotation, translation);
+      }
+      for (npy_intp pair = 0; pair < pairs; ++pair)
+        selected[state * pairs + pair] = array_value<npy_bool>(mask, state, pair);
+    }
+    npy_intp dimensions[] = {states, pairs, 12};
+    auto* array = reinterpret_cast<PyArrayObject*>(PyArray_ZEROS(3, dimensions, NPY_DOUBLE, 0));
+    if (!array) bp::throw_error_already_set();
+    bp::object output(bp::handle<>(reinterpret_cast<PyObject*>(array)));
+    auto* values = static_cast<double*>(PyArray_DATA(array));
+    const coal::DistanceRequest frozen_request(request);
+    {
+      const ReleasedGIL released;
+      for (npy_intp state = 0; state < states; ++state) {
+        for (npy_intp index = 0; index < pairs; ++index) {
+          const auto pair = pairs_[index];
+          const auto& first = transforms[state * geometries + pair[0]];
+          const auto& second = transforms[state * geometries + pair[1]];
+          double* row = values + (state * pairs + index) * 12;
+          try {
+            coal::DistanceResult result;
+            const coal::DistanceRequest local_request(frozen_request);
+            coal::distance(shapes_[pair[0]], first, shapes_[pair[1]], second,
+                           local_request, result);
+            row[0] = result.min_distance;
+            for (int axis = 0; axis < 3; ++axis) {
+              row[1 + axis] = result.nearest_points[0][axis];
+              row[4 + axis] = result.nearest_points[1][axis];
+              row[7 + axis] = result.normal[axis];
+            }
+            for (int column = 0; column < 10; ++column)
+              if (!std::isfinite(row[column]))
+                throw std::runtime_error("Coal returned nonfinite geometry evidence");
+            row[10] = (result.nearest_points[1] - result.nearest_points[0]
+                       - result.min_distance * result.normal).norm();
+            if (selected[state * pairs + index]) {
+              // Reuse SpatialQuery's interval proof. If n is the Coal normal,
+              // distance >= projected gap / |n|. Directed interval operations
+              // enclose both support ranges, bound |n| upward and the quotient
+              // downward. Coal itself runs outside this rounding scope.
+              const RoundingGuard rounding;
+              const double norm_upper = norm_interval(point_intervals(result.normal)).upper();
+              if (norm_upper > 0.) {
+                Interval a, b;
+                if (!shape_projection(*shapes_[pair[0]], first, result.normal, a)
+                    || !shape_projection(*shapes_[pair[1]], second, result.normal, b))
+                  throw std::invalid_argument("Registered native shape has no supported projection enclosure");
+                const double gap = std::max({0.,
+                    (Interval(b.lower()) - Interval(a.upper())).lower(),
+                    (Interval(a.lower()) - Interval(b.upper())).lower()});
+                row[11] = (Interval(gap) / Interval(norm_upper)).lower();
+              }
+            }
+          } catch (const std::exception& error) {
+            throw std::runtime_error("Native pair query state " + std::to_string(state)
+                + ", pair " + std::to_string(index) + ": " + error.what());
+          }
+        }
+      }
+    }
+    return output;
+  }
+
+  std::size_t storage_nbytes() const {
+    // Shapes are already owned by the fixed robot model; count table storage
+    // only. Query matrices/results and the cold solver are transient.
+    return sizeof(*this) + owners_.capacity() * sizeof(bp::object)
+        + shapes_.capacity() * sizeof(const coal::CollisionGeometry*)
+        + pairs_.capacity() * sizeof(std::array<npy_intp, 2>);
+  }
+
+ private:
+  std::vector<bp::object> owners_;
+  std::vector<const coal::CollisionGeometry*> shapes_;
+  std::vector<std::array<npy_intp, 2>> pairs_;
+};
+// END raw distance and conservative separation share one fixed-model table.
+
 }  // namespace
 
 BOOST_PYTHON_MODULE(_coal_scene_batch) {
@@ -1443,6 +1591,11 @@ BOOST_PYTHON_MODULE(_coal_scene_batch) {
   // result converters. Reuse those exact types rather than defining a second
   // binding system or reconstructing geometry in this project.
   boost::python::import("coal");
+  // BEGIN fixed robot pair API shares Coal's existing Python geometry types.
+  bp::class_<NativePairTable, boost::noncopyable>("NativePairTable", bp::init<bp::object, bp::object>())
+    .def("query", &NativePairTable::query)
+    .add_property("storage_nbytes", &NativePairTable::storage_nbytes);
+  // END output arrays own their numeric evidence independently of the table.
   boost::python::scope().attr("MAX_BATCH_SIZE") = kMaximumBatchSize;
   boost::python::scope().attr("MAX_PROJECTION_DIRECTIONS") = kMaximumProjectionDirections;
   // BEGIN prepared component bindings own geometry and preserve source-order evidence.

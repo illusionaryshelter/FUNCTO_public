@@ -1,6 +1,6 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`NATIVE_IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -995,14 +995,19 @@ self.tool_geometry_names
 complete_q.detach().cpu().numpy
 complete_q.detach().cpu
 complete_q.detach
-np.ndindex
-self.robot_model.query
-self.robot_validator.T_reference_base
-self.robot_validator
 self.robot_validator.required_pairs
-self.check_request
-self.robot_model._geometries
+self.robot_validator
 np.asarray
+pair.first
+pair.second
+uncertain.reshape
+self.robot_model.query_pair_batches
+q_cpu.reshape
+q_cpu.shape
+self.robot_validator.T_reference_base
+self.check_request
+np.ndindex
+self.robot_model.pair_evidence
 report['status_counts'].get
 ((_world(b, pb) - _world(a, pa)) * normal).sum
 signed.detach
@@ -1023,10 +1028,19 @@ report
 q_cpu
 self_costs
 self_unresolved
+pairs
+unknown_pair
+pair
+projection_mask
+batches
+rows_by_state
+batch
+state
 index
-evidence
+numeric_rows
 value
 undecided
+numeric
 row
 first_id
 second_id
@@ -1058,11 +1072,17 @@ list
 complete_q.detach().cpu().numpy
 complete_q.detach().cpu
 complete_q.detach
-np.ndindex
-self.robot_model.query
-record_pair
-native_pair_lower_bound
 np.asarray
+bool
+uncertain.reshape
+self.robot_model.query_pair_batches
+q_cpu.reshape
+np.ndindex
+next
+zip
+self.check_request
+self.robot_model.pair_evidence
+record_pair
 report['status_counts'].get
 inverse_points
 _tensor
@@ -1079,7 +1099,7 @@ torch.stack(self_unresolved).reshape
 
 ## `OnlinePlanningScene.components`
 
-[定义位置](../../../manipulation/online_geometry.py#L481)。
+[定义位置](../../../manipulation/online_geometry.py#L486)。
 
 输入签名：
 
@@ -1458,7 +1478,7 @@ progress.new_tensor(unresolved).reshape
 
 ## `OnlinePlanningScene.components.record_pair`
 
-[定义位置](../../../manipulation/online_geometry.py#L508)。
+[定义位置](../../../manipulation/online_geometry.py#L513)。
 
 输入签名：
 
@@ -1490,7 +1510,7 @@ float
 
 ## `OnlinePlanningScene.components.record_nonclear`
 
-[定义位置](../../../manipulation/online_geometry.py#L527)。
+[定义位置](../../../manipulation/online_geometry.py#L532)。
 
 输入签名：
 
@@ -1530,7 +1550,7 @@ order
 
 ## `OnlinePlanningScene.components.nonclear_diagnostics`
 
-[定义位置](../../../manipulation/online_geometry.py#L546)。
+[定义位置](../../../manipulation/online_geometry.py#L551)。
 
 输入签名：
 
@@ -1571,7 +1591,7 @@ rows.extend
 
 ## `OnlinePlanningScene.optimization_objective`
 
-[定义位置](../../../manipulation/online_geometry.py#L801)。
+[定义位置](../../../manipulation/online_geometry.py#L806)。
 
 输入签名：
 
@@ -1886,7 +1906,7 @@ report_out.update
 
 ## `OnlinePlanningScene.evaluate`
 
-[定义位置](../../../manipulation/online_geometry.py#L971)。
+[定义位置](../../../manipulation/online_geometry.py#L976)。
 
 输入签名：
 
@@ -1935,7 +1955,7 @@ name.startswith
 
 ## `OnlinePlanningScene.estimated_workspace_allocation`
 
-[定义位置](../../../manipulation/online_geometry.py#L981)。
+[定义位置](../../../manipulation/online_geometry.py#L986)。
 
 输入签名：
 
@@ -1961,8 +1981,9 @@ owner.query
 self.owners
 {id(value): value for value in fields}.values
 field.storage_nbytes
-self.robot_model._native_distance_batches
+self.robot_model.native_query_resident_nbytes
 self.robot_model
+self.robot_model._native_pair_table
 self.robot_validator
 pair.first
 pair.second
@@ -1992,6 +2013,7 @@ value.cell_radius.nbytes
 value.cell_radius
 rule.feature_points
 self.contacts
+self.robot_model.native_query_temporary_nbytes
 self.robot_model.joint_names
 self.required_robot_links
 ```
@@ -2045,7 +2067,7 @@ dict
 
 ## `OnlinePlanningScene.describe`
 
-[定义位置](../../../manipulation/online_geometry.py#L1045)。
+[定义位置](../../../manipulation/online_geometry.py#L1048)。
 
 输入签名：
 
@@ -2089,7 +2111,7 @@ deepcopy
 
 ## `OnlinePlanningScene.to_execution_binding`
 
-[定义位置](../../../manipulation/online_geometry.py#L1057)。
+[定义位置](../../../manipulation/online_geometry.py#L1060)。
 
 输入签名：
 

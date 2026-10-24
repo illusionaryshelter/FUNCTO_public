@@ -1,6 +1,6 @@
 # `manipulation/native_field_distance.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`NATIVE_IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_transform`
@@ -74,69 +74,9 @@ np.eye
 np.asarray
 ```
 
-## `native_pair_lower_bound`
-
-[定义位置](../../../manipulation/native_field_distance.py#L33)。
-
-输入签名：
-
-```python
-def native_pair_lower_bound(first, first_pose, second, second_pose, direction):
-```
-
-实现说明：
-
-> Return a whole-entity distance lower bound along a proposed direction.
->
-> The direction may come from a numerical distance solver. Its quality can
-> affect tightness only: both support intervals retain their outward error.
-
-显式输出分支：
-
-```python
-0.0
-max(0.0, float(np.nextafter((gap - error) / (length * (1 + _GAMMA)), -np.inf)))
-```
-
-读取的对象属性：
-
-```python
-np.asarray
-np.linalg.norm
-np.linalg
-np.nextafter
-np.inf
-```
-
-写入目标：
-
-```python
-direction
-length
-a
-b
-gap
-error
-value
-```
-
-直接调用符号：
-
-```python
-np.asarray
-float
-np.linalg.norm
-native_projection_bounds
-_transform
-max
-sum
-abs
-np.nextafter
-```
-
 ## `_projection_gap`
 
-[定义位置](../../../manipulation/native_field_distance.py#L51)。
+[定义位置](../../../manipulation/native_field_distance.py#L33)。
 
 输入签名：
 
@@ -231,7 +171,7 @@ abs
 
 ## `_local_interval`
 
-[定义位置](../../../manipulation/native_field_distance.py#L78)。
+[定义位置](../../../manipulation/native_field_distance.py#L60)。
 
 输入签名：
 
@@ -275,7 +215,7 @@ np.nextafter
 
 ## `query_native_field`
 
-[定义位置](../../../manipulation/native_field_distance.py#L85)。
+[定义位置](../../../manipulation/native_field_distance.py#L67)。
 
 输入签名：
 
@@ -461,7 +401,7 @@ field.split
 
 ## `query_native_field.report`
 
-[定义位置](../../../manipulation/native_field_distance.py#L119)。
+[定义位置](../../../manipulation/native_field_distance.py#L101)。
 
 输入签名：
 
@@ -512,7 +452,7 @@ np.asarray(b).tolist
 
 ## `query_native_field.push`
 
-[定义位置](../../../manipulation/native_field_distance.py#L155)。
+[定义位置](../../../manipulation/native_field_distance.py#L137)。
 
 输入签名：
 

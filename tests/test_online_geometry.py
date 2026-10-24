@@ -62,17 +62,17 @@ def test_robot_scope_returns_before_task_owner_poses_and_field_queries(tmp_path)
     scene = make_scene(tmp_path, occupied_background=True)
     with patch.object(scene, "_owner_poses", side_effect=AssertionError("Task owner pose outside robot scope")), \
          patch("manipulation.online_geometry.pair_residual", side_effect=AssertionError("Task field outside robot scope")), \
-         patch.object(scene.robot_model, "query", wraps=scene.robot_model.query) as native:
+         patch.object(scene.robot_model, "query_pair_batches", wraps=scene.robot_model.query_pair_batches) as native:
         terms, _ = query(scene, "robot")
     assert native.call_count == 1
-    assert native.call_args.kwargs["pairs"] is scene.robot_validator.required_pairs
+    assert native.call_args.kwargs["pairs"] == scene.robot_validator.required_pairs
     assert sum(terms.values()).item() == 0.
 
 
 def test_full_scope_queries_self_once_before_owner_poses_and_keeps_field_failure(tmp_path):
     scene = make_scene(tmp_path, occupied_background=True)
     events = []
-    original_query, original_owners = scene.robot_model.query, scene._owner_poses
+    original_query, original_owners = scene.robot_model.query_pair_batches, scene._owner_poses
 
     def native(**kwargs):
         events.append("self")
@@ -82,7 +82,7 @@ def test_full_scope_queries_self_once_before_owner_poses_and_keeps_field_failure
         events.append("owners")
         return original_owners(*args, **kwargs)
 
-    with patch.object(scene.robot_model, "query", side_effect=native) as robot, \
+    with patch.object(scene.robot_model, "query_pair_batches", side_effect=native) as robot, \
          patch.object(scene, "_owner_poses", side_effect=owners):
         terms, evidence = query(scene, "full")
     assert events == ["self", "owners"] and robot.call_count == 1
@@ -92,7 +92,9 @@ def test_full_scope_queries_self_once_before_owner_poses_and_keeps_field_failure
                for row in evidence)
 
 
-def test_hand_controller_and_unknown_motion_retain_their_original_components(tmp_path, monkeypatch):
+# BEGIN compact evidence preserves each numeric dtype and unknown hand mask.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_hand_controller_and_unknown_motion_retain_their_original_components(tmp_path, monkeypatch, dtype):
     scene = make_scene(tmp_path, gap=-.001)
     # The first state has measured coordinates; the second declares unknown
     # finger motion. Its dependent pair is unmodelled, not a measured collision.
@@ -100,10 +102,13 @@ def test_hand_controller_and_unknown_motion_retain_their_original_components(tmp
         state=lambda progress, q, names, **kwargs: GripperState(q[..., :1], q[..., :1] * 0,
             progress * 0 + .125, torch.tensor([[False, True]])))
     monkeypatch.setattr(scene.robot_model, "geometry_depending_on", lambda names: ("first",))
-    q = torch.tensor([[[.04, -.02], [.04, -.02]]], dtype=torch.float64)
+    q = torch.tensor([[[.04, -.02], [.04, -.02]]], dtype=dtype)
     previous = None
     for scope in ("robot", "full"):
-        terms, evidence = query(scene, scope, q=q)
+        with patch.object(scene.robot_model, "query_pair_batches", wraps=scene.robot_model.query_pair_batches) as native:
+            terms, evidence = query(scene, scope, q=q)
+        np.testing.assert_array_equal(native.call_args.kwargs["projection_mask"], [[True], [False]])
+        assert native.call_args.kwargs["joint_positions"].dtype == q.detach().numpy().dtype
         selected = {key: terms[key] for key in ("collision/robot/self", "unresolved/robot/self",
                                                 "gripper/controller", "conditional/hand_geometry")}
         assert selected["collision/robot/self"][0, 0] > 0
@@ -116,6 +121,7 @@ def test_hand_controller_and_unknown_motion_retain_their_original_components(tmp
             for key in selected:
                 torch.testing.assert_close(selected[key], previous[key], rtol=0, atol=0)
         previous = selected
+# END an unknown descendant suppresses only its declared support-bound query.
 
 
 def moving_scene(tmp_path):
@@ -139,19 +145,25 @@ def moving_scene(tmp_path):
 
 
 @pytest.mark.parametrize("scope", ["robot", "full"])
-def test_native_self_scalar_and_witness_gradient_match_finite_difference(tmp_path, scope):
+# BEGIN both optimization dtypes retain the same native collision derivative.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_native_self_scalar_and_witness_gradient_match_finite_difference(tmp_path, scope, dtype):
     scene = moving_scene(tmp_path)
-    q = torch.tensor([[[.015, -.02]]], dtype=torch.float64, requires_grad=True)
+    q = torch.tensor([[[.015, -.02]]], dtype=dtype, requires_grad=True)
     terms, _ = query(scene, scope, q)
     value = terms["collision/robot/self"].sum()
     derivative = torch.autograd.grad(value, q)[0]
     # The 2 cm boxes overlap by 5 mm along x. A positive left_slide motion
     # decreases that overlap; the independent right_slide does not move either.
-    assert value.item() == pytest.approx(.005, abs=1e-10)
-    np.testing.assert_allclose(derivative.detach().numpy(), [[[-1., 0.]]], atol=1e-10)
+    assert value.item() == pytest.approx(.02-float(q[0, 0, 0].detach()), abs=2e-9)
+    np.testing.assert_allclose(derivative.detach().numpy(), [[[-1., 0.]]], atol=1e-7)
     step = torch.zeros_like(q)
     step[..., 0] = 1e-6
     plus = query(scene, scope, q=q.detach() + step)[0]["collision/robot/self"]
     minus = query(scene, scope, q=q.detach() - step)[0]["collision/robot/self"]
-    torch.testing.assert_close(derivative[..., 0], (plus - minus) / 2e-6, rtol=1e-6, atol=1e-9)
+    # Divide by the represented perturbation. A float32 step of 1e-6 at
+    # q=.015 is rounded, while the underlying derivative remains exactly -1.
+    difference = (q.detach() + step)[..., 0] - (q.detach() - step)[..., 0]
+    torch.testing.assert_close(derivative[..., 0], (plus - minus) / difference, rtol=2e-6, atol=1e-7)
+# END the finite-difference reference uses the actual named joint inputs.
 # END no task model, source tolerance or collision policy changes across scopes.

@@ -1,6 +1,6 @@
 # API 契约与调用关系
 
-算法接口基线为 `be44b54`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+观测场与求解算法接口基线为 `be44b54`，官方机器人距离批处理接口基线为 `NATIVE_IMPLEMENTATION_COMMIT`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -95,12 +95,15 @@
 | `ObservedSpace/query_coverage` | 原自由射线格、运动实体场及条件区域 | covered/unknown_witness/unresolved；场景按明确策略解释条件区域及未知 |
 | `NativeSolid/NativePrimitive` | 原凸组件顶点或解析尺寸、所属连杆、固定变换和来源 | 原生机器人实体；共享检查器 |
 | `native_field_distance.query_native_field` | Coal 原实体、原任务场、两个位姿、精度、许可及可选同实体 local/world bounds | 当前未许可域的状态与 lower_m、完整实体的 full_entity_lower_m、可行点区间；场景与区间检查消费各自域的证据 |
-| `native_pair_lower_bound` | 两个官方机器人原实体、当前变换及候选分离轴 | 完整实体支持投影的分离下界；区间几何证据，原生容差不作为误差界 |
 | `RobotGeometryChecker.model_record` | 已消费的原模型 | URDF和原顶点/解析尺寸/局部变换的独立副本；输入绑定 |
 | `DifferentiableRobotKinematics.poses` | 验证器现有 Pinocchio 模型、基座标定和完整具名关节 | 同一 CPU float64 FK，输出传回输入设备与精度并保留梯度；场景再合成原实体局部变换 |
-| `RobotGeometryChecker.query` | 完整具名关节值、基座标定、冻结 PairQuery 和所需帧；同一模型中复用最近一次已验证的关节列、官方限位、frame IDs 与完整配对规则 | 每次状态的限位、独立 FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` 与场景共享机器人检查 |
-| `RobotGeometryChecker._native_pair_distances` | 原有序配对与当前各实体刚体位姿；最近一组配对按每块最多 128 对保存原生模型及工作数据 | 每次先恢复原始求解器、写入当前变换并调用 pin.computeDistances，按原顺序返回全部距离结果；query 构造逐对证据 |
+| `RobotGeometryChecker.query` | 完整具名关节值、基座标定、冻结 PairQuery 和所需帧；同一模型中复用最近一次已验证的关节列、官方限位、frame IDs 与完整配对规则 | 每次状态的限位、独立 FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` 与执行前检查消费完整报告 |
 | `OnlinePlanningScene.bind_online_robot` | 同一验证器及请求期限回调 | 直接绑定检查器现有 Pinocchio 完整模型与标定；后端初始化 |
+| `RobotGeometryChecker._prepare_query` | 完整具名状态、基座标定、配对、所需帧 | 验证后的状态及 float64 帧/实体矩阵；报告和数值批次共享 |
+| `RobotGeometryChecker.query_pair_batches` | 多行具名状态、有序配对、逐状态逐对投影 mask | 有序十二列数值列表；规划场景生成实际需要的证据 |
+| `RobotGeometryChecker._pair_table` / `pair_evidence` | 已验证配对 / 单对数值 | 固定表身份复用 / 当前声明策略与数值关系报告 |
+| `NativePairTable.query` | 官方形状表、float64 当前位姿、bool 投影 mask、冷 Coal 请求 | 独立距离、双见证、法向、恒等式误差、完整实体保守下界数组；[接口与公式](api/native_pair_table.md) |
+| `native_query_resident_nbytes` / `native_query_storage_nbytes` / `native_query_temporary_nbytes` | 当前表 / 模型实体和配对容量 | 已驻留字节 / 待构造表上界 / 每次查询临时容量；场景资源准入 |
 | `OnlinePlanningScene._robot_self_components` | 已准备的完整具名关节、可微机器人位姿及同值矩阵、手部状态、原 required_pairs | 官方机器人自身穿透与数值边界硬分项、原见证导数及查询报告；robot/full 两种 components 范围共用 |
 | `OnlinePlanningScene.components/evaluate` | 同时刻关节、工具位姿、进度、时间与 geometry_scope | robot 范围计算官方机器人自身与手部，full 范围继续计算任务场；components 返回原分项，evaluate 汇总非 conditional 项，原证据独立保留 |
 | `OnlinePlanningScene.optimization_objective` | 轨迹位置、单位四元数、进度、具名关节、物理时刻与必填 robot_link_poses | 固定材料点几何、原生自身、required contact 和初始支撑的标量目标；SLSQP 消费一阶导数，report_out 解释有限目标范围 |

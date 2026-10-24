@@ -22,7 +22,7 @@ from .observed_robot import DifferentiableRobotKinematics
 from .robot_geometry_check import RobotGeometryChecker
 from .observed_collision import pair_residual
 # BEGIN scene-owned immutable and per-query native projection bounds.
-from .native_field_distance import _native_bounds, _transform, native_pair_lower_bound
+from .native_field_distance import _native_bounds, _transform
 # END support computations retain the registered native entity.
 from .planning_problem import PosePath, quaternion_rotate, quaternion_conjugate, quaternion_multiply
 from .planning_scene import (Attachment, CollisionOwner, ContactRule, ObservedSpace,
@@ -429,28 +429,32 @@ class OnlinePlanningScene:
                   "coverage_scope": "not_queried"}
         q_cpu = complete_q.detach().cpu().numpy()
         self_costs, self_unresolved = [], []
+        # BEGIN consume one cold numeric batch without constructing FK reports.
+        pairs = tuple(self.robot_validator.required_pairs)
+        unknown_pair = np.asarray([bool({pair.first, pair.second} & unmodelled)
+                                   for pair in pairs], dtype=bool)
+        projection_mask = include_bounds & ~(uncertain.reshape(-1, 1) & unknown_pair[None, :])
+        batches = self.robot_model.query_pair_batches(joint_names=complete_names,
+            joint_positions=q_cpu.reshape(-1, q_cpu.shape[-1]),
+            T_reference_base=self.robot_validator.T_reference_base, pairs=pairs,
+            projection_mask=projection_mask, check_request=self.check_request)
+        rows_by_state = (state for batch in batches for state in batch)
         for index in np.ndindex(shape):
-            evidence = self.robot_model.query(joint_names=complete_names,
-                joint_positions=q_cpu[index], T_reference_base=self.robot_validator.T_reference_base,
-                pairs=self.robot_validator.required_pairs, check_request=self.check_request)
+            numeric_rows = next(rows_by_state)
             value = zero[index]
             undecided = value
-            for row in evidence["pairs"]:
-                first_id, second_id = row["first"], row["second"]
+            for pair, numeric in zip(pairs, numeric_rows):
+                if self.check_request is not None:
+                    self.check_request()
+                row = self.robot_model.pair_evidence(pair, numeric)
+                first_id, second_id = pair.first, pair.second
                 entity_key = {"first": f"robot/{first_id}", "second": f"robot/{second_id}"}
                 if uncertain[index] and ({first_id, second_id} & unmodelled):
                     record_pair(index, "collision/robot/self", first_id, second_id,
                         {"status": "unmodelled_motion", "lower_m": None}, geometry_entity_key=entity_key)
                     continue
                 status = row["relation"]
-                lower = None
-                if include_bounds:
-                    lower = native_pair_lower_bound(
-                        self.robot_model._geometries[first_id][1],
-                        np.asarray(evidence["geometry_poses"][first_id], float),
-                        self.robot_model._geometries[second_id][1],
-                        np.asarray(evidence["geometry_poses"][second_id], float),
-                        row["normal_first_to_second"])
+                lower = numeric[11] if include_bounds else None
                 record_pair(index, "collision/robot/self", first_id, second_id,
                     {**row, "status": {"separated": "clear", "penetrating": "intersection",
                                        "numerical_boundary": "unresolved"}[status],
@@ -474,6 +478,7 @@ class OnlinePlanningScene:
                 # END the original pair residual determines within-component severity.
             self_costs.append(value)
             self_unresolved.append(undecided)
+        # END original classification, witnesses, unknown states and gradients remain consumers.
         return {"collision/robot/self": torch.stack(self_costs).reshape(shape),
                 "unresolved/robot/self": torch.stack(self_unresolved).reshape(shape)}, report
     # END all consumers retain the same entity identities and distance semantics.
@@ -985,16 +990,14 @@ class OnlinePlanningScene:
         # BEGIN resident observations and lazy scene allocations have distinct ownership.
         resident = sum(field.storage_nbytes for field in unique_fields)
         pending = 0
-        # Native pair buffers are lazy and are replaced when the exact pair
-        # layout changes. Only the already matching layout belongs to RSS;
-        # otherwise retain the existing full-model allocation upper bound.
-        schema = self.robot_model._native_distance_batches
+        # BEGIN fixed-table inventory and per-query arrays have separate lifetimes.
+        resident += self.robot_model.native_query_resident_nbytes
+        schema = self.robot_model._native_pair_table
         expected = (None if self.robot_validator is None else
                     tuple((pair.first, pair.second) for pair in self.robot_validator.required_pairs))
-        if schema is not None and schema[0] == expected:
-            resident += self.robot_model.native_query_storage_nbytes
-        else:
+        if schema is None or schema[0] != expected:
             pending += self.robot_model.native_query_storage_nbytes
+        # END a warm table never implies that a future numeric chunk is resident.
         # Each original cell has at most eight zero vertices and twelve edge
         # roots. Deduplication can reduce this storage, so the preconstruction
         # bound covers fixed material arrays; the temporary bound below also
@@ -1031,7 +1034,7 @@ class OnlinePlanningScene:
         # the trajectory retains no material-point-sized autograd arrays.
         entities = len(self.robot_model.geometry_names)+len(self.owners)+1
         states = int(batch)*int(horizon)
-        live = states*(entities*256+entities*entities*512)
+        live = states*(entities*256+entities*entities*512) + self.robot_model.native_query_temporary_nbytes
         # The scene geometry and Pinocchio workspaces reside on the host.
         # Native IK can pass device joints through the CPU FK adapter; count
         # its named input and link-pose output together with their reverse
