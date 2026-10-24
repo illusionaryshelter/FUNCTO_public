@@ -1,6 +1,6 @@
 # `manipulation/execution_binding.py` 实现契约
 
-代码基线：本文件随精确内置标量分派的实现一同提交；实现提交生成后由文档提交回填其具体引用。
+代码基线：`6f40fb5`。本文所在的后续文档提交仅回填实现引用，生产代码与该实现提交相同。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `plain`
