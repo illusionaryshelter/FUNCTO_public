@@ -2,6 +2,7 @@
 
 # BEGIN offline truth is graded in original frames and cannot become runtime evidence.
 from copy import deepcopy
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -491,7 +492,7 @@ def test_native_contact_probe_only_appends_offline_truth_and_returns_no_runtime_
 # BEGIN native support histories keep the original material frame, clock and role.
 # BEGIN support and effect histories can share body identity without a material mapping.
 def _support_history(*, delta=None, until=None, mapped=True, material_frame=True, binding_case=None,
-                     arrival_window=None, goal_progress=.5):
+                     arrival_window=None, goal_progress=.5, hard_components=None):
     """Create explicit CPU body motion, with an independently retreating tool.
 
     The support basis and native body frame are deliberately nonidentity. The
@@ -516,6 +517,10 @@ def _support_history(*, delta=None, until=None, mapped=True, material_frame=True
         "outward_normal": [0., 0., -1.], "surface": surface,
         "gap_tolerance": .0001, "normal_tolerance": .0001, "margin": .002,
         "source": "Original synthetic bottom-on-finite-support event"}
+    # BEGIN explicit component sets and the omitted-field default share a fixture.
+    if hard_components is not None:
+        support["hard_components"] = list(hard_components)
+    # END only declared component identities change between these geometry cases.
     held = {"metadata": {"mode": "held", "carrier_id": "declared_material",
         "owner_initial_pose": entry.tolist(), "attachment": attachment.tolist(),
         "attachment_condition_id": "declared_holding", "attachment_interval": [0., 1.],
@@ -600,12 +605,16 @@ def test_support_native_material_pose_preserves_original_goal_and_does_not_follo
     assert result.execution_binding == before and execution["completed_goal_ids"] == []
 
 
+# BEGIN every hard subset uses the same measured geometry and physical thresholds.
+@pytest.mark.parametrize("hard_components", [None, *(
+    subset for size in range(5)
+    for subset in combinations(("gap", "body", "footprint", "normal"), size))])
 @pytest.mark.parametrize("kind", ["gap", "normal", "whole_body_boundary", "wrong_contact_face",
                                   "body_penetration", "positive_face_gap", "numerical_body_slack"])
-def test_support_metrics_match_original_compiled_allowed_set_without_adding_a_full_pose(kind):
+def test_support_metrics_match_original_compiled_allowed_set_without_adding_a_full_pose(kind, hard_components):
     import torch
 
-    evaluator, _ = _support_history()
+    evaluator, _ = _support_history(hard_components=hard_components)
     identity = ("supports", 11)
     requirement = evaluator._goals._requirements[identity]
     entry = evaluator._goals._owner_pose_samples[0]["declared_material"]
@@ -632,16 +641,32 @@ def test_support_metrics_match_original_compiled_allowed_set_without_adding_a_fu
     position = torch.tensor(tool[:3, 3], dtype=torch.float64)
     quaternion = torch.tensor(Rotation.from_matrix(tool[:3, :3]).as_quat()[[3, 0, 1, 2]], dtype=torch.float64)
     residual = requirement.evaluate(position, quaternion, evaluator._goals._support_numerical).item()
-    expected = kind in ("positive_face_gap", "numerical_body_slack")
+    # Each synthetic perturbation has a known violated geometry component.
+    # Selection changes its required role, not that measured violation.
+    violated = {"gap": {"gap"}, "normal": {"normal"},
+                "whole_body_boundary": {"footprint"}, "wrong_contact_face": {"gap"},
+                "body_penetration": {"body"}, "positive_face_gap": set(),
+                "numerical_body_slack": set()}[kind]
+    declared = ("body", "footprint") if hard_components is None else hard_components
+    expected = not (set(declared) & violated)
+    assert requirement.hard_components == declared
+    assert measured["hard_components"] == list(declared)
     assert (measured["value"] == "T") == expected
     assert (residual == 0.) == expected
-    assert sum(measured["violations"].values()) == pytest.approx(residual, abs=1e-12)
+    metric_names = {"gap": "contact_gap_m", "body": "body_penetration_m",
+                    "footprint": "body_boundary_m", "normal": "normal_chord"}
+    assert set(measured["violations"]) == set(metric_names.values())
+    assert {name for name, metric in metric_names.items()
+            if measured["violations"][metric] > 0.} == violated
+    assert sum(measured["violations"][metric_names[name]] for name in declared) == pytest.approx(residual, abs=1e-12)
+    assert measured["gap_tolerance_m"] == measured["normal_tolerance_rad"] == .0001
     if kind == "wrong_contact_face":
         assert measured["body"]["support_gap_m"] < 1e-12
         assert measured["contact_face"]["max_abs_gap_m"] > .09
     if kind == "whole_body_boundary":
         assert measured["contact_face"]["boundary_violation_m"] == 0.
         assert measured["violations"]["body_boundary_m"] > 0.
+# END an empty hard set preserves all preference diagnostics and has zero hard residual.
 
 
 @pytest.mark.parametrize("case", ["missing_mapping", "missing_phase", "missing_condition",
@@ -664,8 +689,10 @@ def test_support_duplicate_same_attachment_at_phase_boundary_is_one_fact(tmp_pat
 
 
 def test_support_original_point_failure_is_not_repaired_by_final_success(tmp_path):
-    evaluator, _ = _support_history(delta=lambda time:
+    # BEGIN this clock test explicitly declares its gap defect as a hard goal.
+    evaluator, _ = _support_history(hard_components=("gap", "body", "footprint", "normal"), delta=lambda time:
         _pose([0., 0., .001 if time == .1 else 0.], [0., 0., 0.]))
+    # END the later sample cannot replace the original declared point.
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     goal = report["functional_goal_evidence"][0]
     assert goal["value"] == "F" and goal["sample_elapsed_s"] == .1 and goal["query_count"] == 1
@@ -675,8 +702,10 @@ def test_support_original_point_failure_is_not_repaired_by_final_success(tmp_pat
 
 
 def test_support_final_diagnostic_failure_does_not_invent_an_original_terminal_obligation(tmp_path):
-    evaluator, _ = _support_history(delta=lambda time:
+    # BEGIN retain a hard gap metric while checking its original grading time.
+    evaluator, _ = _support_history(hard_components=("gap", "body", "footprint", "normal"), delta=lambda time:
         _pose([0., 0., .002 if time >= .3 else 0.], [0., 0., 0.]))
+    # END a failed final diagnostic is independent of the earlier point goal.
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     assert report["functional_goal_evidence"][0]["value"] == "T"
     assert report["final_support_diagnostics"][0]["measurement"]["value"] == "F"
@@ -685,8 +714,10 @@ def test_support_final_diagnostic_failure_does_not_invent_an_original_terminal_o
 
 @pytest.mark.parametrize("window,passing_time,expected", [((.1, .16), .14, "T"), ((.1, .12), .14, "F")])
 def test_support_declared_arrival_window_preserves_actual_opportunity(tmp_path, window, passing_time, expected):
-    evaluator, _ = _support_history(arrival_window=window, delta=lambda time:
+    # BEGIN the declared window evaluates the same explicitly hard gap metric.
+    evaluator, _ = _support_history(hard_components=("gap", "body", "footprint", "normal"), arrival_window=window, delta=lambda time:
         _pose([0., 0., 0. if time == 0. or time == passing_time else .001], [0., 0., 0.]))
+    # END component selection does not alter arrival scheduling.
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=_completed(evaluator))
     goal = report["functional_goal_evidence"][0]
     assert goal["value"] == expected and goal["arrival_window_s"] == list(window)

@@ -394,6 +394,8 @@ class _FunctionalGoalEvaluator:
         minimum-height criteria are not a replacement for SupportRequirement:
         only its specified face supplies the contact gap, and its original
         numerical position budget applies to body height and footprint alone.
+        All four measurements remain available; the serialized hard_components
+        alone determine this requirement's T/F result, including an empty set.
         """
         requirement = self._requirements[identity]
         binding = self._support_bindings[identity]
@@ -423,13 +425,22 @@ class _FunctionalGoalEvaluator:
             "body_penetration_m": max(0., -height-numerical),
             "body_boundary_m": max(0., requirement.margin-body["minimum_boundary_clearance_m"]-numerical),
             "normal_chord": max(0., chord-angular_bound)}
-        measured.update(value="T" if not any(violations.values()) else "F",
+        # BEGIN the original hard-component declaration selects the verdict.
+        # Physical metric names retain their units; this map relates them to
+        # the same four component identities used by SupportRequirement.
+        component_measurements = {"gap": "contact_gap_m", "body": "body_penetration_m",
+                                  "footprint": "body_boundary_m", "normal": "normal_chord"}
+        passed = all(violations[component_measurements[name]] == 0.
+                     for name in requirement.hard_components)
+        measured.update(value="T" if passed else "F",
+            hard_components=list(requirement.hard_components),
             actual_carrier_pose=pose.tolist(), contact_face=region,
             body={**body, "minimum_signed_height_m": height}, violations=violations,
             normal_chord=chord, normal_chord_bound=angular_bound,
             gap_tolerance_m=requirement.gap_tolerance,
             normal_tolerance_rad=requirement.normal_tolerance,
             margin_m=requirement.margin, numerical_position_tolerance_m=numerical)
+        # END preference measurements remain reported with their original bounds.
         return measured
     # END gap, angle, finite footprint and whole-body clearance retain their separate roles.
 

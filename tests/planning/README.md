@@ -1,6 +1,6 @@
 # 记录式规划、执行与诊断入口
 
-本文对应 FUNCTO_public 代码基线 `774e121` 上已实现的统一约束工作区；最终代码基线随实现提交更新。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+本文对应 FUNCTO_public 代码基线 `13fefbc` 及本次独立评估接口更新，实际实现提交在配套文档提交中回填。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
 
 ## 运行环境与输入
 
@@ -27,5 +27,19 @@
 `recorded_task_planning.plan_and_record` 保存一次后端结果。正式曲线保存原多项式、事件时钟、任务、场景快照及设备条件；拒绝候选标为 `rejected_diagnostic_not_executable`。`status=completed` 表示记录流程完成，规划结果以 success/failure 字段解释。
 
 `TrajectoryExecutor` 检查实际具名关节、速度、指令跟踪、设备时钟和已知原生机器人模型。末端与冻结预测目标的差只供事后评价；指令按原事件执行。保存的场景快照用于来源与模型身份，曲线恢复不等于重建可查询场景。具体交接见[执行组件](../../docs/planner-architecture/05-acceptance-and-execution.md)。
+
+## 独立物理证据与评分
+
+`run_recorded_simulation` 将正式曲线交给既有执行器，并把原生仿真采样送入独立记录回调。`recorded_skill_evaluation.NativeSkillPhysicsEvaluator` 消费正式执行绑定、显式原生实体对应、任务声明和每一步采样；输入中的真实TCP位姿、物体位姿、接触只用于结果分析。世界位姿 `T_W_B` 将物体本体坐标B映射到标定世界W，固定 `T_B_C` 将技能/观测实体坐标C映射到B，支持任务的材料点按 `T_W_C=T_W_B T_B_C` 转入世界坐标。每个效果在其原声明进度对应的设备时刻计算，记录保留原始样本与独立时钟。
+
+| API | 前置输入与实际作用 | 输出及消费者 |
+|---|---|---|
+| `NativeSkillPhysicsEvaluator.__init__` | 正式执行绑定、原生模型/实体清单、手指接触组与明确坐标对应；恢复原任务及效果声明 | 独立评估对象，由实验运行器持有 |
+| `observe` | 初态及每个正常物理步的原生状态、执行器采样时间 | 连续位姿、关节、接触与原任务测量；回调返回值不参与控制 |
+| `_FunctionalGoalEvaluator._measure_support` | 保存的 `SupportRequirement`、原生物体位姿、材料坐标对应；逐点计算gap/body/footprint/normal | 四项原测量全部保留，`contact_face.valid`仍表示完整几何便利判定；要求的T/F只汇总 `hard_components` 中的项，空集表达全部为偏好 |
+| `NativeSkillPhysicsEvaluator.finalize` | 完整采样序列及执行器的正常步账本 | `physics-evidence.npz`、`evaluation-report.json`；覆盖缺失保留U，原始目标时刻与末帧诊断分别保存 |
+| `summarize_skill_evidence` | 已测量的目标/效果/过程/终点T/F/U、正式绑定和覆盖 | 聚合任务结果与诊断角色；不重新测量原始NPZ、不把缺失谓词变为通过 |
+
+标准释放效果 `actual_release_from_current_feedback` 在原设备时刻截取接触前缀：同一目标此前有接触，且声明手指组均持续无接触达到已有释放窗口，才得到T。终点接触诊断和原事件时刻的效果证据分别记录。生产条件的 `effect_requirement` 选择这一独立评分计算；在线事件是否等待证据由它自身的 `requires_evidence` 指定。
 
 `--profile-runtime` 启用已有 cProfile 记录，分析器开销计入请求。实验交付使用可直接打开的本地 HTML，优先展示真实仿真图像上的源示教区域、迁移目标区域和采样点，支持比较与放大，同时保存接受、警告、拒绝、失败和缺失状态。阶段数据放在工作区 `sim-version-plans`。
