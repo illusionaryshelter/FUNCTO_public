@@ -1,6 +1,6 @@
 # `manipulation/optimizer_device_checks.py` 实现契约
 
-代码基线：`CURRENT_IMPLEMENTATION`。
+代码基线：`be44b54`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `require_tensor`

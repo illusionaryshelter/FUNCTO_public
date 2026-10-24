@@ -1,6 +1,6 @@
 # `manipulation/grasp_region.py` 实现契约
 
-代码基线：`CURRENT_IMPLEMENTATION`。
+代码基线：`be44b54`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_array`
