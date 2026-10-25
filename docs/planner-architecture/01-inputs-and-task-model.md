@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`c059334`。参考生成、完整路径归档和场景位姿显示与该实现提交一致。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`IMPLEMENTATION_COMMIT`。grounding 入口绑定、连续归档和场景位姿显示与该实现提交一致。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 输入的来源与相互依赖
 
@@ -63,19 +63,27 @@ manipulation 的功能位姿参考可在技能表示中声明 `is_initial_relati
 
 `generate_reference` 在 manipulation 的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
 
-`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer(..., skill_kind=representation["kind"])` 获得 `T_world_region`，再传给 `generate_reference`。它将数组写入 `reference.npz`，通过 `execution_binding.plain` 与 `PosePath.to_record` 将连续表达式、各路径源时间、入口/事件边界及源事件写入 `reference-paths.json`；后者由 `PosePath.from_record` 恢复同一连续函数。manipulation 声明旋转选择时，依据写入 `report.json.reference_rotation_transfer`，将连续工具路径与边界传给 `reference_phase`，最后调用参考网页输出。这个报告字段是上述参考运算的可追溯结果，其坐标与计算入口与路径对象一致。
+`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer(..., skill_kind=representation["kind"])` 获得 `T_world_region`，再传给 `generate_reference`。名义数组保存为 `nominal-reference.npz`；`nominal-reference-paths.json` 使用 `plain` 和 `PosePath.to_record` 保存全部连续物体/工具路径、原时刻、事件及边界。manipulation 声明旋转选择时，依据写入 `report.json.reference_rotation_transfer`。
 
-输出包括 `object_path/eef_path`、对应时间和名义位姿数组、`object_boundaries/eef_boundaries`、`boundary_checks`、`summaries`、`missing` 与 `status`。受控路径的终点为源释放时间与显式持物终点中的较早者；`bound_*` 另保存原名义绑定诊断。每份边界声明包含 `initial_pose`、带局部进度/位姿/来源的 `goals` 以及声明来源；`boundary_checks` 记录 `declared_for_physical_time_binding`。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
+当名义工具路径可用时，入口继续调用 `reference_phase` 和 `BoundToolReference`。grounding 的绑定时钟明确采用受控源区间的经过秒数：`t=t_D-t_D0`，`duration=t_D_end-t_D0`，进度节点为 `u=[0,1]`、`s=[0,1]`。这里 `t_D` 为源示教绝对时间，`t` 为本次参考的经过时间。当前 `robot_feedback.eef_pose` 与 `eef_twist=[v_W,omega_W]` 给出工具入口位姿和世界坐标速度，速度单位分别为 m/s 与 rad/s。反馈生产方根据具名 q/dq、固定官方机器人运动学及标定计算这两个量；本入口直接消费它们。缺少 `eef_twist` 时记录 `bind_reference` 失败，已有名义结果继续作为诊断产物保存。
+
+`reference.npz` 保存绑定后的 `eef_poses`、对应源时刻 `eef_timestamps`、参考经过秒数 `elapsed_s`、当前入口位姿/速度，以及明确命名的原 `source_frame_indices/source_timestamps`。`reference-paths.json` 保存源帧、源时间、原事件、源时间原点和 `BoundToolReference.to_record()` 的输入表达式；`reference-samples.npy` 是同一绑定对象的均匀时间采样。`nominal_reference_status` 表示原组合路径的生成状态，`reference_binding_status` 来自绑定器诊断；`reference_status='reference'` 要求入口速度绑定已实际完成，否则保留 `unbound`。图像、数值与归档使用同一个绑定对象。
+
+后续规划继续读取原名义函数和边界，由 `_reference_entrance` 从该请求的具名 q/dq 计算入口，再在规划时钟上使用同一 `BoundToolReference`。grounding 的源经过时钟提供完整参考几何及导数；规划的请求时钟决定实际候选采用的参考函数。
+
+`generate_reference` 的返回值包括 `object_path/eef_path`、对应时间和名义位姿数组、`object_boundaries/eef_boundaries`、`boundary_checks`、`summaries`、`missing` 与 `status`。受控路径的终点为源释放时间与显式持物终点中的较早者；`bound_*` 另保存原名义绑定诊断。每份边界声明包含 `initial_pose`、带局部进度/位姿/来源的 `goals` 以及声明来源；`boundary_checks` 记录 `declared_for_physical_time_binding`。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
 
 `reference_phase` 复用完整 `eef_path`，将 `eef_boundaries` 复制到 `MotionPhase.metadata["reference_boundaries"]`；源帧、源时间和原事件分别保存。
 
-`reference_visualization.write_reference_html` 接收完整技能、标定 RGB 视图、区域迁移输出、生成参考和运行记录。源图使用 `T_world_carrier/T_world_eef` 的示教实际记录；当前图使用 `object_path/eef_path` 的名义参考。显示时钟合并原示教时刻、参考事件节点和区间内均匀取样；源运动经 `sample_poses` 求值，当前参考经各自连续路径求值。每条轨迹在滑块所选源时刻仅显示一个位姿；超出其时间区间时显示缺失状态。源世界 `W_D` 与当前世界 `W_N` 分别标注，位置单位 m，姿态给出完整旋转矩阵与 XYZ 外禀 RPY 度数。当前实际物理轨迹的缺失状态独立展示，执行时钟由规划器绑定。
+`reference_visualization.write_reference_html` 接收完整技能、标定 RGB 视图、区域迁移输出、生成参考和运行记录。源图使用 `T_world_carrier/T_world_eef` 的示教实际记录；当前图中的工具轨迹使用传入的 `tool_reference`，其数据来源为已完成入口绑定的 `BoundToolReference`；物体名义路径保留独立标签。显示时钟合并原示教时刻、参考事件节点和区间内均匀取样；源运动经 `sample_poses` 求值，当前工具参考在源经过秒数上向同一绑定对象求值，其他名义路径按源进度求值。每条轨迹在滑块所选源时刻仅显示一个位姿；超出其时间区间时显示缺失状态。源世界 `W_D` 与当前世界 `W_N` 分别标注，位置单位 m，姿态给出完整旋转矩阵与 XYZ 外禀 RPY 度数。仅有名义路径时工具状态显示为 `unbound`；当前实际物理轨迹的缺失状态独立展示。
 
-`_pose_track` 将同一组完整位姿转为轨迹像素、4 cm 姿态轴、原矩阵与旋转数值；`_project` 使用原相机 `T_world_camera_cv` 和 `K` 投影，`_axes` 使用位姿的三个基向量生成轴端点。`_entity_outline` 在区域图上描绘实际观测实体掩码边缘，原场景、区域色块、源查询点及当前采样点继续显示。工具入口、名义首点和事件目标分别来自显式边界及同一连续路径；它们是几何标记，轨迹姿态始终由所选时刻决定。网页在本地读取所保存图像，缩放只改变显示尺寸。
+`_pose_track` 将同一组完整位姿转为轨迹像素、4 cm 姿态轴、原矩阵与旋转数值；`_project` 使用原相机 `T_world_camera_cv` 和 `K` 投影，`_axes` 使用位姿的三个基向量生成轴端点。`_entity_outline` 在区域图上描绘实际观测实体掩码边缘，原场景、区域色块、源查询点及当前采样点继续显示。工具入口、显示参考的首点和事件目标分别来自显式边界及对应连续路径；它们是几何标记，轨迹姿态始终由所选时刻决定。网页在本地读取所保存图像，缩放只改变显示尺寸。
+
+`BoundToolReference.to_record` 保存原 `nominal_paths`、各阶段 `source_boundaries`、进度映射、时长及入口位姿/速度。`execution_binding.plain` 递归序列化其中的 `PosePath`；`BoundToolReference.from_record` 恢复名义表达式与阶段边界，再调用原构造器求出相同的连续修正。重载使用原输入函数和时钟，节点之间的位姿及导数与生成对象一致。
 
 ## 2.1 实际物理时钟上的工具参考
 
-`timed_reference.BoundToolReference` 的输入为名义阶段、归一化物理时间到技能进度的 `progress_u/progress_s`、实际时长 `duration`，以及当前机器人 TCP 位姿和世界速度。`planning._reference_entrance` 使用同一官方机器人模型和具名关节 `q/dq` 运行 Pinocchio FK，读取工具连杆原点的 `LOCAL_WORLD_ALIGNED` 速度，经基座标定旋转到 W，并将 `ω_W × r_W` 加到线速度；`r_W` 为连杆原点到标定 TCP 的世界杆臂。输出 `initial_twist=[v_W,ω_W]` 的单位分别为 m/s 与 rad/s。
+`timed_reference.BoundToolReference` 的输入为名义阶段、归一化参考时间到技能进度的 `progress_u/progress_s`、秒数时长 `duration`，以及当前机器人 TCP 位姿和世界速度。grounding 提供源经过时钟，规划提供请求时钟；两者共用入口与事件连接运算。`planning._reference_entrance` 使用同一官方机器人模型和具名关节 `q/dq` 运行 Pinocchio FK，读取工具连杆原点的 `LOCAL_WORLD_ALIGNED` 速度，经基座标定旋转到 W，并将 `ω_W × r_W` 加到线速度；`r_W` 为连杆原点到标定 TCP 的世界杆臂。输出 `initial_twist=[v_W,ω_W]` 的单位分别为 m/s 与 rad/s。
 
 设名义 TCP 位姿为 `(p_n(t),R_n(t))`，其中 `p_n` 是 E 原点在 W 中的位置，`R_n` 将 E 坐标映到 W。接口使用世界加性平移 `b(t)` 与左旋转 `E(t)=Exp([φ(t)]×)`，计算 `p=p_n+b`、`R=E R_n`。名义物体、机构坐标及父路径组合在实际 `s(t)` 上直接求值。名义线速度和世界角速度由 Torch 对完整组合函数的单侧时间导数获得，保留进度停留段、斜率变化和旋转杆臂。
 
@@ -232,4 +240,4 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 
 两个构造器通过 `_region_frame_record` 输出 `T_world_region`、原源功能坐标、源所属实体与采集时间、支持候选身份。显式提供当前区域所属刚体位姿时，记录同状态依据，并计算 `L_body_region = inverse(T_world_body) @ T_world_region`；世界坐标和实体局部坐标指向同一 F。交互区域结果另有 `construction`，记录中心和方向的实际来源。源区域、源功能坐标、完整示教运动和交互/释放事件仍是技能表示；本步骤只构造其当前参考坐标。
 
-`config.ground_skill` 将该 F 交给 `generate_reference`，后者继续使用原 H_m、J、A、当前机器人反馈及已声明的初始相对旋转规则构造名义物体和工具路径。`reference_phase` 将路径及事件边界连接到规划问题；`BoundToolReference` 再用机器人 FK 入口和请求时钟绑定物理时间。`frame_from_deformation` 是已有的同索引点变形输出局部刚体拟合接口，输入为粗对齐源点、变形后的同索引点、源区域索引和粗功能坐标，输出局部刚体修正与拟合残差；本次双视角区域路径不调用它。
+`config.ground_skill` 将该 F 交给 `generate_reference`，后者继续使用原 H_m、J、A、当前机器人反馈及已声明的初始相对旋转规则构造名义物体和工具路径。`reference_phase` 传递路径及事件边界；grounding 以源经过秒数、当前工具位姿与速度调用 `BoundToolReference`，导出完整工具参考。规划则以原名义函数、该请求的 FK 入口及请求时钟调用同一绑定接口。`frame_from_deformation` 是已有的同索引点变形输出局部刚体拟合接口，输入为粗对齐源点、变形后的同索引点、源区域索引和粗功能坐标，输出局部刚体修正与拟合残差；本次双视角区域路径不调用它。

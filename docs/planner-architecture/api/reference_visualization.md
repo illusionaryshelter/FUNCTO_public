@@ -1,6 +1,6 @@
 # `manipulation/reference_visualization.py` 实现契约
 
-代码基线：`c059334`。
+代码基线：`IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_project`
@@ -192,7 +192,7 @@ Image.fromarray
 输入签名：
 
 ```python
-def write_reference_html(directory, skill, views, transfer, reference, report):
+def write_reference_html(directory, skill, views, transfer, reference, report, *, tool_reference=None):
 ```
 
 实现说明：
@@ -200,8 +200,9 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
 > Show source motion and transferred full poses in calibrated scene images.
 >
 > A shared source-time sample drives one pose per displayed track. Source
-> poses are recorded demonstration evidence; current paths are generated
-> nominal references. A grounding report has no current execution trajectory.
+> poses are recorded demonstration evidence; a supplied tool_reference is
+> evaluated at source elapsed seconds. Other nominal paths remain labeled
+> by their role. A grounding report has no current execution trajectory.
 
 显式输出分支：
 
@@ -227,6 +228,7 @@ transfer.get
 outputs['result'].get
 view.get
 picture.save
+tool_reference.sample_numpy
 path.sample_numpy
 reference['eef_path'].sample_numpy
 markers.extend
@@ -240,7 +242,6 @@ html.replace
 report.get
 '；'.join
 (directory / 'region.json').is_file
-reference.get
 (directory / 'reference.npz').is_file
 (directory / 'reference-paths.json').is_file
 html.replace('CARDS', cards).replace('DETAILS', escape(details)).replace
@@ -292,7 +293,8 @@ paths[name]
 markers
 declaration
 initial
-nominal
+start
+first
 goal
 point
 details
@@ -303,6 +305,7 @@ html
 failure
 warnings
 warning_text
+status
 ```
 
 直接调用符号：
@@ -335,6 +338,7 @@ region_picture
 view.get
 picture.save
 len
+tool_reference.sample_numpy
 path.sample_numpy
 _project
 reference['eef_path'].sample_numpy
@@ -351,7 +355,6 @@ str
 report.get
 '；'.join
 (directory / 'region.json').is_file
-reference.get
 (directory / 'reference.npz').is_file
 (directory / 'reference-paths.json').is_file
 html.replace('CARDS', cards).replace('DETAILS', escape(details)).replace

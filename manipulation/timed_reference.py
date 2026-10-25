@@ -7,6 +7,7 @@ including the current progress map's holds and changes of slope.
 """
 # BEGIN one physical-time reference is shared by IK, costs and saved results.
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pinocchio as pin
@@ -15,7 +16,7 @@ from scipy.spatial.transform import Rotation
 
 from .motion import _pose_array
 from .planning_problem import (
-    _interpolate, _tensor, quaternion_conjugate, quaternion_multiply,
+    PosePath, _interpolate, _tensor, quaternion_conjugate, quaternion_multiply,
 )
 
 
@@ -231,4 +232,28 @@ class BoundToolReference:
         poses[..., :3, 3] = position.detach().numpy()
         poses[..., :3, :3] = Rotation.from_quat(quaternion.detach().numpy().reshape(-1, 4)[:, [1, 2, 3, 0]]).as_matrix().reshape(*times.shape, 3, 3)
         return poses
+
+    # BEGIN archives retain the operands of the same entrance-binding calculation.
+    def to_record(self):
+        """Return nominal expressions, declared boundaries and measured entry.
+
+        ``execution_binding.plain`` serializes the nested PosePath objects.
+        Time remains seconds on the explicitly supplied clock; sampled poses
+        do not replace the continuous nominal or correction functions.
+        """
+        return dict(nominal_paths=list(self.nominal_phases),
+            source_boundaries=deepcopy(self.source_boundaries),
+            progress_u=self.progress_u, progress_s=self.progress_s, duration=self.duration,
+            initial_pose=self.initial_pose, initial_twist=self.initial_twist)
+
+    @classmethod
+    def from_record(cls, record):
+        """Restore a JSON record by applying the original binding operation."""
+        phases = [SimpleNamespace(reference=PosePath.from_record(path), metadata={})
+                  for path in record["nominal_paths"]]
+        for row in record["source_boundaries"]:
+            phases[row["phase_index"]].metadata["reference_boundaries"] = row["declaration"]
+        return cls(SimpleNamespace(phases=phases), record["progress_u"], record["progress_s"],
+                   record["duration"], record["initial_pose"], record["initial_twist"])
+    # END grounding archives and planner references share one numerical implementation.
 # END progress remains task semantics; tool derivatives use physical seconds.

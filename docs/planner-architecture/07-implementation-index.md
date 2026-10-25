@@ -6,7 +6,7 @@
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **60 个文件、957 个定义**。
+覆盖 **60 个文件、959 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -63,7 +63,7 @@
 | [manipulation/sampled_geometry_objective.py](api/sampled_geometry_objective.md) | 15 | [02](02-observation-and-collision.md) |
 | [manipulation/geometry_motion_bound.py](api/geometry_motion_bound.md) | 13 | [05](05-acceptance-and-execution.md) |
 | [manipulation/interval_geometry.py](api/interval_geometry.md) | 11 | [05](05-acceptance-and-execution.md) |
-| [manipulation/timed_reference.py](api/timed_reference.md) | 11 | [01](01-inputs-and-task-model.md) |
+| [manipulation/timed_reference.py](api/timed_reference.md) | 13 | [01](01-inputs-and-task-model.md) |
 | [manipulation/reference_visualization.py](api/reference_visualization.md) | 5 | [01](01-inputs-and-task-model.md) |
 | [manipulation/unified_solver.py](api/unified_solver.md) | 18 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_constraints.py](api/cubic_constraints.md) | 11 | [04](04-solver-and-search.md) |

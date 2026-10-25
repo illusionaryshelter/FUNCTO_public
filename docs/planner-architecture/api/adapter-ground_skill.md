@@ -1,11 +1,11 @@
 # `config/ground_skill.py` 实现契约
 
-代码基线：`c059334`。
+代码基线：`IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
 
-[定义位置](../../../config/ground_skill.py#L26)。
+[定义位置](../../../config/ground_skill.py#L27)。
 
 输入签名：
 
@@ -52,7 +52,7 @@ value.items
 
 ## `ground_skill`
 
-[定义位置](../../../config/ground_skill.py#L38)。
+[定义位置](../../../config/ground_skill.py#L39)。
 
 输入签名：
 
@@ -67,7 +67,10 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
 > ``relations`` may provide explicitly sourced J/A records; it does not
 > provide a target region. Missing A preserves an object-only reference.
 > The current scene supplies actual robot feedback, calibrated RGB-D and an
-> acquisition-state record. The scene's segmentation truth is never opened.
+> acquisition-state record. ``eef_twist`` is the measured world-frame TCP
+> [linear, angular] velocity in m/s and rad/s. The tool reference is bound
+> on source elapsed seconds; a planner rebinds its nominal operands when
+> choosing another request clock. The scene's segmentation truth is never opened.
 
 显式输出分支：
 
@@ -109,10 +112,13 @@ outputs['result']['diagnostics'].get
 reference.items
 np.ndarray
 reference.get
-phase.reference.sample_numpy
-phase.reference
+tool_reference.sample_numpy
+tool_reference.initial_pose
+tool_reference.initial_twist
+tool_reference.to_record
 np.linspace
 np.save
+tool_reference.diagnostics
 type(error).__name__
 (output / 'error.txt').write_text
 traceback.format_exc
@@ -135,6 +141,7 @@ rgb
 record
 transfer
 reference
+tool_reference
 stage
 relations
 field
@@ -168,8 +175,11 @@ frame
 arrays
 record['reference_rotation_transfer']
 phase
+source_clock
+elapsed
+poses
 sample
-record['planning_reference']
+summary
 record['status']
 ```
 
@@ -228,9 +238,14 @@ isinstance
 plain
 reference.get
 reference_phase
-phase.reference.sample_numpy
+BoundToolReference
+SimpleNamespace
+float
+tool_reference.sample_numpy
+tool_reference.to_record
 np.linspace
 np.save
+trajectory_summary
 type
 (output / 'error.txt').write_text
 traceback.format_exc
@@ -239,7 +254,7 @@ write_reference_html
 
 ## `ground_skill.recorded_detection`
 
-[定义位置](../../../config/ground_skill.py#L94)。
+[定义位置](../../../config/ground_skill.py#L99)。
 
 输入签名：
 
@@ -277,7 +292,7 @@ np.asarray
 
 ## `main`
 
-[定义位置](../../../config/ground_skill.py#L229)。
+[定义位置](../../../config/ground_skill.py#L267)。
 
 输入签名：
 

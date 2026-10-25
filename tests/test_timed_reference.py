@@ -1,6 +1,7 @@
 """Physical pose/twist boundaries against independently evaluated source motion."""
 # BEGIN complete output derivatives, source rotations and actual clocks are checked.
 from types import SimpleNamespace
+import json
 
 import numpy as np
 import pytest
@@ -186,4 +187,23 @@ def test_continuation_after_last_declared_join_consumes_the_nominal_suffix():
     assert reference.diagnostics["status"] == "nominal_reference"
     assert reference.diagnostics["declared_boundaries_in_interval"] == 0
     assert not reference.diagnostics["entrance_twist_bound"]
+
+
+# BEGIN archives preserve the same correction at interior times and clock holds.
+def test_record_roundtrip_preserves_entry_twist_continuous_motion_and_nominal_suffix():
+    from manipulation.execution_binding import plain
+    nominal = source_with_rotating_offset()
+    initial = pose((-.3, .4, .8), (.3, -.2, -.4))
+    velocity = [.13, -.07, .05, -.12, .09, .16]
+    reference = bind(nominal, initial, velocity, goals=[(.6, nominal.sample_numpy(.6))],
+        u=(0., .1, .4, .7, 1.), s=(0., 0., .6, .6, 1.), duration=5.)
+    record = json.loads(json.dumps(plain(reference.to_record())))
+    restored = BoundToolReference.from_record(record)
+    query = np.unique(np.r_[np.linspace(0., 5., 101), .137, 1.983, 2., 3.5])
+    np.testing.assert_array_equal(restored.sample_numpy(query), reference.sample_numpy(query))
+    np.testing.assert_array_equal(twist_at(restored, query), twist_at(reference, query))
+    np.testing.assert_allclose(restored.sample_numpy(0.), initial, atol=1e-14)
+    np.testing.assert_allclose(twist_at(restored, [0.])[0], velocity, atol=1e-14)
+    assert plain(restored.to_record()) == record
+# END reloading a sampled pose cache cannot satisfy this continuous invariant.
 # END each continuity claim is tied to explicit input geometry and physical time.

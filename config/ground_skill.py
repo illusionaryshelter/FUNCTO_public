@@ -11,13 +11,14 @@ import argparse
 import json
 from pathlib import Path
 import traceback
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
 
 from manipulation.skill import load_grounding_skill, observe_interaction_reference
 from manipulation.region_transfer import run_region_transfer
-from manipulation.representation import generate_reference
+from manipulation.representation import generate_reference, trajectory_summary
 from manipulation.reference_visualization import write_reference_html
 from transfer.segmentation import prepare_selected_observation, store_detections
 from transfer.features import write_json
@@ -41,7 +42,10 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
     ``relations`` may provide explicitly sourced J/A records; it does not
     provide a target region. Missing A preserves an object-only reference.
     The current scene supplies actual robot feedback, calibrated RGB-D and an
-    acquisition-state record. The scene's segmentation truth is never opened.
+    acquisition-state record. ``eef_twist`` is the measured world-frame TCP
+    [linear, angular] velocity in m/s and rad/s. The tool reference is bound
+    on source elapsed seconds; a planner rebinds its nominal operands when
+    choosing another request clock. The scene's segmentation truth is never opened.
     """
     skill = load_grounding_skill(skill_directory)
     scene_directory, output = Path(scene_directory), Path(output)
@@ -64,9 +68,10 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
     record = dict(skill_id=skill["metadata"]["skill_id"], skill=str(Path(skill_directory).resolve()),
                   scene=str(scene_directory.resolve()), instruction=instruction,
                   status="running", region_status="missing", reference_status="missing",
+                  nominal_reference_status="missing", reference_binding_status="missing",
                   target_region_truth_used=False, executed=False, scene_layout=layout,
                   current_robot_feedback=feedback, stages=[])
-    transfer, reference, stage = None, None, "validate_current_relations"
+    transfer, reference, tool_reference, stage = None, None, None, "validate_current_relations"
     try:
         # BEGIN validate already-declared coordinate identities before models.
         relations = relations or {}
@@ -179,12 +184,13 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
             J=relations.get("J"), A=relations.get("A"),
             T_world_eef=feedback.get("eef_pose"))
         arrays = {key: value for key, value in reference.items() if isinstance(value, np.ndarray)}
-        np.savez_compressed(output / "reference.npz", **arrays)
+        # BEGIN nominal operands are named separately from the bound tool output.
+        np.savez_compressed(output / "nominal-reference.npz", **arrays)
         # BEGIN persist the continuous reference consumed by reference_phase.
         # to_record retains parent compositions between saved pose samples;
         # boundary declarations keep the measured entrance separate.
         from manipulation.execution_binding import plain
-        write_json(output / "reference-paths.json", plain({
+        write_json(output / "nominal-reference-paths.json", plain({
             "frame_indices": reference["frame_indices"], "timestamps": reference["timestamps"],
             "events": reference["events"],
             "paths": {name: {"path": reference[name + "_path"],
@@ -192,37 +198,69 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
                              "boundaries": reference[name + "_boundaries"]}
                       for name in ("object", "eef") if name + "_path" in reference}}))
         # END arrays and continuous expressions describe the same nominal motion.
-        record.update(reference_status=reference["status"], reference_missing=reference["missing"],
-                      reference_summaries=_plain(reference["summaries"]), relations=_plain(relations),
+        record.update(nominal_reference_status=reference["status"],
+                      reference_status="unbound" if "eef_path" in reference else "missing",
+                      reference_missing=dict(reference["missing"]),
+                      nominal_reference_summaries=_plain(reference["summaries"]), relations=_plain(relations),
                       reference_boundary_checks=_plain(reference["boundary_checks"]),
                       reference_boundaries={name: _plain(reference[name + "_boundaries"])
                           for name in ("object", "eef") if name + "_boundaries" in reference},
-                      reference_scope=reference["scope"], reference_method=reference.get("method"))
+                      nominal_reference_scope=reference["scope"],
+                      nominal_reference_method=reference.get("method"))
         # BEGIN retain the exact declared rotation anchor alongside its generated poses.
         # This is reference-generation provenance in the functional frame, not
         # measured object orientation or an execution acceptance condition.
         if "rotation_transfer" in reference:
             record["reference_rotation_transfer"] = _plain(reference["rotation_transfer"])
         # END the report can identify the same rotation computation used by the path.
-        # END physical correction binds later to the robot feedback and planner clock.
+        # END the unchanged nominal expression remains available for planner rebinding.
+        record["stages"].append(stage)
         if "eef_poses" in reference:
+            # BEGIN complete grounding binds the current TCP pose and measured twist.
+            # Source elapsed seconds are an explicit reference clock, not a
+            # predicted execution duration. Use the planner's same binder.
+            stage = "bind_reference"
             from manipulation.planning_problem import reference_phase
+            from manipulation.timed_reference import BoundToolReference
             phase = reference_phase(reference, skill_id=skill["metadata"]["skill_id"],
                                     source="Current single-source dual-view grounding")
-            # Exercise the same PosePath consumed by PlanningProblem, without
-            # inventing task tolerances or executing a robot trajectory.
-            sample = phase.reference.sample_numpy(np.linspace(0., 1., 21))
-            np.save(output / "planner-reference-samples.npy", sample, allow_pickle=False)
-            record["planning_reference"] = dict(status="nominal_path_and_boundaries", samples=len(sample),
-                task_request="not_compiled: independent numerical task conditions were not supplied")
-        record["stages"].append(stage)
+            source_clock = np.asarray(reference["eef_timestamps"])
+            elapsed = source_clock-source_clock[0]
+            tool_reference = BoundToolReference(SimpleNamespace(phases=(phase,)),
+                [0., 1.], [0., 1.], float(elapsed[-1]), feedback["eef_pose"], feedback["eef_twist"])
+            poses = tool_reference.sample_numpy(elapsed)
+            np.savez_compressed(output / "reference.npz", eef_poses=poses,
+                eef_timestamps=source_clock, elapsed_s=elapsed,
+                initial_pose=tool_reference.initial_pose, initial_twist=tool_reference.initial_twist,
+                source_frame_indices=reference["frame_indices"], source_timestamps=reference["timestamps"])
+            write_json(output / "reference-paths.json", plain(dict(
+                source_frame_indices=reference["frame_indices"], source_timestamps=reference["timestamps"],
+                source_events=reference["events"], source_time_origin_s=float(source_clock[0]),
+                tool_reference=tool_reference.to_record())))
+            sample = tool_reference.sample_numpy(np.linspace(0., elapsed[-1], 21))
+            np.save(output / "reference-samples.npy", sample, allow_pickle=False)
+            summary = reference["summaries"]["eef"]
+            record.update(reference_binding_status=tool_reference.diagnostics["status"],
+                reference_status="reference" if tool_reference.diagnostics["entrance_twist_bound"] else "unbound",
+                reference_binding=plain(tool_reference.diagnostics),
+                reference_clock=dict(source_time_origin_s=float(source_clock[0]),
+                    duration_s=float(elapsed[-1]), progress_u=[0., 1.], progress_s=[0., 1.],
+                    meaning="source elapsed seconds; planner rebinds nominal operands to its request clock"),
+                reference_summaries={"eef": plain(trajectory_summary(poses, source_clock,
+                    approach_time=summary["approach_time"], interaction_time=summary["interaction_time"]))},
+                reference_scope="current tool pose and twist bound to nominal interaction on source elapsed seconds",
+                reference_method="BoundToolReference",
+                reference_samples=dict(count=len(sample), file="reference-samples.npy"))
+            record["stages"].append(stage)
+            # END saved arrays, continuous records and the viewer use this same object.
         record["status"] = "completed"
     except Exception as error:
         record.update(status="failed", failed_stage=stage, error_type=type(error).__name__, error=str(error))
         (output / "error.txt").write_text(traceback.format_exc())
     finally:
         write_json(output / "report.json", record)
-        write_reference_html(output, skill, views, transfer, reference, record)
+        write_reference_html(output, skill, views, transfer, reference, record,
+                             tool_reference=tool_reference)
     return record
 
 

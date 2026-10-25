@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`c059334`。参考生成、完整路径归档和场景位姿显示与该实现提交一致。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`IMPLEMENTATION_COMMIT`。grounding 入口绑定、连续归档和场景位姿显示与该实现提交一致。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 技能表示与运行环境状态
 
@@ -42,7 +42,10 @@
 | `region.npz` | 选定功能区域的表面元素掩码等结果 | 当前功能区域、支撑面选择与可视化 |
 | grounding 的 `report.json.functional_frame` | 迁移所得当前功能坐标 `T_world_region` | 实验 `reference_inputs` 实际读取并传给 `generate_reference`；该字段是计算输入 |
 | grounding 的 `report.json.reference_rotation_transfer` | manipulation 的布尔选择、功能坐标中的原名义/当前/选定入口 RPY，以及固定旋转修正矩阵 | `config.ground_skill` 保存 `generate_reference.rotation_transfer`；用于解释生成结果及复核参考运算 |
-| grounding 的 `reference-paths.json` | 原帧/时间/事件及每条连续路径表达式、源时刻、入口和目标边界 | `plain(PosePath)` 递归保存；`PosePath.from_record` 恢复完整函数；区域、物体和工具源表示仍保留在技能包 |
+| grounding 的 `nominal-reference.npz` 与 `nominal-reference-paths.json` | 原功能坐标组合的物体/工具名义路径及入口/事件声明 | `generate_reference` 生成；作为后续规划重新绑定的原操作数 |
+| grounding 的 `reference.npz` | 绑定后的工具位姿、源时刻、参考经过秒数、入口位姿/速度及原源帧/时间 | `BoundToolReference.sample_numpy` 生成，网页使用同一绑定函数 |
+| grounding 的 `reference-paths.json` | 原帧/时间/事件、源时间原点及完整工具绑定记录 | `BoundToolReference.to_record` 保存名义路径、阶段边界、时钟、入口；`from_record` 恢复相同连续函数 |
+| grounding 输入 `robot_feedback.json.eef_twist` | 工具原点在世界坐标下的 `[v_W,omega_W]`，单位 m/s 与 rad/s | 具名关节反馈、固定机器人模型及标定 → 速度生产；ground_skill → BoundToolReference 入口导数 |
 | 关系 JSON 中的 `J`、`A` | `J` 为当前物体坐标到源物体坐标的明确对应；`A=T_eef_body` 为名义附着 | 参考生成、任务点坐标与附着模型 |
 | `reference.npz` | 保存采样后的工具/物体参考、时间和相关数组 | 用于结果保存及指定入口的对照；连续表达式另由 `PosePath.to_record` 保存，`PosePath.from_record` 恢复原插值、机构和组合运算 |
 

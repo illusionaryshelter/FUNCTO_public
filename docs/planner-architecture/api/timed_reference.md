@@ -1,11 +1,11 @@
 # `manipulation/timed_reference.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `BoundToolReference`
 
-[定义位置](../../../manipulation/timed_reference.py#L22)。
+[定义位置](../../../manipulation/timed_reference.py#L23)。
 
 ```python
 class BoundToolReference():
@@ -32,7 +32,7 @@ class BoundToolReference():
 
 ## `BoundToolReference.__init__`
 
-[定义位置](../../../manipulation/timed_reference.py#L37)。
+[定义位置](../../../manipulation/timed_reference.py#L38)。
 
 输入签名：
 
@@ -134,7 +134,7 @@ self._bind_boundaries
 
 ## `BoundToolReference._first_time`
 
-[定义位置](../../../manipulation/timed_reference.py#L85)。
+[定义位置](../../../manipulation/timed_reference.py#L86)。
 
 输入签名：
 
@@ -178,7 +178,7 @@ np.searchsorted
 
 ## `BoundToolReference._nominal`
 
-[定义位置](../../../manipulation/timed_reference.py#L94)。
+[定义位置](../../../manipulation/timed_reference.py#L95)。
 
 输入签名：
 
@@ -237,7 +237,7 @@ torch.where
 
 ## `BoundToolReference._nominal_boundary`
 
-[定义位置](../../../manipulation/timed_reference.py#L105)。
+[定义位置](../../../manipulation/timed_reference.py#L106)。
 
 输入签名：
 
@@ -316,7 +316,7 @@ angular[0].detach
 
 ## `BoundToolReference._rotation_coordinate`
 
-[定义位置](../../../manipulation/timed_reference.py#L121)。
+[定义位置](../../../manipulation/timed_reference.py#L122)。
 
 输入签名：
 
@@ -376,7 +376,7 @@ min
 
 ## `BoundToolReference._correction`
 
-[定义位置](../../../manipulation/timed_reference.py#L138)。
+[定义位置](../../../manipulation/timed_reference.py#L139)。
 
 输入签名：
 
@@ -420,7 +420,7 @@ pin.Jexp3
 
 ## `BoundToolReference._bind_boundaries`
 
-[定义位置](../../../manipulation/timed_reference.py#L148)。
+[定义位置](../../../manipulation/timed_reference.py#L149)。
 
 输入签名：
 
@@ -533,7 +533,7 @@ self.diagnostics.update
 
 ## `BoundToolReference.sample`
 
-[定义位置](../../../manipulation/timed_reference.py#L201)。
+[定义位置](../../../manipulation/timed_reference.py#L202)。
 
 输入签名：
 
@@ -610,7 +610,7 @@ torch.where
 
 ## `BoundToolReference.sample.polynomial`
 
-[定义位置](../../../manipulation/timed_reference.py#L210)。
+[定义位置](../../../manipulation/timed_reference.py#L211)。
 
 输入签名：
 
@@ -642,7 +642,7 @@ _tensor
 
 ## `BoundToolReference.sample_numpy`
 
-[定义位置](../../../manipulation/timed_reference.py#L225)。
+[定义位置](../../../manipulation/timed_reference.py#L226)。
 
 输入签名：
 
@@ -709,4 +709,96 @@ Rotation.from_quat
 quaternion.detach().numpy().reshape
 quaternion.detach().numpy
 quaternion.detach
+```
+
+## `BoundToolReference.to_record`
+
+[定义位置](../../../manipulation/timed_reference.py#L237)。
+
+输入签名：
+
+```python
+def to_record(self):
+```
+
+实现说明：
+
+> Return nominal expressions, declared boundaries and measured entry.
+>
+> ``execution_binding.plain`` serializes the nested PosePath objects.
+> Time remains seconds on the explicitly supplied clock; sampled poses
+> do not replace the continuous nominal or correction functions.
+
+显式输出分支：
+
+```python
+dict(nominal_paths=list(self.nominal_phases), source_boundaries=deepcopy(self.source_boundaries), progress_u=self.progress_u, progress_s=self.progress_s, duration=self.duration, initial_pose=self.initial_pose, initial_twist=self.initial_twist)
+```
+
+读取的对象属性：
+
+```python
+self.nominal_phases
+self.source_boundaries
+self.progress_u
+self.progress_s
+self.duration
+self.initial_pose
+self.initial_twist
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+dict
+list
+deepcopy
+```
+
+## `BoundToolReference.from_record`
+
+[定义位置](../../../manipulation/timed_reference.py#L250)。
+
+输入签名：
+
+```python
+def from_record(cls, record):
+```
+
+实现说明：
+
+> Restore a JSON record by applying the original binding operation.
+
+显式输出分支：
+
+```python
+cls(SimpleNamespace(phases=phases), record['progress_u'], record['progress_s'], record['duration'], record['initial_pose'], record['initial_twist'])
+```
+
+读取的对象属性：
+
+```python
+PosePath.from_record
+phases[row['phase_index']].metadata
+```
+
+写入目标：
+
+```python
+phases
+path
+row
+phases[row['phase_index']].metadata['reference_boundaries']
+```
+
+直接调用符号：
+
+```python
+SimpleNamespace
+PosePath.from_record
+cls
 ```

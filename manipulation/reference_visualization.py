@@ -1,9 +1,9 @@
-"""Local HTML for observed regions, nominal paths and declared boundaries.
+"""Local HTML for observed regions and references bound to the current tool.
 
 Images are recorded RGB observations. The existing dual-view renderer paints
-region membership and supported surface samples. Nominal path projections and
-declared entrance/event poses show the geometric inputs to physical-time
-reference binding; the planning report owns that binding's resulting path.
+region membership and supported surface samples. A supplied BoundToolReference
+owns the tool curve shown on source elapsed seconds. Nominal-only diagnostics
+retain their explicit unbound status.
 """
 
 import json
@@ -59,12 +59,13 @@ def _entity_outline(image, mask):
 # END these display operations neither change a path nor select a region.
 
 
-def write_reference_html(directory, skill, views, transfer, reference, report):
+def write_reference_html(directory, skill, views, transfer, reference, report, *, tool_reference=None):
     """Show source motion and transferred full poses in calibrated scene images.
 
     A shared source-time sample drives one pose per displayed track. Source
-    poses are recorded demonstration evidence; current paths are generated
-    nominal references. A grounding report has no current execution trajectory.
+    poses are recorded demonstration evidence; a supplied tool_reference is
+    evaluated at source elapsed seconds. Other nominal paths remain labeled
+    by their role. A grounding report has no current execution trajectory.
     """
     directory = Path(directory)
     source = skill["source"]
@@ -124,18 +125,22 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
         paths = {}
         for name in ("object", "eef"):
             if reference and name + "_poses" in reference:
-                # BEGIN display the complete nominal path on the shared clock.
+                # BEGIN the complete bound tool is sampled on source elapsed seconds.
                 path = reference[name + "_path"]
                 original_times = np.asarray(reference[name + "_timestamps"])
                 times = display_times[(display_times >= original_times[0]) &
                                       (display_times <= original_times[-1])]
                 progress = ((times-original_times[0])/(original_times[-1]-original_times[0])
                             if len(original_times) > 1 else np.zeros(len(times)))
-                poses = path.sample_numpy(progress)
+                poses = (tool_reference.sample_numpy(times-original_times[0])
+                         if name == "eef" and tool_reference is not None else path.sample_numpy(progress))
+                label = ("入口绑定工具参考" if tool_reference is not None else "未绑定工具名义路径")
                 paths[name] = _pose_track(poses, times, view,
-                    label="物体名义路径" if name == "object" else "工具名义路径",
-                    source="generate_reference: " + name + "_path")
-                # END physical execution time is assigned by the planner.
+                    label="物体名义路径" if name == "object" else label,
+                    source=("BoundToolReference: source elapsed seconds"
+                            if name == "eef" and tool_reference is not None
+                            else "generate_reference: " + name + "_path"))
+                # END every displayed tool pose comes from the exported binding.
         # BEGIN declared tool boundaries are separate from nominal path samples.
         # The generator supplies world-frame initial_pose and local-progress
         # goal poses. Their physical-time connection belongs to BoundToolReference.
@@ -143,9 +148,13 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
         if reference and "eef_boundaries" in reference:
             declaration = reference["eef_boundaries"]
             initial = _project(np.asarray(declaration["initial_pose"])[None, :3, 3], view)[0]
-            nominal = _project(reference["eef_path"].sample_numpy(np.asarray([0.]))[:, :3, 3], view)[0]
+            # BEGIN the first-point marker belongs to the displayed reference.
+            start = (tool_reference.sample_numpy(np.asarray([0.])) if tool_reference is not None
+                     else reference["eef_path"].sample_numpy(np.asarray([0.])))
+            first = _project(start[:, :3, 3], view)[0]
             markers.extend((dict(kind="declared_entrance", label="声明工具入口", color="#ffffff", pixel=initial),
-                            dict(kind="nominal_start", label="名义路径首点", color="#62ff9b", pixel=nominal)))
+                            dict(kind="reference_start", label="参考首点", color="#62ff9b", pixel=first)))
+            # END a bound reference's first point coincides with its current entrance.
             for index, goal in enumerate(declaration["goals"]):
                 point = _project(np.asarray(goal["pose"])[None, :3, 3], view)[0]
                 markers.append(dict(kind="nominal_event", label=f"名义事件目标 {index}", color="#ff75df",
@@ -164,14 +173,14 @@ def write_reference_html(directory, skill, views, transfer, reference, report):
     html = r"""<!doctype html><meta charset="utf-8"><title>技能区域迁移与参考轨迹</title>
 <style>body{font:16px system-ui;background:#10151d;color:#e9eff7;margin:24px}h1{font-size:24px}h2{font-size:17px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px}article{padding:14px;background:#1c2531;border-radius:8px}.viewport{overflow:auto;max-height:75vh}canvas{width:100%;display:block}a{color:#8bcdff}pre{white-space:pre-wrap;overflow-wrap:anywhere}label{margin-right:24px}.controls{position:sticky;top:0;background:#10151df5;padding:12px 0;z-index:2}.status{padding:10px;border-left:4px solid #e8b450}.legend{color:#bdc9d8}</style>
 <h1>技能区域迁移与参考轨迹</h1>
-<p class="status">流程：RUN_STATUS · 区域：REGION_STATUS · 名义参考：REFERENCE_STATUS。本页展示 grounding 的几何输出与边界声明。</p>
+<p class="status">流程：RUN_STATUS · 区域：REGION_STATUS · 工具参考：REFERENCE_STATUS。本页展示 grounding 的区域与参考输出。</p>
 FAILURE_SUMMARY
 REGION_WARNINGS
 <p>源单视角与当前左右视角并排显示。绿色轮廓为实体分割，区域色块与黄色采样点来自本次计算；拒绝时保留诊断区域。源图叠加原示教实际记录，当前图叠加迁移参考。</p>
 <div class="controls"><label>图像放大 <input id="zoom" type="range" min="1" max="4" value="1" step=".25"></label><label>源时间对应进度 <input id="progress" type="range" min="0" max="0" value="0" step="1"></label><span id="time"></span></div>
-<p class="legend">青色为物体轨迹，橙色为工具轨迹；当前两图对应物体名义路径与工具名义路径。每条轨迹只显示所选时刻的一个位姿：红 x、绿 y、蓝 z，轴长 4 cm；虚线 F 为功能坐标。白色十字为声明工具入口，绿色圆环为名义路径首点，粉色菱形为名义事件目标。</p>
-<p>位姿 T_W_E 或 T_W_B 将工具 E 或物体 B 坐标映到各图标注的世界坐标。位置单位 m；RPY 为外禀 XYZ 角度，R=Rz(yaw) Ry(pitch) Rx(roll)，完整旋转矩阵显示在图下。三个视图使用同一源示教时刻，源时间差表示示教经过时长。</p>
-<p class="status">当前实际物理轨迹：缺失（本次记录为 grounding 与参考生成）。当前机器人反馈只提供声明入口；执行时钟及其实际轨迹由规划与执行记录给出。</p>
+<p class="legend">青色为物体轨迹，橙色为工具轨迹；各图下方注明数据来源与绑定状态。每条轨迹只显示所选时刻的一个位姿：红 x、绿 y、蓝 z，轴长 4 cm；虚线 F 为功能坐标。白色十字为声明工具入口，绿色圆环为显示参考的首点，粉色菱形为名义事件目标。</p>
+<p>位姿 T_W_E 或 T_W_B 将工具 E 或物体 B 坐标映到各图标注的世界坐标。位置单位 m；RPY 为外禀 XYZ 角度，R=Rz(yaw) Ry(pitch) Rx(roll)，完整旋转矩阵显示在图下。三个视图对应同一源时刻；参考经过时间等于源时刻减去源参考入口时刻，当前机器人位姿和速度用于绑定该参考的入口。</p>
+<p class="status">当前实际物理轨迹：缺失（本次记录为 grounding 与参考生成）。后续规划按其请求时钟重新绑定原名义路径，执行记录提供实际运动。</p>
 <div class="grid">CARDS</div><details open><summary>本次状态、输入来源与缺项</summary><pre>DETAILS</pre></details>
 <p><a href="report.json">完整运行记录</a>REFERENCE_LINK REGION_LINK</p>
 <script>const panels=DATA;const images={};const slider=document.getElementById('progress');
@@ -181,8 +190,8 @@ function dot(ctx,p,color,r){if(!p)return;ctx.fillStyle=color;ctx.beginPath();ctx
 function axes(ctx,points,label,dashed=false){if(!points||!points[0])return;ctx.setLineDash(dashed?[4,3]:[]);for(let i=1;i<4;i++){if(!points[i])continue;ctx.strokeStyle=['','#ff554e','#4de07b','#559bff'][i];ctx.lineWidth=dashed?2:3;ctx.beginPath();ctx.moveTo(...points[0]);ctx.lineTo(...points[i]);ctx.stroke();ctx.fillStyle=ctx.strokeStyle;ctx.font='12px sans-serif';ctx.fillText(label+' '+['','x','y','z'][i],points[i][0]+3,points[i][1]-3)}ctx.setLineDash([])}
 function numbers(path,i,name){const T=path.poses[i],p=T.slice(0,3).map(row=>row[3].toFixed(6)),rpy=path.rpy_deg[i].map(v=>v.toFixed(3)),R=T.slice(0,3).map(row=>row.slice(0,3).map(v=>v.toFixed(6)).join('  '));return path.label+'\n数据：'+path.source+'\n时间：'+path.times[i].toFixed(3)+' s\n位置 [m]：'+p.join(', ')+'\nRPY [deg]：'+rpy.join(', ')+'\nR_W_'+(name==='eef'?'E':'B')+'：\n'+R.join('\n')}
 // END world-frame matrices accompany the projected orientation axes.
-// BEGIN project declared entrance, nominal first point and explicit event goals.
-function boundaries(ctx,p){for(const m of p.markers||[]){if(!m.pixel)continue;const [x,y]=m.pixel;ctx.strokeStyle=m.color;ctx.lineWidth=2;ctx.beginPath();if(m.kind==='declared_entrance'){ctx.moveTo(x-7,y);ctx.lineTo(x+7,y);ctx.moveTo(x,y-7);ctx.lineTo(x,y+7)}else if(m.kind==='nominal_start'){ctx.arc(x,y,9,0,2*Math.PI)}else{ctx.moveTo(x,y-8);ctx.lineTo(x+8,y);ctx.lineTo(x,y+8);ctx.lineTo(x-8,y);ctx.closePath()}ctx.stroke();ctx.fillStyle=m.color;ctx.font='12px sans-serif';ctx.fillText(m.label,x+12,y+(m.kind==='nominal_start'?18:-12))}}
+// BEGIN project declared entrance, displayed first point and explicit event goals.
+function boundaries(ctx,p){for(const m of p.markers||[]){if(!m.pixel)continue;const [x,y]=m.pixel;ctx.strokeStyle=m.color;ctx.lineWidth=2;ctx.beginPath();if(m.kind==='declared_entrance'){ctx.moveTo(x-7,y);ctx.lineTo(x+7,y);ctx.moveTo(x,y-7);ctx.lineTo(x,y+7)}else if(m.kind==='reference_start'){ctx.arc(x,y,9,0,2*Math.PI)}else{ctx.moveTo(x,y-8);ctx.lineTo(x+8,y);ctx.lineTo(x,y+8);ctx.lineTo(x-8,y);ctx.closePath()}ctx.stroke();ctx.fillStyle=m.color;ctx.font='12px sans-serif';ctx.fillText(m.label,x+12,y+(m.kind==='reference_start'?18:-12))}}
 // END marker roles follow the generator's explicit boundary record.
 function draw(){const time=allTimes[Number(slider.value)];document.getElementById('time').textContent=allTimes.length?time.toFixed(3)+' s · 示教经过 '+(time-begin).toFixed(3)+' s':'没有可用轨迹';for(const p of panels){const c=document.getElementById(p.id),ctx=c.getContext('2d');if(!images[p.id].complete)continue;ctx.clearRect(0,0,c.width,c.height);ctx.drawImage(images[p.id],0,0);boundaries(ctx,p);axes(ctx,p.axes,'F',true);const info=[p.world_frame];for(const [name,path]of Object.entries(p.paths)){const color=name==='object'?'#40e2ed':'#ff9e38';ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();let connected=false;for(const point of path.pixels){if(!point){connected=false;continue}if(connected)ctx.lineTo(...point);else ctx.moveTo(...point);connected=true}ctx.stroke();const i=path.times.indexOf(time);if(i>=0){dot(ctx,path.pixels[i],color,5);axes(ctx,path.axes[i],name==='eef'?'E':'B');info.push(numbers(path,i,name))}else info.push(path.label+'：所选时间在该轨迹区间外')}document.getElementById('pose-'+p.id).textContent=info.join('\n\n')}}
 for(const p of panels)images[p.id]=new Image();for(const p of panels){images[p.id].onload=draw;images[p.id].src=p.image}slider.oninput=draw;document.getElementById('zoom').oninput=e=>document.querySelectorAll('canvas').forEach(c=>c.style.width=(100*Number(e.target.value))+'%');</script>"""
@@ -200,7 +209,11 @@ for(const p of panels)images[p.id]=new Image();for(const p of panels){images[p.i
                         if (directory/'region.json').is_file() else '')
     # END warnings are visible beside the region and reference decisions.
     # END preserve the native status without presenting missing as rejection.
-    html = html.replace("REFERENCE_STATUS", escape(str(reference.get("status", "missing") if reference else "missing")))
+    # BEGIN a nominal-only diagnostic cannot claim a completed entrance binding.
+    status = (report["reference_status"] if tool_reference is not None
+              else "unbound" if reference and "eef_path" in reference else "missing")
+    html = html.replace("REFERENCE_STATUS", escape(status))
+    # END the reference stage is explicit even in a failed or archived nominal view.
     html = html.replace("REFERENCE_LINK", ' · <a href="reference.npz">参考数值</a>'
                         + (' · <a href="reference-paths.json">完整连续路径与事件边界</a>'
                            if (directory / "reference-paths.json").is_file() else "")

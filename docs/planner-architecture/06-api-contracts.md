@@ -2,7 +2,7 @@
 
 观测场与求解算法接口基线为 `be44b54`，官方机器人距离批处理接口基线为 `12e0ef5`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-参考生成、完整路径归档与场景位姿显示代码基线为 `c059334`；本次仅文档提交回填实现编号，相关生产代码与该基线相同；各组件正文描述上述对应提交的当前调用。
+grounding 入口绑定、连续归档与场景位姿显示代码基线为 `IMPLEMENTATION_COMMIT`；各组件正文描述上述对应提交的当前调用。
 
 批量张量记为 `B` 个候选、`H` 个时间点和 `J` 个关节。常用布局为关节 `[B,H,J]`、位姿位置 `[B,H,3]`、四元数 `[B,H,4]`。实体场保存自身 XYZ 栅格，候选仅改变其刚体位姿。NumPy 保存数组通常移除候选维。位姿四元数采用 `wxyz`，齐次变换将右侧坐标中的点映到左侧坐标。物理时间以秒计，平移以米计，角度以弧度计。
 
@@ -19,7 +19,7 @@
 | `generate_reference` | 将源功能运动组合到当前功能坐标，在 manipulation 中按显式布尔字段选择初始旋转基准，并声明工具/物体入口和名义事件 | 表示及 manipulation 可选 `is_initial_relative_rotation_rpy`、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 完整名义组合路径、采样数组、显式 `*_boundaries`、`rotation_transfer` 及缺失状态；任务适配器与 reference_phase |
 | `_initial_rotation_offset` | 在同一功能参考坐标 F 中选择移动材料坐标 M 的初始 RPY 来源 | 原连续材料路径、功能路径、当前材料位姿、三个布尔值 → 固定左旋转 D 及入口选择记录；generate_reference |
 | `RotationOffsetPath.__init__/sample` | 保持材料功能点位置，逐次求值后在 F 中施加固定旋转 D | 原材料路径、功能路径、D、来源及查询进度/侧别 → 连续位置与 wxyz 四元数，保留进度导数；物体/工具子路径与边界求值 |
-| `config.ground_skill.ground_skill` | 从当前 RGB-D 实体观测得到功能区域并生成同一声明的参考 | 技能目录、场景目录、输出目录、任务指令、J/A 及来源 → 区域记录、reference.npz、reference-paths.json、运行 report.json 与网页；manipulation 声明旋转选择时保存 reference_rotation_transfer；命令行入口 |
+| `config.ground_skill.ground_skill` | 从当前 RGB-D 实体观测得到功能区域并生成同一声明的参考 | 技能目录、场景目录、输出目录、任务指令、J/A 及来源 → 区域、nominal-reference 数值/连续函数、入口绑定后的 reference 数值/连续函数、报告与网页；当前 eef_pose/eef_twist 提供入口，源经过秒数提供参考时钟；命令行入口 |
 | `program.ground_program` | 按程序声明绑定当前几何；持物声明与入口须代数一致 | `program,scene` → 工具参考、事件及几何诊断；`build_planning_problem` |
 | `ground_object_program` | 生成当前物体参考 | 物体程序、当前关系与功能绑定 → 物体路径；持物参考调用者 |
 | `function_motion.optimize_trajectory/transfer_function_motion` | 对已有参考施加明确的入口和功能关键帧 | 位姿序列、静态/当前入口、功能目标 → 适配位姿；`program` |
@@ -31,7 +31,8 @@
 | `reference_phase` | 将具名名义参考及其显式边界组织为阶段 | generate_reference 的 eef_path/eef_boundaries、技能身份、来源 → 保留组合路径与 reference_boundaries 元数据的 MotionPhase；问题构造 |
 | `BoundToolReference.__init__` | 把实际物理时钟及机器人入口连接到已声明参考边界 | PlanningProblem、progress_u/s、duration、入口 T_W_E 与 `[v_W,omega_W]` → 名义阶段、物理边界、一阶修正多项式及诊断；规划器绑定、重绑与候选自身时钟 |
 | `BoundToolReference.sample/sample_numpy` | 在物理秒上求同一完整工具参考 | 任意形状时刻 Tensor/NumPy → 同形状前缀的 W 系位置和 wxyz 四元数，或 4×4 齐次变换；参考 IK、保存与网页 |
-| `write_reference_html` | 在真实源/目标图像中展示 grounding 几何输出 | 技能、RGB 视图、区域记录、名义路径及 eef_boundaries → 可缩放本地 HTML 与区域图；共享源时刻上的源实际记录/当前参考完整位姿、姿态轴及旋转数值，声明入口与事件目标；config.ground_skill |
+| `BoundToolReference.to_record/from_record` | 保存并恢复入口绑定的完整连续计算 | 原名义表达式、阶段边界、进度时钟、时长、入口位姿与速度 → 递归记录或同一绑定函数；ground_skill 归档与离线恢复 |
+| `write_reference_html` | 在真实源/目标图像中展示 grounding 几何输出 | 技能、RGB 视图、区域记录、名义路径、eef_boundaries 及 tool_reference → 可缩放本地 HTML 与区域图；共享源时刻上的源实际记录/入口绑定参考完整位姿、姿态轴及旋转数值，声明入口与事件目标；config.ground_skill |
 | `_pose_track` / `_axes` / `_project` | 在各自世界坐标和原标定下显示完整轨迹位姿 | 位姿、源时刻、K、T_world_camera_cv → 原矩阵、RPY、位置与姿态轴像素；write_reference_html |
 | `_entity_outline` | 显示观测实体范围 | 原区域图、实际实体掩码 → 保留区域与采样点的边缘叠加图；write_reference_html |
 | `event_occurrence_key` | 获取一次命令/事件的完整身份 | 事件记录 → `(skill_id,event_id,occurrence)`；规划、手指与执行 |
