@@ -180,6 +180,18 @@ def ground_skill(skill_directory, scene_directory, output, *, instruction, relat
             T_world_eef=feedback.get("eef_pose"))
         arrays = {key: value for key, value in reference.items() if isinstance(value, np.ndarray)}
         np.savez_compressed(output / "reference.npz", **arrays)
+        # BEGIN persist the continuous reference consumed by reference_phase.
+        # to_record retains parent compositions between saved pose samples;
+        # boundary declarations keep the measured entrance separate.
+        from manipulation.execution_binding import plain
+        write_json(output / "reference-paths.json", plain({
+            "frame_indices": reference["frame_indices"], "timestamps": reference["timestamps"],
+            "events": reference["events"],
+            "paths": {name: {"path": reference[name + "_path"],
+                             "timestamps": reference[name + "_timestamps"],
+                             "boundaries": reference[name + "_boundaries"]}
+                      for name in ("object", "eef") if name + "_path" in reference}}))
+        # END arrays and continuous expressions describe the same nominal motion.
         record.update(reference_status=reference["status"], reference_missing=reference["missing"],
                       reference_summaries=_plain(reference["summaries"]), relations=_plain(relations),
                       reference_boundary_checks=_plain(reference["boundary_checks"]),

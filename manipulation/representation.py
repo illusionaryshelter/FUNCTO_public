@@ -215,7 +215,7 @@ def _initial_rotation_offset(nominal, functional, current, flags):
         "is_initial_relative_rotation_rpy": flags.tolist(),
         "rpy_convention": "extrinsic xyz; Rz(yaw) Ry(pitch) Rx(roll); radians",
         "rotation_frame": "current functional reference F",
-        "moving_frame": "fixed material frame M; calibrated tool E for a tool reference",
+        "moving_frame": "fixed material frame M of the manipulated body",
         "nominal_initial_rpy_rad": nominal_rpy,
         "current_initial_rpy_rad": current_rpy,
         "selected_initial_rpy_rad": selected,
@@ -244,6 +244,8 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     named boundaries enter BoundToolReference
     only after the planner has bound physical time and measured TCP velocity.
 
+    Grasp motion composes F_G and H_g directly; the initial-relative rotation
+    declaration belongs to manipulation's material-frame pose reference.
     Grasp motion requires actual E. A scalar mechanism instead uses its current
     model and current coordinate, preserving its physical manifold and winding.
     Production object/tool paths stop at release or an earlier held_until_time.
@@ -262,18 +264,6 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
         raise ValueError("Unknown representation kind")
     if A is not None and contact_motion:
         raise ValueError("Choose a rigid attachment model or time-varying contact, not both")
-    # BEGIN the optional Boolean declaration selects an initial orientation anchor.
-    # The order is roll/pitch/yaw. True uses the current-run initial component;
-    # False uses the functional nominal initial component. This is reference
-    # construction data, not a tolerance, robot goal, or execution condition.
-    rotation_flags = None
-    if "is_initial_relative_rotation_rpy" in representation:
-        rotation_flags = np.asarray(representation["is_initial_relative_rotation_rpy"])
-        if rotation_flags.shape != (3,) or rotation_flags.dtype != np.dtype(bool):
-            raise ValueError("is_initial_relative_rotation_rpy must contain exactly three Boolean values")
-        if motion_model is not None:
-            raise ValueError("Functional-frame rotation transfer requires a pose reference; mechanism orientation is defined by its FK")
-    # END scalar mechanism coordinates retain their independently declared FK meaning.
     extra = [representation.get(key) for key in ("approach_time", "interaction_time", "release_time")]
     extra += [held_until_time]
     extra = [float(value) for value in extra if value is not None]
@@ -346,19 +336,28 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
         elif current_eef is None:
             result["missing"]["eef_poses"] = "Grasp reference needs the actual current EEF pose"
         else:
-            # BEGIN use the calibrated tool frame as the material frame for tool motion.
+            # BEGIN grasp preserves the complete demonstrated F_G-to-tool relation.
+            # Current E is an entrance boundary; it does not replace any
+            # nominal grasp rotation component during geometric transfer.
             raw = _component_path(result["H_g"], times, path_times,
                                   source="bound source grasp relation", parent=function_path(path_times))
-            if rotation_flags is not None:
-                correction, result["rotation_transfer"] = _initial_rotation_offset(
-                    raw, function_path(path_times), current_eef, rotation_flags)
-                raw = RotationOffsetPath(raw, function_path(path_times), correction,
-                                          source=result["rotation_transfer"])
-            # END attachment-free tool references consume the same declared rotation rule.
+            # END initial-relative rotation selection belongs to manipulation.
             diagnostic("eef", raw, path_times)
             publish("eef", raw, current_eef, raw.sample_numpy(event_progress))
             result["method"] = "nominal grasp relation with declared tool boundaries"
     else:
+        # BEGIN manipulation selects the initial material-frame rotation anchor.
+        # The order is roll/pitch/yaw. True uses the current-run initial
+        # component; False uses the functional nominal initial component.
+        # Scalar mechanism orientation remains defined by its declared FK.
+        rotation_flags = None
+        if "is_initial_relative_rotation_rpy" in representation:
+            rotation_flags = np.asarray(representation["is_initial_relative_rotation_rpy"])
+            if rotation_flags.shape != (3,) or rotation_flags.dtype != np.dtype(bool):
+                raise ValueError("is_initial_relative_rotation_rpy must contain exactly three Boolean values")
+            if motion_model is not None:
+                raise ValueError("Functional-frame rotation transfer requires a pose reference; mechanism orientation is defined by its FK")
+        # END this declaration is consumed only by the material pose reference.
         raw_body = None
         if motion_model is not None:
             if not isinstance(motion_model, MotionModel) or motion_model.kind not in {"prismatic", "revolute"}:

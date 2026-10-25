@@ -53,7 +53,7 @@ flowchart TD
 
 `BoundToolReference` 把完整源工具参考与测得 TCP 入口位姿、速度绑定，供参考 IK 产生数值样本。具有任务语义的过程关系、功能区域和事件由 `PlanningProblem` 单独保留。搜索目标由原 STATE 关节运动成本、`optimizer_preferences(phase='feasibility')` 的过程关系与方向偏好，以及固定材料点几何目标组成；硬任务要求以逐分量有符号条件表达。固定进度和声明作用域确定的常量行在核对原值后从求解矩阵消去，完整原条件用于验收。候选的固定质量评分单独记录，其有限性属于资格条件。
 
-功能位姿参考中的 `is_initial_relative_rotation_rpy` 选择材料功能坐标的初始旋转基准。三个布尔值按功能参考坐标中的 XYZ 外禀 RPY 排列：真值选择运行初态，假值选择原名义初态；完整矩阵组合保留源相对旋转。连续材料位置保持原函数，物体与工具位姿由固定局部变换逐次计算。交互边界、释放终点和参考 IK 查询同一生成路径，具体接口见[输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md)。
+manipulation 功能位姿参考中的 `is_initial_relative_rotation_rpy` 选择材料功能坐标的初始旋转基准。三个布尔值按功能参考坐标中的 XYZ 外禀 RPY 排列：真值选择运行初态，假值选择原名义初态；完整矩阵组合保留源相对旋转。连续材料位置保持原函数，物体与工具位姿由固定局部变换逐次计算。交互边界、释放终点和参考 IK 查询同一生成路径，grasp 直接组合当前抓取功能坐标与原 `H_g`，完整保留其旋转。参考生成、完整路径归档和场景位姿显示代码基线为 `IMPLEMENTATION_COMMIT`；具体接口见[输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md)。
 
 机器人及其固定末端配置使用官方碰撞模型，形状和固定关系跨任务复用，位姿由关节反馈、运动学和标定计算。任务物体及环境使用现场 RGB-D 的 `FrozenObservedField`。关系建立后继续复用关系前同一 TSDF，以事件处机器人参考连杆的位姿作为固定锚点预测运动，并使用通用距离余量。源技能中的功能区域、任务点和接触定义经 grounding 后参与任务计算。
 

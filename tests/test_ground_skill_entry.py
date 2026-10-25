@@ -136,11 +136,34 @@ def test_successful_entry_exports_nominal_path_and_declared_tool_boundaries(tmp_
     np.testing.assert_allclose(np.load(output / "planner-reference-samples.npy")[0], nominal_start, atol=1e-12)
     html = (output / "index.html").read_text()
     panels = json.loads(html.split("const panels=", 1)[1].split(";const images=", 1)[0])
+    # BEGIN serialized and displayed full poses share the production reference.
+    from manipulation.planning_problem import PosePath
+    path_record = json.loads((output / "reference-paths.json").read_text())["paths"]["eef"]
+    restored = PosePath.from_record(path_record["path"])
+    np.testing.assert_array_equal(restored.sample_numpy(np.linspace(0., 1., 21)),
+                                  np.load(output / "planner-reference-samples.npy"))
+    source_times = panels[0]["paths"]["eef"]["times"]
+    assert "当前实际物理轨迹：缺失" in html
+    # END source-time correspondence is explicit in every calibrated view.
     for panel in panels[1:]:
+        track = panel["paths"]["eef"]
+        assert track["times"] == source_times
+        assert len(track["poses"]) == len(track["axes"]) == len(track["rpy_deg"])
+        times = np.asarray(track["times"])
+        np.testing.assert_array_equal(np.asarray(track["poses"]),
+            restored.sample_numpy((times-times[0])/(times[-1]-times[0])))
         markers = {row["kind"]: row for row in panel["markers"]}
         assert set(markers) == {"declared_entrance", "nominal_start", "nominal_event"}
         calibration = json.loads((scene / panel["id"] / "calibration.json").read_text())
         K = np.asarray(calibration["K"])
+        # BEGIN axis endpoints come from the displayed orientation, not a fixed frame.
+        index = len(track["times"]) // 2
+        displayed_pose = np.asarray(track["poses"][index])
+        points = np.vstack([displayed_pose[:3, 3],
+            displayed_pose[:3, 3] + .04*displayed_pose[:3, :3].T])
+        pixels = points @ K.T
+        np.testing.assert_allclose(track["axes"][index], pixels[:, :2]/pixels[:, 2:], atol=1e-12)
+        # END each track supplies one complete pose at the selected timestamp.
         for name, pose in (("declared_entrance", actual), ("nominal_start", nominal_start),
                            ("nominal_event", function)):
             pixel = K @ pose[:3, 3]

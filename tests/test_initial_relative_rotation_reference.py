@@ -177,16 +177,24 @@ class InitialRelativeRotationReferenceTest(unittest.TestCase):
         np.testing.assert_allclose(result["eef_path"].sample_numpy(progress),
                                    result["object_path"].sample_numpy(progress) @ relative, atol=2e-14)
 
-    def test_tool_reference_uses_calibrated_tool_frame_with_the_same_flag_contract(self):
+    # BEGIN grasp's full relative tool motion is independent of manipulation flags.
+    def test_grasp_preserves_nominal_rotation_and_separate_current_entry(self):
         source = np.array([pose((.1, .0, .2), (.1, -.2, .3)),
                            pose((.2, .1, .1), (.2, .1, .5))])
         representation = build_representation(kind="grasp", timestamps=[2., 4.], frame_indices=[0, 1],
             T_world_carrier=np.repeat(np.eye(4)[None], 2, axis=0), T_world_eef=source,
             L_G=np.eye(4), interaction_time=4.)
-        representation[FIELD] = [True, True, True]
         entry = pose((.4, -.2, .3), (.4, .2, -.3))
-        result = generate_reference(representation, T_world_function=pose((.7, .0, .2)), T_world_eef=entry)
-        np.testing.assert_allclose(result["eef_path"].sample_numpy(0.)[:3, :3], entry[:3, :3], atol=2e-14)
+        functional = pose((.7, .0, .2), (.2, -.1, .4))
+        progress = np.array([0., .17, .43, .79, 1.])
+        expected = functional @ sample_poses(source, [2., 4.], 2. + 2.*progress)
+        for declaration in ({}, {FIELD: [True, True, True]}):
+            result = generate_reference({**representation, **declaration},
+                T_world_function=functional, T_world_eef=entry)
+            np.testing.assert_allclose(result["eef_path"].sample_numpy(progress), expected, atol=2e-14)
+            np.testing.assert_array_equal(result["eef_boundaries"]["initial_pose"], entry)
+            self.assertNotIn("rotation_transfer", result)
+    # END a manipulation declaration cannot rotate a grasp goal or its path.
 
     def test_flags_require_three_booleans_at_the_consuming_interface(self):
         representation, arguments = fixture()

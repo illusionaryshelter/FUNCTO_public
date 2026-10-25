@@ -1,6 +1,6 @@
 # 外部文件与数据职责
 
-代码基线：`be44b54`。本次文档提交回填实际实现引用，生产代码与该实现提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`IMPLEMENTATION_COMMIT`。参考生成、完整路径归档和场景位姿显示与该实现提交一致。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 技能表示与运行环境状态
 
@@ -19,13 +19,13 @@
 | `skill.json` | 技能包格式及各成员文件名 | `load_grounding_skill` 定位成员 |
 | `metadata.json` | 技能身份、技能类别、对象角色、语义描述与源事件信息 | 技能选择、语义对象选择与 grounding |
 | `source.json` + `source.npz` + `rgb.png` | 源图像、深度、相机标定、裁剪、源实体/功能区域、源点观测、特征和功能坐标 | `load_grounding_skill` 恢复源记录；`run_region_transfer` 使用源区域与特征提出并选择当前区域 |
-| `representation.json` + `motion.npz` | 源帧与时间、源物体/工具轨迹、`L_G/L_R`、`C_D/H_g/H_m`、交互/释放时刻与事件，以及可选布尔数组 `is_initial_relative_rotation_rpy` | `generate_reference` 根据功能参考与声明的初始旋转选择生成连续物体/工具参考 |
+| `representation.json` + `motion.npz` | 源帧与时间、源物体/工具轨迹、`L_G/L_R`、`C_D/H_g/H_m`、交互/释放时刻与事件，以及 manipulation 可选布尔数组 `is_initial_relative_rotation_rpy` | `generate_reference` 根据功能参考与声明的初始旋转选择生成连续物体/工具参考 |
 | `program.json` | 另一任务入口使用的源示教、功能事件、开闭指令与任务关系 | `prepare_candidate` → `build_planning_problem` → `ground_program`；部分实验入口直接由 representation 构造问题 |
 | 源 `episode.h5`、`trajectories.h5`、`masks.h5`、`regions.json`、`evidence.json` | 提取技能时使用的演示记录、区域及事件依据 | 技能导入/导出组件产生上述技能包；独立技能包加载按其成员文件读取 |
 
 `C_D` 表示源工具相对源物体的变换，`H_g` 表示源工具相对抓取功能坐标的变换，`H_m` 表示源物体相对操作功能坐标的变换。它们是参考运动的内容。源 `release_time` 决定参考受控区间的结束时刻；源开爪命令保留自身时刻。两者共同保留，并分别表达源物理事件与源控制意图。
 
-`is_initial_relative_rotation_rpy` 是技能的参考构造声明，依次选择 roll、pitch、yaw 的初始基准。`true` 使用本次运行初态，`false` 使用原功能参考迁移初态；后续旋转保留完整矩阵表示的源相对变化。该计算使用当前机器人反馈和已有物体—工具模型确定材料初态，坐标与组合顺序见[输入与任务模型](01-inputs-and-task-model.md)。
+`is_initial_relative_rotation_rpy` 是 manipulation 的参考构造声明，依次选择 roll、pitch、yaw 的初始基准。`true` 使用本次运行初态，`false` 使用原功能参考迁移初态；后续旋转保留完整矩阵表示的源相对变化。grasp 直接迁移 `H_g` 的完整旋转；该字段只进入 manipulation 的材料参考计算。该计算使用当前机器人反馈和已有物体—工具模型确定材料初态，坐标与组合顺序见[输入与任务模型](01-inputs-and-task-model.md)。
 
 ## 3. 当前感知与 grounding 文件
 
@@ -41,7 +41,8 @@
 | `surface.npz` | 多视角表面元素、观测像素、视图身份、观测与元素对应 | 区域几何和各图的区域投影 |
 | `region.npz` | 选定功能区域的表面元素掩码等结果 | 当前功能区域、支撑面选择与可视化 |
 | grounding 的 `report.json.functional_frame` | 迁移所得当前功能坐标 `T_world_region` | 实验 `reference_inputs` 实际读取并传给 `generate_reference`；该字段是计算输入 |
-| grounding 的 `report.json.reference_rotation_transfer` | 布尔选择、功能坐标中的原名义/当前/选定入口 RPY，以及固定旋转修正矩阵 | `config.ground_skill` 保存 `generate_reference.rotation_transfer`；用于解释生成结果及复核参考运算 |
+| grounding 的 `report.json.reference_rotation_transfer` | manipulation 的布尔选择、功能坐标中的原名义/当前/选定入口 RPY，以及固定旋转修正矩阵 | `config.ground_skill` 保存 `generate_reference.rotation_transfer`；用于解释生成结果及复核参考运算 |
+| grounding 的 `reference-paths.json` | 原帧/时间/事件及每条连续路径表达式、源时刻、入口和目标边界 | `plain(PosePath)` 递归保存；`PosePath.from_record` 恢复完整函数；区域、物体和工具源表示仍保留在技能包 |
 | 关系 JSON 中的 `J`、`A` | `J` 为当前物体坐标到源物体坐标的明确对应；`A=T_eef_body` 为名义附着 | 参考生成、任务点坐标与附着模型 |
 | `reference.npz` | 保存采样后的工具/物体参考、时间和相关数组 | 用于结果保存及指定入口的对照；连续表达式另由 `PosePath.to_record` 保存，`PosePath.from_record` 恢复原插值、机构和组合运算 |
 

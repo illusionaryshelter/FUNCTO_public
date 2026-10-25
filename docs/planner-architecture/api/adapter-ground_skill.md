@@ -1,6 +1,6 @@
 # `config/ground_skill.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -225,6 +225,7 @@ any
 generate_reference
 reference.items
 isinstance
+plain
 reference.get
 reference_phase
 phase.reference.sample_numpy
@@ -276,7 +277,7 @@ np.asarray
 
 ## `main`
 
-[定义位置](../../../config/ground_skill.py#L217)。
+[定义位置](../../../config/ground_skill.py#L229)。
 
 输入签名：
 

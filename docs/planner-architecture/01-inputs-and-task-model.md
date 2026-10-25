@@ -1,6 +1,6 @@
 # 输入、参考与任务模型
 
-代码基线：`be44b54`。本次文档提交回填实际实现引用，生产代码与该实现提交相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+代码基线：`IMPLEMENTATION_COMMIT`。参考生成、完整路径归档和场景位姿显示与该实现提交一致。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 输入的来源与相互依赖
 
@@ -49,25 +49,29 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `generate_reference` 接收以上表示及当前功能坐标 `T_world_function`、当前到示教的物体坐标对应 `J`、声明附着 `A`、当前工具/物体位姿，以及可选机构模型与坐标。该接口以 `body` 命名被操作物体的表示坐标。`A=T_eef_body` 是物体坐标在工具坐标中的位姿，满足 `T_world_body=T_world_eef A`；`J=T_demo_body_current_body` 将当前物体坐标中的点映到示教物体坐标。将该表示绑定到 `program` 接口的同一 `carrier` 坐标后，`A=inv(scene.holding.T_carrier_eef)`。
 
-抓取名义路径由源抓取关系和当前功能坐标组合生成。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数依次组合当前功能路径、`Q(t)`、`Q(t_c)⁻¹` 和 `L_body_material⁻¹`，得到完整名义物体路径。给定声明附着 `A` 后，名义工具路径由该物体路径右乘 `A⁻¹` 唯一确定。父路径与固定右乘在每次求值时组合，旋转引起的 TCP 杆臂运动由同一函数保留。
+抓取名义路径由源抓取关系和当前功能坐标直接组合：`T_W_E(t)=T_W_FG(t) H_g(t)`。其中 `W` 为当前世界坐标、`E` 为标定工具坐标、`F_G` 为迁移得到的抓取功能坐标；`H_g` 完整保留原相对位置与旋转。当前工具反馈单独进入入口边界声明。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数依次组合当前功能路径、`Q(t)`、`Q(t_c)⁻¹` 和 `L_body_material⁻¹`，得到完整名义物体路径。给定声明附着 `A` 后，名义工具路径由该物体路径右乘 `A⁻¹` 唯一确定。父路径与固定右乘在每次求值时组合，旋转引起的 TCP 杆臂运动由同一函数保留。
 
 对于转动或移动机构，输入提供源标量坐标与当前坐标。参考在标量坐标中保留源运动增量与累计转角，再通过当前机构模型的正运动学生成位姿。`contact_motion=True` 与固定附着 `A` 是互斥输入分支，分别对应时变接触关系与刚性附着关系；同时给定时产生 `ValueError`。
 
-功能位姿参考可在技能表示中声明 `is_initial_relative_rotation_rpy`。该字段必须为三个布尔值，顺序为 roll、pitch、yaw，表示初始朝向的分量来源。旋转分量使用功能参考坐标 F 中的 XYZ 外禀约定，即 `R=Rz(yaw) Ry(pitch) Rx(roll)`。`true` 选择本次运行初态的对应分量，`false` 选择原功能参考迁移入口的对应分量。选择发生在入口；后续运动通过完整旋转矩阵保留相对于入口的旋转变化。标量机构参考的姿态由其正运动学定义，该声明适用于功能位姿参考。
+manipulation 的功能位姿参考可在技能表示中声明 `is_initial_relative_rotation_rpy`。grasp 的参考生成只组合原 `H_g` 与当前 `F_G`；旋转字段的解析与运算由 manipulation 分支消费。该字段必须为三个布尔值，顺序为 roll、pitch、yaw，表示初始朝向的分量来源。旋转分量使用功能参考坐标 F 中的 XYZ 外禀约定，即 `R=Rz(yaw) Ry(pitch) Rx(roll)`。`true` 选择本次运行初态的对应分量，`false` 选择原功能参考迁移入口的对应分量。选择发生在入口；后续运动通过完整旋转矩阵保留相对于入口的旋转变化。标量机构参考的姿态由其正运动学定义，该声明适用于功能位姿参考。
 
-对于物体运动，旋转对象是上述固定材料功能坐标 M。记原名义路径为 `T_W_M(s)`，功能路径为 `T_W_F(s)`，技能进度为 s。原初始旋转在 F 中为 `R_n0=R_W_F(0)^T R_W_M(0)`，当前初始旋转为 `R_c=R_W_F(0)^T R_W_body(0) R_body_M`。当前物体模型位姿由已有观测或 `T_W_E A` 给出。`_initial_rotation_offset` 将二者转换为上述 RPY，按布尔值选定入口 `R_a`，计算固定修正 `D=R_a R_n0^T`，同时返回选择依据与修正矩阵。抓取工具参考使用同一规则，移动坐标 M 取已标定的 E。
+对于物体运动，旋转对象是上述固定材料功能坐标 M。记原名义路径为 `T_W_M(s)`，功能路径为 `T_W_F(s)`，技能进度为 s。原初始旋转在 F 中为 `R_n0=R_W_F(0)^T R_W_M(0)`，当前初始旋转为 `R_c=R_W_F(0)^T R_W_body(0) R_body_M`。当前物体模型位姿由已有观测或 `T_W_E A` 给出。`_initial_rotation_offset` 将二者转换为上述 RPY，按布尔值选定入口 `R_a`，计算固定修正 `D=R_a R_n0^T`，同时返回选择依据与修正矩阵。
 
 `planning_problem.RotationOffsetPath` 保存原连续材料路径、连续功能路径与 D，参考生成和归档恢复共同调用该路径类型。每次查询时先求两个父路径，再计算 `R'_W_M(s)=R_W_F(s) D R_W_F(s)^T R_W_M(s)`，材料原点位置 `p_W_M(s)` 保持原函数。其 `sample` 返回保持 Torch 进度导数的位置和 wxyz 四元数；继承的 `sample_numpy` 返回同一位姿函数。该类型的 `poses` 为自身节点处的精确缓存，物体和末端变换通过普通子 `PosePath` 在每次查询时右乘。因而旋转偏移造成的物体原点与 TCP 杆臂位移仍属于同一连续函数。当前入口的三个分量全部选择运行初态时，材料入口朝向与本次模型初态一致；仅 yaw 选择运行初态时，D 是 F-z 轴的固定旋转，原参考的 roll/pitch 曲线保持原值。
 
 `PosePath.to_record` 声明可重建的连续表达式，`execution_binding.plain` 将其递归转换为 JSON 数据。`kind='pose'` 保存原节点、源依据、机构模型与展开坐标、固定 attachment 以及完整 parent；`kind='functional_rotation_offset'` 保存 nominal、functional、原修正矩阵 D 和源依据。旋转偏移的派生节点缓存不替代这两个连续输入。`PosePath.from_record` 按上述运算类型恢复相同路径对象，机构恢复复用 `_model_from_diagnostics`；JSON 往返保持节点间位姿、左右分支进度导数及多圈机构坐标。任务阶段和显式过程关系经 `plain` 使用同一记录入口，场景 owner 的位姿归档也复用该接口，其可用运动类型仍由 `CollisionOwner` 定义。
 
-`generate_reference` 在字段的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
+`generate_reference` 在 manipulation 的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
 
-`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer(..., skill_kind=representation["kind"])` 获得 `T_world_region`，再传给 `generate_reference`。它将数组写入 `reference.npz`，将旋转选择依据写入 `report.json.reference_rotation_transfer`，将连续工具路径与边界传给 `reference_phase`，最后调用参考网页输出。这个报告字段是上述参考运算的可追溯结果，其坐标与计算入口与路径对象一致。
+`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer(..., skill_kind=representation["kind"])` 获得 `T_world_region`，再传给 `generate_reference`。它将数组写入 `reference.npz`，通过 `execution_binding.plain` 与 `PosePath.to_record` 将连续表达式、各路径源时间、入口/事件边界及源事件写入 `reference-paths.json`；后者由 `PosePath.from_record` 恢复同一连续函数。manipulation 声明旋转选择时，依据写入 `report.json.reference_rotation_transfer`，将连续工具路径与边界传给 `reference_phase`，最后调用参考网页输出。这个报告字段是上述参考运算的可追溯结果，其坐标与计算入口与路径对象一致。
 
 输出包括 `object_path/eef_path`、对应时间和名义位姿数组、`object_boundaries/eef_boundaries`、`boundary_checks`、`summaries`、`missing` 与 `status`。受控路径的终点为源释放时间与显式持物终点中的较早者；`bound_*` 另保存原名义绑定诊断。每份边界声明包含 `initial_pose`、带局部进度/位姿/来源的 `goals` 以及声明来源；`boundary_checks` 记录 `declared_for_physical_time_binding`。缺少交互时间、当前入口或必要坐标对应时，函数将相应字段列入 `missing`。
 
-`reference_phase` 复用完整 `eef_path`，将 `eef_boundaries` 复制到 `MotionPhase.metadata["reference_boundaries"]`；源帧、源时间和原事件分别保存。`reference_visualization.write_reference_html` 在真实源/目标图像上叠加原功能区域、采样点和名义路径，直接从该边界声明投影工具入口与每个事件目标。这个页面的时间是源示教时间；物理时间连接在规划器绑定后产生。
+`reference_phase` 复用完整 `eef_path`，将 `eef_boundaries` 复制到 `MotionPhase.metadata["reference_boundaries"]`；源帧、源时间和原事件分别保存。
+
+`reference_visualization.write_reference_html` 接收完整技能、标定 RGB 视图、区域迁移输出、生成参考和运行记录。源图使用 `T_world_carrier/T_world_eef` 的示教实际记录；当前图使用 `object_path/eef_path` 的名义参考。显示时钟合并原示教时刻、参考事件节点和区间内均匀取样；源运动经 `sample_poses` 求值，当前参考经各自连续路径求值。每条轨迹在滑块所选源时刻仅显示一个位姿；超出其时间区间时显示缺失状态。源世界 `W_D` 与当前世界 `W_N` 分别标注，位置单位 m，姿态给出完整旋转矩阵与 XYZ 外禀 RPY 度数。当前实际物理轨迹的缺失状态独立展示，执行时钟由规划器绑定。
+
+`_pose_track` 将同一组完整位姿转为轨迹像素、4 cm 姿态轴、原矩阵与旋转数值；`_project` 使用原相机 `T_world_camera_cv` 和 `K` 投影，`_axes` 使用位姿的三个基向量生成轴端点。`_entity_outline` 在区域图上描绘实际观测实体掩码边缘，原场景、区域色块、源查询点及当前采样点继续显示。工具入口、名义首点和事件目标分别来自显式边界及同一连续路径；它们是几何标记，轨迹姿态始终由所选时刻决定。网页在本地读取所保存图像，缩放只改变显示尺寸。
 
 ## 2.1 实际物理时钟上的工具参考
 

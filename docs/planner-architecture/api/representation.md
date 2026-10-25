@@ -1,6 +1,6 @@
 # `manipulation/representation.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`IMPLEMENTATION_COMMIT`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_timeline`
@@ -536,7 +536,7 @@ def _initial_rotation_offset(nominal, functional, current, flags):
 显式输出分支：
 
 ```python
-(rotation, {'is_initial_relative_rotation_rpy': flags.tolist(), 'rpy_convention': 'extrinsic xyz; Rz(yaw) Ry(pitch) Rx(roll); radians', 'rotation_frame': 'current functional reference F', 'moving_frame': 'fixed material frame M; calibrated tool E for a tool reference', 'nominal_initial_rpy_rad': nominal_rpy, 'current_initial_rpy_rad': current_rpy, 'selected_initial_rpy_rad': selected, 'functional_rotation_offset': rotation, 'meaning': 'select initial RPY anchor, preserve complete initial-relative SO(3) motion'})
+(rotation, {'is_initial_relative_rotation_rpy': flags.tolist(), 'rpy_convention': 'extrinsic xyz; Rz(yaw) Ry(pitch) Rx(roll); radians', 'rotation_frame': 'current functional reference F', 'moving_frame': 'fixed material frame M of the manipulated body', 'nominal_initial_rpy_rad': nominal_rpy, 'current_initial_rpy_rad': current_rpy, 'selected_initial_rpy_rad': selected, 'functional_rotation_offset': rotation, 'meaning': 'select initial RPY anchor, preserve complete initial-relative SO(3) motion'})
 ```
 
 读取的对象属性：
@@ -608,6 +608,8 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
 > named boundaries enter BoundToolReference
 > only after the planner has bound physical time and measured TCP velocity.
 >
+> Grasp motion composes F_G and H_g directly; the initial-relative rotation
+> declaration belongs to manipulation's material-frame pose reference.
 > Grasp motion requires actual E. A scalar mechanism instead uses its current
 > model and current coordinate, preserving its physical manifold and winding.
 > Production object/tool paths stop at release or an earlier held_until_time.
@@ -628,16 +630,16 @@ result
 
 ```python
 representation.get
-np.asarray
-rotation_flags.shape
-rotation_flags.dtype
-np.dtype
 np.isfinite
 np.unique
 np.r_
 np.asarray(T_world_function).shape
+np.asarray
 result.get
 raw.sample_numpy
+rotation_flags.shape
+rotation_flags.dtype
+np.dtype
 motion_model.kind
 coordinates.shape
 np.asarray(current_coordinates, dtype=float).reshape
@@ -660,7 +662,6 @@ frames
 times
 result
 kind
-rotation_flags
 extra
 key
 value
@@ -678,9 +679,8 @@ current_body
 current_eef
 result['missing']['eef_poses']
 raw
-correction
-result['rotation_transfer']
 result['method']
+rotation_flags
 raw_body
 result['missing']['object_poses']
 coordinates
@@ -695,7 +695,9 @@ Q
 Qc
 L_body
 result['L_body_material']
+correction
 original
+result['rotation_transfer']
 raw_material
 inverse_A
 raw_eef
@@ -711,8 +713,6 @@ dict
 deepcopy
 representation.get
 ValueError
-np.asarray
-np.dtype
 float
 any
 np.isfinite
@@ -720,17 +720,17 @@ np.unique
 min
 _pose_array
 _aligned_poses
+np.asarray
 len
 result.get
 _inverse
 _require_same_pose
 _component_path
 function_path
-_initial_rotation_offset
-RotationOffsetPath
 diagnostic
 publish
 raw.sample_numpy
+np.dtype
 isinstance
 np.asarray(current_coordinates, dtype=float).reshape
 np.isfinite(coordinates).all
@@ -741,6 +741,7 @@ motion_model.poses
 mechanism_path
 raw_body.coordinates.copy
 sample_poses
+_initial_rotation_offset
 material_path
 _right_path
 raw_body.sample_numpy
@@ -749,7 +750,7 @@ raw_eef.sample_numpy
 
 ## `generate_reference.function_path`
 
-[定义位置](../../../manipulation/representation.py#L314)。
+[定义位置](../../../manipulation/representation.py#L304)。
 
 输入签名：
 
@@ -779,7 +780,7 @@ _component_path
 
 ## `generate_reference.diagnostic`
 
-[定义位置](../../../manipulation/representation.py#L317)。
+[定义位置](../../../manipulation/representation.py#L307)。
 
 输入签名：
 
@@ -815,7 +816,7 @@ _progress
 
 ## `generate_reference.publish`
 
-[定义位置](../../../manipulation/representation.py#L321)。
+[定义位置](../../../manipulation/representation.py#L311)。
 
 输入签名：
 
@@ -869,7 +870,7 @@ _sampled_summary
 
 ## `generate_reference.publish.sample`
 
-[定义位置](../../../manipulation/representation.py#L338)。
+[定义位置](../../../manipulation/representation.py#L328)。
 
 输入签名：
 
@@ -904,7 +905,7 @@ path.sample_numpy
 
 ## `generate_reference.mechanism_path`
 
-[定义位置](../../../manipulation/representation.py#L377)。
+[定义位置](../../../manipulation/representation.py#L376)。
 
 输入签名：
 
@@ -942,7 +943,7 @@ motion_model.poses
 
 ## `generate_reference.material_path`
 
-[定义位置](../../../manipulation/representation.py#L421)。
+[定义位置](../../../manipulation/representation.py#L420)。
 
 输入签名：
 
