@@ -1,6 +1,8 @@
 # `config/ground_skill.py` 实现契约
 
-代码基线：`IMPLEMENTATION_COMMIT`。
+代码基线：`0620320`。
+
+该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`

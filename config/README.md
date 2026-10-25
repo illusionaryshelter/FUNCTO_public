@@ -186,7 +186,9 @@ result = import_point2pose_skill(
 整个原始区间逐帧核对 NPZ 与跟踪证据。失败记录、缺时间/world，或任一已绑定实例含 stale/missing/未知状态，返回 `status="missing_source_observations"` 与具体缺项，不写包、不跳帧。warning 候选可保留，完整逐帧原始证据随包保存；正常写入返回 `status="saved_observation_segment"`，该状态只表示保存成功，不表示追踪准确或执行成功。包来源分别标明 Point2Pose 估计运动、已给视觉区域和同步 EEF 记录。
 
 <!-- BEGIN the grounding command preserves nominal paths and explicit boundaries. -->
-本节 grounding 实现基线：`IMPLEMENTATION_COMMIT`。
+本节 grounding 实现基线：`0620320`。
+
+该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
 `ground_skill.py` 从当前场景的 `robot_feedback.json` 读取 `eef_pose`（世界坐标下工具控制坐标的位姿），传入 `generate_reference`。抓取参考通过当前抓取功能坐标和源 `H_g` 组合完整位姿，实际末端入口独立写入边界声明；持物操作结合当前 `A`（物体局部坐标到工具坐标的固定变换）得到实际物体入口。`A_context` 已声明的工具或世界坐标名称若与反馈冲突，在模型调用前拒绝；不要求增加重复观测。
 
 `generate_reference` 的 `object_path/eef_path` 是经 grounding 组合得到的名义路径，受控区间止于释放或明确持物终点。名义数组和完整连续表达式分别保存在 `nominal-reference.npz` 与 `nominal-reference-paths.json`；原帧、源时间、运动、交互及释放事件完整保留。`is_initial_relative_rotation_rpy` 只由 manipulation 的材料参考计算消费。
