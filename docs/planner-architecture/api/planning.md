@@ -1,6 +1,6 @@
 # `manipulation/planning.py` 实现契约
 
-代码基线：`99eae0c`。本文所在的后续文档提交固定实现引用，生产代码与该实现提交相同。
+算法代码基线：`99eae0c`。当前预算配置为修改前检查点 `5192f41` 上已实现的工作区修改，代码提交引用待回填；该配置将请求累计墙钟默认值设为 60 s。
 职责和数据语义见[求解组件](../04-solver-and-search.md)、[验收交付组件](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`
@@ -158,9 +158,11 @@ validation_joint_step: float = 0.025
 validation_spatial_step_m: float = 0.001
 search_seconds: float = 3.0
 maximum_trajectory_solves: int = 2
-planning_seconds: float = 120.0
+planning_seconds: float = 60.0
 random_seed: int = 123
 ```
+
+`planning_seconds` 的默认值由库内此字段统一定义。记录式 CLI 和诊断适配器直接读取 `PlanningBudget.planning_seconds`；请求的绑定、初始化、优化、验收和执行绑定使用原累计计时与账本，阶段切换不重置上限。
 
 实现说明：
 

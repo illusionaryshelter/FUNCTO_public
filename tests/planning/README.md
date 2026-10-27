@@ -1,6 +1,8 @@
 # 记录式规划、执行与诊断入口
 
-本文对应 FUNCTO_public 代码基线 `6090527`；本文档提交仅回填代码基线，相关源码与该实现提交相同。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+本目录原适配接口代码基线为 `6090527`，当前时间预算接入的代码引用在下一段单列。规划器完整架构见 [PLANNER_ARCHITECTURE.md](../../PLANNER_ARCHITECTURE.md)，逐 API 的作用、输入、输出和前置数据见[接口契约](../../docs/planner-architecture/06-api-contracts.md)。本目录负责把明确的记录数据连接到通用规划与执行库，通用 `manipulation` 模块不按数据集或技能名称派发。
+
+当前时间预算接入基于修改前检查点 `5192f41` 的工作区实现，代码提交引用待回填。`run_recorded_skill.parse_args` 的 `--planning-seconds` 默认直接取 `PlanningBudget.planning_seconds`，当前为 60 s；`probe_recorded_grasp_feasibility.observed_scene` 准备的预算同样读取这一字段。前者将值传入完整请求累计账本，后者保留其原规划边界截获职责。源记录中的显式预算是当时实验的数据；活动实验调用器在需要使用当前全局配置时明确覆盖并记录原始值与生效值。
 
 ## 运行环境与输入
 

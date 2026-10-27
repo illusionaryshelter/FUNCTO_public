@@ -142,7 +142,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 
 | API | 必要输入与计算 | 输出及实际消费者 |
 |---|---|---|
-| `PlanningBudget` | 请求维数、IK/求解/搜索/验证额度和资源上限 | 固定请求预算；IK与主求解各完整消费自身迭代额度 |
+| `PlanningBudget` | 请求维数、IK/求解/搜索/验证额度和资源上限；累计墙钟默认 60 s | 固定请求预算；绑定、初始化、优化、验收及执行绑定共享累计时间，IK与主求解各消费自身迭代额度 |
 | `MotionBackend.bind_request/plan/close` | 任务、场景、机器人模型和预算 | 创建或重绑IK及CPU计算对象，规划并释放；调用者 |
 | `plan_trajectory` | 完整任务与原场景、独立验证器及可选原关节曲线 | `PlanningResult`、累计工作和诊断；执行交接 |
 | `CubicBasis.weights/weights_at_knot_times/hermite_nodes` | 自由系数、原入口q/dq、段长和时间 | 同一曲线系数、导数及Hermite节点；域计算和保存 |

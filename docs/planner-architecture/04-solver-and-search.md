@@ -2,6 +2,8 @@
 
 求解算法基线为 `be44b54`；同一请求中候选交付的当前实现见 [planning API](api/planning.md) 所列代码提交。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
+时间预算配置为修改前检查点 `5192f41` 上已实现的工作区修改，代码提交引用待回填；当前默认值为 `PlanningBudget.planning_seconds=60.0`。
+
 ## 1. 请求、变量与依赖
 
 `plan_trajectory` 接受 `PlanningProblem`、`OnlinePlanningScene`、机器人配置、`RobotStateValidator`、工作预算和可选原关节曲线，返回 `PlanningResult`。`MotionBackend` 管理可复用 cuRobo IK、请求占用及释放。每次请求私有化任务和场景，绑定事件、名义手指和附着释放时刻。
@@ -59,6 +61,8 @@ Pinocchio 临时增量为 `8[S(6FNᵣ+12F+Nᵣ)+2]` 字节，其中 `S` 是任�
 预算中断时，`optimize` 依次选取最近完整求值、库回调迭代、最近已开始试算，使用 `_controls_curve` 导出独立的 `diagnostic_optimizer_candidate`。`diagnostic_optimizer_provenance` 保存系数、种子和试算身份、完成分项以及已有目标证据，其 `validation_status` 为 `not_completed`。若有限系数在 Hermite 速度导出中溢出，`diagnostic_curve_export_error` 保存导出错误，原求解异常仍向调用方传播。`plan_trajectory` 单独保存已完成参考验收的 `reference_candidate`，其中 `curve` 是原多项式快照、`source` 为 `validated_reference_seed`、`accepted` 保留原判定。失败结果通过 `diagnostic_candidate_source` 区分 `diagnostic_optimizer_trial`、`last_solver_iterate`、`validated_reference_seed` 和 `validated_optimizer_candidate`。后两者的完整验收结果与曲线身份对应，保存在 `diagnostic_candidate_report`；`accepted` 保留原判定。归档消费者保留该来源与验收状态。SLSQP 终止描述数值算法状态，候选交付继续经过原条件验收。
 
 ## 6. 搜索、验收与预算
+
+`PlanningBudget.planning_seconds` 给出一次规划请求的累计墙钟上限，默认 60 s。`plan_trajectory` 的原计时器覆盖后端绑定、参考初始化、搜索、优化、候选验收和执行绑定；原请求重试继续累计已有消耗。`check_request` 消费同一账本，因此阶段切换与后续候选不重置时间。记录式 CLI 的省略值直接读取该字段；显式预算仍按原 API 传入和校验。输入场景准备及物理执行保留各自计时边界。`trajectory_iterations=100`、最多两个求解批次及其余原预算字段保持独立语义。
 
 初值首先通过完整候选评价；合格并完成执行绑定时立即交付。若 require_observation 策略的完整分项证据将失败隔离为仅覆盖不足，返回 `needs_observation`；否则已有正碰撞或覆盖残差触发一次 `ompl_seed`，再进入主求解。forbid 的覆盖违例可由搜索处理，require_observation 与其他失败混合的证据沿同一几何调度；allow_attempt 的条件未知保持原含义。功能事件 IK 给出允许集合中的边界提议；搜索将每个提议放到当前前缀私有场景中，按该分支已建立的释放锚点和关系计算任务及几何资格。预计算时缺少释放锚点的静态判定只作为记录。
 

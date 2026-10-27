@@ -718,6 +718,9 @@ def run(args):
 
 def parse_args(argv=None):
     """Share the existing resource/scene CLI without a second option schema."""
+    # BEGIN recorded requests use the planner's single wall-time default.
+    from manipulation.planning import PlanningBudget
+    # END explicit command values still pass through the original parser.
     parser = argparse.ArgumentParser(description=__doc__)
     # BEGIN grasp permission comes from arrival/close, with local contacts separately explicit.
     for name in ("manifest", "robot-fixture", "feedback", "execution-limits", "finger-targets", "output"):
@@ -780,7 +783,9 @@ def parse_args(argv=None):
     parser.add_argument("--max-task-anchors", type=int, default=256)
     # BEGIN make the existing request work limits reviewable in run commands.
     parser.add_argument("--maximum-trajectory-solves", type=int, default=2)
-    parser.add_argument("--planning-seconds", type=float, default=120.)
+    # BEGIN initialization, solves and qualification share the same default.
+    parser.add_argument("--planning-seconds", type=float, default=PlanningBudget.planning_seconds)
+    # END no separate CLI wall-time default is maintained.
     # BEGIN expose bounded OMPL time without changing the production default.
     parser.add_argument("--search-seconds", type=float, default=3.,
                         help="OMPL search time within the existing total planning budget")

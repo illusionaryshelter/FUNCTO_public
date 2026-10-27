@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`be44b54`。
+原适配器算法代码基线：`be44b54`。当前默认预算接入为修改前检查点 `5192f41` 上已实现的工作区修改，代码提交引用待回填。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -1116,6 +1116,8 @@ def parse_args(argv=None):
 
 > Share the existing resource/scene CLI without a second option schema.
 
+`--planning-seconds` 省略时直接取 `PlanningBudget.planning_seconds`，当前为 60 s。`run_prepared` 将解析值传给原 `PlanningBudget` 构造器，随后由 `plan_and_record → plan_trajectory` 维护原完整请求的累计计时。显式命令值继续通过原参数接口解析。
+
 显式输出分支：
 
 ```python
@@ -1128,6 +1130,7 @@ parser.parse_args(argv)
 argparse.ArgumentParser
 parser.add_argument
 parser.parse_args
+PlanningBudget.planning_seconds
 ```
 
 写入目标：

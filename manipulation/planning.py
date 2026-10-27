@@ -151,8 +151,9 @@ class PlanningBudget:
     # END this relative-displacement bound is not a physical collision margin.
     search_seconds: float = 3.0
     maximum_trajectory_solves: int = 2
-    # BEGIN wall work is cumulative across binding attempts, independently of physics.
-    planning_seconds: float = 120.0
+    # BEGIN one 60-second default covers cumulative planning request work.
+    # Binding, initialization, optimization and qualification share this clock.
+    planning_seconds: float = 60.0
     # END a stage may finish over this limit, but its candidate cannot be accepted.
     random_seed: int = 123
 

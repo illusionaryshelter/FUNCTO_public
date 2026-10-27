@@ -114,6 +114,9 @@ def observed_scene(args):
     and explicitly records that the real planning function was never called.
     """
     import run_recorded_skill
+    # BEGIN diagnostic preparation follows the shared planning-time default.
+    from manipulation.planning import PlanningBudget
+    # END this probe still intercepts before any planning invocation.
 
     captured = {}
 
@@ -146,7 +149,7 @@ def observed_scene(args):
     # BEGIN diagnostic preparation supplies the current bounded runner contract.
     runner_args.max_task_anchors = 256
     runner_args.maximum_trajectory_solves = 2
-    runner_args.planning_seconds = 120.
+    runner_args.planning_seconds = PlanningBudget.planning_seconds
     runner_args.joint_reference = None
     runner_args.host_process_root_pid = None
     # END capture still prevents all native planning work.
