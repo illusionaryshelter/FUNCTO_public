@@ -1,6 +1,6 @@
 # `manipulation/planning.py` 实现契约
 
-算法代码基线：`99eae0c`。当前预算配置为修改前检查点 `5192f41` 上已实现的工作区修改，代码提交引用待回填；该配置将请求累计墙钟默认值设为 60 s。
+算法代码基线：`99eae0c`。当前预算配置对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容；该配置将请求累计墙钟默认值设为 60 s。
 职责和数据语义见[求解组件](../04-solver-and-search.md)、[验收交付组件](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_fixed_spline_grid`

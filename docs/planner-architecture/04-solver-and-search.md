@@ -2,7 +2,7 @@
 
 求解算法基线为 `be44b54`；同一请求中候选交付的当前实现见 [planning API](api/planning.md) 所列代码提交。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-时间预算配置为修改前检查点 `5192f41` 上已实现的工作区修改，代码提交引用待回填；当前默认值为 `PlanningBudget.planning_seconds=60.0`。
+时间预算配置对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容；当前默认值为 `PlanningBudget.planning_seconds=60.0`。
 
 ## 1. 请求、变量与依赖
 

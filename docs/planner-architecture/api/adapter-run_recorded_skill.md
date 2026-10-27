@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-原适配器算法代码基线：`be44b54`。当前默认预算接入为修改前检查点 `5192f41` 上已实现的工作区修改，代码提交引用待回填。
+原适配器算法代码基线：`be44b54`。当前默认预算接入对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
