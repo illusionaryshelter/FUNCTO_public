@@ -212,7 +212,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 
 ## 共享验收 API
 
-代码基线：`WORKING_IMPLEMENTATION`。完整前置数据、坐标及调用次序见[共享验收组件](10-shared-candidate-validation.md)。
+代码基线：`8b0e326`。完整前置数据、坐标及调用次序见[共享验收组件](10-shared-candidate-validation.md)。
 
 | 接口 | 输入 | 输出与消费者 |
 |---|---|---|

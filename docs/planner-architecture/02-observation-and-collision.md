@@ -90,7 +90,7 @@ SciPy 四元数转换给出数值旋转。代码计算 `δ≥||BᵀB-I||∞`，�
 
 `_prepare_query` 供完整报告与数值批次共享输入验证和 float64 FK。`query` 服务 `RobotStateValidator` 与执行前检查，返回关节限位、帧和实体位姿以及逐对距离报告；`query_pair_batches` 服务规划场景，只交付各状态有序配对的十二个数值。两者经 `_pair_table` 使用同一个 `NativePairTable`；该表只持有官方形状强引用和有向配对索引。端点顺序改变时替换表，策略和来源仍随当前 `PairQuery` 进入报告。每次 Coal `distance` 创建独立冷求解器，不缓存见证点、距离或 GJK/EPA 历史。原有 Pinocchio 关节模型继续承担 FK。
 
-`query_pair_batches` 按每块最多 4096 次配对组织连续状态；若单状态配对更多，该状态作为完整一块。准备状态、进入与离开原生调用、场景逐对消费时分别检查请求期限。原生块内错误使整块失败，错误记录块的状态范围以及块内状态、配对索引。形状与配对索引在固定表中持有；原生调用在释放 GIL 前复制变换、mask 和请求，返回独立 NumPy 数组。Python 批次接口直接交付该数组；完整验收使用四个线程分片处理同一块中的连续状态并按原顺序连接结果。`PairBatch` 保存全部原生列与完整观测 payload，最终诊断和已选见证才恢复字典。共享实现代码基线为 `WORKING_IMPLEMENTATION`，数据所有权见[共享验收组件](10-shared-candidate-validation.md)。具体坐标、字段和舍入推导见[原生配对接口](api/native_pair_table.md)。
+`query_pair_batches` 按每块最多 4096 次配对组织连续状态；若单状态配对更多，该状态作为完整一块。准备状态、进入与离开原生调用、场景逐对消费时分别检查请求期限。原生块内错误使整块失败，错误记录块的状态范围以及块内状态、配对索引。形状与配对索引在固定表中持有；原生调用在释放 GIL 前复制变换、mask 和请求，返回独立 NumPy 数组。Python 批次接口直接交付该数组；完整验收使用四个线程分片处理同一块中的连续状态并按原顺序连接结果。`PairBatch` 保存全部原生列与完整观测 payload，最终诊断和已选见证才恢复字典。共享实现代码基线为 `8b0e326`，数据所有权见[共享验收组件](10-shared-candidate-validation.md)。具体坐标、字段和舍入推导见[原生配对接口](api/native_pair_table.md)。
 
 资源估计将已存在的表字节 `native_query_resident_nbytes` 计入驻留项，将需要构造或替换的表上界 `native_query_storage_nbytes` 计入待分配项。`native_query_temporary_nbytes` 始终进入单次查询的临时项，涵盖相邻块短暂共存的矩阵、原生变换、输出数组和 Python 列表，以及一个冷距离求解器。固定表已存在时，这些临时数组仍需预留。
 

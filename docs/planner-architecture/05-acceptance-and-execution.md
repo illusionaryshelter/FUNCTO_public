@@ -1,6 +1,6 @@
 # 候选验收、执行交接与续规划
 
-候选验收代码基线为 `WORKING_IMPLEMENTATION`，执行算法基线为 `be44b54`；执行绑定数据转换基线见 [execution_binding API](api/execution_binding.md)。共享验收的数据布局、API 前置条件及实际调用关系见[共享验收组件](10-shared-candidate-validation.md)。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+候选验收代码基线为 `8b0e326`，执行算法基线为 `be44b54`；执行绑定数据转换基线见 [execution_binding API](api/execution_binding.md)。共享验收的数据布局、API 前置条件及实际调用关系见[共享验收组件](10-shared-candidate-validation.md)。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 候选的完整验收
 

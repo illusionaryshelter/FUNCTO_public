@@ -10,7 +10,7 @@
 
 ## 独立规划入口
 
-原 `manipulation.planning.plan_trajectory` 继续使用 `MotionBackend` 和 `_ConstrainedPlanner`。新增 `manipulation.preference_planner.plan_trajectory` 使用 `PreferenceMotionBackend` 和 `PreferencePlanner`，根据显式事件角色处理位姿硬要求与偏好，并使用末段静止消元和原实体证据产生的几何必要条件。两路共享任务、机器人、场景、保存曲线验收和执行接口；候选生成与目标函数保持各入口的职责。共享验收代码基线为 `WORKING_IMPLEMENTATION`，其完整数值证据和显式运动学复用见[共享验收组件](docs/planner-architecture/10-shared-candidate-validation.md)。
+原 `manipulation.planning.plan_trajectory` 继续使用 `MotionBackend` 和 `_ConstrainedPlanner`。新增 `manipulation.preference_planner.plan_trajectory` 使用 `PreferenceMotionBackend` 和 `PreferencePlanner`，根据显式事件角色处理位姿硬要求与偏好，并使用末段静止消元和原实体证据产生的几何必要条件。两路共享任务、机器人、场景、保存曲线验收和执行接口；候选生成与目标函数保持各入口的职责。共享验收代码基线为 `8b0e326`，其完整数值证据和显式运动学复用见[共享验收组件](docs/planner-architecture/10-shared-candidate-validation.md)。
 
 新增组件及完成证据、纯前向运动学代码基线为 `c289890`，详细输入、坐标、API 和调用关系见 [声明位姿偏好规划器](docs/preference-planner/README.md)。以下原组件章节继续描述原入口；新增组件的覆盖方法与独立生命周期由其文档列明。
 
