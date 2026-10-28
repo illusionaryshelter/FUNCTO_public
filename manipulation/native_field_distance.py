@@ -8,6 +8,7 @@ never establishes intersection of these two represented sets.
 # BEGIN mixed model/observation query; neither entity is converted to the other.
 import heapq
 from itertools import count
+from functools import lru_cache
 
 import coal
 import numpy as np
@@ -15,8 +16,26 @@ import numpy as np
 from ._coal_scene_batch import native_projection_bounds, native_feasible_point_bounds
 from .implicit_distance import (
     _GAMMA, box_corners, box_distance, inverse_points, inverse_point_error,
-    transform_points, transform_point_error, world_bounds,
+    transform_points, transform_point_error, world_bounds as _world_bounds,
 )
+
+
+# BEGIN complete numerical inputs identify the same outward-rounded transform.
+@lru_cache(maxsize=65536)
+def _prepared_world_bounds(lower_key, upper_key, pose_key):
+    arrays = [np.frombuffer(raw, dtype=np.dtype(dtype)).reshape(shape)
+              for dtype, shape, raw in (lower_key, upper_key, pose_key)]
+    result = _world_bounds(*arrays)
+    for value in result:
+        value.flags.writeable = False
+    return result
+
+
+def world_bounds(lower, upper, pose):
+    """Reuse a pure box transform by dtype, shape and every input byte."""
+    return _prepared_world_bounds(*((value.dtype.str, value.shape, value.tobytes())
+                                   for value in (lower, upper, pose)))
+# END field distances, permissions and classifications remain actual queries.
 
 
 def _transform(matrix):

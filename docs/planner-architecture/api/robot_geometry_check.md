@@ -1,13 +1,13 @@
 # `manipulation/robot_geometry_check.py` 实现契约
 
-代码基线：`12e0ef5`。
+代码基线：`WORKING_IMPLEMENTATION`。
+共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
 
-本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_name`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L31)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L34)。
 
 输入签名：
 
@@ -41,7 +41,7 @@ ValueError
 
 ## `_rigid_pose`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L37)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L40)。
 
 输入签名：
 
@@ -95,7 +95,7 @@ pose.astype
 
 ## `NativeSolid`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L49)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L52)。
 
 ```python
 class NativeSolid():
@@ -122,7 +122,7 @@ source: str
 
 ## `PairQuery`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L66)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L69)。
 
 ```python
 class PairQuery():
@@ -149,7 +149,7 @@ source: str
 
 ## `NativePrimitive`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L83)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L86)。
 
 ```python
 class NativePrimitive():
@@ -177,7 +177,7 @@ source: str
 
 ## `_convex_solid`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L100)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L103)。
 
 输入签名：
 
@@ -235,7 +235,7 @@ coal.ConvexBase.convexHull
 
 ## `RobotGeometryChecker`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L114)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L117)。
 
 ```python
 class RobotGeometryChecker():
@@ -251,7 +251,7 @@ class RobotGeometryChecker():
 
 ## `RobotGeometryChecker.__init__`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L117)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L120)。
 
 输入签名：
 
@@ -419,7 +419,7 @@ max
 
 ## `RobotGeometryChecker._frame_id`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L219)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L222)。
 
 输入签名：
 
@@ -458,7 +458,7 @@ ValueError
 
 ## `RobotGeometryChecker.geometry_names`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L227)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L230)。
 
 输入签名：
 
@@ -494,7 +494,7 @@ tuple
 
 ## `RobotGeometryChecker.geometry_sources`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L232)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L235)。
 
 输入签名：
 
@@ -530,7 +530,7 @@ self._geometries.items
 
 ## `RobotGeometryChecker.model_record`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L235)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L238)。
 
 输入签名：
 
@@ -567,7 +567,7 @@ deepcopy
 
 ## `RobotGeometryChecker.geometry_depending_on`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L239)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L242)。
 
 输入签名：
 
@@ -622,12 +622,12 @@ tuple
 
 ## `RobotGeometryChecker._prepare_query`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L254)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L257)。
 
 输入签名：
 
 ```python
-def _prepare_query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(), check_request=None):
+def _prepare_query(self, *, joint_names, joint_positions, T_reference_base, pairs, frames=(), check_request=None, fk_session=None):
 ```
 
 实现说明：
@@ -668,8 +668,9 @@ identities.add
 pin.forwardKinematics
 self._data
 pin.updateFramePlacements
-self._data.oMf[index].homogeneous
 self._data.oMf
+fk_session.placements
+placements[index].homogeneous
 frame_ids.items
 self._geometries.items
 ```
@@ -701,6 +702,7 @@ identities
 pair
 identity
 self._query_schema
+placements
 poses
 index
 geometry_poses
@@ -734,13 +736,14 @@ _name
 identities.add
 pin.forwardKinematics
 pin.updateFramePlacements
+fk_session.placements
 frame_ids.items
 self._geometries.items
 ```
 
 ## `RobotGeometryChecker._pair_table`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L315)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L324)。
 
 输入签名：
 
@@ -801,7 +804,7 @@ NativePairTable
 
 ## `RobotGeometryChecker.native_query_resident_nbytes`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L333)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L342)。
 
 输入签名：
 
@@ -842,7 +845,7 @@ len
 
 ## `RobotGeometryChecker.pair_evidence`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L340)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L349)。
 
 输入签名：
 
@@ -891,7 +894,7 @@ max
 
 ## `RobotGeometryChecker.query`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L358)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L367)。
 
 输入签名：
 
@@ -984,12 +987,12 @@ dict
 
 ## `RobotGeometryChecker.query_pair_batches`
 
-[定义位置](../../../manipulation/robot_geometry_check.py#L389)。
+[定义位置](../../../manipulation/robot_geometry_check.py#L398)。
 
 输入签名：
 
 ```python
-def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base, pairs, projection_mask, check_request=None):
+def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base, pairs, projection_mask, check_request=None, fk_session=None, parallel=False):
 ```
 
 实现说明：
@@ -998,8 +1001,8 @@ def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base, 
 >
 > Every state uses _prepare_query's original float64 FK and matrix
 > products. Projection bounds are computed only at true mask entries.
-> The scene consumes Python floats/lists directly for its retained JSON
-> evidence. Each chunk has at most MAX_BATCH_SIZE pair evaluations,
+> The scene retains the owned numeric block and materializes only final
+> selected evidence. Each chunk has at most MAX_BATCH_SIZE pair evaluations,
 > except that a larger single state remains one complete query.
 > Cancellation is checked during state preparation, before/after each
 > native call, and by the scene while consuming each pair. Errors within
@@ -1008,7 +1011,7 @@ def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base, 
 显式输出分支：
 
 ```python
-numeric.tolist()
+numeric
 ```
 
 读取的对象属性：
@@ -1033,7 +1036,11 @@ self._prepare_query
 self._pair_table
 table.query
 self._request
-numeric.tolist
+np.linspace
+executor.submit
+chunks.append
+future.result
+np.concatenate
 ```
 
 写入目标：
@@ -1047,6 +1054,7 @@ state_count
 geometry_names
 pair
 name
+executor
 begin
 end
 matrices
@@ -1058,6 +1066,12 @@ column
 matrices[offset, column]
 table
 numeric
+cuts
+futures
+left
+right
+chunks
+future
 ```
 
 直接调用符号：
@@ -1071,6 +1085,8 @@ np.isfinite
 ValueError
 max
 dict.fromkeys
+ThreadPoolExecutor
+nullcontext
 range
 min
 np.empty
@@ -1079,6 +1095,11 @@ self._prepare_query
 self._pair_table
 check_request
 table.query
+np.linspace
+executor.submit
+zip
+chunks.append
+future.result
 RuntimeError
-numeric.tolist
+np.concatenate
 ```

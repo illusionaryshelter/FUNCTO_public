@@ -22,6 +22,9 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import coal
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+
 import numpy as np
 import pinocchio as pin
 
@@ -252,7 +255,7 @@ class RobotGeometryChecker:
 
     # BEGIN report and numeric batch interfaces share preparation and one distance kernel.
     def _prepare_query(self, *, joint_names, joint_positions, T_reference_base,
-                       pairs, frames=(), check_request=None):
+                       pairs, frames=(), check_request=None, fk_session=None):
         """Validate one complete named state and compute its float64 FK poses."""
         if check_request is not None:
             check_request()
@@ -305,10 +308,16 @@ class RobotGeometryChecker:
             self._query_schema = schema
         frame_ids = schema["frame_ids"]
         # END metadata reuse leaves each state and calibration independently evaluated.
-        pin.forwardKinematics(self.model, self._data, q)
-        pin.updateFramePlacements(self.model, self._data)
-        poses = {name: world_base @ self._data.oMf[index].homogeneous
+        # BEGIN explicit candidate ownership shares raw FK, not rounded scene matrices.
+        if fk_session is None:
+            pin.forwardKinematics(self.model, self._data, q)
+            pin.updateFramePlacements(self.model, self._data)
+            placements = self._data.oMf
+        else:
+            placements = fk_session.placements(self.model, q)
+        poses = {name: world_base @ placements[index].homogeneous
                  for name, index in frame_ids.items()}
+        # END each entity retains its original homogeneous multiplication path.
         geometry_poses = {name: poses[frame] @ local for name, (frame, _, _, local) in self._geometries.items()}
         return names, values, violations, poses, geometry_poses, pair_list
 
@@ -387,13 +396,13 @@ class RobotGeometryChecker:
                 "numerics": dict(self.numerics), "pairs": rows}
 
     def query_pair_batches(self, *, joint_names, joint_positions, T_reference_base,
-                           pairs, projection_mask, check_request=None):
+                           pairs, projection_mask, check_request=None, fk_session=None, parallel=False):
         """Yield owned numeric rows [state, pair, 12] in input order.
 
         Every state uses _prepare_query's original float64 FK and matrix
         products. Projection bounds are computed only at true mask entries.
-        The scene consumes Python floats/lists directly for its retained JSON
-        evidence. Each chunk has at most MAX_BATCH_SIZE pair evaluations,
+        The scene retains the owned numeric block and materializes only final
+        selected evidence. Each chunk has at most MAX_BATCH_SIZE pair evaluations,
         except that a larger single state remains one complete query.
         Cancellation is checked during state preparation, before/after each
         native call, and by the scene while consuming each pair. Errors within
@@ -409,25 +418,41 @@ class RobotGeometryChecker:
             raise ValueError("projection_mask must have one Boolean per state and declared pair")
         state_count = max(1, MAX_BATCH_SIZE // max(1, len(pairs)))
         geometry_names = tuple(dict.fromkeys(name for pair in pairs for name in (pair.first, pair.second)))
-        for begin in range(0, len(positions), state_count):
-            end = min(begin + state_count, len(positions))
-            matrices = np.empty((end - begin, len(geometry_names), 4, 4), dtype=np.float64)
-            for offset, position in enumerate(positions[begin:end]):
-                _, _, _, _, geometry_poses, _ = self._prepare_query(
-                    joint_names=joint_names, joint_positions=position,
-                    T_reference_base=T_reference_base, pairs=pairs,
-                    check_request=check_request)
-                for column, name in enumerate(geometry_names):
-                    matrices[offset, column] = geometry_poses[name]
-            _, table = self._pair_table(pairs)
-            if check_request is not None:
-                check_request()
-            try:
-                numeric = table.query(matrices, mask[begin:end], self._request)
-            except RuntimeError as error:
-                raise RuntimeError(f"Robot pair batch states [{begin}, {end}): {error}") from error
-            if check_request is not None:
-                check_request()
-            yield numeric.tolist()
+        # BEGIN independent cold native rows run in four bounded acceptance workers.
+        with (ThreadPoolExecutor(max_workers=4) if parallel else nullcontext(None)) as executor:
+            for begin in range(0, len(positions), state_count):
+                end = min(begin + state_count, len(positions))
+                matrices = np.empty((end - begin, len(geometry_names), 4, 4), dtype=np.float64)
+                for offset, position in enumerate(positions[begin:end]):
+                    _, _, _, _, geometry_poses, _ = self._prepare_query(
+                        joint_names=joint_names, joint_positions=position,
+                        T_reference_base=T_reference_base, pairs=pairs,
+                        check_request=check_request, fk_session=fk_session)
+                    for column, name in enumerate(geometry_names):
+                        matrices[offset, column] = geometry_poses[name]
+                _, table = self._pair_table(pairs)
+                if check_request is not None:
+                    check_request()
+                try:
+                    if executor is None:
+                        numeric = table.query(matrices, mask[begin:end], self._request)
+                    else:
+                        cuts = np.linspace(0, len(matrices), min(4, len(matrices))+1, dtype=int)
+                        futures = [(left, right, executor.submit(table.query, matrices[left:right],
+                            mask[begin+left:begin+right], self._request))
+                            for left, right in zip(cuts[:-1], cuts[1:])]
+                        chunks = []
+                        for left, right, future in futures:
+                            try:
+                                chunks.append(future.result())
+                            except RuntimeError as error:
+                                raise RuntimeError(f"Partition states [{begin+left}, {begin+right}): {error}") from error
+                        numeric = np.concatenate(chunks, axis=0)
+                except RuntimeError as error:
+                    raise RuntimeError(f"Robot pair batch states [{begin}, {end}): {error}") from error
+                if check_request is not None:
+                    check_request()
+                yield numeric
+        # END native output and exception context retain the original state order.
     # END no native solver history or duplicate distance backend is retained.
 # END known robot geometry remains separate from observed task fields.

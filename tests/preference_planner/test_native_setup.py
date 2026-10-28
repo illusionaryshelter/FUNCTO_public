@@ -205,7 +205,7 @@ class AnalyticalScene:
         self.calls, self.component = calls, component
 
     def evaluate(self, spheres, p, r, progress, q, names, *, trajectory_time,
-                 geometry_evidence_out, geometry_scope, components_out):
+                 geometry_evidence_out, geometry_scope, components_out, fk_session=None):
         self.calls["scene"] += 1
         value = torch.zeros_like(progress)
         if self.component is not None:

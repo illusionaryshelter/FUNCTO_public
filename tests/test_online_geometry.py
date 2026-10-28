@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from manipulation.planning_scene import GripperState
+from pair_evidence_fixtures import PairBatch, records
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from test_native_scene_contract import make_scene
 
@@ -28,10 +29,10 @@ def arguments(q=None):
 def query(scene, scope, q=None):
     """Return original component evidence for the declared geometry scope."""
     args = arguments(q)
-    evidence = []
+    evidence = PairBatch()
     terms = scene.components(*args, trajectory_time=args[3], geometry_scope=scope,
                              geometry_evidence_out=evidence)
-    return terms, evidence
+    return terms, records(evidence)
 
 
 @pytest.mark.parametrize("gap,status", [(.001, "clear"), (-.001, "intersection"), (0., "unresolved")])
@@ -134,7 +135,7 @@ def moving_scene(tmp_path):
         NativePrimitive("second", "left", "box", (.02, .02, .02), local, "analytic robot fixture")))
     scene.robot_model = scene.robot_validator.checker = checker
 
-    def poses(q, names):
+    def poses(q, names, *, fk_session=None):
         zero = q[..., 0] * 0
         quaternion = torch.stack((zero + 1, zero, zero, zero), -1)
         return {"base": (torch.stack((zero, zero, zero), -1), quaternion),

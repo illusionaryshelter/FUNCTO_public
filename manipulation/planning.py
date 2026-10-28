@@ -12,6 +12,9 @@ identities.  It does not manufacture grasp evidence or execute robot commands.
 # BEGIN complete-window robot planning and generation-time process constraints.
 from __future__ import annotations
 
+from .pair_evidence import PairBatch, _geometry_query_states
+from .validation_kinematics import FKSession
+
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 import gc
@@ -2104,34 +2107,12 @@ def _native_gradient_layout_type():
 # END padding repeats the same final instant as the shared cubic sampler.
 
 
-# BEGIN complete scene rows belong to one physical candidate query.
-def _geometry_query_states(evidence, times, progress, residuals):
-    """Group complete pair records by exact physical time and relation side.
-
-    Empty pair sets still represent completed physical queries. Pair records
-    retain their original bounds, witnesses, permissions and namespaced entity
-    keys; the surrounding state supplies the query's physical coordinates.
-    """
-    states = {(float(time), 0): {"time_s": float(time), "side": 0,
-        "progress": float(progress[index]), "residuals": {"scene": float(residuals[index])}, "pairs": []}
-        for index, time in enumerate(times)}
-    for row in evidence:
-        index = row["query_index"][1]
-        key = (float(times[index]), int(row["side"]))
-        state = states.setdefault(key, {"time_s": key[0], "side": key[1],
-            "progress": float(progress[index]), "residuals": {"scene": float(residuals[index])}, "pairs": []})
-        state["pairs"].append({name: value for name, value in row.items()
-            if name not in {"state_index", "query_index", "time_s", "side"}})
-    return list(states.values())
-# END cached evidence is private to this curve, hand model and release history.
-
-
 # BEGIN scene switches share q/t while querying distinct adjacent modes.
 def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, quaternion,
                              progress, joint_position, joint_names, *, trajectory_time,
                              normalized_time, query_counts=None, component_diagnostics=None,
                              scene_evidence_out=None,
-                             geometry_evidence_out=None, geometry_scope="full"):
+                             geometry_evidence_out=None, geometry_scope="full", fk_session=None):
     """Check material/attachment mode limits without changing physical time.
 
     Float64 neighbors vanish when native inputs are float32. Construct the
@@ -2142,16 +2123,17 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
     """
     import torch
     from .optimizer_device_checks import constant_tensor
-    pair_evidence = [] if geometry_evidence_out is not None else None
+    pair_evidence = geometry_evidence_out
     def evaluate(*args, **kwargs):
-        return scene.evaluate(*args, **kwargs, geometry_evidence_out=pair_evidence, geometry_scope=geometry_scope)
+        return scene.evaluate(*args, **kwargs, geometry_evidence_out=pair_evidence, geometry_scope=geometry_scope, fk_session=fk_session)
 
     # BEGIN retain physical query identity through same-time mode expansion.
     def retain_pair_evidence(exact_count, left_columns=(), right_columns=()):
         if geometry_evidence_out is None:
             return
-        for row in pair_evidence:
-            batch, column = row["state_index"]
+        indices = pair_evidence.state_index.copy()
+        sides = np.zeros(len(indices), dtype=np.int8)
+        for row_index, (batch, column) in enumerate(pair_evidence.state_index):
             if column < exact_count:
                 source, side = column, 0
             elif column < exact_count+len(left_columns):
@@ -2160,7 +2142,9 @@ def _scene_boundary_evaluate(scene, problem, progress_map, spheres, position, qu
             else:
                 source = int(right_columns[column-exact_count-len(left_columns)])
                 side = 1 if bool(right[batch, source]) else 0
-            geometry_evidence_out.append({**row, "query_index": [batch, source], "side": side})
+            indices[row_index] = batch, source
+            sides[row_index] = side
+        pair_evidence.set_query_layout(indices, sides)
     # END geometry proofs consume the same pair query as hard residuals.
     # BEGIN classify scene evidence without changing the hard scene sum.
     # The recovery consumer needs actual collision components, not the mixed
@@ -3526,15 +3510,25 @@ class _ConstrainedPlanner:
         _, progress = mapping.query_parameters(times, trajectory.duration, self.anchors)
         return mapping, times, progress
 
-    def _candidate_robot_state(self, trajectory, candidate_scene, times, progress):
+    # BEGIN candidate checks share explicit ownership of original FK results.
+    def _candidate_kinematics(self, scene):
+        """Own original FK values for this candidate's declared consumer frames."""
+        checker = scene.robot_model
+        frames = tuple(dict.fromkeys((*self.pin_kinematics.frames,
+            checker.base_frame, *scene.required_robot_links)))
+        return FKSession(checker.model, frames=frames)
+
+    def _candidate_robot_state(self, trajectory, candidate_scene, times, progress, *, fk_session=None):
         from .unified_solver import robot_tool_states
         columns = [trajectory.joint_names.index(name) for name in self.joint_names]
         states = [self.torch.as_tensor(trajectory._curve(times, order)[:, columns])[None]
                   for order in range(4)]
         values = robot_tool_states(problem=self.problem, scene=candidate_scene, kinematics=self.pin_kinematics,
             q=states[0], dq=states[1], joint_names=self.joint_names,
-            progress=self.torch.as_tensor(progress)[None], times=self.torch.as_tensor(times)[None])
+            progress=self.torch.as_tensor(progress)[None], times=self.torch.as_tensor(times)[None],
+            fk_session=fk_session)
         return states, values
+    # END scoring and optimization retain their independent calculation scopes.
 
     def _candidate_objective(self, trajectory, candidate_scene):
         """Record finite motion and declared task quality on fixed queries."""
@@ -3554,6 +3548,7 @@ class _ConstrainedPlanner:
                           'task_quality': self.budget.constraint_weight*float(preferences.sum())}
         return {'fixed_objective': sum(components.values()), 'objective_components': components}
 
+    # BEGIN both planners consume the same numeric acceptance evidence.
     def _candidate_metrics(self, trajectory, candidate_scene, *, record_work):
         """Evaluate the exact saved polynomial with original task and scene rules."""
         mapping, times, progress = self._candidate_queries(trajectory, _candidate_sample_times(trajectory, self.budget))
@@ -3569,12 +3564,12 @@ class _ConstrainedPlanner:
                                      max_host_rss_bytes=self.budget.max_host_rss_bytes)
         # END already resident fields remain in measured RSS, not pending bytes.
         tensor = lambda value: self.torch.as_tensor(value, dtype=self.torch.float64)[None]
-        details, channels, evidence = {}, {}, []
+        details, channels, evidence = {}, {}, PairBatch()
         parameters, progress = mapping.query_parameters(times, trajectory.duration, self.anchors)
-        with self.torch.no_grad():
+        with self.torch.no_grad(), self._candidate_kinematics(candidate_scene) as fk_session:
             self.check_request()
             states, (q, dq, names, _, tool, twist) = self._candidate_robot_state(
-                trajectory, candidate_scene, times, progress)
+                trajectory, candidate_scene, times, progress, fk_session=fk_session)
             terms = self.problem.residuals(*tool, tensor(progress), q, names, dq,
                 trajectory_time=tensor(times), tool_linear_velocity=twist[0], tool_angular_velocity=twist[1])
             issues = self.problem.verification_issues(tensor(progress))
@@ -3582,7 +3577,7 @@ class _ConstrainedPlanner:
             terms['process_scene'] = _scene_boundary_evaluate(candidate_scene, self.problem, mapping,
                 q.new_empty((1, len(times), 0, 4)), *tool, tensor(progress), states[0], self.joint_names,
                 trajectory_time=tensor(times), normalized_time=tensor(parameters),
-                component_diagnostics=details, scene_evidence_out=channels, geometry_evidence_out=evidence)
+                component_diagnostics=details, scene_evidence_out=channels, geometry_evidence_out=evidence, fk_session=fk_session)
             record_work(points=len(times))
             self.check_request()
             def maximum(value):
@@ -3604,9 +3599,11 @@ class _ConstrainedPlanner:
             terms['process_scene'].detach().cpu().numpy()[0])
         return report, parameters, len(times), (released_scene, initial_states)
         # END later batches reuse these charged times and candidate-private poses.
+    # END task and geometry verdicts retain their original computation.
     # END final acceptance is independent of numerical solver termination.
 
     # BEGIN one exact-curve scene callback supplies interval proof and hard evidence.
+    # BEGIN both planners consume the same numeric acceptance evidence.
     def _candidate_geometry(self, trajectory, candidate_scene, *, initial_states, remaining_points, record_work):
         """Check continuous entity separation on the candidate's physical clock.
 
@@ -3618,7 +3615,7 @@ class _ConstrainedPlanner:
         mapping = _ProgressMap(trajectory.progress_u, trajectory.progress_s)
         motion = SceneMotionBounds.from_scene(candidate_scene, tool_link=self.problem.tool_link,
                                               T_link_tool=self.problem.tool_transform)
-        hard = [state["residuals"]["scene"] for state in initial_states]
+        hard = [state.residual for state in initial_states]
         categories, details = {}, {}
 
         def query(times_s, *, point_budget):
@@ -3631,14 +3628,14 @@ class _ConstrainedPlanner:
             tensor = lambda value: self.torch.as_tensor(value, dtype=self.torch.float64)
             with self.torch.no_grad():
                 states, (_, _, _, _, (position, quaternion), _) = self._candidate_robot_state(
-                    trajectory, candidate_scene, times, progress)
-                evidence, scene_channels, query_details = [], {}, {}
+                    trajectory, candidate_scene, times, progress, fk_session=fk_session)
+                evidence, scene_channels, query_details = PairBatch(), {}, {}
                 values = _scene_boundary_evaluate(candidate_scene, self.problem, mapping,
                     position.new_empty((1, len(times), 0, 4)), position, quaternion,
                     tensor(progress)[None], states[0], self.joint_names,
                     trajectory_time=tensor(times)[None], normalized_time=tensor(parameters)[None],
                     component_diagnostics=query_details, scene_evidence_out=scene_channels,
-                    geometry_evidence_out=evidence)
+                    geometry_evidence_out=evidence, fk_session=fk_session)
                 # BEGIN count each completed scene query exactly once.
                 record_work(points=len(times))
                 # END counts remain committed if a later batch is interrupted.
@@ -3661,14 +3658,16 @@ class _ConstrainedPlanner:
             self.check_request()
             return {"states": states, "query_points": len(times), "capacity_exhausted": False}
 
-        report = check_interval_geometry(trajectory, motion, query,
-            max_query_points=remaining_points, spatial_step_m=self.budget.validation_spatial_step_m,
-            initial_states=initial_states)
+        with self._candidate_kinematics(candidate_scene) as fk_session:
+            report = check_interval_geometry(trajectory, motion, query,
+                max_query_points=remaining_points, spatial_step_m=self.budget.validation_spatial_step_m,
+                initial_states=initial_states)
         report["hard_scene_residual"] = (float("inf") if not np.isfinite(hard).all()
                                          else max(hard, default=0.))
         report["scene_categories"] = categories
         report["scene_components"] = details
         return report
+    # END task and geometry verdicts retain their original computation.
     # END unresolved intervals report their scope separately from actual scene violations.
 
     # BEGIN one saved polynomial determines every candidate qualification.

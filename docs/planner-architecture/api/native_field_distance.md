@@ -1,13 +1,102 @@
 # `manipulation/native_field_distance.py` 实现契约
 
-代码基线：`12e0ef5`。
+代码基线：`WORKING_IMPLEMENTATION`。
+共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
 
-本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+
+## `_prepared_world_bounds`
+
+[定义位置](../../../manipulation/native_field_distance.py#L25)。
+
+输入签名：
+
+```python
+def _prepared_world_bounds(lower_key, upper_key, pose_key):
+```
+
+显式输出分支：
+
+```python
+result
+```
+
+读取的对象属性：
+
+```python
+np.frombuffer(raw, dtype=np.dtype(dtype)).reshape
+np.frombuffer
+np.dtype
+value.flags
+```
+
+写入目标：
+
+```python
+arrays
+dtype
+shape
+raw
+result
+value
+value.flags.writeable
+```
+
+直接调用符号：
+
+```python
+np.frombuffer(raw, dtype=np.dtype(dtype)).reshape
+np.frombuffer
+np.dtype
+_world_bounds
+lru_cache
+```
+
+## `world_bounds`
+
+[定义位置](../../../manipulation/native_field_distance.py#L34)。
+
+输入签名：
+
+```python
+def world_bounds(lower, upper, pose):
+```
+
+实现说明：
+
+> Reuse a pure box transform by dtype, shape and every input byte.
+
+显式输出分支：
+
+```python
+_prepared_world_bounds(*((value.dtype.str, value.shape, value.tobytes()) for value in (lower, upper, pose)))
+```
+
+读取的对象属性：
+
+```python
+value.dtype.str
+value.dtype
+value.shape
+value.tobytes
+```
+
+写入目标：
+
+```python
+value
+```
+
+直接调用符号：
+
+```python
+_prepared_world_bounds
+value.tobytes
+```
 
 ## `_transform`
 
-[定义位置](../../../manipulation/native_field_distance.py#L22)。
+[定义位置](../../../manipulation/native_field_distance.py#L41)。
 
 输入签名：
 
@@ -39,7 +128,7 @@ coal.Transform3s
 
 ## `_native_bounds`
 
-[定义位置](../../../manipulation/native_field_distance.py#L26)。
+[定义位置](../../../manipulation/native_field_distance.py#L45)。
 
 输入签名：
 
@@ -78,7 +167,7 @@ np.asarray
 
 ## `_projection_gap`
 
-[定义位置](../../../manipulation/native_field_distance.py#L33)。
+[定义位置](../../../manipulation/native_field_distance.py#L52)。
 
 输入签名：
 
@@ -173,7 +262,7 @@ abs
 
 ## `_local_interval`
 
-[定义位置](../../../manipulation/native_field_distance.py#L60)。
+[定义位置](../../../manipulation/native_field_distance.py#L79)。
 
 输入签名：
 
@@ -217,7 +306,7 @@ np.nextafter
 
 ## `query_native_field`
 
-[定义位置](../../../manipulation/native_field_distance.py#L67)。
+[定义位置](../../../manipulation/native_field_distance.py#L86)。
 
 输入签名：
 
@@ -403,7 +492,7 @@ field.split
 
 ## `query_native_field.report`
 
-[定义位置](../../../manipulation/native_field_distance.py#L101)。
+[定义位置](../../../manipulation/native_field_distance.py#L120)。
 
 输入签名：
 
@@ -454,7 +543,7 @@ np.asarray(b).tolist
 
 ## `query_native_field.push`
 
-[定义位置](../../../manipulation/native_field_distance.py#L137)。
+[定义位置](../../../manipulation/native_field_distance.py#L156)。
 
 输入签名：
 

@@ -232,17 +232,17 @@ class PreferencePlanner(NativeSetup, _ConstrainedPlanner):
 
             def collect(*args, geometry_evidence_out, **kwargs):
                 value = evaluate(*args, geometry_evidence_out=geometry_evidence_out, **kwargs)
-                batches.append(tuple(geometry_evidence_out))
+                batches.append(geometry_evidence_out)
                 return value
 
             candidate_scene.evaluate = collect
         report = super()._candidate_geometry(trajectory, candidate_scene,
             initial_states=initial_states, remaining_points=remaining_points, record_work=record_work)
-        for pairs in batches:
-            states = [{"time_s": pair["time_s"], "progress": pair["progress"],
-                       "pairs": [pair]} for pair in pairs]
-            update = self.geometry_constraints.add_evidence(self._current_full_controls, states)
+        # BEGIN each completed query batch retains its original witness order.
+        for batch in batches:
+            update = self.geometry_constraints.add_evidence(self._current_full_controls, pair_batch=batch)
             self._candidate_added_rows += update["added_rows"]
+        # END the common interval checker still owns all query decisions.
         return report
     # END original same-curve geometry evidence supplies both consumers once.
 

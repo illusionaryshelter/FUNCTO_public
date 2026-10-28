@@ -6,7 +6,7 @@
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **60 个文件、959 个定义**。
+覆盖 **62 个文件、994 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -26,7 +26,7 @@
 | [manipulation/selection.py](api/selection.md) | 7 | [01](01-inputs-and-task-model.md) |
 | [manipulation/planning_observation.py](api/planning_observation.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/robot_self_filter.py](api/robot_self_filter.md) | 6 | [02](02-observation-and-collision.md) |
-| [manipulation/online_geometry.py](api/online_geometry.md) | 23 | [02](02-observation-and-collision.md) |
+| [manipulation/online_geometry.py](api/online_geometry.md) | 24 | [02](02-observation-and-collision.md) |
 | [manipulation/planning_scene.py](api/planning_scene.md) | 26 | [02](02-observation-and-collision.md) |
 | [manipulation/collision_records.py](api/collision_records.md) | 4 | [02](02-observation-and-collision.md) |
 | [manipulation/observations.py](api/observations.md) | 16 | [02](02-observation-and-collision.md) |
@@ -34,7 +34,7 @@
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/planning.py](api/planning.md) | 161 | [04](04-solver-and-search.md) |
+| [manipulation/planning.py](api/planning.md) | 161 | [05](05-acceptance-and-execution.md) |
 | [manipulation/planning_ik.py](api/planning_ik.md) | 5 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 6 | [04](04-solver-and-search.md) |
 | [manipulation/physical_joint_domain.py](api/physical_joint_domain.md) | 10 | [04](04-solver-and-search.md) |
@@ -45,7 +45,7 @@
 | [manipulation/execution.py](api/execution.md) | 44 | [05](05-acceptance-and-execution.md) |
 | [manipulation/execution_binding.py](api/execution_binding.md) | 9 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robot_validation.py](api/robot_validation.md) | 11 | [05](05-acceptance-and-execution.md) |
-| [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 19 | [05](05-acceptance-and-execution.md) |
+| [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 19 | [02](02-observation-and-collision.md) |
 | [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 26 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 5 | [05](05-acceptance-and-execution.md) |
@@ -56,13 +56,13 @@
 | [manipulation/observed_coverage.py](api/observed_coverage.md) | 4 | [02](02-observation-and-collision.md) |
 | [tests/planning/observed_robot_fixture.py](api/adapter-observed_robot_fixture.md) | 2 | [05](05-acceptance-and-execution.md) |
 | [manipulation/grasp_region.py](api/grasp_region.md) | 4 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/native_field_distance.py](api/native_field_distance.md) | 7 | [02](02-observation-and-collision.md) |
+| [manipulation/native_field_distance.py](api/native_field_distance.md) | 9 | [02](02-observation-and-collision.md) |
 | [manipulation/tool_geometry.py](api/tool_geometry.md) | 11 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_fixture.py](api/adapter-robot_fixture.md) | 31 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 6 | [02](02-observation-and-collision.md) |
 | [manipulation/sampled_geometry_objective.py](api/sampled_geometry_objective.md) | 15 | [02](02-observation-and-collision.md) |
 | [manipulation/geometry_motion_bound.py](api/geometry_motion_bound.md) | 13 | [05](05-acceptance-and-execution.md) |
-| [manipulation/interval_geometry.py](api/interval_geometry.md) | 11 | [05](05-acceptance-and-execution.md) |
+| [manipulation/interval_geometry.py](api/interval_geometry.md) | 12 | [05](05-acceptance-and-execution.md) |
 | [manipulation/timed_reference.py](api/timed_reference.md) | 13 | [01](01-inputs-and-task-model.md) |
 | [manipulation/reference_visualization.py](api/reference_visualization.md) | 5 | [01](01-inputs-and-task-model.md) |
 | [manipulation/unified_solver.py](api/unified_solver.md) | 18 | [04](04-solver-and-search.md) |
@@ -72,3 +72,5 @@
 | [manipulation/progress_clock.py](api/progress_clock.md) | 6 | [05](05-acceptance-and-execution.md) |
 
 原生固定配对数值接口与舍入语义见 [NativePairTable](api/native_pair_table.md)，实现位于 `manipulation/_coal_scene_batch.cpp`。
+| [manipulation/pair_evidence.py](api/pair_evidence.md) | 22 | [05](05-acceptance-and-execution.md) |
+| [manipulation/validation_kinematics.py](api/validation_kinematics.md) | 9 | [05](05-acceptance-and-execution.md) |

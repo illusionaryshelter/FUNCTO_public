@@ -111,20 +111,21 @@ class PinKinematics:
             raise ValueError("Robot kinematics requires float64 CPU named joint tensors")
         return value[..., [names.index(name) for name in self.joint_names]]
 
-    def poses(self, position, joint_names):
+    def poses(self, position, joint_names, *, fk_session=None):
         """Return {frame: (position[...,3], quaternion_wxyz[...,4])}."""
         # BEGIN forward-only consumers do not construct unused analytic derivatives.
         ordered = self._ordered(position, joint_names)
         if torch.is_grad_enabled() and ordered.requires_grad:
             packed = _PinPoses.apply(ordered, self)
         else:
-            poses, _ = self._evaluate(ordered.detach().numpy(), with_derivatives=False)
+            poses, _ = self._evaluate(ordered.detach().numpy(), with_derivatives=False,
+                                      fk_session=fk_session)
             packed = torch.from_numpy(poses)
         # END the differentiable path retains its original analytic VJP.
         return {frame: (packed[..., index, :3], packed[..., index, 3:])
                 for index, frame in enumerate(self.frames)}
 
-    def states(self, position, velocity, joint_names):
+    def states(self, position, velocity, joint_names, *, fk_session=None):
         """Return (poses, {frame: (linear_velocity, angular_velocity)}).
 
         Pinocchio supplies LOCAL frame-origin velocity derivatives. Ordinary
@@ -141,7 +142,7 @@ class PinKinematics:
             packed, twists = _PinStates.apply(q, dq, self)
         else:
             poses, _, rates, _, _ = self._evaluate(q.detach().numpy(), dq.detach().numpy(),
-                                                  with_derivatives=False)
+                                                  with_derivatives=False, fk_session=fk_session)
             packed, twists = torch.from_numpy(poses), torch.from_numpy(rates)
         # END LOCAL velocities and the following reference-frame rotation are unchanged.
         poses = {frame: (packed[..., index, :3], packed[..., index, 3:])
@@ -151,8 +152,12 @@ class PinKinematics:
                       for index, frame in enumerate(self.frames)}
         return poses, velocities
 
-    def _evaluate(self, position, velocity=None, *, with_derivatives=True):
+    def _evaluate(self, position, velocity=None, *, with_derivatives=True, fk_session=None):
         """Evaluate library FK, computing first derivatives only on demand."""
+        # BEGIN saved-candidate callers explicitly share their original FK values.
+        if fk_session is not None and not with_derivatives:
+            return fk_session.evaluate(self, position, velocity)
+        # END derivative buffers and ordinary callers keep their declared calculation.
         leading = position.shape[:-1]
         count, joints, frames = int(np.prod(leading)), len(self.joint_names), len(self.frames)
         values = position.reshape(count, joints)

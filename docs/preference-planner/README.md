@@ -11,7 +11,7 @@
 | `manipulation.planning.plan_trajectory` | `MotionBackend` → `_ConstrainedPlanner` | 原完整条件验收及执行绑定后交付 |
 | `manipulation.preference_planner.plan_trajectory` | `PreferenceMotionBackend` → `PreferencePlanner` | 显式角色下的完整条件、末段静止及执行绑定完成后交付 |
 
-新类通过正常继承复用原构造器、普通参考 IK、搜索、运动学与验收方法。`NativeSetup` 定义事件 IK 的偏好成本和静态排序；`PreferencePlanner` 定义终止消元、共同轨迹成本及几何必要条件。原分支的实现和默认入口保持独立。当前每次调用只运行选定的一路规划器；多个规划器的时间截止与比较调度属于另行讨论的方案。
+新类通过正常继承复用原构造器、普通参考 IK、搜索、运动学与验收方法。`NativeSetup` 定义事件 IK 的偏好成本和静态排序；`PreferencePlanner` 定义终止消元、共同轨迹成本及几何必要条件。两路候选生成和默认入口保持独立，保存曲线验收通过共同父方法和数值证据接口复用；该共享组件代码基线为 `WORKING_IMPLEMENTATION`，见[共享验收架构](../planner-architecture/10-shared-candidate-validation.md)。当前每次调用只运行选定的一路规划器；多个规划器的时间截止与比较调度属于另行讨论的方案。
 
 ```python
 from manipulation.preference_planner import bind_pose_objectives, plan_trajectory

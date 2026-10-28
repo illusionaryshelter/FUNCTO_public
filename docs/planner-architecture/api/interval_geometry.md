@@ -1,11 +1,75 @@
 # `manipulation/interval_geometry.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`WORKING_IMPLEMENTATION`。
+共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
+
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+
+## `prepared_polynomial`
+
+[定义位置](../../../manipulation/interval_geometry.py#L27)。
+
+输入签名：
+
+```python
+def prepared_polynomial(shape, coefficients, breakpoints, derivative):
+```
+
+实现说明：
+
+> Prepare one complete binary64 polynomial, including mutation identity.
+>
+> Exact coefficient and breakpoint bytes define the existing PPoly input.
+> SciPy computes the original derivative once. Long-double source arrays
+> retain the same values and ordering used by the original interval formula.
+> Changed coefficients or breakpoints produce a distinct cache entry.
+
+显式输出分支：
+
+```python
+(polynomial, sources)
+```
+
+读取的对象属性：
+
+```python
+PPoly.construct_fast
+np.frombuffer(coefficients, dtype=np.float64).reshape
+np.frombuffer
+np.float64
+curve.derivative
+polynomial.c[:, index].astype
+polynomial.c
+np.longdouble
+polynomial.x
+```
+
+写入目标：
+
+```python
+curve
+polynomial
+sources
+index
+```
+
+直接调用符号：
+
+```python
+PPoly.construct_fast
+np.frombuffer(coefficients, dtype=np.float64).reshape
+np.frombuffer
+curve.derivative
+tuple
+polynomial.c[:, index].astype
+range
+len
+lru_cache
+```
 
 ## `_polynomial_ranges`
 
-[定义位置](../../../manipulation/interval_geometry.py#L22)。
+[定义位置](../../../manipulation/interval_geometry.py#L44)。
 
 输入签名：
 
@@ -31,15 +95,19 @@ def _polynomial_ranges(curve, start, end, derivative=0):
 读取的对象属性：
 
 ```python
-curve.derivative
+curve.c.shape
+curve.c
+curve.c.tobytes
+curve.x.tobytes
+curve.x
 polynomial.c.shape
 polynomial.c
 np.full
 np.inf
 np.full_like
+np.searchsorted
 polynomial.x
 np.longdouble
-polynomial.c[:, i].astype
 np.zeros_like
 shifted.append
 np.abs
@@ -59,9 +127,12 @@ np.maximum
 
 ```python
 polynomial
+sources
 degree
 lower
 upper
+first
+stop
 i
 left
 right
@@ -86,18 +157,20 @@ structural_zero
 直接调用符号：
 
 ```python
-curve.derivative
+prepared_polynomial
+curve.c.tobytes
+curve.x.tobytes
 np.full
 np.full_like
-enumerate
-zip
 max
-float
+int
+np.searchsorted
 min
-np.longdouble
-polynomial.c[:, i].astype
-np.zeros_like
+len
 range
+float
+np.longdouble
+np.zeros_like
 comb
 shifted.append
 sum
@@ -115,7 +188,7 @@ np.maximum
 
 ## `_progress_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L61)。
+[定义位置](../../../manipulation/interval_geometry.py#L89)。
 
 输入签名：
 
@@ -163,7 +236,7 @@ progress_anchor_parameters
 
 ## `SceneMotionBounds`
 
-[定义位置](../../../manipulation/interval_geometry.py#L69)。
+[定义位置](../../../manipulation/interval_geometry.py#L97)。
 
 ```python
 class SceneMotionBounds():
@@ -176,6 +249,7 @@ scene: object
 robot: object
 attached_names: dict
 owner_radii: dict
+segment_bounds: dict = field(default_factory=dict)
 ```
 
 实现说明：
@@ -188,7 +262,7 @@ owner_radii: dict
 
 ## `SceneMotionBounds.from_scene`
 
-[定义位置](../../../manipulation/interval_geometry.py#L82)。
+[定义位置](../../../manipulation/interval_geometry.py#L111)。
 
 输入签名：
 
@@ -283,7 +357,7 @@ cls
 
 ## `SceneMotionBounds.declaration_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L121)。
+[定义位置](../../../manipulation/interval_geometry.py#L150)。
 
 输入签名：
 
@@ -339,7 +413,7 @@ result.setdefault(last, set()).add
 
 ## `SceneMotionBounds.partition_times`
 
-[定义位置](../../../manipulation/interval_geometry.py#L139)。
+[定义位置](../../../manipulation/interval_geometry.py#L168)。
 
 输入签名：
 
@@ -398,7 +472,7 @@ np.unique
 
 ## `SceneMotionBounds._owner_speed`
 
-[定义位置](../../../manipulation/interval_geometry.py#L153)。
+[定义位置](../../../manipulation/interval_geometry.py#L182)。
 
 输入签名：
 
@@ -432,6 +506,7 @@ owner.pose_path.progress
 owner.pose_path
 np.nextafter
 np.inf
+self.segment_bounds
 path.attachment
 path.progress
 path.motion_model
@@ -445,6 +520,7 @@ model.reference_pose
 model.axis_point
 model.axis
 model.basis
+prepared.append
 ```
 
 写入目标：
@@ -460,12 +536,11 @@ u0
 u1
 path
 rate
-result
+prepared
 reach
 i
 left
 right
-scale
 linear
 angle
 speed
@@ -473,6 +548,10 @@ model
 delta
 arm
 rotation
+self.segment_bounds[owner.owner_id]
+result
+reciprocal
+scale
 ```
 
 直接调用符号：
@@ -496,12 +575,13 @@ zip
 Rotation.from_matrix(path.poses[i, :3, :3]).inv
 Rotation.from_matrix
 abs
+prepared.append
 max
 ```
 
 ## `SceneMotionBounds.interval`
 
-[定义位置](../../../manipulation/interval_geometry.py#L195)。
+[定义位置](../../../manipulation/interval_geometry.py#L231)。
 
 输入签名：
 
@@ -612,7 +692,7 @@ unavailable.pop
 
 ## `check_interval_geometry`
 
-[定义位置](../../../manipulation/interval_geometry.py#L253)。
+[定义位置](../../../manipulation/interval_geometry.py#L289)。
 
 输入签名：
 
@@ -649,18 +729,39 @@ np.asarray
 motion.partition_times
 batch_sizes.append
 queried_times.update
+state.time_s
 unresolved.extend
 cache.get
 motion.interval
 speeds.values
 unresolved.append
+first.batch
+second.batch
+first.pair_columns
+second.pair_columns
+first.source_rows
+second.source_rows
 maps[0].get
 maps[1].get
+blocks[0].descriptors
+blocks[1].descriptors
+entries.append
+descriptor.display
 failures.append
+first.source
+second.source
+blocks[0].status
+blocks[1].status
 proofs.append
-a.get
-b.get
-row.get
+blocks[0].empty_set
+blocks[1].empty_set
+blocks[0].permission_kind
+blocks[1].permission_kind
+block.full_lower
+block.full_lower_valid
+block.lower
+block.lower_valid
+distance.append
 proved.append
 pending.extend
 ```
@@ -671,6 +772,7 @@ pending.extend
 cache
 intersections
 seen_intersections
+pair_catalogs
 queried_times
 consumed
 batch_sizes
@@ -702,19 +804,34 @@ speeds
 unavailable
 movement
 base
+first
+second
+blocks
 maps
-row
+catalog_key
+entries
+descriptor
+pair_catalogs[catalog_key]
 failures
 proofs
-display
 item
+ia
+ib
+statuses
 name
 relative
+permissions
 finite_permission
 distance
+block
+index
+permitted
+values
+valid
 change
 value
 reason
+row
 middle
 ```
 
@@ -737,9 +854,9 @@ boundary_keys
 query_geometry
 batch_sizes.append
 queried_times.update
-float
 bool
 unresolved.extend
+float
 cache.get
 motion.interval
 _mul_up
@@ -747,14 +864,15 @@ max
 speeds.values
 any
 unresolved.append
+id
 maps[0].get
 maps[1].get
+entries.append
+descriptor.display
 failures.append
 proofs.append
-a.get
-b.get
 _add_up
-row.get
+distance.append
 all
 min
 proved.append
@@ -763,7 +881,7 @@ pending.extend
 
 ## `check_interval_geometry.retain`
 
-[定义位置](../../../manipulation/interval_geometry.py#L274)。
+[定义位置](../../../manipulation/interval_geometry.py#L313)。
 
 输入签名：
 
@@ -778,7 +896,18 @@ def retain(states):
 读取的对象属性：
 
 ```python
+state.time_s
+state.side
+state.batch
+np.any
+block.status
+state.source_rows
+state.tokens
+block.descriptors
+descriptor.key
 seen_intersections.add
+block.materialize
+row.items
 intersections.append
 ```
 
@@ -788,23 +917,32 @@ intersections.append
 state
 key
 cache[key]
-pair
-entities
+block
+source
+column
+descriptor
 identity
+row
+pair
+name
+value
 ```
 
 直接调用符号：
 
 ```python
-float
-int
+any
+np.any
+state.tokens
 seen_intersections.add
+block.materialize
+row.items
 intersections.append
 ```
 
 ## `check_interval_geometry.boundary_keys`
 
-[定义位置](../../../manipulation/interval_geometry.py#L293)。
+[定义位置](../../../manipulation/interval_geometry.py#L337)。
 
 输入签名：
 

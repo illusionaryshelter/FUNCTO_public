@@ -303,14 +303,14 @@ def test_complete_pair_evidence_fits_candidate_allocation_before_robot_binding(t
         weights=np.ones((2, 2, 2)), origin=[-.005]*3, voxel_size=.01,
         name='material', source='synthetic RGB-D')
     scene.owners = (CollisionOwner('material', material, path, 'observed field', moving=True),)
-    count, rows = 3, []
+    from manipulation.pair_evidence import PairBatch
+    count, rows = 3, PairBatch()
     progress = torch.linspace(0., 1., count, dtype=torch.float64)[None]
     values = scene.evaluate(None, torch.zeros((1, count, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64).expand(1, count, 4), progress,
         torch.tensor([[[.04, -.02]]], dtype=torch.float64).expand(1, count, 2),
         ('left_slide', 'right_slide'), trajectory_time=progress, geometry_evidence_out=rows)
-    for row in rows:
-        row.update(query_index=row['state_index'].copy(), side=0)
+    rows.set_query_layout(rows.state_index, np.zeros(rows.state_count, dtype=np.int8))
     states = _geometry_query_states(rows, progress.numpy()[0], progress.numpy()[0], values.numpy()[0])
     seen = set()
     def nbytes(value):
@@ -322,15 +322,18 @@ def test_complete_pair_evidence_fits_candidate_allocation_before_robot_binding(t
             total += sum(nbytes(key)+nbytes(item) for key, item in value.items())
         elif isinstance(value, (tuple, list)):
             total += sum(nbytes(item) for item in value)
+        elif hasattr(value, '__dict__'):
+            total += nbytes(vars(value))
         return total
 
     measured = nbytes((rows, states))
     estimate = _candidate_evidence_workspace_bytes(scene, count, 0, 2)
     assert measured < estimate
-    assert any('witness_first_bounds' in row for row in rows)
-    assert any('normal_first_to_second' in row for row in rows)
-    assert any(row['geometry_entity_key']['first'] == 'owner/material' for row in rows)
-    record_property('complete_pair_rows', len(rows))
+    from pair_evidence_fixtures import records
+    assert any('witness_first_bounds' in row for row in records(rows))
+    assert any('normal_first_to_second' in row for row in records(rows))
+    assert any(row['geometry_entity_key']['first'] == 'owner/material' for row in records(rows))
+    record_property('complete_pair_rows', len(rows.order))
     record_property('live_original_and_grouped_bytes', measured)
     record_property('candidate_evidence_bound_bytes', estimate)
     scene.robot_validator = None

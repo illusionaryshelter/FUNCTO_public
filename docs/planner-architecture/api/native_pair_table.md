@@ -14,7 +14,7 @@
 
 调用开始时在持有 Python GIL 的范围内复制矩阵、mask 和请求；数值循环释放 GIL，每对以独立冷 Coal 求解器计算。结果是独立拥有内存的 `float64[S,P,12]` 数组，按原状态和配对顺序写入。异常恢复 GIL，报告状态与配对索引；Python 批次入口补充该块在完整输入中的状态范围。`storage_nbytes` 返回表自身向量容量及对象占用，不重复计已有模型形状，不包含临时求解器与查询数组。
 
-`RobotGeometryChecker.query` 使用同一表查询一个状态，关闭投影 mask，并组织完整 FK、关节限位和距离报告。`query_pair_batches` 连续准备多个状态，按配对总量分块并转为现有 JSON 证据所需的 Python 数值列表。`pair_evidence` 将原 `PairQuery` 身份、策略和来源附到数值行。`OnlinePlanningScene._robot_self_components` 消费该列表，保留未知运动处理、距离分类和穿透见证导数。机器人验证与执行前检查继续消费完整报告。
+`RobotGeometryChecker.query` 使用同一表查询一个状态，关闭投影 mask，并组织完整 FK、关节限位和距离报告。`query_pair_batches` 连续准备多个状态，按配对总量分块并保留完整 NumPy 数组；完整验收按最多四个连续状态分片调用同一原生函数。此 Python 消费接口的代码基线为 `WORKING_IMPLEMENTATION`，原生核本身仍使用本页所列实现。`pair_evidence` 将原 `PairQuery` 身份、策略和来源附到数值行。`OnlinePlanningScene._robot_self_components` 消费该数组，保留未知运动处理、距离分类和穿透见证导数。机器人验证与执行前检查继续消费完整报告。
 
 ## 输出列与数值语义
 

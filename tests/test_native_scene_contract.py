@@ -3,6 +3,8 @@
 # BEGIN use real native queries with a small analytic FK fixture.
 from types import SimpleNamespace
 
+from pair_evidence_fixtures import PairBatch, records
+
 import numpy as np
 import pytest
 import torch
@@ -43,7 +45,7 @@ def make_scene(tmp_path, *, gap=.001, fixed=(), occupied_background=False, polic
     # END the full scene policy remains separately available for serialization.
 
     class BaseKinematics:
-        def poses(self, q, names):
+        def poses(self, q, names, *, fk_session=None):
             zero = q[..., :1] * 0
             return {"base": (zero.expand(*q.shape[:-1], 3),
                              torch.cat((zero + 1, zero.expand(*q.shape[:-1], 3)), -1))}
@@ -129,7 +131,7 @@ def test_nonclear_diagnostics_keep_first_and_maximum_per_component(tmp_path):
         NativePrimitive("second", "left", "box", (.02, .02, .02), local, "source")))
     scene.robot_model = scene.robot_validator.checker = checker
 
-    def poses(q, names):
+    def poses(q, names, *, fk_session=None):
         zero = q[..., :1] * 0
         quaternion = torch.cat((zero + 1, zero.expand(*q.shape[:-1], 3)), -1)
         return {"base": (zero.expand(*q.shape[:-1], 3), quaternion),
@@ -141,10 +143,11 @@ def test_nonclear_diagnostics_keep_first_and_maximum_per_component(tmp_path):
     permission = progress + .05
     times = torch.linspace(2., 6., 40, dtype=torch.float64)[None]
     position, quaternion = poses(q, ())['base']
-    complete_evidence = []
+    complete_evidence = PairBatch()
     costs = scene.components(None, position, quaternion, progress, q,
         ("left_slide", "right_slide"), trajectory_time=times,
         contact_permission_progress=permission, geometry_evidence_out=complete_evidence)
+    complete_evidence = records(complete_evidence)
     report = scene.last_query_report
     assert report['pair_queries'] == len(complete_evidence) == 120
     rows = report['nonclear_pairs']
@@ -242,7 +245,7 @@ def test_scene_shares_batch_zero_across_pairs_and_retains_all_position_gradients
     robot_position = torch.zeros((1, 2, 3), dtype=torch.float64, requires_grad=True)
     rotation = torch.tensor([[[1., 0., 0., 0.], [1., 0., 0., 0.]]],
                             dtype=torch.float64, requires_grad=True)
-    scene.kinematics = SimpleNamespace(poses=lambda *args: {"base": (robot_position, rotation)})
+    scene.kinematics = SimpleNamespace(poses=lambda *args, **kwargs: {"base": (robot_position, rotation)})
     pair_query = geometry.pair_residual
     shared_zeros = []
 

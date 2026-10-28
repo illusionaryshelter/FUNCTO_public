@@ -1,12 +1,12 @@
 # 候选验收、执行交接与续规划
 
-候选验收与执行算法的代码基线为 `be44b54`；当前候选报告交付代码为 `99eae0c`，详见 [planning API](api/planning.md)；执行绑定数据转换的代码基线见 [execution_binding API](api/execution_binding.md)。本次文档引用提交与 `99eae0c` 的相关生产代码相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
+候选验收代码基线为 `WORKING_IMPLEMENTATION`，执行算法基线为 `be44b54`；执行绑定数据转换基线见 [execution_binding API](api/execution_binding.md)。共享验收的数据布局、API 前置条件及实际调用关系见[共享验收组件](10-shared-candidate-validation.md)。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 ## 1. 候选的完整验收
 
 初值由参考 IK 或原关节曲线的物理时间样本经最小二乘取得。`reference_initialization.fits` 保存拟合结果；其系数、入口和时钟定义一条可评价曲线。`evaluate_reference` 为每个初值建立 `ConstrainedSolution` 记录，`select_candidate` 将初值和求解输出统一交给保存曲线验收。
 
-`_ConstrainedPlanner._candidate_metrics` 消费实际 `JointTrajectory` 和候选场景，沿保存多项式计算 `q/dq/ddq/jerk`，通过共享 Pin 模型计算完整名义机器人、TCP 及速度。`_candidate_sample_times` 保留原多项式区间端点，并按 `interpolation_dt` 分割；任务锚点按候选自身进度映射精确加入。`PlanningProblem.residuals` 计算原任务允许集合，`_scene_boundary_evaluate` 在同一次查询中计算相同物理时刻的原场景分项及完整实体对证据。`_geometry_query_states` 按精确物理时刻与关系侧 `−1/0/+1` 组织原距离界、状态、许可及见证；即使没有实体对，该物理时刻也保留已完成记录。方法返回正式报告、规范时间参数、实际物理点数和候选几何上下文；上下文由候选私有释放场景及这些完整状态组成。报告保存具体分项、查询时刻及覆盖范围。
+`_ConstrainedPlanner._candidate_metrics` 消费实际 `JointTrajectory` 和候选场景，沿保存多项式计算 `q/dq/ddq/jerk`，通过共享 Pin 模型计算完整名义机器人、TCP 及速度。`_candidate_sample_times` 保留原多项式区间端点，并按 `interpolation_dt` 分割；任务锚点按候选自身进度映射精确加入。`PlanningProblem.residuals` 计算原任务允许集合，`_scene_boundary_evaluate` 在同一次查询中计算相同物理时刻的原场景分项及完整实体对证据。`pair_evidence._geometry_query_states` 将 `PairBatch` 的状态索引组织为 `EvidenceState`，按精确物理时刻与关系侧 `−1/0/+1` 组织原距离界、状态、许可及见证；即使没有实体对，该物理时刻也保留已完成记录。方法返回正式报告、规范时间参数、实际物理点数和候选几何上下文；上下文由候选私有释放场景及这些完整状态组成。报告保存具体分项、查询时刻及覆盖范围。
 
 `progress_clock.progress_anchor_parameters` 为所有消费者产生同一组 `(u,s)` 事件记录，其中 `u` 是候选归一化时间、`s` 是声明进度；事件物理时间为 `uT`，`T` 是该候选时长。`progress_query_parameters` 在此精确物理时间使用原 `u,s`，普通查询按原进度映射插值。固定任务查询、场景关系侧、区间分区与实体速度界因此使用相同事件身份。进度平台的入口和出口分别保留；CPU 实体路径折点按 binary64 存储，原生张量的 float32 约束仍在 `_ProgressMap.anchor_parameters` 中核对。
 
@@ -26,7 +26,7 @@
 
 未取得分离证明的区间按实体最大位移二分，直到位移上界不超过 `validation_spatial_step_m`、时间无法再分或共享查询容量用尽，保留为 `unresolved_intervals`。剩余新点容量为零时，已有中点仍可继续分割并完成证明。新增查询沿原多项式计算完整 FK 与原场景，进度平台仅在入口使用左侧、出口使用右侧。`proved_intervals`、`confirmed_intersections`、`unresolved_intervals` 与 `initial_query_points`、新增 `query_points`、各实际批次大小 `query_batch_sizes` 和新增查询时刻共同组成报告。
 
-候选几何缓存与新查询使用同一主机资源准入。`_candidate_evidence_workspace_bytes` 从注册机器人实体数 G、任务实体数 O 构造配对数量上界 `G(G−1)/2+G(O+1)+O(O+1)/2`；该上界在机器人验证器绑定前即可计算，实际配对仍由原场景规则确定。令 P 为候选物理点上限、A 为锚点参数数目、C 为实际进度映射节点数，则完整状态数至多 `P+2A`；令 N 为各实体路径进度节点数之和，则带完整配对证明或失败行的区间数上界为 `L=P+C+2A+1+2N`。最终一批可能只覆盖部分新中点，其余子区间各自保留缺边界记录，因此区间容器单独按 `2L` 计入；完整配对行仍按 L 计入。每条完整记录的存储估算覆盖当前原生/观测模式的字典、嵌套列表、数字与实体身份，并包含重组时的临时字典和最终区间证明。`_planning_workspace_bytes` 将其与同批场景、Pin 状态及共享材料索引合并。初始化、重绑定、求解和 `_candidate_metrics` 分别传入各自明确时钟长度；保存曲线的实际 C 在查询前重新完成主机准入。
+候选几何缓存与新查询使用同一主机资源准入。`_candidate_evidence_workspace_bytes` 从注册机器人实体数 G、任务实体数 O 构造配对数量上界 `G(G−1)/2+G(O+1)+O(O+1)/2`；该上界在机器人验证器绑定前即可计算，实际配对仍由原场景规则确定。令 P 为候选物理点上限、A 为锚点参数数目、C 为实际进度映射节点数，则完整状态数至多 `P+2A`；令 N 为各实体路径进度节点数之和，则带完整配对证明或失败行的区间数上界为 `L=P+C+2A+1+2N`。最终一批可能只覆盖部分新中点，其余子区间各自保留缺边界记录，因此区间容器单独按 `2L` 计入；完整配对行仍按 L 计入。该分配上界覆盖完整观测 payload、原生十二列数值块、状态／实体对索引、FK 结果及最终区间证明。证据生产和区间读取使用共享 `PairBatch`、`EvidenceState`，最终报告按原字段导出。`_planning_workspace_bytes` 将其与同批场景、Pin 状态及共享材料索引合并。初始化、重绑定、求解和 `_candidate_metrics` 分别传入各自明确时钟长度；保存曲线的实际 C 在查询前重新完成主机准入。
 
 报告范围 `continuous_declared_geometry_model` 指输入数值所描述的连续运动与实体模型。该模型界的含义独立于设备浮点 FK 舍入和实际控制跟踪误差。空间细分截止、未知运动或容量不足均保留未决状态；它们不被解释为连续分离，也不新增碰撞拒绝。新增实际场景正残差以 `interval:process_scene` 进入原验收条件和恢复路径。`validation_joint_step` 继续用于 OMPL 连接检查。
 

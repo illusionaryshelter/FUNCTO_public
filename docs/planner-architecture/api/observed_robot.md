@@ -1,6 +1,8 @@
 # `manipulation/observed_robot.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`WORKING_IMPLEMENTATION`。
+共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
+
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pure_kinematics`
@@ -117,7 +119,7 @@ PinKinematics
 输入签名：
 
 ```python
-def poses(self, position, joint_names):
+def poses(self, position, joint_names, *, fk_session=None):
 ```
 
 实现说明：

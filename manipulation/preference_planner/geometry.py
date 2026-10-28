@@ -15,6 +15,8 @@ and observation support.  No task mesh or alternate collision solid is made.
 from dataclasses import asdict, dataclass
 
 import coal
+from ..pair_evidence import selected_witness_records
+
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
@@ -322,7 +324,7 @@ class GeometryConstraints:
             proposal = next_proposal
             fraction *= .5
 
-    def add_evidence(self, full_controls, states):
+    def add_evidence(self, full_controls, states=None, *, pair_batch=None):
         """Add necessary rows from a completed original full-curve query.
 
         All confirmed intersections retain their actual times.  Other states
@@ -331,27 +333,9 @@ class GeometryConstraints:
         geometry coverage.  Evidence without actual material witnesses adds
         no artificial point or direction.
         """
-        records, closest = [], {}
-        total = 0
-        for state in states:
-            for pair in state["pairs"]:
-                total += 1
-                entity = pair["geometry_entity_key"]
-                record = {**pair, "time_s": float(state["time_s"]),
-                    "progress": float(pair.get("progress", state["progress"])),
-                    "permission_progress": float(pair.get("permission_progress", state["progress"])),
-                    "first": entity["first"], "second": entity["second"]}
-                if pair["status"] in {"unmodelled_motion", "internal_assembly"}:
-                    continue
-                if pair["status"] == "intersection":
-                    records.append(record)
-                elif pair.get("witness_first") is not None and pair.get("witness_second") is not None:
-                    key = entity["first"], entity["second"]
-                    rank = (float(pair.get("lower_m") or 0.), float(pair.get("upper_m") or np.inf),
-                            float(state["time_s"]))
-                    if key not in closest or rank < closest[key][0]:
-                        closest[key] = rank, record
-        records.extend(value[1] for value in closest.values())
+        # BEGIN select native/observed values through their shared state indices.
+        records, total = selected_witness_records(states=states, batch=pair_batch)
+        # END only the original selected witnesses become optimization records.
         result = {"source_pair_records": total, "selected_pair_records": len(records),
                   "added_rows": 0, "skipped": []}
         if not records:

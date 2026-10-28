@@ -399,9 +399,11 @@ class OnlinePlanningScene:
         return poses
 
     # BEGIN one official-robot self query serves both initialization and full scenes.
+    # BEGIN shared numeric evidence retains original scene calculations.
     def _robot_self_components(self, complete_q, complete_names, robot_poses,
                                robot_matrices, hand_state, zero, *,
-                               record_pair, record_nonclear, include_bounds):
+                               record_nonclear, include_bounds,
+                               geometry_evidence_out, fk_session=None):
         """Query the fixed robot's required entity pairs at prepared states.
 
         Entity shapes and fixed link transforms are the official model of
@@ -437,8 +439,25 @@ class OnlinePlanningScene:
         batches = self.robot_model.query_pair_batches(joint_names=complete_names,
             joint_positions=q_cpu.reshape(-1, q_cpu.shape[-1]),
             T_reference_base=self.robot_validator.T_reference_base, pairs=pairs,
-            projection_mask=projection_mask, check_request=self.check_request)
-        rows_by_state = (state for batch in batches for state in batch)
+            projection_mask=projection_mask, check_request=self.check_request,
+            fk_session=fk_session, parallel=include_bounds)
+        # BEGIN own the raw matrix block without per-pair Python evidence.
+        boundary = max(self.robot_model.numerics["gjk_tolerance"], self.robot_model.numerics["epa_tolerance"])
+        if geometry_evidence_out is not None:
+            geometry_evidence_out.begin_native(pairs, boundary=boundary, include_bounds=include_bounds)
+
+        def retained_states():
+            begin = 0
+            for batch in batches:
+                end = begin + len(batch)
+                if geometry_evidence_out is not None:
+                    unmodelled_rows = uncertain.reshape(-1, 1)[begin:end] & unknown_pair[None, :]
+                    geometry_evidence_out.retain_native_chunk(begin, batch, unmodelled_rows)
+                yield from batch
+                begin = end
+
+        rows_by_state = retained_states()
+        # END native chunks retain the original lazy consumption/error order.
         for index in np.ndindex(shape):
             numeric_rows = next(rows_by_state)
             value = zero[index]
@@ -446,47 +465,45 @@ class OnlinePlanningScene:
             for pair, numeric in zip(pairs, numeric_rows):
                 if self.check_request is not None:
                     self.check_request()
-                row = self.robot_model.pair_evidence(pair, numeric)
                 first_id, second_id = pair.first, pair.second
-                entity_key = {"first": f"robot/{first_id}", "second": f"robot/{second_id}"}
                 if uncertain[index] and ({first_id, second_id} & unmodelled):
-                    record_pair(index, "collision/robot/self", first_id, second_id,
-                        {"status": "unmodelled_motion", "lower_m": None}, geometry_entity_key=entity_key)
                     continue
-                status = row["relation"]
-                lower = numeric[11] if include_bounds else None
-                record_pair(index, "collision/robot/self", first_id, second_id,
-                    {**row, "status": {"separated": "clear", "penetrating": "intersection",
-                                       "numerical_boundary": "unresolved"}[status],
-                     "lower_m": lower, "distance_scope": "full_entities"}, geometry_entity_key=entity_key)
+                # BEGIN classify the original scalar directly; materialize only failures.
+                distance = float(numeric[0])
+                status = ("separated" if distance > boundary else "penetrating"
+                          if distance < -boundary else "numerical_boundary")
+                # END values/thresholds remain identical to pair_evidence.
                 report["pair_queries"] += 1
                 report["status_counts"][status] = report["status_counts"].get(status, 0) + 1
                 if status == "numerical_boundary":
                     undecided = undecided + 1.
                 elif status == "penetrating":
-                    a = inverse_points(row["witness_first"], robot_matrices[first_id][index])
-                    b = inverse_points(row["witness_second"], robot_matrices[second_id][index])
+                    a = inverse_points(numeric[1:4], robot_matrices[first_id][index])
+                    b = inverse_points(numeric[4:7], robot_matrices[second_id][index])
                     pa = tuple(item[index] for item in robot_poses[first_id])
                     pb = tuple(item[index] for item in robot_poses[second_id])
-                    normal = _tensor(row["normal_first_to_second"], complete_q)
+                    normal = _tensor(numeric[7:10], complete_q)
                     signed = ((_world(b, pb) - _world(a, pa)) * normal).sum()
-                    value = value - row["signed_distance_m"] - (signed - signed.detach())
+                    value = value - distance - (signed - signed.detach())
                 # BEGIN display evidence retains the actual query clock.
                 if status != "separated":
+                    row = self.robot_model.pair_evidence(pair, numeric.tolist())
                     record_nonclear(index, "collision/robot/self", first_id, second_id,
-                        row, -row["signed_distance_m"] if status == "penetrating" else 0.)
+                        row, -distance if status == "penetrating" else 0.)
                 # END the original pair residual determines within-component severity.
             self_costs.append(value)
             self_unresolved.append(undecided)
         # END original classification, witnesses, unknown states and gradients remain consumers.
         return {"collision/robot/self": torch.stack(self_costs).reshape(shape),
                 "unresolved/robot/self": torch.stack(self_unresolved).reshape(shape)}, report
+    # END state clocks and pair payloads have one explicit owner.
     # END all consumers retain the same entity identities and distance semantics.
 
+    # BEGIN shared numeric evidence retains original scene calculations.
     def components(self, robot_spheres, position, quaternion, progress,
                    joint_position=None, joint_names=None, *, trajectory_time,
                    active_contact_rule_ids=None, contact_permission_progress=None,
-                   owner_poses=None, geometry_evidence_out=None, geometry_scope="full"):
+                   owner_poses=None, geometry_evidence_out=None, geometry_scope="full", fk_session=None):
         """Return same-state residuals and retain distance/coverage diagnostics.
 
         ``robot_spheres`` is an empty native-kinematics output. Registered
@@ -504,22 +521,22 @@ class OnlinePlanningScene:
         costs = {}
         permission_progress = progress if contact_permission_progress is None else contact_permission_progress
         # BEGIN complete pair evidence is an explicit interval-verification output.
-        # Unlike display diagnostics, this list includes every required pair
+        # Unlike display diagnostics, this numeric block includes every required pair
         # and every skipped relation at each physical query state.
         evidence_time, evidence_progress, evidence_permission = (
             value.detach().cpu().numpy() for value in
             (trajectory_time, progress, permission_progress))
 
+        # BEGIN one clock table replaces repeated row metadata.
+        if geometry_evidence_out is not None:
+            geometry_evidence_out.bind_clock(evidence_time, evidence_progress, evidence_permission)
+        # END the expanded state and actual permission progress remain distinct.
+
         def record_pair(index, component, first, second, evidence, *, geometry_entity_key,
                         permission_kind="none"):
             if geometry_evidence_out is not None:
-                geometry_evidence_out.append({"state_index": list(index),
-                    "time_s": float(evidence_time[index]),
-                    "progress": float(evidence_progress[index]),
-                    "permission_progress": float(evidence_permission[index]),
-                    "component": component, "first": first, "second": second,
-                    "geometry_entity_key": geometry_entity_key,
-                    "permission_kind": permission_kind, **evidence})
+                geometry_evidence_out.append_observed(index, component, first, second,
+                    evidence, geometry_entity_key=geometry_entity_key, permission_kind=permission_kind)
         # END hard residuals and optional proof evidence have separate consumers.
         # BEGIN bounded diagnostics retain every component's failure location.
         # Pair iteration is entity-major, so the earliest physical time is
@@ -573,7 +590,7 @@ class OnlinePlanningScene:
                     self.gripper.joint_names.index(name) for name in missing_names]]), dim=-1)
                 complete_names += tuple(missing_names)
         # BEGIN place each original collision entity using complete joint FK.
-        link_poses = self.kinematics.poses(complete_q, complete_names)
+        link_poses = self.kinematics.poses(complete_q, complete_names, fk_session=fk_session)
         robot_poses = {}
         for name, (frame, _, _, local) in self.robot_model._geometries.items():
             link_position, link_quaternion = link_poses[frame]
@@ -591,13 +608,16 @@ class OnlinePlanningScene:
             zero = zero + pose[0].sum(-1) * 0
         robot_costs, report = self._robot_self_components(complete_q, complete_names,
             robot_poses, robot_matrices, hand_state, zero,
-            record_pair=record_pair, record_nonclear=record_nonclear,
-            include_bounds=geometry_evidence_out is not None)
+            record_nonclear=record_nonclear,
+            include_bounds=geometry_evidence_out is not None,
+            geometry_evidence_out=geometry_evidence_out, fk_session=fk_session)
         costs.update(robot_costs)
         report["geometry_scope"] = geometry_scope
         if geometry_scope == "robot":
             report["nonclear_pairs"] = nonclear_diagnostics()
             self.last_query_report = report
+            if geometry_evidence_out is not None:
+                geometry_evidence_out.seal()
             return costs
         report["coverage_scope"] = "represented_observed_occupancy"
         # END full scenes continue from this same completed self query.
@@ -800,7 +820,10 @@ class OnlinePlanningScene:
         # END robot camera coverage cannot enter a refusal or recovery component.
         report["nonclear_pairs"] = nonclear_diagnostics()
         self.last_query_report = report
+        if geometry_evidence_out is not None:
+            geometry_evidence_out.seal()
         return costs
+    # END state clocks and pair payloads have one explicit owner.
 
     # BEGIN one deterministic finite objective serves a constrained optimizer.
     def optimization_objective(self, position, quaternion, progress, joint_position,

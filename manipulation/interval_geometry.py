@@ -6,7 +6,10 @@ intervals separately. Observed free-space coverage and execution decisions
 remain responsibilities of the scene and its caller.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
+from scipy.interpolate import PPoly
+from .pair_evidence import INTERSECTION, INTERNAL, NONE
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -19,6 +22,25 @@ from .implicit_distance import box_corners
 from .progress_clock import progress_anchor_parameters, progress_query_parameters
 
 
+# BEGIN immutable polynomial inputs share derivative preparation across intervals.
+@lru_cache(maxsize=32)
+def prepared_polynomial(shape, coefficients, breakpoints, derivative):
+    """Prepare one complete binary64 polynomial, including mutation identity.
+
+    Exact coefficient and breakpoint bytes define the existing PPoly input.
+    SciPy computes the original derivative once. Long-double source arrays
+    retain the same values and ordering used by the original interval formula.
+    Changed coefficients or breakpoints produce a distinct cache entry.
+    """
+    curve = PPoly.construct_fast(np.frombuffer(coefficients, dtype=np.float64).reshape(shape),
+                                np.frombuffer(breakpoints, dtype=np.float64))
+    polynomial = curve.derivative(derivative)
+    sources = tuple(polynomial.c[:, index].astype(np.longdouble)[::-1]
+                    for index in range(len(polynomial.x)-1))
+    return polynomial, sources
+# END the bounded cache owns the full coefficients and breakpoint values.
+
+
 def _polynomial_ranges(curve, start, end, derivative=0):
     """Enclose a cubic or its derivative using Bernstein convex hulls.
 
@@ -27,17 +49,23 @@ def _polynomial_ranges(curve, start, end, derivative=0):
     outward allowance proportional to the arithmetic's absolute terms.
     This is an interval bound, rather than a sampled derivative maximum.
     """
-    polynomial = curve.derivative(derivative)
+    polynomial, sources = prepared_polynomial(curve.c.shape, curve.c.tobytes(),
+                                              curve.x.tobytes(), derivative)
     degree = polynomial.c.shape[0] - 1
     lower = np.full(polynomial.c.shape[2:], np.inf)
     upper = np.full_like(lower, -np.inf)
     from math import comb
-    for i, (left, right) in enumerate(zip(polynomial.x[:-1], polynomial.x[1:])):
+    # BEGIN select exactly the pieces intersecting this interval.
+    first = max(0, int(np.searchsorted(polynomial.x, start, side="right"))-1)
+    stop = min(len(polynomial.x)-1, int(np.searchsorted(polynomial.x, end, side="left")))
+    for i in range(first, stop):
+        left, right = polynomial.x[i:i+2]
+    # END every intersected original piece still uses the original arithmetic.
         a, b = max(float(start), float(left)), min(float(end), float(right))
         if b <= a:
             continue
         x, h = np.longdouble(a-left), np.longdouble(b-a)
-        source = polynomial.c[:, i].astype(np.longdouble)[::-1]
+        source = sources[i]
         shifted = []
         arithmetic_scale = np.zeros_like(source[0])
         for k in range(degree+1):
@@ -77,6 +105,7 @@ class SceneMotionBounds:
     robot: object
     attached_names: dict
     owner_radii: dict
+    segment_bounds: dict = field(default_factory=dict)
 
     @classmethod
     def from_scene(cls, scene, *, tool_link, T_link_tool):
@@ -164,33 +193,40 @@ class SceneMotionBounds:
             return 0.
         path = owner.pose_path
         rate = float(np.nextafter((u1-u0)/duration, np.inf))
+        # BEGIN one bound instance owns the unchanged declared path preparation.
+        if owner.owner_id not in self.segment_bounds:
+            prepared = []
+            reach = _add_up(_norm_up(path.attachment[:3, 3]),
+                            _mul_up(_linear_norm_up(path.attachment[:3, :3]), radius))
+            for i, (left, right) in enumerate(zip(path.progress[:-1], path.progress[1:])):
+                if path.motion_model is None:
+                    linear = _norm_up(path.poses[i+1, :3, 3]-path.poses[i, :3, 3])
+                    angle = float((Rotation.from_matrix(path.poses[i, :3, :3]).inv()*
+                                   Rotation.from_matrix(path.poses[i+1, :3, :3])).magnitude())
+                    speed = _add_up(linear, _mul_up(np.nextafter(angle, np.inf), reach))
+                else:
+                    model = path.motion_model
+                    delta = path.coordinates[i+1]-path.coordinates[i]
+                    if model.kind == 'revolute':
+                        arm = _add_up(_norm_up(model.reference_pose[:3, 3]-model.axis_point), reach)
+                        speed = _mul_up(abs(float(delta[0])), _mul_up(_norm_up(model.axis), arm))
+                    elif model.kind == 'prismatic':
+                        speed = _mul_up(abs(float(delta[0])), _norm_up(model.axis))
+                    else:
+                        linear = _norm_up(model.basis[:, :2] @ delta[:2])
+                        rotation = 0. if model.kind == 'translation_plane' else _mul_up(
+                            abs(float(delta[2])), _mul_up(_norm_up(model.axis), reach))
+                        speed = _add_up(linear, rotation)
+                prepared.append((left, right, float(np.nextafter(1/(right-left), np.inf)), speed))
+            self.segment_bounds[owner.owner_id] = prepared
         result = 0.
-        reach = _add_up(_norm_up(path.attachment[:3, 3]),
-                        _mul_up(_linear_norm_up(path.attachment[:3, :3]), radius))
-        for i, (left, right) in enumerate(zip(path.progress[:-1], path.progress[1:])):
+        for left, right, reciprocal, speed in self.segment_bounds[owner.owner_id]:
             if right <= u0 or left >= u1:
                 continue
-            scale = _mul_up(rate, float(np.nextafter(1/(right-left), np.inf)))
-            if path.motion_model is None:
-                linear = _norm_up(path.poses[i+1, :3, 3]-path.poses[i, :3, 3])
-                angle = float((Rotation.from_matrix(path.poses[i, :3, :3]).inv()*
-                               Rotation.from_matrix(path.poses[i+1, :3, :3])).magnitude())
-                speed = _add_up(linear, _mul_up(np.nextafter(angle, np.inf), reach))
-            else:
-                model = path.motion_model
-                delta = path.coordinates[i+1]-path.coordinates[i]
-                if model.kind == "revolute":
-                    arm = _add_up(_norm_up(model.reference_pose[:3, 3]-model.axis_point), reach)
-                    speed = _mul_up(abs(float(delta[0])), _mul_up(_norm_up(model.axis), arm))
-                elif model.kind == "prismatic":
-                    speed = _mul_up(abs(float(delta[0])), _norm_up(model.axis))
-                else:
-                    linear = _norm_up(model.basis[:, :2] @ delta[:2])
-                    rotation = 0. if model.kind == "translation_plane" else _mul_up(
-                        abs(float(delta[2])), _mul_up(_norm_up(model.axis), reach))
-                    speed = _add_up(linear, rotation)
+            scale = _mul_up(rate, reciprocal)
             result = max(result, _mul_up(scale, speed))
         return result
+        # END interval progress and duration still determine each physical speed.
 
     def interval(self, trajectory, start, end):
         """Return entity speed bounds and explicit unavailable coordinates.
@@ -269,18 +305,26 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
     if not np.isfinite(spatial_step_m) or spatial_step_m <= 0:
         raise ValueError("Spatial subdivision requires a positive finite maximum movement")
     cache, intersections, seen_intersections = {}, [], set()
+    # BEGIN exact state evidence is indexed once for its adjacent intervals.
+    pair_catalogs = {}
+    # END the complete original records remain owned by cache.
     queried_times, consumed, batch_sizes = set(), 0, []
 
     def retain(states):
         for state in states:
-            key = (float(state["time_s"]), int(state["side"]))
+            key = (state.time_s, state.side)
             cache[key] = state
-            for pair in state["pairs"]:
-                entities = pair["geometry_entity_key"]
-                identity = (*key, pair["component"], entities["first"], entities["second"])
-                if pair["status"] == "intersection" and identity not in seen_intersections:
-                    seen_intersections.add(identity)
-                    intersections.append({"time_s": key[0], "side": key[1], **pair})
+            block = state.batch
+            if any(np.any(block.status[source] == INTERSECTION) for source in state.source_rows):
+                for source, column in state.tokens():
+                    descriptor = block.descriptors[column]
+                    identity = (*key, *descriptor.key)
+                    if block.status[source, column] == INTERSECTION and identity not in seen_intersections:
+                        seen_intersections.add(identity)
+                        row = block.materialize(source, column)
+                        pair = {name: value for name, value in row.items()
+                                if name not in {'state_index', 'query_index', 'time_s', 'side'}}
+                        intersections.append({"time_s": key[0], "side": key[1], **pair})
 
     retain(initial_states)
     initial_points = len({time for time, side in cache})
@@ -312,7 +356,7 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
             consumed += used
             batch_sizes.append(used)
             retain(response["states"])
-            queried_times.update(float(state["time_s"]) for state in response["states"])
+            queried_times.update(state.time_s for state in response["states"])
             exhausted = exhausted or bool(response["capacity_exhausted"])
         if intersections:
             unresolved.extend({"start_s": float(a), "end_s": float(b),
@@ -333,39 +377,52 @@ def check_interval_geometry(trajectory, motion, query_geometry, *, max_query_poi
             if any(state is None for state in states):
                 unresolved.append({**base, "reason": "sampling_capacity" if exhausted else "missing_boundary_side"})
                 continue
-            maps = [{(row["component"], row["geometry_entity_key"]["first"],
-                      row["geometry_entity_key"]["second"]): row
-                     for row in state["pairs"]} for state in states]
+            # BEGIN neighbors reuse the same exact endpoint pair index.
+            first, second = states
+            blocks = first.batch, second.batch
+            maps = first.pair_columns, second.pair_columns
+            # A shared catalog contains descriptor columns, never copied rows.
+            catalog_key = (id(blocks[0]), bool(first.source_rows),
+                           id(blocks[1]), bool(second.source_rows))
+            if catalog_key not in pair_catalogs:
+                entries = []
+                for key in sorted(set(maps[0]) | set(maps[1])):
+                    a, b = maps[0].get(key), maps[1].get(key)
+                    descriptor = blocks[0].descriptors[a] if a is not None else blocks[1].descriptors[b]
+                    entries.append((key, a, b, descriptor.display()))
+                pair_catalogs[catalog_key] = entries
+            # END pair order and all classification/proof formulas are unchanged.
             failures, proofs = [], []
-            for key in sorted(set(maps[0]) | set(maps[1])):
-                a, b = maps[0].get(key), maps[1].get(key)
-                display = a if a is not None else b
-                item = {"component": key[0], "first": display["first"], "second": display["second"],
-                        "geometry_entity_key": display["geometry_entity_key"]}
+            for key, a, b, item in pair_catalogs[catalog_key]:
                 if a is None or b is None:
                     failures.append({**item, "reason": "missing_pair_evidence"})
                     continue
-                if "intersection" in (a["status"], b["status"]):
+                ia, ib = (first.source, a), (second.source, b)
+                statuses = blocks[0].status[ia], blocks[1].status[ib]
+                if INTERSECTION in statuses:
                     failures.append({**item, "reason": "confirmed_endpoint_intersection"})
                     continue
-                if a["status"] == b["status"] == "internal_assembly":
+                if statuses[0] == statuses[1] == INTERNAL:
                     proofs.append({**item, "basis": "declared_rigid_assembly"})
                     continue
-                if a.get("empty_set") and b.get("empty_set"):
+                if blocks[0].empty_set[ia] and blocks[1].empty_set[ib]:
                     proofs.append({**item, "basis": "empty_represented_set"})
                     continue
                 if any(name in unavailable or name not in speeds for name in key[1:]):
                     failures.append({**item, "reason": "unmodelled_entity_motion"})
                     continue
                 relative = _add_up(speeds[key[1]], speeds[key[2]])
-                finite_permission = any(row.get("permission_kind", "none") != "none" for row in (a, b))
+                permissions = blocks[0].permission_kind[ia] != NONE, blocks[1].permission_kind[ib] != NONE
+                finite_permission = any(permissions)
                 # BEGIN only complete entity domains prove an entire time span.
                 # Without a permission, lower_m already covers the full pair.
                 # A finite permission has a separate full-entity bound; its
                 # clipped distance cannot be used after that permission moves.
-                distance = [row.get("full_entity_lower_m")
-                            if row.get("permission_kind", "none") != "none"
-                            else row.get("lower_m") for row in (a, b)]
+                distance = []
+                for block, index, permitted in zip(blocks, (ia, ib), permissions):
+                    values, valid = ((block.full_lower, block.full_lower_valid) if permitted
+                                     else (block.lower, block.lower_valid))
+                    distance.append(float(values[index]) if valid[index] else None)
                 # END the existing relative motion bound remains the proof rule.
                 change = _mul_up(relative, end-start)
                 if (all(value is not None for value in distance)

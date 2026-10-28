@@ -18,6 +18,10 @@ from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import Attachment, CollisionOwner
 from manipulation.motion import MotionModel
 from test_geometry_motion_bound import model
+# BEGIN typed complete scene evidence in test declarations.
+from manipulation.pair_evidence import PairBatch
+from pair_evidence_fixtures import declared_state, records
+# END test declarations use the same explicit query interface.
 
 
 def trajectory(*, duration=.025, position=None, velocity=None, names=("q",)):
@@ -59,7 +63,7 @@ def callback(function, *, sides=(0,), anchor_cost=0):
         calls.append((list(times), point_budget))
         if needed > point_budget:
             return {"states": [], "query_points": 0, "capacity_exhausted": True}
-        return {"states": [{"time_s": time, "side": side, "pairs": function(time, side)}
+        return {"states": [declared_state(time, side, function(time, side))
                            for time in times for side in sides],
                 "query_points": needed, "capacity_exhausted": False}
 
@@ -153,7 +157,7 @@ def test_cached_sides_remain_distinct_at_declared_relation_boundary():
 
 def test_previously_charged_initial_states_are_reused_with_zero_remaining_budget():
     curve = trajectory()
-    initial = [{"time_s": time, "side": 0, "pairs": [pair()]} for time in (0., curve.duration)]
+    initial = [declared_state(time, 0, [pair()]) for time in (0., curve.duration)]
     query = callback(lambda time, side: pytest.fail("Cached physical points must be reused"))
     result = check_interval_geometry(curve, ConstantMotion(), query,
         max_query_points=0, spatial_step_m=.001, initial_states=initial)
@@ -231,8 +235,7 @@ def test_progress_plateau_requests_only_its_actual_relation_sides():
         states = []
         for time in times:
             sides = [0, *bound.declaration_times(curve).get(time, ())]
-            states.extend({"time_s": time, "side": side,
-                "pairs": [pair(first="body", lower_m=1.)]} for side in sides)
+            states.extend(declared_state(time, side, [pair(first="body", lower_m=1.)]) for side in sides)
         return {"states": states, "query_points": len(times), "capacity_exhausted": False}
 
     result = check_interval_geometry(curve, bound, query, max_query_points=10, spatial_step_m=.001)
@@ -292,11 +295,12 @@ def test_scene_pair_producer_namespaces_an_owner_equal_to_a_robot_geometry(tmp_p
     from test_geometry_query_reuse import owner
     scene = make_scene(tmp_path)
     scene.owners = (owner("first"),)
-    evidence = []
+    evidence = PairBatch()
     scene.evaluate(None, torch.zeros((1, 1, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64), torch.zeros((1, 1)),
         torch.tensor([[[.04, -.02]]], dtype=torch.float64), ("left_slide", "right_slide"),
         trajectory_time=torch.zeros((1, 1)), geometry_evidence_out=evidence)
+    evidence = records(evidence)
     same_name = next(row for row in evidence if row["first"] == row["second"] == "first")
     assert same_name["geometry_entity_key"] == {"first": "robot/first", "second": "owner/first"}
 
@@ -312,11 +316,12 @@ def test_unknown_robot_finger_does_not_hide_an_owner_with_the_same_name(tmp_path
         state=lambda progress, q, names, **kwargs: GripperState(q[..., :1], q[..., :1]*0,
             progress*0, torch.ones_like(progress, dtype=torch.bool)))
     monkeypatch.setattr(scene.robot_model, "geometry_depending_on", lambda names: ("first",))
-    evidence = []
+    evidence = PairBatch()
     scene.evaluate(None, torch.zeros((1, 1, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64), torch.zeros((1, 1)),
         torch.tensor([[[.04, -.02]]], dtype=torch.float64), ("left_slide", "right_slide"),
         trajectory_time=torch.zeros((1, 1)), geometry_evidence_out=evidence)
+    evidence = records(evidence)
     known_pair = next(row for row in evidence
         if row["geometry_entity_key"] == {"first": "robot/second", "second": "owner/first"})
     assert known_pair["status"] == "clear"
@@ -329,11 +334,12 @@ def test_scene_output_contains_complete_pair_records_through_evaluate(tmp_path):
     from test_native_scene_contract import make_scene
     scene = make_scene(tmp_path)
     q = torch.tensor([[[.04, -.02]]], dtype=torch.float64)
-    evidence = []
+    evidence = PairBatch()
     scene.evaluate(None, torch.zeros((1, 1, 3), dtype=torch.float64),
         torch.tensor([[[1., 0., 0., 0.]]], dtype=torch.float64), torch.zeros((1, 1)),
         q, ("left_slide", "right_slide"), trajectory_time=torch.zeros((1, 1)),
         geometry_evidence_out=evidence)
+    evidence = records(evidence)
     assert len(evidence) == 3
     native = next(row for row in evidence if row["component"] == "collision/robot/self")
     # BEGIN compare the certificate with the exact stored robot geometry.
@@ -378,7 +384,7 @@ def test_finite_point_capacity_truncates_only_known_endpoints():
 
 def test_initial_intersection_retains_every_supplied_row_without_starting_batch():
     curve = trajectory(duration=1.)
-    initial = [{'time_s': time, 'side': 0, 'pairs': [pair(status='intersection')]}
+    initial = [declared_state(time, 0, [pair(status='intersection')])
                for time in (0., 1.)]
     query = callback(lambda time, side: pytest.fail('Initial intersection stops the next batch'))
     result = check_interval_geometry(curve, ConstantMotion(), query,
@@ -390,7 +396,7 @@ def test_initial_intersection_retains_every_supplied_row_without_starting_batch(
 
 
 def test_already_charged_midpoints_refine_with_zero_remaining_point_budget():
-    initial = [{'time_s': time, 'side': 0, 'pairs': [pair(lower_m=.3)]} for time in (0., .5, 1.)]
+    initial = [declared_state(time, 0, [pair(lower_m=.3)]) for time in (0., .5, 1.)]
     query = callback(lambda time, side: pytest.fail('All three physical points were already charged'))
     result = check_interval_geometry(trajectory(duration=1.), ConstantMotion(), query,
         max_query_points=0, spatial_step_m=.01, initial_states=initial)
@@ -432,7 +438,7 @@ def test_actual_attachment_speed_uses_canonical_event_progress_at_ulp_boundary()
 
 
 def test_final_partial_batch_retains_pair_free_children_as_actual_output():
-    initial = [{'time_s': time, 'side': 0, 'pairs': [pair(lower_m=0.)]}
+    initial = [declared_state(time, 0, [pair(lower_m=0.)])
                for time in np.linspace(0., 1., 9)]
     query = callback(lambda time, side: [pair(lower_m=0.)])
     result = check_interval_geometry(trajectory(duration=1.), ConstantMotion(), query,

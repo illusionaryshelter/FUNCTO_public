@@ -122,7 +122,7 @@ class PlanningBindingTest(unittest.TestCase):
         # BEGIN the CPU solver consumes both nominal hand columns on that clock.
         from manipulation.unified_solver import robot_tool_states
         captured = []
-        def states(q, dq, names):
+        def states(q, dq, names, *, fk_session=None):
             captured.append((q, dq, names))
             zero = q[..., 0] * 0
             position = torch.stack((zero, zero, zero), -1)
@@ -553,7 +553,7 @@ class PlanningBindingTest(unittest.TestCase):
         # BEGIN the material-mode fixture consumes the explicit geometry scope.
         def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
                      contact_permission_progress, geometry_evidence_out,
-                     geometry_scope):
+                     geometry_scope, fk_session=None):
             self.assertEqual(geometry_scope, "full")
             observations.append((s.clone(), joints.clone(), trajectory_time.clone()))
             return ((s < .5) & (joints[..., 0] > 0)).to(s.dtype)

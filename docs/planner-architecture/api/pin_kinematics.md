@@ -1,6 +1,8 @@
 # `manipulation/pin_kinematics.py` 实现契约
 
-代码基线：`c289890`。
+代码基线：`WORKING_IMPLEMENTATION`。
+共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
+
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_pose_vjp`
@@ -407,7 +409,7 @@ names.index
 输入签名：
 
 ```python
-def poses(self, position, joint_names):
+def poses(self, position, joint_names, *, fk_session=None):
 ```
 
 实现说明：
@@ -460,12 +462,12 @@ enumerate
 
 ## `PinKinematics.states`
 
-[定义位置](../../../manipulation/pin_kinematics.py#L127)。
+[定义位置](../../../manipulation/pin_kinematics.py#L128)。
 
 输入签名：
 
 ```python
-def states(self, position, velocity, joint_names):
+def states(self, position, velocity, joint_names, *, fk_session=None):
 ```
 
 实现说明：
@@ -537,12 +539,12 @@ quaternion_rotate
 
 ## `PinKinematics._evaluate`
 
-[定义位置](../../../manipulation/pin_kinematics.py#L154)。
+[定义位置](../../../manipulation/pin_kinematics.py#L155)。
 
 输入签名：
 
 ```python
-def _evaluate(self, position, velocity=None, *, with_derivatives=True):
+def _evaluate(self, position, velocity=None, *, with_derivatives=True, fk_session=None):
 ```
 
 实现说明：
@@ -552,6 +554,7 @@ def _evaluate(self, position, velocity=None, *, with_derivatives=True):
 显式输出分支：
 
 ```python
+fk_session.evaluate(self, position, velocity)
 (*result, twists.reshape(*leading, frames, 6), None if velocity_position is None else velocity_position.reshape(*leading, frames, 6, joints), None if velocity_velocity is None else velocity_velocity.reshape(*leading, frames, 6, joints))
 result
 ```
@@ -559,6 +562,7 @@ result
 读取的对象属性：
 
 ```python
+fk_session.evaluate
 position.shape
 np.prod
 self.joint_names
@@ -642,6 +646,7 @@ result
 直接调用符号：
 
 ```python
+fk_session.evaluate
 int
 np.prod
 len

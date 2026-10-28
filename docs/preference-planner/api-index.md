@@ -1,6 +1,6 @@
 # 实际 API 定义及调用索引
 
-代码基线：`c289890`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`WORKING_IMPLEMENTATION`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 签名和直接调用来自当前源文件 AST；数据前置条件、坐标与结果含义由对应组件正文定义。内部辅助函数保留具体名称以定位计算。
 
@@ -70,7 +70,7 @@ Reuse bounded interval queries and collect their necessary witnesses.
 
 内部计算辅助；输入输出见对应组件的调用定义。
 
-[定义](../../manipulation/preference_planner/backend.py#L233)。直接调用：`batches.append`, `evaluate`, `tuple`。
+[定义](../../manipulation/preference_planner/backend.py#L233)。直接调用：`batches.append`, `evaluate`。
 
 ### `PreferencePlanner.evaluate_candidate(self, trajectory, *, record_work, candidate_scene=None, objective=None)`
 
@@ -252,85 +252,85 @@ Return normalized time, terminal parameter and their explicit source.
 
 Place one fixed material coordinate in the calibrated world frame.
 
-[定义](../../manipulation/preference_planner/geometry.py#L31)。直接调用：`pose[0].new_tensor`, `quaternion_rotate`。
+[定义](../../manipulation/preference_planner/geometry.py#L33)。直接调用：`pose[0].new_tensor`, `quaternion_rotate`。
 
 ### `_local(world, pose)`
 
 内部计算辅助；输入输出见对应组件的调用定义。
 
-[定义](../../manipulation/preference_planner/geometry.py#L36)。直接调用：`quaternion_conjugate`, `quaternion_rotate`。
+[定义](../../manipulation/preference_planner/geometry.py#L38)。直接调用：`quaternion_conjugate`, `quaternion_rotate`。
 
 ### `native_point_value(geometry, local)`
 
 Original signed point distance and current closest-feature direction.
 
-[定义](../../manipulation/preference_planner/geometry.py#L40)。直接调用：`((local - local.detach()) * gradient).sum`, `_transform`, `coal.DistanceRequest`, `coal.DistanceResult`, `coal.Sphere`, `coal.Transform3s`, `coal.distance`, `local.detach`, `local.detach().cpu`, `local.detach().cpu().numpy`, `local.new_tensor`, `np.asarray`, `np.eye`。
+[定义](../../manipulation/preference_planner/geometry.py#L42)。直接调用：`((local - local.detach()) * gradient).sum`, `_transform`, `coal.DistanceRequest`, `coal.DistanceResult`, `coal.Sphere`, `coal.Transform3s`, `coal.distance`, `local.detach`, `local.detach().cpu`, `local.detach().cpu().numpy`, `local.new_tensor`, `np.asarray`, `np.eye`。
 
 ### `field_point_value(field, local, *, excluded_cells=())`
 
 Original supported trilinear scalar, or an explicitly inactive row.
 
-[定义](../../manipulation/preference_planner/geometry.py#L61)。直接调用：`((local - local.detach()) * derivative).sum`, `bool`, `field.sample`, `local.detach`, `local.detach().cpu`, `local.detach().cpu().numpy`, `local.new_tensor`, `local.sum`, `np.any`。
+[定义](../../manipulation/preference_planner/geometry.py#L63)。直接调用：`((local - local.detach()) * derivative).sum`, `bool`, `field.sample`, `local.detach`, `local.detach().cpu`, `local.detach().cpu().numpy`, `local.new_tensor`, `local.sum`, `np.any`。
 
 ### `occupied_material(field, local, *, excluded_cells=())`
 
 Check that a point belongs to the closure of represented volume.
 
-[定义](../../manipulation/preference_planner/geometry.py#L77)。直接调用：`CORNERS.astype`, `bool`, `field.sample`, `int`, `len`, `np.all`, `np.any`, `np.asarray`, `np.flatnonzero`, `np.floor`, `np.floor(grid).astype`, `set`, `tuple`。
+[定义](../../manipulation/preference_planner/geometry.py#L79)。直接调用：`CORNERS.astype`, `bool`, `field.sample`, `int`, `len`, `np.all`, `np.any`, `np.asarray`, `np.flatnonzero`, `np.floor`, `np.floor(grid).astype`, `set`, `tuple`。
 
 ### `GeometryConstraints.__init__(self, computation)`
 
 内部计算辅助；输入输出见对应组件的调用定义。
 
-[定义](../../manipulation/preference_planner/geometry.py#L140)。直接调用：`self.scene.robot_model.geometry_depending_on`, `set`。
+[定义](../../manipulation/preference_planner/geometry.py#L142)。直接调用：`self.scene.robot_model.geometry_depending_on`, `set`。
 
 ### `GeometryConstraints.row_count(self)`
 
 Fixed solver dimension until the next explicit evidence update.
 
-[定义](../../manipulation/preference_planner/geometry.py#L152)。直接调用：`len`。
+[定义](../../manipulation/preference_planner/geometry.py#L154)。直接调用：`len`。
 
 ### `GeometryConstraints.workspace_bytes(self, *, record_count=None)`
 
 Bound this component's added arrays at its actual query dimensions.
 
-[定义](../../manipulation/preference_planner/geometry.py#L156)。直接调用：`int`, `len`, `max`, `sum`。
+[定义](../../manipulation/preference_planner/geometry.py#L158)。直接调用：`int`, `len`, `max`, `sum`。
 
 ### `GeometryConstraints._context(self, controls, records)`
 
 Reuse full FK and original relation producers at exact record times.
 
-[定义](../../manipulation/preference_planner/geometry.py#L200)。直接调用：`Rotation.from_matrix`, `Rotation.from_matrix(local[:3, :3]).as_quat`, `_matrices`, `base.domain._curve_map.query`, `base.progress.detach`, `base.progress.detach().numpy`, `base.times.detach`, `base.times.detach().numpy`, `controls.new_tensor`, `dict`, `len`, `poses.items`, `position.new_tensor`, `quaternion.new_tensor`, `quaternion_multiply`, `quaternion_rotate`, `require_host_memory`, `robot_tool_states`, `self.scene._owner_poses`, `self.scene._permission`, `self.scene.gripper.state`, `self.scene.robot_model._geometries.items`, `self.workspace_bytes`, `self.workspace_bytes(record_count=len(records)).values`, `sum`, `torch.zeros_like`。
+[定义](../../manipulation/preference_planner/geometry.py#L202)。直接调用：`Rotation.from_matrix`, `Rotation.from_matrix(local[:3, :3]).as_quat`, `_matrices`, `base.domain._curve_map.query`, `base.progress.detach`, `base.progress.detach().numpy`, `base.times.detach`, `base.times.detach().numpy`, `controls.new_tensor`, `dict`, `len`, `poses.items`, `position.new_tensor`, `quaternion.new_tensor`, `quaternion_multiply`, `quaternion_rotate`, `require_host_memory`, `robot_tool_states`, `self.scene._owner_poses`, `self.scene._permission`, `self.scene.gripper.state`, `self.scene.robot_model._geometries.items`, `self.workspace_bytes`, `self.workspace_bytes(record_count=len(records)).values`, `sum`, `torch.zeros_like`。
 
 ### `GeometryConstraints._permission(self, context, record, column)`
 
 Recreate the existing pair domain from current poses and declarations.
 
-[定义](../../manipulation/preference_planner/geometry.py#L253)。直接调用：`PairPermission`, `any`, `bool`, `first.removeprefix`, `first.startswith`, `model.permission`, `name.removeprefix`, `name.startswith`, `np.asarray`, `policy['bounds'][0, column].detach`, `policy['bounds'][0, column].detach().numpy`, `policy['normals'][0, column].detach`, `policy['normals'][0, column].detach().numpy`, `regions.append`, `relation.active`, `second.removeprefix`, `second.startswith`, `self.scene._initial_support_models.values`。
+[定义](../../manipulation/preference_planner/geometry.py#L255)。直接调用：`PairPermission`, `any`, `bool`, `first.removeprefix`, `first.startswith`, `model.permission`, `name.removeprefix`, `name.startswith`, `np.asarray`, `policy['bounds'][0, column].detach`, `policy['bounds'][0, column].detach().numpy`, `policy['normals'][0, column].detach`, `policy['normals'][0, column].detach().numpy`, `regions.append`, `relation.active`, `second.removeprefix`, `second.startswith`, `self.scene._initial_support_models.values`。
 
 ### `GeometryConstraints._native_interior_witness(self, native, native_matrix, field, field_matrix, world, permission, excluded)`
 
 Find actual observed material strictly inside the unchanged native solid.
 
-[定义](../../manipulation/preference_planner/geometry.py#L291)。直接调用：`_allowed`, `bool`, `float`, `id`, `inverse_points`, `native.computeCOM`, `native_point_value`, `np.array_equal`, `np.asarray`, `occupied_material`, `self.scene.check_request`, `torch.as_tensor`。
+[定义](../../manipulation/preference_planner/geometry.py#L293)。直接调用：`_allowed`, `bool`, `float`, `id`, `inverse_points`, `native.computeCOM`, `native_point_value`, `np.array_equal`, `np.asarray`, `occupied_material`, `self.scene.check_request`, `torch.as_tensor`。
 
-### `GeometryConstraints.add_evidence(self, full_controls, states)`
+### `GeometryConstraints.add_evidence(self, full_controls, states=None, *, pair_batch=None)`
 
 Add necessary rows from a completed original full-curve query.
 
-[定义](../../manipulation/preference_planner/geometry.py#L325)。直接调用：`WitnessRow`, `closest.values`, `enumerate`, `first.startswith`, `float`, `inverse_points`, `len`, `map`, `np.asarray`, `occupied_material`, `pair.get`, `pending.append`, `record.get`, `records.append`, `records.extend`, `result['skipped'].append`, `second.startswith`, `self._context`, `self._identities.add`, `self._native_interior_witness`, `self._permission`, `self.discoveries.append`, `self.witnesses.append`, `torch.as_tensor`, `torch.no_grad`, `tuple`。
+[定义](../../manipulation/preference_planner/geometry.py#L327)。直接调用：`WitnessRow`, `enumerate`, `first.startswith`, `inverse_points`, `len`, `map`, `np.asarray`, `occupied_material`, `pending.append`, `record.get`, `result['skipped'].append`, `second.startswith`, `selected_witness_records`, `self._context`, `self._identities.add`, `self._native_interior_witness`, `self._permission`, `self.discoveries.append`, `self.witnesses.append`, `torch.as_tensor`, `torch.no_grad`, `tuple`。
 
 ### `GeometryConstraints.rows(self, full_controls)`
 
 Return fixed-dimensional necessary inequalities g <= 0.
 
-[定义](../../manipulation/preference_planner/geometry.py#L414)。直接调用：`(relative * relative.new_tensor(np.asarray(result.normal))).sum`, `_allowed`, `_local`, `_transform`, `_world`, `asdict`, `bool`, `coal.DistanceRequest`, `coal.DistanceResult`, `coal.distance`, `derivative.detach`, `derivative.new_tensor`, `enumerate`, `field_point_value`, `float`, `full_controls.reshape`, `full_controls.sum`, `inverse_points`, `isinstance`, `native_point_value`, `np.any`, `np.asarray`, `occupied_material`, `pose`, `relative.new_tensor`, `reports.append`, `result.getNearestPoint1`, `result.getNearestPoint2`, `self._context`, `self._permission`, `self.scene.check_request`, `sum`, `torch.stack`, `tuple`, `value.detach`, `values.append`, `world.detach`, `world.detach().numpy`。
+[定义](../../manipulation/preference_planner/geometry.py#L398)。直接调用：`(relative * relative.new_tensor(np.asarray(result.normal))).sum`, `_allowed`, `_local`, `_transform`, `_world`, `asdict`, `bool`, `coal.DistanceRequest`, `coal.DistanceResult`, `coal.distance`, `derivative.detach`, `derivative.new_tensor`, `enumerate`, `field_point_value`, `float`, `full_controls.reshape`, `full_controls.sum`, `inverse_points`, `isinstance`, `native_point_value`, `np.any`, `np.asarray`, `occupied_material`, `pose`, `relative.new_tensor`, `reports.append`, `result.getNearestPoint1`, `result.getNearestPoint2`, `self._context`, `self._permission`, `self.scene.check_request`, `sum`, `torch.stack`, `tuple`, `value.detach`, `values.append`, `world.detach`, `world.detach().numpy`。
 
 ### `GeometryConstraints.describe(self)`
 
 Return row provenance and actual query states for the planner report.
 
-[定义](../../manipulation/preference_planner/geometry.py#L485)。直接调用：`asdict`。
+[定义](../../manipulation/preference_planner/geometry.py#L469)。直接调用：`asdict`。
 
 ## joint_computation.py
 

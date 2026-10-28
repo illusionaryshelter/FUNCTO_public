@@ -22,6 +22,8 @@ from manipulation.pin_kinematics import PinKinematics
 from manipulation.robot_geometry_check import NativePrimitive, RobotGeometryChecker
 from manipulation.unified_solver import robot_tool_states
 from test_native_scene_contract import make_scene
+from manipulation.pair_evidence import PairBatch, _geometry_query_states
+from pair_evidence_fixtures import state_record, declared_state
 
 
 def test_native_point_derivative_uses_real_signed_shape_query():
@@ -96,19 +98,18 @@ def original_evidence(base, controls, *, time=1.2):
     _, _, _, _, tool, _ = robot_tool_states(problem=base.problem, scene=base.scene,
         kinematics=base.kinematics, q=q, dq=dq, joint_names=base.joint_names,
         progress=progress, times=times)
-    evidence = []
+    evidence = PairBatch()
     base.scene.components(None, *tool, progress, q, base.joint_names,
                           trajectory_time=times, geometry_evidence_out=evidence)
-    return [{"time_s": float(moment), "side": 0, "progress": float(parameters[index]),
-             "pairs": [row for row in evidence if row["state_index"][1] == index]}
-            for index, moment in enumerate(query_times)]
+    evidence.set_query_layout(evidence.state_index, np.zeros(evidence.state_count, dtype=np.int8))
+    return _geometry_query_states(evidence, query_times, parameters, np.zeros_like(query_times))
 
 
 @pytest.mark.parametrize("field_value", [-1., 0.])
 def test_complete_intersection_generates_signed_material_rows_and_real_gradients(tmp_path, field_value):
     base, controls = computation(tmp_path, value=field_value)
     states = original_evidence(base, controls)
-    assert any(row["status"] == "intersection" for row in states[0]["pairs"])
+    assert any(row["status"] == "intersection" for row in state_record(states[0])["pairs"])
     geometry = GeometryConstraints(base)
     added = geometry.add_evidence(controls, states)
     assert added["added_rows"] > 0
@@ -126,11 +127,11 @@ def test_rows_keep_unknown_and_declared_internal_pairs_inactive(tmp_path):
     base, controls = computation(tmp_path)
     states = original_evidence(base, controls)
     geometry = GeometryConstraints(base)
-    internal = [{**states[0], "pairs": [{**row, "status": "internal_assembly"}
-                                       for row in states[0]["pairs"]]}]
+    internal = [declared_state(states[0].time_s, 0, [{**row, "status": "internal_assembly"}
+                                       for row in state_record(states[0])["pairs"]])]
     assert geometry.add_evidence(controls, internal)["added_rows"] == 0
-    unknown = [{**states[0], "pairs": [{**row, "status": "unmodelled_motion"}
-                                      for row in states[0]["pairs"]]}]
+    unknown = [declared_state(states[0].time_s, 0, [{**row, "status": "unmodelled_motion"}
+                                      for row in state_record(states[0])["pairs"]])]
     assert geometry.add_evidence(controls, unknown)["added_rows"] == 0
     tensor = torch.tensor(controls, dtype=torch.float64, requires_grad=True)
     assert geometry.rows(tensor).shape == (0,)

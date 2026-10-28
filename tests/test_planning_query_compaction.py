@@ -25,7 +25,7 @@ def test_boundary_compaction_keeps_batched_plateaus_release_witness_and_tie_grad
 
     # BEGIN direct and compact callbacks share the original scene conditions.
     def evaluate(spheres, position, quaternion, s, joints, names, *, trajectory_time,
-                 contact_permission_progress, geometry_evidence_out=None, geometry_scope="full"):
+                 contact_permission_progress, geometry_evidence_out=None, geometry_scope="full", fk_session=None):
         # END the geometry scope is independent of optimization objectives.
         seen.append((s.detach().clone(), joints.detach().clone(), trajectory_time.detach().clone(),
                      contact_permission_progress.detach().clone()))

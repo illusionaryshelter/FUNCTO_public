@@ -45,10 +45,10 @@ class DifferentiableRobotKinematics:
         self.joint_names = self._bridge.joint_names
         self.frames = self._bridge.frames
 
-    def poses(self, position, joint_names):
+    def poses(self, position, joint_names, *, fk_session=None):
         """Return original-device link poses with the same named-joint VJP."""
         cpu_position = position.to(device="cpu", dtype=torch.float64)
-        poses = self._bridge.poses(cpu_position, joint_names)
+        poses = self._bridge.poses(cpu_position, joint_names, fk_session=fk_session)
         return {frame: tuple(value.to(device=position.device, dtype=position.dtype) for value in pose)
                 for frame, pose in poses.items()}
     # END device copies carry gradients without introducing another FK model.

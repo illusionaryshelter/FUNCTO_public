@@ -2,7 +2,7 @@
 
 ## 实现范围与代码基线
 
-代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`WORKING_IMPLEMENTATION`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 ## 研究对象、坐标与职责
 
@@ -32,7 +32,7 @@ g_b(C)=-d_A\bigl(T_{WA}(t)^{-1}T_{WB}(t)b_B\bigr)\leq0,
 
 `GeometryConstraints(computation)` 接收原完整控制系数接口的 `TrajectoryComputation`。它依赖已经绑定的原场景、机器人运动学、三次曲线映射、参考进度和物理时钟。终止区间消元先把减少后的变量展开回完整C，再传入本组件。
 
-`add_evidence(full_controls, states)` 接收对应同一C的实体查询记录。初始有限查询使用原 `_geometry_query_states` 输出；自适应查询使用原 `scene.evaluate(..., geometry_evidence_out=...)` 输出，并为每条pair记录提供其物理时间和进度。pair记录保留实体标识、实际关系侧的 `progress`、有限许可侧的 `permission_progress` 和见证。所有已确认相交保留其具体时刻；其他查询每对实体保留最接近的一个可用见证。缺少合格材料见证时，记录跳过原因。该选择控制必要行数量，完整实体查询继续负责寻找遗漏。输入必须对应当前三次基和时钟；外部曲线由原候选验收接口处理。
+`add_evidence(full_controls, states=None, *, pair_batch=None)` 接收对应同一C的完整实体证据。初始有限查询传入 `_geometry_query_states` 生成的 `EvidenceState`；自适应查询通过 `pair_batch` 传入场景产生的 `PairBatch`。共享数值索引保留实体标识、实际关系侧的 `progress`、有限许可侧的 `permission_progress` 和全部原始见证。`selected_witness_records` 按这两种原遍历次序选择见证，随后仅将所选行恢复为优化记录。数据所有权和全部 API 见[共享验收组件](../planner-architecture/10-shared-candidate-validation.md)。所有已确认相交保留其具体时刻；其他查询每对实体保留最接近的一个可用见证。缺少合格材料见证时，记录跳过原因。该选择控制必要行数量，完整实体查询继续负责寻找遗漏。输入必须对应当前三次基和时钟；外部曲线由原候选验收接口处理。
 
 `rows(full_controls)` 返回固定维度的 `g <= 0` 张量。它在每次试探下重新计算当前实体位姿、原许可域、原支持状态、当前有符号标量与一阶方向。`row_count` 为本次优化调用的行数；只有两次求解之间显式调用 `add_evidence` 才改变该维度。`describe()` 输出材料点所属实体、局部坐标、时刻、原状态、发现记录及最后一次行求值状态。
 
@@ -54,7 +54,7 @@ Coal 最近特征方向是其默认数值距离模型提供的一阶方向；当
 
 `PreferencePlanner._candidate_geometry` 调用父类 `_ConstrainedPlanner._candidate_geometry`；父方法拥有原 `SceneMotionBounds`、同一三次多项式的导数上界、原完整实体距离下界、物理查询预算及所有场景残差。父方法内部调用 `manipulation.interval_geometry.check_interval_geometry`。`query_geometry(times_s, point_budget=...)` 查询同一保存曲线，并返回原实体证据；初始有限查询已经计入的 `initial_states` 继续复用。
 
-本组件接入只对当前控制系数所生成的候选曲线采集优化见证。`candidate_scene.clone_for_rollout()` 创建本次查询专用场景，保留原候选的机器人模型、观测场、手指声明以及 `_fixed_release_poses` 中的释放锚点；实体和手指实例按原克隆接口处理。本组件仅装饰此实例的 `evaluate` 方法，并沿用父调用传入的 `geometry_evidence_out` 容器。每次原查询完成后保存pair记录的引用；父区间方法完成原计费和诊断后，按批次将这些记录交给 `GeometryConstraints.add_evidence`。因此原查询中的碰撞证据、关系侧、许可侧与优化见证具有共同来源。共享场景及库内函数保持原绑定，见证消费阶段不执行第二次场景查询。
+本组件接入只对当前控制系数所生成的候选曲线采集优化见证。`candidate_scene.clone_for_rollout()` 创建本次查询专用场景，保留原候选的机器人模型、观测场、手指声明以及 `_fixed_release_poses` 中的释放锚点；实体和手指实例按原克隆接口处理。本组件仅装饰此实例的 `evaluate` 方法，并沿用父调用传入的 `geometry_evidence_out` 容器。每次原查询完成后保存 `PairBatch` 引用；父区间方法完成原计费和诊断后，以 `pair_batch` 参数逐批交给 `GeometryConstraints.add_evidence`。因此原查询中的碰撞证据、关系侧、许可侧与优化见证具有共同来源。共享场景及库内函数保持原绑定，见证消费阶段不执行第二次场景查询。
 
 令L为两个实体在世界坐标中的点速度上界之和，Δt为时间区间长度，`d_a,d_b` 为两端完整实体分离距离的下界。原条件 `max(d_a,d_b)>LΔt` 或 `min(d_a,d_b)>LΔt/2` 足以证明该区间完整实体分离。有限许可随实体运动时，许可裁剪后的点对距离属于变化的查询域，因此原接口使用单独的完整实体下界。声明刚性内部组合与空表示域沿用原规则，时间分区保留接触激活、附着、释放和手指模型有效边界。
 

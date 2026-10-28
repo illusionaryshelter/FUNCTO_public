@@ -40,6 +40,9 @@ def assert_bits_equal(expected, actual):
         assert len(actual) == len(expected)
         for left, right in zip(expected, actual):
             assert_bits_equal(left, right)
+    elif isinstance(expected, np.ndarray):
+        assert actual.dtype == expected.dtype and actual.shape == expected.shape
+        assert actual.tobytes() == expected.tobytes()
     elif isinstance(expected, float):
         assert struct.pack("=d", actual) == struct.pack("=d", expected)
     else:

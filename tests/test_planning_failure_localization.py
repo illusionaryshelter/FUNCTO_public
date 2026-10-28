@@ -4,6 +4,8 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from pair_evidence_fixtures import PairBatch, records
+
 import numpy as np
 import pytest
 import torch
@@ -63,7 +65,7 @@ def test_native_pair_failures_keep_candidate_time_and_mode_on_a_progress_plateau
     progress = torch.full((2, 2), .5, dtype=q.dtype)
     parameters = torch.tensor([[.25, .75], [.25, .75]], dtype=q.dtype)
     quaternion = q.new_zeros((2, 2, 4)); quaternion[..., 0] = 1.
-    evidence, diagnostics, counts = [], {}, {}
+    evidence, diagnostics, counts = PairBatch(), {}, {}
     # BEGIN full evidence is compared with its own original Coal query.
     native_results, original_query = [], original.robot_model.query_pair_batches
     def capture_native(*args, **kwargs):
@@ -84,6 +86,7 @@ def test_native_pair_failures_keep_candidate_time_and_mode_on_a_progress_plateau
     assert evaluate.call_count == 1 and native.call_count == 1
     assert len(native_results) == 8
     assert counts == {"exact_states": 4, "left_states": 2, "right_states": 2, "evaluated_states": 8}
+    evidence = records(evidence)
     failures = [row for row in evidence if row["status"] == "intersection"]
     assert {(tuple(row["query_index"]), row["side"], row["time_s"]) for row in failures} == {
         ((0, 1), 0, 3.), ((0, 1), 1, 3.), ((1, 0), 0, 1.), ((1, 0), -1, 1.)}
@@ -147,8 +150,9 @@ def test_candidate_report_owns_its_failure_time_entities_and_native_witnesses(tm
     # BEGIN capture the complete same-call records alongside the public summary.
     complete, original_evaluate = [], scene.evaluate
     def capture_complete(*args, **kwargs):
-        kwargs["geometry_evidence_out"] = complete
-        return original_evaluate(*args, **kwargs)
+        result = original_evaluate(*args, **kwargs)
+        complete.extend(records(kwargs['geometry_evidence_out']))
+        return result
     with patch.object(scene, "evaluate", side_effect=capture_complete):
         report, parameters, count, context = planner._candidate_metrics(curve, scene, record_work=record_work)
     assert not report["accepted"]

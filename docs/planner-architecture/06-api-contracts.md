@@ -107,14 +107,14 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 | `RobotGeometryChecker.query` | 完整具名关节值、基座标定、冻结 PairQuery 和所需帧；同一模型中复用最近一次已验证的关节列、官方限位、frame IDs 与完整配对规则 | 每次状态的限位、独立 FK、原生有符号距离/见证/法向及分离/穿透/数值边界；`RobotStateValidator` 与执行前检查消费完整报告 |
 | `OnlinePlanningScene.bind_online_robot` | 同一验证器及请求期限回调 | 直接绑定检查器现有 Pinocchio 完整模型与标定；后端初始化 |
 | `RobotGeometryChecker._prepare_query` | 完整具名状态、基座标定、配对、所需帧 | 验证后的状态及 float64 帧/实体矩阵；报告和数值批次共享 |
-| `RobotGeometryChecker.query_pair_batches` | 多行具名状态、有序配对、逐状态逐对投影 mask | 有序十二列数值列表；规划场景生成实际需要的证据 |
+| `RobotGeometryChecker.query_pair_batches` | 多行具名状态、有序配对、逐状态逐对投影 mask | 有序十二列 NumPy 数组；完整验收可显式传入 FKSession 并使用四线程状态分片，场景写入完整 PairBatch |
 | `RobotGeometryChecker._pair_table` / `pair_evidence` | 已验证配对 / 单对数值 | 固定表身份复用 / 当前声明策略与数值关系报告 |
 | `NativePairTable.query` | 官方形状表、float64 当前位姿、bool 投影 mask、冷 Coal 请求 | 独立距离、双见证、法向、恒等式误差、完整实体保守下界数组；[接口与公式](api/native_pair_table.md) |
 | `native_query_resident_nbytes` / `native_query_storage_nbytes` / `native_query_temporary_nbytes` | 当前表 / 模型实体和配对容量 | 已驻留字节 / 待构造表上界 / 每次查询临时容量；场景资源准入 |
 | `OnlinePlanningScene._robot_self_components` | 已准备的完整具名关节、可微机器人位姿及同值矩阵、手部状态、原 required_pairs | 官方机器人自身穿透与数值边界硬分项、原见证导数及查询报告；robot/full 两种 components 范围共用 |
 | `OnlinePlanningScene.components/evaluate` | 同时刻关节、工具位姿、进度、时间与 geometry_scope | robot 范围计算官方机器人自身与手部，full 范围继续计算任务场；components 返回原分项，evaluate 汇总非 conditional 项，原证据独立保留 |
 | `OnlinePlanningScene.optimization_objective` | 轨迹位置、单位四元数、进度、具名关节、物理时刻与必填 robot_link_poses | 固定材料点几何、原生自身、required contact 和初始支撑的标量目标；SLSQP 消费一阶导数，report_out 解释有限目标范围 |
-| `OnlinePlanningScene.components(..., geometry_evidence_out=...)` | 同一实际场景查询及显式证据容器 | 全量逐实体对的状态、当前距离下界、许可与内部关系；geometry_entity_key 以 robot/、owner/ 或 background 区分实体类别，供区间检查 |
+| `OnlinePlanningScene.components(..., geometry_evidence_out=...)` | 同一实际场景查询及显式 PairBatch 证据容器 | 全量逐实体对的状态、当前距离下界、许可与内部关系；geometry_entity_key 以 robot/、owner/ 或 background 区分实体类别，供区间检查 |
 | `describe/to_execution_binding` | 场景已有输入、工具成员及实体附着 | `collision_rule='nonpenetration'`、`tool_geometry_names` 描述与 `native_robot_observed_scene_v1` 快照；结果绑定 |
 | `clone_for_rollout/with_release_history` | 同一原始场及已选搜索前缀，或固定候选的释放锚点 FK | 私有关系状态、共享不可变场；搜索前缀与候选区间几何复用预测释放位姿 |
 | `estimated_workspace_allocation` | batch/horizon、原场规模、实体数与样本／原生配对缓存构造状态 | CPU 已驻留、待分配共享数组、单次临时峰值三项；GPU 具名关节/连杆位姿及梯度传送；求解前将待分配与单次临时量和求解器合并准入 |
@@ -148,7 +148,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 | `CubicBasis.weights/weights_at_knot_times/hermite_nodes` | 自由系数、原入口q/dq、段长和时间 | 同一曲线系数、导数及Hermite节点；域计算和保存 |
 | `CubicAffineMap.query/evaluate/fit_samples` | 固定基、样本时间及目标关节状态 | 仿射矩阵、状态、最小二乘系数与误差；初值构造 |
 | `CubicJointDomain.signed_constraints` | 原四阶关节界和实际自由系数 | 每段十类有符号行及Jacobians、可选极值见证；SLSQP |
-| `PinKinematics.poses/states` | 已加载完整Pin模型、参考系标定、具名q/dq | 各帧位姿与速度及可微关系；场景和任务 |
+| `PinKinematics.poses/states` | 已加载完整Pin模型、参考系标定、具名q/dq及可选显式fk_session | 各帧位姿与速度及可微关系；场景和任务 |
 | `robot_tool_states` | 活动关节、名义手指、物理时刻、进度和TCP标定 | 完整关节、帧位姿、TCP位姿与速度；求解与保存曲线验收 |
 | `TrajectoryComputation.__init__/states/task/objective_components` | 固定完整查询、原任务、场景、仿射域和成本配置；task可接收solver_rows_out | 完整原任务EQ/INEQ及同次声明布局，运动、任务质量、几何标量；统一求解 |
 | `time_mean_weights/motion_cost` | 普通物理网格、原STATE配置、物理导数和原界 | 时间平均运动成本；优化和固定评分 |
@@ -209,3 +209,17 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 实验运行器位于 `tests/planning`。`run_recorded_skill.run_prepared` 接收已编译问题，读取已有实体，再为本次需要建图的实体读取 mask、深度与采集时反馈。`robot_validation_fixture` 构造已知机器人验证器和图像过滤组件；其 `tool_geometry_names(fixture)` 从声明手指机构的公共父子树返回工具成员元组，写入运行报告并传给场景。`observed_robot_fixture` 恢复已有任务实体。`load_contact_bindings` 读取必填 `contacts/source` 和可选 `grasp_activations/initial_support_relations`，分别提供原有限任务接触与初始支撑记录。`recorded_task_planning.plan_and_record` 调用后端并保存曲线、结果和 `native_robot_observed_scene_v1` 来源快照。`load_saved_trajectory` 恢复正式执行输入；该操作不重建可查询场景。具体命令与数据字段见[记录入口说明](../../tests/planning/README.md)。
 
 跨阶段读写时，调用者需要同时保留几何记录、其坐标变换、对象身份、任务区域、原事件与机器人入口。各接口按上述结构解释数据；原生模型恢复与本次回放见[阶段对照](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
+
+## 共享验收 API
+
+代码基线：`WORKING_IMPLEMENTATION`。完整前置数据、坐标及调用次序见[共享验收组件](10-shared-candidate-validation.md)。
+
+| 接口 | 输入 | 输出与消费者 |
+|---|---|---|
+| `PairBatch.bind_clock/begin_native/retain_native_chunk/append_observed/seal` | 原查询时钟、原生十二列、完整观测 payload 与实体声明 | 一次查询的只读数值证据；场景生产，区间与必要约束消费 |
+| `PairBatch.set_query_layout/materialize` | 原物理列与关系侧／已选状态和实体对 | 物理查询身份／完整诊断字典；边界查询和最终记录 |
+| `EvidenceState`、`_geometry_query_states` | 完整批次、原物理时间、进度与场景残差 | 共享批次的物理状态索引；区间计算 |
+| `selected_witness_records` | 初始分组状态或原生产批次 | 已选完整见证及源行总数；GeometryConstraints |
+| `FKSession.placements/evaluate/describe` | 同一模型、完整 q/dq、声明 frames 与消费标定 | 原 SE3／投影位姿和 LOCAL 速度／存储统计；候选工具及场景计算 |
+| `prepared_polynomial` | 完整系数与断点字节、形状、导数阶数 | 原 PPoly 导数及 long-double 段系数；区间 Bernstein 包络 |
+| `native_field_distance.world_bounds` | 上下界和位姿的完整数组 | 只读原外向舍入变换；原机器人—观测查询 |

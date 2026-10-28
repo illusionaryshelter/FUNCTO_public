@@ -1,6 +1,8 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`c289890`。
+代码基线：`WORKING_IMPLEMENTATION`。
+共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
+
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -951,12 +953,12 @@ owner.pose
 
 ## `OnlinePlanningScene._robot_self_components`
 
-[定义位置](../../../manipulation/online_geometry.py#L402)。
+[定义位置](../../../manipulation/online_geometry.py#L403)。
 
 输入签名：
 
 ```python
-def _robot_self_components(self, complete_q, complete_names, robot_poses, robot_matrices, hand_state, zero, *, record_pair, record_nonclear, include_bounds):
+def _robot_self_components(self, complete_q, complete_names, robot_poses, robot_matrices, hand_state, zero, *, record_nonclear, include_bounds, geometry_evidence_out, fk_session=None):
 ```
 
 实现说明：
@@ -1006,11 +1008,14 @@ q_cpu.reshape
 q_cpu.shape
 self.robot_validator.T_reference_base
 self.check_request
+self.robot_model.numerics
+geometry_evidence_out.begin_native
 np.ndindex
-self.robot_model.pair_evidence
 report['status_counts'].get
 ((_world(b, pb) - _world(a, pa)) * normal).sum
 signed.detach
+self.robot_model.pair_evidence
+numeric.tolist
 self_costs.append
 self_unresolved.append
 torch.stack(self_costs).reshape
@@ -1033,20 +1038,17 @@ unknown_pair
 pair
 projection_mask
 batches
+boundary
 rows_by_state
-batch
-state
 index
 numeric_rows
 value
 undecided
 numeric
-row
 first_id
 second_id
-entity_key
+distance
 status
-lower
 report['pair_queries']
 report['status_counts'][status]
 a
@@ -1056,6 +1058,7 @@ item
 pb
 normal
 signed
+row
 ```
 
 直接调用符号：
@@ -1077,18 +1080,22 @@ bool
 uncertain.reshape
 self.robot_model.query_pair_batches
 q_cpu.reshape
+max
+geometry_evidence_out.begin_native
+retained_states
 np.ndindex
 next
 zip
 self.check_request
-self.robot_model.pair_evidence
-record_pair
+float
 report['status_counts'].get
 inverse_points
 _tensor
 ((_world(b, pb) - _world(a, pa)) * normal).sum
 _world
 signed.detach
+self.robot_model.pair_evidence
+numeric.tolist
 record_nonclear
 self_costs.append
 self_unresolved.append
@@ -1097,14 +1104,54 @@ torch.stack
 torch.stack(self_unresolved).reshape
 ```
 
-## `OnlinePlanningScene.components`
+## `OnlinePlanningScene._robot_self_components.retained_states`
 
-[定义位置](../../../manipulation/online_geometry.py#L486)。
+[定义位置](../../../manipulation/online_geometry.py#L449)。
 
 输入签名：
 
 ```python
-def components(self, robot_spheres, position, quaternion, progress, joint_position=None, joint_names=None, *, trajectory_time, active_contact_rule_ids=None, contact_permission_progress=None, owner_poses=None, geometry_evidence_out=None, geometry_scope='full'):
+def retained_states():
+```
+
+显式输出分支：
+
+```python
+batch
+```
+
+读取的对象属性：
+
+```python
+uncertain.reshape
+geometry_evidence_out.retain_native_chunk
+```
+
+写入目标：
+
+```python
+begin
+batch
+end
+unmodelled_rows
+```
+
+直接调用符号：
+
+```python
+len
+uncertain.reshape
+geometry_evidence_out.retain_native_chunk
+```
+
+## `OnlinePlanningScene.components`
+
+[定义位置](../../../manipulation/online_geometry.py#L503)。
+
+输入签名：
+
+```python
+def components(self, robot_spheres, position, quaternion, progress, joint_position=None, joint_names=None, *, trajectory_time, active_contact_rule_ids=None, contact_permission_progress=None, owner_poses=None, geometry_evidence_out=None, geometry_scope='full', fk_session=None):
 ```
 
 实现说明：
@@ -1132,6 +1179,7 @@ self.kinematics
 value.detach().cpu().numpy
 value.detach().cpu
 value.detach
+geometry_evidence_out.bind_clock
 self.gripper
 self.gripper.state
 hand_state.coordinates
@@ -1156,6 +1204,7 @@ robot_poses.values
 pose[0].sum
 self._robot_self_components
 costs.update
+geometry_evidence_out.seal
 self._owner_poses
 torch.zeros_like
 owner.owner_id
@@ -1384,6 +1433,7 @@ ValueError
 value.detach().cpu().numpy
 value.detach().cpu
 value.detach
+geometry_evidence_out.bind_clock
 tuple
 self.gripper.state
 hand_state.uncertain.to
@@ -1405,6 +1455,7 @@ pose[0].sum
 self._robot_self_components
 costs.update
 nonclear_diagnostics
+geometry_evidence_out.seal
 self._owner_poses
 torch.zeros_like
 poses.items
@@ -1478,7 +1529,7 @@ progress.new_tensor(unresolved).reshape
 
 ## `OnlinePlanningScene.components.record_pair`
 
-[定义位置](../../../manipulation/online_geometry.py#L513)。
+[定义位置](../../../manipulation/online_geometry.py#L535)。
 
 输入签名：
 
@@ -1493,7 +1544,7 @@ def record_pair(index, component, first, second, evidence, *, geometry_entity_ke
 读取的对象属性：
 
 ```python
-geometry_evidence_out.append
+geometry_evidence_out.append_observed
 ```
 
 写入目标：
@@ -1503,14 +1554,12 @@ geometry_evidence_out.append
 直接调用符号：
 
 ```python
-geometry_evidence_out.append
-list
-float
+geometry_evidence_out.append_observed
 ```
 
 ## `OnlinePlanningScene.components.record_nonclear`
 
-[定义位置](../../../manipulation/online_geometry.py#L532)。
+[定义位置](../../../manipulation/online_geometry.py#L549)。
 
 输入签名：
 
@@ -1550,7 +1599,7 @@ order
 
 ## `OnlinePlanningScene.components.nonclear_diagnostics`
 
-[定义位置](../../../manipulation/online_geometry.py#L551)。
+[定义位置](../../../manipulation/online_geometry.py#L568)。
 
 输入签名：
 
@@ -1591,7 +1640,7 @@ rows.extend
 
 ## `OnlinePlanningScene.optimization_objective`
 
-[定义位置](../../../manipulation/online_geometry.py#L806)。
+[定义位置](../../../manipulation/online_geometry.py#L829)。
 
 输入签名：
 
@@ -1906,7 +1955,7 @@ report_out.update
 
 ## `OnlinePlanningScene.evaluate`
 
-[定义位置](../../../manipulation/online_geometry.py#L976)。
+[定义位置](../../../manipulation/online_geometry.py#L999)。
 
 输入签名：
 
@@ -1955,7 +2004,7 @@ name.startswith
 
 ## `OnlinePlanningScene.estimated_workspace_allocation`
 
-[定义位置](../../../manipulation/online_geometry.py#L986)。
+[定义位置](../../../manipulation/online_geometry.py#L1009)。
 
 输入签名：
 
@@ -2067,7 +2116,7 @@ dict
 
 ## `OnlinePlanningScene.describe`
 
-[定义位置](../../../manipulation/online_geometry.py#L1048)。
+[定义位置](../../../manipulation/online_geometry.py#L1071)。
 
 输入签名：
 
@@ -2111,7 +2160,7 @@ deepcopy
 
 ## `OnlinePlanningScene.to_execution_binding`
 
-[定义位置](../../../manipulation/online_geometry.py#L1060)。
+[定义位置](../../../manipulation/online_geometry.py#L1083)。
 
 输入签名：
 

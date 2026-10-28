@@ -57,7 +57,7 @@ def motion_cost(states, bounds, configuration, native_dt, weights):
 
 
 # BEGIN arbitrary saved curves and numerical controls share one robot/TCP computation.
-def robot_tool_states(*, problem, scene, kinematics, q, dq, joint_names, progress, times):
+def robot_tool_states(*, problem, scene, kinematics, q, dq, joint_names, progress, times, fk_session=None):
     """Complete nominal model joints and form the reference-frame tool state.
 
     ``q/dq`` describe one shared physical-time sample layout and named joint
@@ -82,7 +82,7 @@ def robot_tool_states(*, problem, scene, kinematics, q, dq, joint_names, progres
             q = torch.cat((q, coordinates[..., columns]), -1)
             dq = torch.cat((dq, rate[..., columns]), -1)
             names += tuple(missing)
-    poses, velocities = kinematics.states(q, dq, names)
+    poses, velocities = kinematics.states(q, dq, names, fk_session=fk_session)
     position, quaternion = poses[problem.tool_link]
     linear, angular = velocities[problem.tool_link]
     tool_position = q.new_tensor(problem.tool_transform[:3, 3])

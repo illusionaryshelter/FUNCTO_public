@@ -1,6 +1,9 @@
 """Exact candidate queries connect interval evidence to original scene verdicts."""
 # BEGIN CPU integration keeps real native/field queries and an analytic robot FK.
 from copy import deepcopy
+from contextlib import nullcontext
+from manipulation.pair_evidence import PairBatch
+from pair_evidence_fixtures import records as evidence_records, state_record
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -38,6 +41,8 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
         end_progress=1., residuals=lambda *args, **kwargs: {}, verification_issues=lambda progress: [],
         transform_tool_pose=lambda p, q: (p, q), transform_robot_spheres=lambda x: x)
     instance._candidate_domain_validation = lambda value: {}
+    # The analytic FK fixture explicitly has no native Pinocchio session.
+    instance._candidate_kinematics = lambda scene: nullcontext(None)
     shape = coal.Box(.002, .002, .002)
     field = ObservedField(-np.ones((2, 2, 2)), np.ones((2, 2, 2), bool),
         origin=[.0115, -.001, -.001], voxel_size=.002)
@@ -45,7 +50,7 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
     instance.scene_queries = []
 
     # BEGIN analytic CPU states preserve the production candidate helper output.
-    def robot_state(trajectory, candidate_scene, times, progress):
+    def robot_state(trajectory, candidate_scene, times, progress, *, fk_session=None):
         states = [torch.as_tensor(trajectory._curve(times, order))[None] for order in range(4)]
         q, dq = states[:2]
         position = torch.cat((q, q.new_zeros((*q.shape[:2], 2))), -1)
@@ -63,6 +68,7 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
         queries.append(trajectory_time.numpy().copy())
         permissions = progress if contact_permission_progress is None else contact_permission_progress
         values = torch.zeros_like(progress)
+        geometry_evidence_out.bind_clock(trajectory_time.numpy(), progress.numpy(), permissions.numpy())
         # BEGIN consume the same production release relation as the real scene.
         relation_costs = {}
         owner_position, _ = self._owner_poses(p, quaternion, progress, None, relation_costs)["material"]
@@ -81,8 +87,10 @@ def planner(monkeypatch, *, permission="none", residual=0., release=False):
                 "first": "body", "second": "background", "component": "collision/body/background",
                 "geometry_entity_key": {"first": "robot/body", "second": "background"},
                 "permission_kind": permission, **evidence}
-            geometry_evidence_out.append(row)
+            geometry_evidence_out.append_observed(index, row["component"], row["first"], row["second"],
+                evidence, geometry_entity_key=row["geometry_entity_key"], permission_kind=permission)
             record["pairs"].append(deepcopy(row))
+        geometry_evidence_out.seal()
         components_out["collision/body/background"] = values
         components_out["gripper/controller"] = torch.full_like(progress, residual)
         components_out.update(relation_costs)
@@ -186,7 +194,7 @@ def test_release_cache_charges_each_new_time_once_and_preserves_full_scene_resul
     _, _, _, progress = curve.sample(times)
     states, (_, _, _, _, (position, quaternion), _) = instance._candidate_robot_state(
         curve, instance.scene, times, progress)
-    evidence = []
+    evidence = PairBatch()
     value = _scene_boundary_evaluate(instance.scene, instance.problem, _ProgressMap(curve.progress_u, curve.progress_s),
         position.new_empty((1, len(times), 0, 4)), position, quaternion,
         torch.as_tensor(progress)[None], states[0], ("q",), trajectory_time=torch.as_tensor(times)[None],
@@ -254,17 +262,21 @@ def test_event_ulp_identity_matches_interval_partition_and_boundary_sides(monkey
         required_progress_anchors, contacts = (anchor,), ()
         def evaluate(self, spheres, position, quaternion, progress, joints, names, **kwargs):
             self.progress = progress.numpy().ravel().tolist()
+            batch = kwargs['geometry_evidence_out']
+            batch.bind_clock(kwargs['trajectory_time'].numpy(), progress.numpy(), progress.numpy())
             for index in np.ndindex(progress.shape):
-                kwargs['geometry_evidence_out'].append({'state_index': list(index)})
+                batch.append_observed(index, 'collision/fixture', 'body', 'background',
+                    {'status': 'clear'}, geometry_entity_key={'first': 'robot/body', 'second': 'background'})
+            batch.seal()
             return torch.zeros_like(progress)
 
-    scene, evidence = Scene(), []
+    scene, evidence = Scene(), PairBatch()
     tensor = lambda value: torch.as_tensor(value, dtype=torch.float64)[None]
     _scene_boundary_evaluate(scene, SimpleNamespace(start_progress=0., end_progress=1.), mapping,
         torch.empty((1, 1, 0, 4)), torch.zeros((1, 1, 3)), torch.tensor([[[1., 0., 0., 0.]]]),
         tensor(progress), torch.zeros((1, 1, 1)), ('q',), trajectory_time=tensor([physical_time]),
         normalized_time=tensor(parameters), geometry_evidence_out=evidence)
-    assert [row['side'] for row in evidence] == [0, -1, 1]
+    assert [row['side'] for row in evidence_records(evidence)] == [0, -1, 1]
     assert scene.progress == [anchor, np.nextafter(anchor, -np.inf), np.nextafter(anchor, np.inf)]
 
 
@@ -282,7 +294,8 @@ def test_actual_candidate_array_and_split_queries_have_identical_cached_release_
         monkeypatch.setattr(interval, 'check_interval_geometry', capture)
         instance._candidate_geometry(curve, scene, initial_states=initial, remaining_points=100-points,
                                      record_work=Mock())
-        return {(row['time_s'], row['side']): row for response in responses for row in response['states']}
+        return {(state.time_s, state.side): state_record(state)
+                for response in responses for state in response['states']}
 
     assert invoke([[.00625, .01875]]) == invoke([[.00625], [.01875]])
 # END actual scene evidence, release poses and physical counts agree for both layouts.

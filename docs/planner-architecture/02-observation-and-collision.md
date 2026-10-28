@@ -90,7 +90,7 @@ SciPy 四元数转换给出数值旋转。代码计算 `δ≥||BᵀB-I||∞`，�
 
 `_prepare_query` 供完整报告与数值批次共享输入验证和 float64 FK。`query` 服务 `RobotStateValidator` 与执行前检查，返回关节限位、帧和实体位姿以及逐对距离报告；`query_pair_batches` 服务规划场景，只交付各状态有序配对的十二个数值。两者经 `_pair_table` 使用同一个 `NativePairTable`；该表只持有官方形状强引用和有向配对索引。端点顺序改变时替换表，策略和来源仍随当前 `PairQuery` 进入报告。每次 Coal `distance` 创建独立冷求解器，不缓存见证点、距离或 GJK/EPA 历史。原有 Pinocchio 关节模型继续承担 FK。
 
-`query_pair_batches` 按每块最多 4096 次配对组织连续状态；若单状态配对更多，该状态作为完整一块。准备状态、进入与离开原生调用、场景逐对消费时分别检查请求期限。原生块内错误使整块失败，错误记录块的状态范围以及块内状态、配对索引。形状与配对索引在固定表中持有；原生调用在释放 GIL 前复制变换、mask 和请求，返回独立 NumPy 数组。Python 批次接口将数组转成调用者持有的列表，用于已有 JSON 证据。具体坐标、字段和舍入推导见[原生配对接口](api/native_pair_table.md)。
+`query_pair_batches` 按每块最多 4096 次配对组织连续状态；若单状态配对更多，该状态作为完整一块。准备状态、进入与离开原生调用、场景逐对消费时分别检查请求期限。原生块内错误使整块失败，错误记录块的状态范围以及块内状态、配对索引。形状与配对索引在固定表中持有；原生调用在释放 GIL 前复制变换、mask 和请求，返回独立 NumPy 数组。Python 批次接口直接交付该数组；完整验收使用四个线程分片处理同一块中的连续状态并按原顺序连接结果。`PairBatch` 保存全部原生列与完整观测 payload，最终诊断和已选见证才恢复字典。共享实现代码基线为 `WORKING_IMPLEMENTATION`，数据所有权见[共享验收组件](10-shared-candidate-validation.md)。具体坐标、字段和舍入推导见[原生配对接口](api/native_pair_table.md)。
 
 资源估计将已存在的表字节 `native_query_resident_nbytes` 计入驻留项，将需要构造或替换的表上界 `native_query_storage_nbytes` 计入待分配项。`native_query_temporary_nbytes` 始终进入单次查询的临时项，涵盖相邻块短暂共存的矩阵、原生变换、输出数组和 Python 列表，以及一个冷距离求解器。固定表已存在时，这些临时数组仍需预留。
 
@@ -108,7 +108,7 @@ SciPy 四元数转换给出数值旋转。代码计算 `δ≥||BᵀB-I||∞`，�
 
 完整范围的 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。主约束求解器通过独立 `optimization_objective` 取得固定有限目标，通过 `components` 与连续区间接口取得原实体证据，具体输入和作用见[场景接口](api/online_geometry.md)。`evaluate` 汇总所有非 conditional 原分项并保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留 `geometry_scope`、分类计数和有限见证；`nonclear_pairs` 按硬分项各选取物理时间最早与配对残差最大的记录，若两者相同则合并为一条。每条记录同时保留 `state_index`、`time_s`、任务 `progress`、接触许可 `permission_progress` 和选择原因。残差最大只在同一分项内部比较：机器人自身配对使用原生穿透距离，实体场配对使用原有交叠分类值。该显示选择直接消费已有查询证据；连续区间验收的完整 `geometry_evidence_out` 仍覆盖每个状态的每个要求配对。场配对的未决只进入查询报告。原生自身的 `numerical_boundary`、required contact、初始支撑高度与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
 
-区间几何调用显式提供 `geometry_evidence_out`，接收每个状态的完整实体对记录，包含原实体 ID、硬状态、距离范围、许可种类、内部组合体和未建模运动；该记录不受显示报告的有限条数限制。`first/second` 保存显示名称，`geometry_entity_key` 的两个同名字段分别保存 `robot/<geometry ID>`、`owner/<owner ID>` 或 `background`。带类别的实体键连接距离证据、运动界、配对缓存和交叠去重，也用于筛选依赖未建模手指运动的机器人实体；同名机器人组件与任务实体保留独立身份。
+区间几何调用显式提供 `PairBatch` 类型的 `geometry_evidence_out`，接收每个状态的完整实体对证据，包含原实体 ID、硬状态、距离范围、许可种类、内部组合体和未建模运动；该记录不受显示报告的有限条数限制。`first/second` 保存显示名称，`geometry_entity_key` 的两个同名字段分别保存 `robot/<geometry ID>`、`owner/<owner ID>` 或 `background`。带类别的实体键连接距离证据、运动界、配对缓存和交叠去重，也用于筛选依赖未建模手指运动的机器人实体；同名机器人组件与任务实体保留独立身份。
 
 原生机器人实体对的分离下界由 `NativePairTable.query` 在同一距离循环中对两个完整形状作支持投影，并采用外向区间运算。方向范数取上界，投影间隙和除法取下界；零方向给出零分离下界。Coal 查询法向只提供投影方向，原生求解容差不被解释为距离误差界。区间检查如何将端点状态的几何证据与运动界结合，见[验收组件](05-acceptance-and-execution.md)。
 
