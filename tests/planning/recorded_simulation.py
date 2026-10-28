@@ -25,6 +25,7 @@ from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
 # BEGIN use the same complete formal archive bound as its writer.
 from recorded_task_planning import MAX_CURVE_METADATA_BYTES
+from manipulation.evidence_archive import read_evidence_json
 # END ordinary input-document and per-array limits remain separate.
 
 # BEGIN archive inspection is separate from execution authorization.
@@ -40,7 +41,9 @@ def load_curve_archive(path):
     metadata_path = path.with_suffix(".json")
     if metadata_path.stat().st_size > MAX_CURVE_METADATA_BYTES:
         raise ValueError(f"Trajectory metadata exceeds the bounded 512 MiB archive size: {metadata_path}")
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    # BEGIN count and read each shared completed record once with this archive.
+    metadata = read_evidence_json(metadata_path, max_bytes=MAX_CURVE_METADATA_BYTES)
+    # END the restored binding retains immutable numerical evidence.
     # END the archive is parsed once, without geometry or evidence truncation.
     with np.load(path, allow_pickle=False) as arrays:
         if str(arrays["classification"].item()) != metadata["classification"]:

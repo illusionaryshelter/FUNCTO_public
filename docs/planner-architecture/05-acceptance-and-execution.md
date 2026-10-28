@@ -46,7 +46,7 @@
 
 `qualify_candidate` 在绑定成功后把已完成的 `attempt` 报告直接保存在内部交付记录中。该报告的几何证据已经转为自有 CPU 数值；首个合格候选立即结束选择，后续请求替换 `last_validation` 等引用。内部交付继续读取当前报告，保持原轨迹副本；绑定的 `plain` 转换、公开参考诊断和返回诊断分别构造自己的容器。私有 `last_validation` 与报告中的部分完成几何树共享引用，其生命周期内的生产计算只读这些完成记录。
 
-深复制递归建立嵌套字典、列表和数组的独立容器，用于当前可变接口的所有权隔离。公开诊断修改不改变其他公开视图或正式执行绑定；`check_result` 返回的绑定副本则供执行器及设备重绑定修改自身状态。完整诊断副本服务于结果解释，验收计算服务于规划资格，两者具有不同职责。当前接口在规划返回前同步完成这些内存操作，归档 JSON/NPZ 的文件操作由调用方另行执行。
+深复制递归建立可变字典、列表和数组的独立容器，用于接口的所有权隔离。原规划分支继续原可变报告契约；`PreferencePlanner` 将完成的区间几何记录转换为递归只读 `CompletedEvidence`，深复制时共享其值，对公开写入抛出 `TypeError`。两路中的曲线、可变报告头和输入快照保持原隔离。`check_result` 返回的可变绑定副本供执行器及设备重绑定修改自身状态，其中只读完成证据可以共享。具体数值和文件接口见[完成证据与归档](09-completed-evidence-and-archives.md)。
 
 `PlanningResult` 保存 `success`、`trajectory`、`diagnostics`、`execution_binding`、`request_ledger`。成功结果的 `trajectory` 为 `JointTrajectory`；其具名关节、时间、位置、速度、进度映射、原事件、条件、手指曲线及已满足依赖共同定义可执行内容。失败候选以 `diagnostics.diagnostic_trajectory` 保存，用于解释残差。
 

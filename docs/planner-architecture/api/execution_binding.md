@@ -1,17 +1,11 @@
 # `manipulation/execution_binding.py` 实现契约
 
-代码基线：`6f40fb5`。本文所在的后续文档提交仅回填实现引用，生产代码与该实现提交相同。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `plain`
 
-[定义位置](../../../manipulation/execution_binding.py#L25)。
-
-该接口输入无循环的声明数据树，输出可供绑定与 JSON 保存的独立普通数据树。精确内置叶子首先返回；其中 float 由 `math.isnan/isfinite` 分类，有限值及负零保持原二进制值，NaN 抛 `ValueError`，正负无穷编码为 `{"unbounded": "+"}` 或 `{"unbounded": "-"}`。使用 `type(value) is ...` 使具有自定义行为的子类继续执行其原分支。
-
-结构输入按 PosePath 连续表达式、公开 dataclass 字段、NumPy 数组/标量、Mapping、序列的既有顺序递归。NumPy `tolist/item` 和自定义子类方法保留其调用职责；Mapping 按原条目顺序将键转为字符串，tuple/list 输出新列表。普通内置叶子不可变，可原位返回；所有 dict/list 递归重建，同一输入容器在两条路径出现时也分别拥有输出容器。
-
-消费者包括 `bind_candidate` 的问题、场景和验收记录，`curve_snapshot` 的可执行曲线，规划器的请求义务合同及 continuation 事件比较，以及场景中类型化路径的保存。转换保持字段自身的坐标系、单位和数据语义；其输出本身不生成新的规划或执行许可。
+[定义位置](../../../manipulation/execution_binding.py#L26)。
 
 输入签名：
 
@@ -30,6 +24,8 @@ def plain(value):
 
 ```python
 value if math.isfinite(value) else {'unbounded': '+' if value > 0 else '-'}
+value
+value.formal()
 plain(value.to_record())
 {item.name: plain(getattr(value, item.name)) for item in fields(value) if not item.name.startswith('_')}
 plain(value.tolist())
@@ -43,9 +39,10 @@ value if np.isfinite(value) else {'unbounded': '+' if value > 0 else '-'}
 读取的对象属性：
 
 ```python
-value.to_record
 math.isnan
 math.isfinite
+value.formal
+value.to_record
 item.name
 item.name.startswith
 np.ndarray
@@ -69,10 +66,13 @@ key
 直接调用符号：
 
 ```python
-is_dataclass
+type
 math.isnan
+ValueError
 math.isfinite
 isinstance
+value.formal
+is_dataclass
 plain
 value.to_record
 getattr
@@ -83,15 +83,13 @@ value.item
 str
 value.items
 np.isnan
-ValueError
 np.isfinite
 TypeError
-type
 ```
 
 ## `curve_snapshot`
 
-[定义位置](../../../manipulation/execution_binding.py#L68)。
+[定义位置](../../../manipulation/execution_binding.py#L73)。
 
 输入签名：
 
@@ -147,15 +145,13 @@ trajectory.finger_trajectory.describe
 
 ## `bind_candidate`
 
-[定义位置](../../../manipulation/execution_binding.py#L90)。
+[定义位置](../../../manipulation/execution_binding.py#L95)。
 
 输入签名：
 
 ```python
 def bind_candidate(trajectory, *, problem, scene, validation, native_report):
 ```
-
-调用者直接传入当前候选的 validation；本函数同步只读 `u/violations`，随后以 `plain(validation)` 构造独立的 `validation.export`。返回的验证记录与后端数组独立，后端可继续复用原数组。绑定顶层输入与 `validation.inputs` 仍分别持有独立记录，供 `check_result` 检测交付后修改。
 
 实现说明：
 
@@ -216,7 +212,7 @@ deepcopy
 
 ## `_relaxed_pose_contract`
 
-[定义位置](../../../manipulation/execution_binding.py#L121)。
+[定义位置](../../../manipulation/execution_binding.py#L126)。
 
 输入签名：
 
@@ -300,7 +296,7 @@ contract.get
 
 ## `relax_pose_goal_tolerances`
 
-[定义位置](../../../manipulation/execution_binding.py#L181)。
+[定义位置](../../../manipulation/execution_binding.py#L186)。
 
 输入签名：
 
@@ -372,7 +368,7 @@ PlanningResult
 
 ## `check_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L220)。
+[定义位置](../../../manipulation/execution_binding.py#L225)。
 
 输入签名：
 
@@ -457,7 +453,7 @@ deepcopy
 
 ## `validate_controller_policy`
 
-[定义位置](../../../manipulation/execution_binding.py#L272)。
+[定义位置](../../../manipulation/execution_binding.py#L277)。
 
 输入签名：
 
@@ -513,7 +509,7 @@ np.any
 
 ## `validate_result_only_goal_ids`
 
-[定义位置](../../../manipulation/execution_binding.py#L300)。
+[定义位置](../../../manipulation/execution_binding.py#L305)。
 
 输入签名：
 
@@ -572,7 +568,7 @@ binding['problem'].get
 
 ## `rebind_execution_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L339)。
+[定义位置](../../../manipulation/execution_binding.py#L344)。
 
 输入签名：
 

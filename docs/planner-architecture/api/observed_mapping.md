@@ -1,11 +1,11 @@
 # `manipulation/observed_mapping.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `FrozenObservedField`
 
-[定义位置](../../../manipulation/observed_mapping.py#L25)。
+[定义位置](../../../manipulation/observed_mapping.py#L26)。
 
 ```python
 class FrozenObservedField(ObservedField):
@@ -21,7 +21,7 @@ class FrozenObservedField(ObservedField):
 
 ## `FrozenObservedField.__init__`
 
-[定义位置](../../../manipulation/observed_mapping.py#L28)。
+[定义位置](../../../manipulation/observed_mapping.py#L29)。
 
 输入签名：
 
@@ -61,6 +61,7 @@ self.name
 self.source
 self.owner_ids
 self.storage_nbytes
+self._array_records
 ```
 
 直接调用符号：
@@ -80,7 +81,7 @@ frozenset
 
 ## `FrozenObservedField.clone_for_rollout`
 
-[定义位置](../../../manipulation/observed_mapping.py#L39)。
+[定义位置](../../../manipulation/observed_mapping.py#L43)。
 
 输入签名：
 
@@ -112,7 +113,7 @@ self
 
 ## `FrozenObservedField.record`
 
-[定义位置](../../../manipulation/observed_mapping.py#L43)。
+[定义位置](../../../manipulation/observed_mapping.py#L47)。
 
 输入签名：
 
@@ -127,17 +128,15 @@ def record(self):
 显式输出分支：
 
 ```python
-{'kind': 'observed_trilinear_field_v1', 'name': self.name, 'source': self.source, 'values': encode_array(self.values), 'observed': encode_array(self.observed), 'weights': encode_array(self.weights), 'origin': self.origin.tolist(), 'voxel_size': self.voxel_size}
+{'kind': 'observed_trilinear_field_v1', 'name': self.name, 'source': self.source, **self._array_records, 'origin': self.origin.tolist(), 'voxel_size': self.voxel_size}
 ```
 
 读取的对象属性：
 
 ```python
+self._array_records
 self.name
 self.source
-self.values
-self.observed
-self.weights
 self.origin.tolist
 self.origin
 self.voxel_size
@@ -145,18 +144,23 @@ self.voxel_size
 
 写入目标：
 
-无显式条目。
+```python
+self._array_records
+name
+```
 
 直接调用符号：
 
 ```python
+completed_evidence
 encode_array
+getattr
 self.origin.tolist
 ```
 
 ## `FrozenObservedField.from_record`
 
-[定义位置](../../../manipulation/observed_mapping.py#L53)。
+[定义位置](../../../manipulation/observed_mapping.py#L64)。
 
 输入签名：
 
@@ -188,7 +192,7 @@ decode_array
 
 ## `FrozenObservedField.save`
 
-[定义位置](../../../manipulation/observed_mapping.py#L60)。
+[定义位置](../../../manipulation/observed_mapping.py#L71)。
 
 输入签名：
 
@@ -223,7 +227,7 @@ self.record
 
 ## `FrozenObservedField.load`
 
-[定义位置](../../../manipulation/observed_mapping.py#L64)。
+[定义位置](../../../manipulation/observed_mapping.py#L75)。
 
 输入签名：
 
@@ -260,7 +264,7 @@ Path
 
 ## `FrozenObservedField.summary`
 
-[定义位置](../../../manipulation/observed_mapping.py#L67)。
+[定义位置](../../../manipulation/observed_mapping.py#L78)。
 
 输入签名：
 
@@ -307,7 +311,7 @@ len
 
 ## `freeze_mapper`
 
-[定义位置](../../../manipulation/observed_mapping.py#L79)。
+[定义位置](../../../manipulation/observed_mapping.py#L90)。
 
 输入签名：
 
@@ -433,7 +437,7 @@ FrozenObservedField
 
 ## `integrate_entity`
 
-[定义位置](../../../manipulation/observed_mapping.py#L123)。
+[定义位置](../../../manipulation/observed_mapping.py#L134)。
 
 输入签名：
 

@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 
-from .collision_records import encode_array, decode_array
+from .collision_records import decode_array
 from .implicit_distance import PairPermission
 from .observed_mapping import FrozenObservedField
 from .observed_robot import DifferentiableRobotKinematics
@@ -1093,9 +1093,9 @@ class OnlinePlanningScene:
             "gripper": hand_record, "has_gripper": self.has_gripper,
             "numerical_position_tolerance_m": self.numerical_position_tolerance_m,
             "numerical_rotation_tolerance_rad": self.numerical_rotation_tolerance_rad,
-            "coverage": {"known_free": encode_array(self.coverage.known_free),
-                "origin": self.coverage.origin.tolist(), "voxel_size": self.coverage.voxel_size,
-                "observation_ids": list(self.coverage.observation_ids)}}
+            # BEGIN reuse the same immutable observed-free array record across bindings.
+            "coverage": self.coverage.record()}
+            # END only the fixed sample bytes are shared; input headers remain independent.
         # END scene serialization does not recreate a robot observation field.
 
     binding_record = to_execution_binding

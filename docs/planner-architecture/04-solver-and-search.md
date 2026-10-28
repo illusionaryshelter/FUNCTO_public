@@ -32,6 +32,8 @@
 
 `robot_tool_states` 从仿射样条取得 `q,dq`，加入场景声明的名义手指坐标与速度，调用 `PinKinematics.states`。Pin 模型复用验证器的完整机器人。位姿导数使用帧 Jacobian；速度导数使用 Pin 的 LOCAL 帧原生导数，再经可微旋转表达在参考系中。工具固定平移贡献线速度杆臂项，固定旋转组成 TCP 姿态。`_candidate_robot_state` 对任意保存曲线调用同一接口。
 
+`PinKinematics.poses/states` 按实际 Torch 梯度需求选择原生计算。启用 autograd 且输入需要梯度时，`_evaluate(..., with_derivatives=True)` 计算原帧 Jacobian 和速度导数。纯前向评分、验收及不需要梯度的调用使用 `forwardKinematics`、`updateFramePlacements` 和相同的 LOCAL 速度读取；位姿、标定、四元数和参考系旋转公式保持一致，导数缓冲为空。坐标、接口和验证见[运动学 API](api/pin_kinematics.md)。
+
 `PlanningProblem.constraint_components` 返回等式字典和逐项有符号不等式字典。约定不等式 `g(a)<=0`，各行保留原物理单位、原任务点、半空间和事件身份。过程关系、位姿及机构坐标事件、方向历史、关节耦合和声明停止均从同一曲线状态计算。条件生产函数可同时写入 `solver_rows_out=(equality_masks, inequality_masks)`：与完整条件具有同一键、顺序和形状的布尔布局。固定进度界、声明区间外零行、方向历史中的固定首项及零宽固定入口偏航均由声明和曲线结构识别。布局只在初始任务求值中绑定，先核对被省去行的原值有限且满足等式为零或不等式非正，再按同一布局向 SLSQP 提交剩余行。`fixed_task_constraints` 保存原键、组内行索引、值和判定。固定行违反条件时直接返回原初值及不可变条件失败记录。完整 `task` 与最终验收保留所有原值；某次数值导数为零的变量行仍参与求解。
 
 ## 4. 连续关节约束

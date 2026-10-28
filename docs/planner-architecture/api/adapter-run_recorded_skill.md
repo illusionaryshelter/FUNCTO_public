@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-原适配器算法代码基线：`be44b54`。当前默认预算接入对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -630,7 +630,6 @@ args.execution_limits.read_text
 args.execution_limits
 args.execution_limits.resolve
 args.continuation
-args.continuation.read_text
 args.rebind
 args.rebind.read_text
 args.request_ledger
@@ -890,7 +889,7 @@ args.finger_targets.resolve
 ExecutionLimits.from_mapping
 args.execution_limits.read_text
 args.execution_limits.resolve
-args.continuation.read_text
+read_evidence_json
 args.rebind.read_text
 args.request_ledger.read_text
 isinstance
@@ -1026,7 +1025,7 @@ print
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L690)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L693)。
 
 输入签名：
 
@@ -1104,7 +1103,7 @@ run_prepared
 
 ## `parse_args`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L719)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L722)。
 
 输入签名：
 
@@ -1115,8 +1114,6 @@ def parse_args(argv=None):
 实现说明：
 
 > Share the existing resource/scene CLI without a second option schema.
-
-`--planning-seconds` 省略时直接取 `PlanningBudget.planning_seconds`，当前为 60 s。`run_prepared` 将解析值传给原 `PlanningBudget` 构造器，随后由 `plan_and_record → plan_trajectory` 维护原完整请求的累计计时。显式命令值继续通过原参数接口解析。
 
 显式输出分支：
 
@@ -1129,8 +1126,8 @@ parser.parse_args(argv)
 ```python
 argparse.ArgumentParser
 parser.add_argument
-parser.parse_args
 PlanningBudget.planning_seconds
+parser.parse_args
 ```
 
 写入目标：

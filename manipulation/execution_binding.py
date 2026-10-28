@@ -19,6 +19,7 @@ import numpy as np
 
 # BEGIN path expressions declare their operands before dataclass serialization.
 from .planning_problem import PosePath
+from .completed_evidence import CompletedEvidence
 # END this import has no planning backend or device initialization.
 
 
@@ -40,6 +41,10 @@ def plain(value):
     if kind is str or kind is bool or kind is int or value is None:
         return value
     # END remaining input types keep their declared conversion precedence.
+    # BEGIN completed records already own their immutable value tree.
+    if isinstance(value, CompletedEvidence):
+        return value.formal()
+    # END mutable inputs still acquire independent containers below.
     if is_dataclass(value):
         # BEGIN continuous operands take precedence over inherited data fields.
         if isinstance(value, PosePath):

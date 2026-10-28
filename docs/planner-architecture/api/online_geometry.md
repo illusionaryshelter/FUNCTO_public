@@ -1,8 +1,6 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`12e0ef5`。
-
-本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -2124,7 +2122,7 @@ def to_execution_binding(self):
 显式输出分支：
 
 ```python
-{'schema': 'native_robot_observed_scene_v1', **self.describe(), 'owners': owners, 'robot_model': native, 'background': self.background.record(), 'contacts': _plain([asdict(row) for row in self.contacts]), 'tool_geometry_names': list(self.tool_geometry_names), 'grasp_contact_activations': _plain(self.grasp_contact_activations), 'initial_support_relations': [row.record() for row in self.initial_support_relations], 'gripper': hand_record, 'has_gripper': self.has_gripper, 'numerical_position_tolerance_m': self.numerical_position_tolerance_m, 'numerical_rotation_tolerance_rad': self.numerical_rotation_tolerance_rad, 'coverage': {'known_free': encode_array(self.coverage.known_free), 'origin': self.coverage.origin.tolist(), 'voxel_size': self.coverage.voxel_size, 'observation_ids': list(self.coverage.observation_ids)}}
+{'schema': 'native_robot_observed_scene_v1', **self.describe(), 'owners': owners, 'robot_model': native, 'background': self.background.record(), 'contacts': _plain([asdict(row) for row in self.contacts]), 'tool_geometry_names': list(self.tool_geometry_names), 'grasp_contact_activations': _plain(self.grasp_contact_activations), 'initial_support_relations': [row.record() for row in self.initial_support_relations], 'gripper': hand_record, 'has_gripper': self.has_gripper, 'numerical_position_tolerance_m': self.numerical_position_tolerance_m, 'numerical_rotation_tolerance_rad': self.numerical_rotation_tolerance_rad, 'coverage': self.coverage.record()}
 ```
 
 读取的对象属性：
@@ -2161,12 +2159,8 @@ self.initial_support_relations
 self.has_gripper
 self.numerical_position_tolerance_m
 self.numerical_rotation_tolerance_rad
-self.coverage.known_free
+self.coverage.record
 self.coverage
-self.coverage.origin.tolist
-self.coverage.origin
-self.coverage.voxel_size
-self.coverage.observation_ids
 ```
 
 写入目标：
@@ -2200,6 +2194,5 @@ self.robot_validator.T_reference_base.tolist
 self.describe
 self.background.record
 row.record
-encode_array
-self.coverage.origin.tolist
+self.coverage.record
 ```

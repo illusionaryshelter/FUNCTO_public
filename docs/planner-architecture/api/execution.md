@@ -1,6 +1,6 @@
 # `manipulation/execution.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pose_goal_schedule`
@@ -480,9 +480,37 @@ float
 int
 ```
 
-## `ExecutionLimits`
+## `_write_execution_json`
 
 [定义位置](../../../manipulation/execution.py#L210)。
+
+输入签名：
+
+```python
+def _write_execution_json(path, value):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+无显式条目。
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+write_evidence_json
+```
+
+## `ExecutionLimits`
+
+[定义位置](../../../manipulation/execution.py#L217)。
 
 ```python
 class ExecutionLimits():
@@ -520,7 +548,7 @@ observation_policy: dict | None
 
 ## `ExecutionLimits.__post_init__`
 
-[定义位置](../../../manipulation/execution.py#L240)。
+[定义位置](../../../manipulation/execution.py#L247)。
 
 输入签名：
 
@@ -596,7 +624,7 @@ deepcopy
 
 ## `ExecutionLimits.__post_init__.finger_bounds`
 
-[定义位置](../../../manipulation/execution.py#L267)。
+[定义位置](../../../manipulation/execution.py#L274)。
 
 输入签名：
 
@@ -649,7 +677,7 @@ speed.tolist
 
 ## `ExecutionLimits.from_mapping`
 
-[定义位置](../../../manipulation/execution.py#L309)。
+[定义位置](../../../manipulation/execution.py#L316)。
 
 输入签名：
 
@@ -685,7 +713,7 @@ deepcopy
 
 ## `ExecutionLimits.describe`
 
-[定义位置](../../../manipulation/execution.py#L314)。
+[定义位置](../../../manipulation/execution.py#L321)。
 
 输入签名：
 
@@ -721,7 +749,7 @@ getattr
 
 ## `ExecutionLimits.bind`
 
-[定义位置](../../../manipulation/execution.py#L317)。
+[定义位置](../../../manipulation/execution.py#L324)。
 
 输入签名：
 
@@ -794,7 +822,7 @@ np.asarray
 
 ## `ExecutionGuardError`
 
-[定义位置](../../../manipulation/execution.py#L361)。
+[定义位置](../../../manipulation/execution.py#L368)。
 
 ```python
 class ExecutionGuardError(RuntimeError):
@@ -810,7 +838,7 @@ class ExecutionGuardError(RuntimeError):
 
 ## `continuation_execution_inputs`
 
-[定义位置](../../../manipulation/execution.py#L367)。
+[定义位置](../../../manipulation/execution.py#L374)。
 
 输入签名：
 
@@ -886,7 +914,7 @@ ExecutionLimits.from_mapping
 
 ## `TrajectoryExecutor`
 
-[定义位置](../../../manipulation/execution.py#L427)。
+[定义位置](../../../manipulation/execution.py#L434)。
 
 ```python
 class TrajectoryExecutor():
@@ -907,7 +935,7 @@ class TrajectoryExecutor():
 
 ## `TrajectoryExecutor.__init__`
 
-[定义位置](../../../manipulation/execution.py#L436)。
+[定义位置](../../../manipulation/execution.py#L443)。
 
 输入签名：
 
@@ -959,7 +987,7 @@ len
 
 ## `TrajectoryExecutor._geometry_result`
 
-[定义位置](../../../manipulation/execution.py#L456)。
+[定义位置](../../../manipulation/execution.py#L463)。
 
 输入签名：
 
@@ -1022,7 +1050,7 @@ distances.tolist
 
 ## `TrajectoryExecutor._execution_violations`
 
-[定义位置](../../../manipulation/execution.py#L483)。
+[定义位置](../../../manipulation/execution.py#L490)。
 
 输入签名：
 
@@ -1136,7 +1164,7 @@ Rotation.from_matrix
 
 ## `TrajectoryExecutor._execution_violations.add`
 
-[定义位置](../../../manipulation/execution.py#L490)。
+[定义位置](../../../manipulation/execution.py#L497)。
 
 输入签名：
 
@@ -1166,7 +1194,7 @@ failures.append
 
 ## `TrajectoryExecutor.execute`
 
-[定义位置](../../../manipulation/execution.py#L581)。
+[定义位置](../../../manipulation/execution.py#L588)。
 
 输入签名：
 
@@ -1377,8 +1405,6 @@ request_ledger.setdefault
 rows.extend
 (output / 'continuation.json').resolve
 continuation_path.name
-continuation_path.write_text
-json.dumps
 np.savez_compressed
 np.asarray(values).reshape
 control_terms.items
@@ -1393,7 +1419,7 @@ np.arange
 (output / name).resolve
 feedback.update
 feedback_path.write_text
-(output / 'execution-report.json').write_text
+json.dumps
 ```
 
 写入目标：
@@ -1775,9 +1801,7 @@ request_ledger.setdefault
 rows.extend
 (output / 'continuation.json').resolve
 persist
-continuation_path.write_text
-json.dumps
-_feedback_json
+_write_execution_json
 np.savez_compressed
 np.asarray(values).reshape
 control_terms.items
@@ -1789,12 +1813,13 @@ np.arange
 (output / name).resolve
 feedback.update
 feedback_path.write_text
-(output / 'execution-report.json').write_text
+json.dumps
+_feedback_json
 ```
 
 ## `TrajectoryExecutor.execute.mark_wallclock`
 
-[定义位置](../../../manipulation/execution.py#L625)。
+[定义位置](../../../manipulation/execution.py#L632)。
 
 输入签名：
 
@@ -1828,7 +1853,7 @@ time.monotonic
 
 ## `TrajectoryExecutor.execute.step_accounting`
 
-[定义位置](../../../manipulation/execution.py#L868)。
+[定义位置](../../../manipulation/execution.py#L875)。
 
 输入签名：
 
@@ -1869,7 +1894,7 @@ max
 
 ## `TrajectoryExecutor.execute.run_hold`
 
-[定义位置](../../../manipulation/execution.py#L880)。
+[定义位置](../../../manipulation/execution.py#L887)。
 
 输入签名：
 
@@ -1921,7 +1946,7 @@ ValueError
 
 ## `TrajectoryExecutor.execute.normal_step`
 
-[定义位置](../../../manipulation/execution.py#L905)。
+[定义位置](../../../manipulation/execution.py#L912)。
 
 输入签名：
 
@@ -1986,7 +2011,7 @@ float
 
 ## `TrajectoryExecutor.execute.dependency_already_observed`
 
-[定义位置](../../../manipulation/execution.py#L1124)。
+[定义位置](../../../manipulation/execution.py#L1131)。
 
 输入签名：
 
@@ -2018,7 +2043,7 @@ float
 
 ## `TrajectoryExecutor.execute.check_directions`
 
-[定义位置](../../../manipulation/execution.py#L1150)。
+[定义位置](../../../manipulation/execution.py#L1157)。
 
 输入签名：
 
@@ -2135,7 +2160,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.effect_timestamp`
 
-[定义位置](../../../manipulation/execution.py#L1255)。
+[定义位置](../../../manipulation/execution.py#L1262)。
 
 输入签名：
 
@@ -2205,7 +2230,7 @@ max
 
 ## `TrajectoryExecutor.execute.witness`
 
-[定义位置](../../../manipulation/execution.py#L1290)。
+[定义位置](../../../manipulation/execution.py#L1297)。
 
 输入签名：
 
@@ -2252,7 +2277,7 @@ report['history'].append
 
 ## `TrajectoryExecutor.execute.timed_witness`
 
-[定义位置](../../../manipulation/execution.py#L1305)。
+[定义位置](../../../manipulation/execution.py#L1312)。
 
 输入签名：
 
@@ -2292,7 +2317,7 @@ witness
 
 ## `TrajectoryExecutor.execute.reject_timing`
 
-[定义位置](../../../manipulation/execution.py#L1317)。
+[定义位置](../../../manipulation/execution.py#L1324)。
 
 输入签名：
 
@@ -2339,7 +2364,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.resolve_pending_timing`
 
-[定义位置](../../../manipulation/execution.py#L1337)。
+[定义位置](../../../manipulation/execution.py#L1344)。
 
 输入签名：
 
@@ -2397,7 +2422,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.check_deadlines`
 
-[定义位置](../../../manipulation/execution.py#L1366)。
+[定义位置](../../../manipulation/execution.py#L1373)。
 
 输入签名：
 
@@ -2457,7 +2482,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observe_timed_effects`
 
-[定义位置](../../../manipulation/execution.py#L1393)。
+[定义位置](../../../manipulation/execution.py#L1400)。
 
 输入签名：
 
@@ -2520,7 +2545,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observation_at`
 
-[定义位置](../../../manipulation/execution.py#L1428)。
+[定义位置](../../../manipulation/execution.py#L1435)。
 
 输入签名：
 
@@ -2638,7 +2663,7 @@ condition.get
 
 ## `TrajectoryExecutor.execute.record`
 
-[定义位置](../../../manipulation/execution.py#L1530)。
+[定义位置](../../../manipulation/execution.py#L1537)。
 
 输入签名：
 
@@ -2697,7 +2722,7 @@ deepcopy
 
 ## `TrajectoryExecutor.execute.check_close_binding`
 
-[定义位置](../../../manipulation/execution.py#L1558)。
+[定义位置](../../../manipulation/execution.py#L1565)。
 
 输入签名：
 
@@ -2756,7 +2781,7 @@ failures.append
 
 ## `TrajectoryExecutor.execute.guard`
 
-[定义位置](../../../manipulation/execution.py#L1593)。
+[定义位置](../../../manipulation/execution.py#L1600)。
 
 输入签名：
 
@@ -2852,7 +2877,7 @@ check_deadlines
 
 ## `TrajectoryExecutor.execute.consume_ordinary_events`
 
-[定义位置](../../../manipulation/execution.py#L1667)。
+[定义位置](../../../manipulation/execution.py#L1674)。
 
 输入签名：
 
@@ -2938,7 +2963,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.release_dependencies`
 
-[定义位置](../../../manipulation/execution.py#L1726)。
+[定义位置](../../../manipulation/execution.py#L1733)。
 
 输入签名：
 
@@ -3013,7 +3038,7 @@ timed_witness
 
 ## `TrajectoryExecutor.execute.emit_independent_evidence`
 
-[定义位置](../../../manipulation/execution.py#L1781)。
+[定义位置](../../../manipulation/execution.py#L1788)。
 
 输入签名：
 
@@ -3056,7 +3081,7 @@ str
 
 ## `TrajectoryExecutor.execute.persist`
 
-[定义位置](../../../manipulation/execution.py#L2158)。
+[定义位置](../../../manipulation/execution.py#L2165)。
 
 输入签名：
 

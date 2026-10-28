@@ -206,6 +206,13 @@ def _feedback_json(value):
     return value
 
 
+# BEGIN persistence references completed planning evidence without traversing it again.
+def _write_execution_json(path, value):
+    from .evidence_archive import write_evidence_json
+    write_evidence_json(path, value, convert=_feedback_json)
+# END current feedback and execution records retain their existing JSON value policy.
+
+
 @dataclass(frozen=True)
 class ExecutionLimits:
     """Measured-state limits supplied by the same physical planning contract.
@@ -2167,9 +2174,11 @@ class TrajectoryExecutor:
                 return True
 
             continuation_path = (output/"continuation.json").resolve()
-            if persist(continuation_path.name, lambda: continuation_path.write_text(
-                    json.dumps(_feedback_json(report["continuation"]), indent=2, allow_nan=False)+"\n")):
+            # BEGIN continuation and report retain one shared completed evidence file.
+            if persist(continuation_path.name, lambda: _write_execution_json(
+                    continuation_path, report["continuation"])):
                 report["continuation_path"] = str(continuation_path)
+            # END only artifact representation changes; online checks have already finished.
             persist("physical-trajectory.npz", lambda: np.savez_compressed(
                 output/"physical-trajectory.npz", joint_names=np.asarray(backend.joint_names),
                 command_joint_names=np.asarray(backend.joint_names),
@@ -2236,8 +2245,9 @@ class TrajectoryExecutor:
                         json.dumps(_feedback_json(feedback), indent=2, allow_nan=False)+"\n")):
                     report.update(robot_feedback_path=str(feedback_path), feedback_id=feedback["feedback_id"],
                                   barrier_feedback_path=str(feedback_path) if completed and trajectory.next_verification is not None else None)
-            persist("execution-report.json", lambda: (output/"execution-report.json").write_text(
-                json.dumps(_feedback_json(report), indent=2, allow_nan=False)+"\n"))
+            # BEGIN the execution report references the same planning evidence as continuation.
+            persist("execution-report.json", lambda: _write_execution_json(output/"execution-report.json", report))
+            # END physical samples, failure location and ledger values remain complete.
             # BEGIN final capture errors precede later persistence errors.
             if execution_error is None:
                 if finalization_error is not None:

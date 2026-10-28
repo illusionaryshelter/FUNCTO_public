@@ -34,7 +34,7 @@
 
 `qualify_candidate(trajectory, validation, attempt, binding_scene)` 要求原报告为合格且验证记录完整。它调用原 `bind_candidate`，将曲线、场景和同一候选的验收记录转换为正式执行绑定，再补齐当前区间、目标身份、事件时钟、独立效果记录、物理预算和历史账本。正式绑定中的 `validation.export` 保存属于该曲线的验证数据。
 
-完成上述绑定后，组件复制曲线及报告，执行原请求 `check()`，随后将它们发布到 `PlanningResult`，设置 `qualified_candidate_ready` 时间记录。返回结果持有独立曲线，`returned_candidate` 和正式绑定各自保存报告数据；后端复用验证数组或曲线缓冲区不改变已交付结果。参考候选报告与实际返回报告各自保留所属曲线的来源和验证状态。
+完成上述绑定后，组件复制曲线及可变报告部分，执行原请求 `check()`，随后将它们发布到 `PlanningResult`，设置 `qualified_candidate_ready` 时间记录。返回结果持有独立曲线，`returned_candidate` 和正式绑定各自保存可变报告数据。已经完成的 `continuous_geometry` 为递归只读记录，其 `deepcopy` 直接返回同一对象；后端后续请求分配新记录。对只读证据的公开修改会抛出 `TypeError`，轻量报告字典继续保持独立。参考候选报告与实际返回报告保留所属曲线的来源和验证状态。具体接口见[完成证据与归档](../planner-architecture/09-completed-evidence-and-archives.md)。
 
 完整供给曲线、参考初始化、主优化和几何恢复的调用点均在成功发布后立即返回。生命周期因此只需维护当前交付结果，完成之后不再建立用于比较后续候选的状态。
 

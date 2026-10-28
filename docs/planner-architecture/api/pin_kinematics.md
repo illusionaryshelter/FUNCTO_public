@@ -1,6 +1,6 @@
 # `manipulation/pin_kinematics.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_pose_vjp`
@@ -423,15 +423,24 @@ def poses(self, position, joint_names):
 读取的对象属性：
 
 ```python
-_PinPoses.apply
 self._ordered
+torch.is_grad_enabled
+ordered.requires_grad
+_PinPoses.apply
+self._evaluate
+ordered.detach().numpy
+ordered.detach
+torch.from_numpy
 self.frames
 ```
 
 写入目标：
 
 ```python
+ordered
 packed
+poses
+_
 index
 frame
 ```
@@ -439,14 +448,19 @@ frame
 直接调用符号：
 
 ```python
-_PinPoses.apply
 self._ordered
+torch.is_grad_enabled
+_PinPoses.apply
+self._evaluate
+ordered.detach().numpy
+ordered.detach
+torch.from_numpy
 enumerate
 ```
 
 ## `PinKinematics.states`
 
-[定义位置](../../../manipulation/pin_kinematics.py#L120)。
+[定义位置](../../../manipulation/pin_kinematics.py#L127)。
 
 输入签名：
 
@@ -475,17 +489,30 @@ def states(self, position, velocity, joint_names):
 ```python
 position.shape
 velocity.shape
-_PinStates.apply
 self._ordered
+torch.is_grad_enabled
+q.requires_grad
+dq.requires_grad
+_PinStates.apply
+self._evaluate
+q.detach().numpy
+q.detach
+dq.detach().numpy
+dq.detach
+torch.from_numpy
 self.frames
 ```
 
 写入目标：
 
 ```python
+q
+dq
 packed
 twists
 poses
+_
+rates
 index
 frame
 velocities
@@ -495,30 +522,37 @@ velocities
 
 ```python
 ValueError
-_PinStates.apply
 self._ordered
+torch.is_grad_enabled
+_PinStates.apply
+self._evaluate
+q.detach().numpy
+q.detach
+dq.detach().numpy
+dq.detach
+torch.from_numpy
 enumerate
 quaternion_rotate
 ```
 
 ## `PinKinematics._evaluate`
 
-[定义位置](../../../manipulation/pin_kinematics.py#L140)。
+[定义位置](../../../manipulation/pin_kinematics.py#L154)。
 
 输入签名：
 
 ```python
-def _evaluate(self, position, velocity=None):
+def _evaluate(self, position, velocity=None, *, with_derivatives=True):
 ```
 
 实现说明：
 
-> Evaluate library FK and first derivatives at each admitted sample.
+> Evaluate library FK, computing first derivatives only on demand.
 
 显式输出分支：
 
 ```python
-(*result, twists.reshape(*leading, frames, 6), velocity_position.reshape(*leading, frames, 6, joints), velocity_velocity.reshape(*leading, frames, 6, joints))
+(*result, twists.reshape(*leading, frames, 6), None if velocity_position is None else velocity_position.reshape(*leading, frames, 6, joints), None if velocity_velocity is None else velocity_velocity.reshape(*leading, frames, 6, joints))
 result
 ```
 
@@ -539,6 +573,7 @@ self.model.nq
 self.model.nv
 self._q_columns
 pin.computeJointJacobians
+pin.forwardKinematics
 self._v_columns
 pin.computeForwardKinematicsDerivatives
 np.zeros
@@ -551,13 +586,13 @@ placement.translation
 self._translation
 pin.Quaternion(rotation).coeffs
 pin.Quaternion
-pin.getFrameJacobian
-pin.LOCAL_WORLD_ALIGNED
-pin.getFrameVelocityDerivatives
-pin.LOCAL
 pin.getFrameVelocity
+pin.LOCAL
 motion.linear
 motion.angular
+pin.getFrameVelocityDerivatives
+pin.getFrameJacobian
+pin.LOCAL_WORLD_ALIGNED
 poses.reshape
 jacobian.reshape
 twists.reshape
@@ -591,14 +626,14 @@ placement
 rotation
 poses[sample, index, :3]
 poses[sample, index, 3:]
-geometric
-derivative_q
-derivative_v
 motion
 twists[sample, index, :3]
 twists[sample, index, 3:]
+derivative_q
+derivative_v
 velocity_position[sample, index]
 velocity_velocity[sample, index]
+geometric
 jacobian[sample, index, :3]
 jacobian[sample, index, 3:]
 result
@@ -617,15 +652,16 @@ np.empty_like
 self.model.createData
 range
 pin.computeJointJacobians
+pin.forwardKinematics
 pin.computeForwardKinematicsDerivatives
 np.zeros
 pin.updateFramePlacements
 enumerate
 pin.Quaternion(rotation).coeffs
 pin.Quaternion
-pin.getFrameJacobian
-pin.getFrameVelocityDerivatives
 pin.getFrameVelocity
+pin.getFrameVelocityDerivatives
+pin.getFrameJacobian
 poses.reshape
 jacobian.reshape
 twists.reshape

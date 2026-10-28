@@ -18,6 +18,7 @@ from manipulation.planning import (
     _phase_aligned_parameters, _planning_workspace_bytes,
 )
 from manipulation.unified_solver import ConstrainedSolution
+from manipulation.completed_evidence import completed_evidence
 
 from .geometry import GeometryConstraints
 from .joint_computation import JointComputation
@@ -251,6 +252,16 @@ class PreferencePlanner(NativeSetup, _ConstrainedPlanner):
         result = super().evaluate_candidate(trajectory, record_work=record_work,
             candidate_scene=candidate_scene, objective=objective)
         report = result[1]
+        # BEGIN one immutable record owns this candidate's completed geometry.
+        # The parent has finished every query and residual update. Reports,
+        # selector snapshots and formal bindings can now share this value;
+        # later candidates allocate their own records instead of changing it.
+        if 'continuous_geometry' in report:
+            geometry = completed_evidence(report['continuous_geometry'])
+            report['continuous_geometry'] = geometry
+            if self.last_validation is not None:
+                self.last_validation['continuous_geometry'] = geometry
+        # END mutable controls, ledger counters and report headers stay separate.
         # BEGIN interval scope stays diagnostic; original scene residuals own acceptance.
         # The parent's report retains confirmed intersections, unresolved
         # intervals and the declared unknown-space channels for this curve.

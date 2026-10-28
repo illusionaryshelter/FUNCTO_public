@@ -113,7 +113,14 @@ class PinKinematics:
 
     def poses(self, position, joint_names):
         """Return {frame: (position[...,3], quaternion_wxyz[...,4])}."""
-        packed = _PinPoses.apply(self._ordered(position, joint_names), self)
+        # BEGIN forward-only consumers do not construct unused analytic derivatives.
+        ordered = self._ordered(position, joint_names)
+        if torch.is_grad_enabled() and ordered.requires_grad:
+            packed = _PinPoses.apply(ordered, self)
+        else:
+            poses, _ = self._evaluate(ordered.detach().numpy(), with_derivatives=False)
+            packed = torch.from_numpy(poses)
+        # END the differentiable path retains its original analytic VJP.
         return {frame: (packed[..., index, :3], packed[..., index, 3:])
                 for index, frame in enumerate(self.frames)}
 
@@ -128,8 +135,15 @@ class PinKinematics:
         """
         if position.shape != velocity.shape:
             raise ValueError("Robot positions and velocities must share their named sample layout")
-        packed, twists = _PinStates.apply(self._ordered(position, joint_names),
-                                          self._ordered(velocity, joint_names), self)
+        # BEGIN choose the derivative calculation from the actual Torch demand.
+        q, dq = self._ordered(position, joint_names), self._ordered(velocity, joint_names)
+        if torch.is_grad_enabled() and (q.requires_grad or dq.requires_grad):
+            packed, twists = _PinStates.apply(q, dq, self)
+        else:
+            poses, _, rates, _, _ = self._evaluate(q.detach().numpy(), dq.detach().numpy(),
+                                                  with_derivatives=False)
+            packed, twists = torch.from_numpy(poses), torch.from_numpy(rates)
+        # END LOCAL velocities and the following reference-frame rotation are unchanged.
         poses = {frame: (packed[..., index, :3], packed[..., index, 3:])
                  for index, frame in enumerate(self.frames)}
         velocities = {frame: (quaternion_rotate(packed[..., index, 3:], twists[..., index, :3]),
@@ -137,50 +151,68 @@ class PinKinematics:
                       for index, frame in enumerate(self.frames)}
         return poses, velocities
 
-    def _evaluate(self, position, velocity=None):
-        """Evaluate library FK and first derivatives at each admitted sample."""
+    def _evaluate(self, position, velocity=None, *, with_derivatives=True):
+        """Evaluate library FK, computing first derivatives only on demand."""
         leading = position.shape[:-1]
         count, joints, frames = int(np.prod(leading)), len(self.joint_names), len(self.frames)
         values = position.reshape(count, joints)
         rates = None if velocity is None else velocity.reshape(count, joints)
         poses = np.empty((count, frames, 7))
-        jacobian = np.empty((count, frames, 6, joints))
+        # BEGIN derivative buffers exist only for a differentiable caller.
+        jacobian = np.empty((count, frames, 6, joints)) if with_derivatives else None
         if rates is not None:
             twists = np.empty((count, frames, 6))
-            velocity_position = np.empty_like(jacobian)
-            velocity_velocity = np.empty_like(jacobian)
+            velocity_position = np.empty_like(jacobian) if with_derivatives else None
+            velocity_velocity = np.empty_like(jacobian) if with_derivatives else None
+        # END poses and requested twists always retain the same sample layout.
         data = self.model.createData()
         q, dq = np.empty(self.model.nq), np.empty(self.model.nv)
         for sample in range(count):
             q[self._q_columns] = values[sample]
             if rates is None:
-                pin.computeJointJacobians(self.model, data, q)
+                # BEGIN FK alone supplies every value consumed by pure pose queries.
+                if with_derivatives:
+                    pin.computeJointJacobians(self.model, data, q)
+                else:
+                    pin.forwardKinematics(self.model, data, q)
+                # END Jacobian work remains in the differentiable branch.
             else:
                 dq[self._v_columns] = rates[sample]
-                pin.computeForwardKinematicsDerivatives(self.model, data, q, dq, np.zeros(self.model.nv))
+                # BEGIN velocity FK and velocity derivatives have distinct consumers.
+                if with_derivatives:
+                    pin.computeForwardKinematicsDerivatives(self.model, data, q, dq, np.zeros(self.model.nv))
+                else:
+                    pin.forwardKinematics(self.model, data, q, dq)
+                # END no_grad does not implicitly skip a manually requested Pin derivative.
             pin.updateFramePlacements(self.model, data)
             for index, frame in enumerate(self._frame_ids):
                 placement = data.oMf[frame]
                 rotation = self._rotation@placement.rotation
                 poses[sample, index, :3] = self._rotation@placement.translation+self._translation
                 poses[sample, index, 3:] = pin.Quaternion(rotation).coeffs()[[3, 0, 1, 2]]
-                if rates is None:
-                    geometric = pin.getFrameJacobian(self.model, data, frame, pin.LOCAL_WORLD_ALIGNED)
-                else:
-                    derivative_q, derivative_v = pin.getFrameVelocityDerivatives(
-                        self.model, data, frame, pin.LOCAL)
+                # BEGIN always read the same LOCAL frame-origin velocity values.
+                if rates is not None:
                     motion = pin.getFrameVelocity(self.model, data, frame, pin.LOCAL)
                     twists[sample, index, :3] = motion.linear
                     twists[sample, index, 3:] = motion.angular
+                if not with_derivatives:
+                    continue
+                if rates is not None:
+                    derivative_q, derivative_v = pin.getFrameVelocityDerivatives(
+                        self.model, data, frame, pin.LOCAL)
                     velocity_position[sample, index] = derivative_q[:, self._v_columns]
                     velocity_velocity[sample, index] = derivative_v[:, self._v_columns]
-                    geometric = pin.getFrameJacobian(self.model, data, frame, pin.LOCAL_WORLD_ALIGNED)
+                geometric = pin.getFrameJacobian(self.model, data, frame, pin.LOCAL_WORLD_ALIGNED)
                 jacobian[sample, index, :3] = self._rotation@geometric[:3, self._v_columns]
                 jacobian[sample, index, 3:] = self._rotation@geometric[3:, self._v_columns]
-        result = poses.reshape(*leading, frames, 7), jacobian.reshape(*leading, frames, 6, joints)
+                # END only backward consumers require these analytic arrays.
+        # BEGIN preserve one result layout with absent, rather than computed, derivatives.
+        result = poses.reshape(*leading, frames, 7), (None if jacobian is None else
+                                                     jacobian.reshape(*leading, frames, 6, joints))
         if rates is not None:
             return (*result, twists.reshape(*leading, frames, 6),
-                    velocity_position.reshape(*leading, frames, 6, joints),
-                    velocity_velocity.reshape(*leading, frames, 6, joints))
+                    None if velocity_position is None else velocity_position.reshape(*leading, frames, 6, joints),
+                    None if velocity_velocity is None else velocity_velocity.reshape(*leading, frames, 6, joints))
         return result
+        # END poses, LOCAL twists and calibration keep their original numerical definitions.
 # END ordinary Torch composition handles fixed TCP offsets after robot FK.

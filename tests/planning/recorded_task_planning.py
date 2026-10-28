@@ -15,6 +15,7 @@ import time
 import traceback
 
 import numpy as np
+from manipulation.evidence_archive import externalize_evidence, referenced_evidence_bytes
 
 MAX_CURVE_METADATA_BYTES = 512 * 1024**2
 # END writers cannot emit metadata that the matching reader will refuse by size.
@@ -44,8 +45,8 @@ def _diagnostic_value(value):
     return value
 
 
-def _write_diagnostic_json(path, document):
-    """Replace a complete JSON document; a failed write keeps the last one."""
+def _write_json_value(path, document):
+    """Replace one complete value document using the existing numeric rules."""
     path = Path(path)
     rendered = json.dumps(_diagnostic_value(document), default=_json_value,
                           indent=2, allow_nan=False)+"\n"
@@ -58,6 +59,14 @@ def _write_diagnostic_json(path, document):
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+# BEGIN immutable completed evidence is archived once per result directory.
+def _write_diagnostic_json(path, document):
+    """Write a report and relative references to its full shared evidence."""
+    path = Path(path)
+    _write_json_value(path, externalize_evidence(document, path.parent, write_record=_write_json_value))
+# END every referenced file contains the complete original record.
 
 
 def save_curve(path, curve, *, classification, execution_limits, fk=None, validation_status="completed",
@@ -80,7 +89,9 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
         limits = ExecutionLimits.from_mapping(execution_limits)
         binding = check_result(planning_result, execution_limits=limits)
         binding["execution_limits"] = limits.describe()
-        planning_result.execution_binding = deepcopy(binding)
+        # BEGIN check_result already returns an owned mutable binding header.
+        planning_result.execution_binding = binding
+        # END immutable completed evidence remains shared with its diagnostics.
     elif planning_result is not None:
         raise ValueError("Diagnostic archives cannot carry executable result authorization")
     # END rejected curves remain diagnostic data only.
@@ -101,22 +112,28 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
     derivative_metadata = {}
     if joint_limits is not None:
         from manipulation.planning import cubic_derivative_report
+        # BEGIN reuse only the exact curve and limits checked by this binding.
+        full = (binding["validation"]["export"]["cubic_derivatives"]
+            if binding is not None and joint_limits == binding.get("verification_joint_limits")
+            else cubic_derivative_report(curve, joint_limits["acceleration"],
+                                         joint_names=joint_limits["joint_names"]))
+        prefix = (full if curve.executable_until == curve.duration else
+            cubic_derivative_report(curve, joint_limits["acceleration"],
+                joint_names=joint_limits["joint_names"], until=curve.executable_until))
+        # END a genuinely different interval still needs its own extrema.
         derivative_metadata = {
             "verification_joint_limits": joint_limits,
             "cubic_derivatives": {
-                "full_curve": cubic_derivative_report(
-                    curve, joint_limits["acceleration"], joint_names=joint_limits["joint_names"]),
-                "executable_prefix": cubic_derivative_report(
-                    curve, joint_limits["acceleration"], joint_names=joint_limits["joint_names"],
-                    until=curve.executable_until),
+                "full_curve": full,
+                "executable_prefix": prefix,
             },
         }
     # END full/prefix diagnostics do not relabel or resample the saved curve.
     # BEGIN admit the complete metadata before creating either archive file.
     # ensure_ascii makes the character count the exact UTF-8 byte count without
     # allocating a second encoded copy of this potentially large document.
-    rendered = json.dumps(
-        {"classification": classification, "validation_status": validation_status,
+    # BEGIN the curve metadata names the same complete evidence files as its report.
+    metadata = {"classification": classification, "validation_status": validation_status,
          # BEGIN source names the candidate that owns this archive's polynomial.
          "source": source,
          # END qualification remains in the independent execution binding.
@@ -128,10 +145,15 @@ def save_curve(path, curve, *, classification, execution_limits, fk=None, valida
          "conditions": curve.conditions, "residuals": curve.residuals,
          "duration_seconds": curve.duration,
          "executable_until_seconds": curve.executable_until,
-         "next_verification": curve.next_verification, **derivative_metadata},
+         "next_verification": curve.next_verification, **derivative_metadata}
+    metadata = externalize_evidence(metadata, path.parent, write_record=_write_json_value)
+    rendered = json.dumps(metadata,
         default=_json_value, indent=2, allow_nan=False, ensure_ascii=True)+"\n"
-    if len(rendered) > MAX_CURVE_METADATA_BYTES:
+    # END numerical arrays and acceptance data remain unchanged by file sharing.
+    # BEGIN the original archive bound includes each unique complete side record.
+    if len(rendered) + referenced_evidence_bytes(metadata, path.parent) > MAX_CURVE_METADATA_BYTES:
         raise ValueError("Trajectory metadata exceeds the bounded 512 MiB archive size")
+    # END sharing avoids duplicate storage, not accounting for retained data.
     np.savez_compressed(path, **arrays)
     path.with_suffix(".json").write_text(rendered, encoding="utf-8")
     # END every geometry and validation field is retained without truncation.

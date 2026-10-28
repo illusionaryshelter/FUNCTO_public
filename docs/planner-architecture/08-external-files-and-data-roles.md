@@ -92,7 +92,7 @@
 
 ## 5. 输出、执行与评价
 
-`recorded_task_planning.save_curve` 生成 `trajectory.npz` 与同名 JSON。NPZ 保存关节名称、时间、位置、速度和进度等数组；JSON 保存分类、执行绑定、问题和场景、事件、验收与设备限制。`load_saved_trajectory` 读取二者恢复正式执行输入。`diagnostic-trajectory.*` 保存拒绝候选的诊断数据，其执行资格与正式曲线不同。
+`recorded_task_planning.save_curve` 生成 `trajectory.npz` 与同名 JSON。NPZ 保存关节名称、时间、位置、速度和进度等数组；JSON 保存分类、执行绑定、问题和场景、事件、验收与设备限制。只读完成证据保存到一份 `evidence/<record_id>.json`，同候选的多个报告位置以及后续执行归档通过本地相对 `$ref` 引用该文件。`read_evidence_json` 解析完整记录，`load_saved_trajectory` 再结合原数组恢复正式执行输入。`diagnostic-trajectory.*` 保存拒绝候选的诊断数据，其执行资格与正式曲线不同。具体格式和所有权见[完成证据与归档](09-completed-evidence-and-archives.md)。
 
 `planning-report.json`、场景快照 NPZ、自过滤与分区文件记录计算结果。场景绑定中的 owner query 保存用于复现的几何及坐标；某文件以后被显式加载时，它同时成为该后续阶段的输入。来源路径和实际文件读取须分别说明。
 

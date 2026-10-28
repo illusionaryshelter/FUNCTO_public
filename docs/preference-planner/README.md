@@ -38,6 +38,8 @@ result = plan_trajectory(bound, scene, robot, robot_validator=validator, budget=
 
 `PlanningResult` 保存正式曲线、验收、执行绑定和累计账本。`diagnostics['preference_planner']` 保存独立 CPU 计算记录，字段为 `joint_problem` 和 `objective_trials`；文件写入由调用者负责。拒绝候选、未完成的优化试探、非有限数值和失败类型均保留各自含义。执行使用同一已绑定曲线和手指时钟；预测目标位姿误差用于事后评价。
 
+完成的区间几何证据采用递归只读记录，在同候选诊断和正式绑定之间共享；可变报告、曲线和输入快照保持各自所有权。JSON 归档保存一份完整证据文件，各报告通过相对引用连接，完整读取接口恢复同一记录。纯前向评分和验收调用 Pinocchio FK 与速度计算，需要梯度的求解调用原解析导数。相关共享组件见[完成证据与归档](../planner-architecture/09-completed-evidence-and-archives.md)与[运动学 API](../planner-architecture/api/pin_kinematics.md)。
+
 ## 组件文档
 
 - [后端与联合计算](backend.md)：资源所有权、公共调用、系数投影、共同评分和候选证据。

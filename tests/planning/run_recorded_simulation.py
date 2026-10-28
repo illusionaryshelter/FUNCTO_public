@@ -30,6 +30,7 @@ sys.path.insert(0, str(WORKSPACE_ROOT))
 # BEGIN production execution owns control; this adapter owns recording setup.
 from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor, _feedback_json
 from manipulation.execution_binding import rebind_execution_result
+from manipulation.evidence_archive import write_evidence_json
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
 from recorded_task_planning import save_curve
 from robot_validation_fixture import build_robot_validator
@@ -156,7 +157,7 @@ class _TrialVideos:
 
 # BEGIN one skill may borrow an already running physical session without reset.
 def run(args, *, simulation=None, initial_feedback=None,
-        observation_callback=None, step_callback=None, on_simulation_ready=None):
+        observation_callback=None, step_callback=None, on_simulation_ready=None, planning_result=None):
     """Execute one skill from a recorded entrance or an explicit live handoff.
 
     The native physics evaluator remains independent and never authorizes a
@@ -179,6 +180,10 @@ def run(args, *, simulation=None, initial_feedback=None,
     ``args.feedback`` then identifies the caller's saved handoff artifact and
     is not decoded as a recorded entrance. The caller owns the borrowed
     backend and its cameras. This function never restores or closes them.
+
+    ``planning_result`` supplies an already returned or loaded formal result.
+    With no in-memory result the archive loader supplies it. Both inputs enter
+    the same device rebinding and actual entrance checks before execution.
 
     ``on_simulation_ready(simulation, restore_report)`` may retain a newly
     restored backend for later skills. It runs once after the recorded
@@ -333,13 +338,16 @@ def run(args, *, simulation=None, initial_feedback=None,
         if Path(fixture["episode_path"]).resolve() != recording/"episode.h5":
             raise ValueError("Simulator fixture and input manifest refer to different source episodes")
         # BEGIN restore and execute the same formal result, without label gates.
-        planning_result = load_saved_trajectory(args.trajectory)
+        # BEGIN an in-memory handoff reuses the caller's completed formal result.
+        if planning_result is None:
+            planning_result = load_saved_trajectory(args.trajectory)
+        # END rebinding below validates this exact candidate in either input mode.
         curve = planning_result.trajectory
         # END the loader checks exact candidate, clock and physical policy.
         # BEGIN use the same archive already checked by the formal loader.
         # Ordinary inputs keep their 16 MiB bound; the complete scene archive
         # owns its separate admission limit and is not read or decoded twice.
-        report["trajectory_classification"] = planning_result.diagnostics["archive_classification"]
+        # Classification is published after the common formal rebinding check.
         # END reporting cannot observe a different second copy of the archive.
         if {event["skill_id"] for event in curve.events} != {args.segment}:
             raise ValueError("The exported candidate must contain only the selected skill instance")
@@ -376,6 +384,9 @@ def run(args, *, simulation=None, initial_feedback=None,
             source={"kind": "explicit_recorded_trial_execution_contract",
                 "source_trajectory": str(args.trajectory.resolve()),
                 "source_candidate_id": source_candidate})
+        # BEGIN both file and memory inputs have completed the same binding check.
+        report["trajectory_classification"] = "planner_accepted"
+        # END this label is a report of the completed check, not its input.
         rebound_path = output/"rebound-planning"/"trajectory.npz"
         rebound_path.parent.mkdir()
         save_curve(rebound_path, planning_result.trajectory, classification="planner_accepted",
@@ -663,7 +674,9 @@ def run(args, *, simulation=None, initial_feedback=None,
                       peak_rss_mib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024)
         # BEGIN even the final summary write must preserve a prior execution error.
         try:
-            (output/"simulation-report.json").write_text(json.dumps(_feedback_json(report), indent=2, allow_nan=False)+"\n")
+            # BEGIN this summary references its existing immutable numerical evidence.
+            write_evidence_json(output/"simulation-report.json", report, convert=_feedback_json)
+            # END the independent simulation verdict and error path are unchanged.
         except Exception as error:
             caught = caught or error
         # END all evidence sinks above have already had their cleanup opportunity.

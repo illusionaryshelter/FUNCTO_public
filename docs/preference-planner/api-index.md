@@ -10,103 +10,109 @@
 
 Compute complete suffix position/rate extrema of the saved polynomial.
 
-[定义](../../manipulation/preference_planner/backend.py#L37)。直接调用：`PPoly`, `derivative.roots`, `dict`, `enumerate`, `float`, `int`, `np.abs`, `np.argmax`, `np.isfinite`, `np.unique`, `position`, `position.derivative`, `velocity`, `velocity.derivative`。
+[定义](../../manipulation/preference_planner/backend.py#L38)。直接调用：`PPoly`, `derivative.roots`, `dict`, `enumerate`, `float`, `int`, `np.abs`, `np.argmax`, `np.isfinite`, `np.unique`, `position`, `position.derivative`, `velocity`, `velocity.derivative`。
 
 ### `PreferencePlanner.__init__(self, *args, incoming_terminal_contract=None, **kwargs)`
 
 内部计算辅助；输入输出见对应组件的调用定义。
 
-[定义](../../manipulation/preference_planner/backend.py#L78)。直接调用：`kwargs.get`, `super`, `super().__init__`。
+[定义](../../manipulation/preference_planner/backend.py#L79)。直接调用：`kwargs.get`, `super`, `super().__init__`。
 
 ### `PreferencePlanner.rebind(self, problem, scene, budget, *, continuation=None, goal_identities=None)`
 
 Reset request-local computations through the original rebinding API.
 
-[定义](../../manipulation/preference_planner/backend.py#L83)。直接调用：`super`, `super().rebind`。
+[定义](../../manipulation/preference_planner/backend.py#L84)。直接调用：`super`, `super().rebind`。
 
 ### `PreferencePlanner._bind_computation(self, extra_parameters=())`
 
 Bind one original full calculation and its explicit reduced problem.
 
-[定义](../../manipulation/preference_planner/backend.py#L89)。直接调用：`GeometryConstraints`, `JointComputation`, `TerminalHold.from_clock`, `dict`, `enumerate`, `pose_objective`, `super`, `super()._bind_computation`, `terminal_clock`。
+[定义](../../manipulation/preference_planner/backend.py#L90)。直接调用：`GeometryConstraints`, `JointComputation`, `TerminalHold.from_clock`, `dict`, `enumerate`, `pose_objective`, `super`, `super()._bind_computation`, `terminal_clock`。
 
 ### `PreferencePlanner._controls_curve(self, actions)`
 
 Keep the full coefficients associated with this exact exported curve.
 
-[定义](../../manipulation/preference_planner/backend.py#L112)。直接调用：`actions.detach`, `actions.detach().cpu`, `actions.detach().cpu().numpy`, `actions.detach().cpu().numpy().copy`, `isinstance`, `np.asarray`, `np.asarray(actions, float).copy`, `super`, `super()._controls_curve`。
+[定义](../../manipulation/preference_planner/backend.py#L113)。直接调用：`actions.detach`, `actions.detach().cpu`, `actions.detach().cpu().numpy`, `actions.detach().cpu().numpy().copy`, `isinstance`, `np.asarray`, `np.asarray(actions, float).copy`, `super`, `super()._controls_curve`。
 
 ### `PreferencePlanner.reference_seeds(self, joint_reference=None)`
 
 Project the original numerical initializer into the declared subspace.
 
-[定义](../../manipulation/preference_planner/backend.py#L120)。直接调用：`float`, `np.abs`, `np.max`, `original[0].tolist`, `projected[0].tolist`, `seeds.detach`, `seeds.detach().cpu`, `seeds.detach().cpu().numpy`, `self._controls_curve`, `self.terminal.expand`, `self.terminal.reduce`, `self.torch.as_tensor`, `super`, `super().reference_seeds`。
+[定义](../../manipulation/preference_planner/backend.py#L121)。直接调用：`float`, `np.abs`, `np.max`, `original[0].tolist`, `projected[0].tolist`, `seeds.detach`, `seeds.detach().cpu`, `seeds.detach().cpu().numpy`, `self._controls_curve`, `self.terminal.expand`, `self.terminal.reduce`, `self.torch.as_tensor`, `super`, `super().reference_seeds`。
 
 ### `PreferencePlanner._candidate_metrics(self, trajectory, candidate_scene, *, record_work)`
 
 Consume the same completed entity evidence for necessary-row updates.
 
-[定义](../../manipulation/preference_planner/backend.py#L136)。直接调用：`self.geometry_constraints.add_evidence`, `super`, `super()._candidate_metrics`。
+[定义](../../manipulation/preference_planner/backend.py#L137)。直接调用：`self.geometry_constraints.add_evidence`, `super`, `super()._candidate_metrics`。
 
 ### `PreferencePlanner._candidate_domain_validation(self, trajectory)`
 
 Qualify terminal motion on the same saved curve, including initializers.
 
-[定义](../../manipulation/preference_planner/backend.py#L146)。直接调用：`_ProgressMap`, `_hold_polynomial_report`, `_phase_aligned_parameters`, `float`, `max`, `np.array_equal`, `np.asarray`, `super`, `super()._candidate_domain_validation`, `trajectory.residuals.update`。
+[定义](../../manipulation/preference_planner/backend.py#L147)。直接调用：`_ProgressMap`, `_hold_polynomial_report`, `_phase_aligned_parameters`, `float`, `max`, `np.array_equal`, `np.asarray`, `super`, `super()._candidate_domain_validation`, `trajectory.residuals.update`。
 
 ### `PreferencePlanner._candidate_objective(self, trajectory, candidate_scene)`
 
 Score the saved curve with the solver's fixed physical computation.
 
-[定义](../../manipulation/preference_planner/backend.py#L169)。直接调用：`_ProgressMap`, `_phase_aligned_parameters`, `components.values`, `dict`, `float`, `np.array_equal`, `self._candidate_robot_state`, `self.computation.progress.numpy`, `self.computation.times.numpy`, `sum`, `tensors.items`, `torch.as_tensor`, `torch.no_grad`, `trajectory_objective_components`。
+[定义](../../manipulation/preference_planner/backend.py#L170)。直接调用：`_ProgressMap`, `_phase_aligned_parameters`, `components.values`, `dict`, `float`, `np.array_equal`, `self._candidate_robot_state`, `self.computation.progress.numpy`, `self.computation.times.numpy`, `sum`, `tensors.items`, `torch.as_tensor`, `torch.no_grad`, `trajectory_objective_components`。
 
 ### `PreferencePlanner._candidate_geometry(self, trajectory, candidate_scene, *, initial_states, remaining_points, record_work)`
 
 Reuse bounded interval queries and collect their necessary witnesses.
 
-[定义](../../manipulation/preference_planner/backend.py#L211)。直接调用：`batches.append`, `candidate_scene.clone_for_rollout`, `evaluate`, `self.geometry_constraints.add_evidence`, `super`, `super()._candidate_geometry`, `tuple`。
+[定义](../../manipulation/preference_planner/backend.py#L212)。直接调用：`candidate_scene.clone_for_rollout`, `self.geometry_constraints.add_evidence`, `super`, `super()._candidate_geometry`。
+
+### `PreferencePlanner._candidate_geometry.collect(*args, geometry_evidence_out, **kwargs)`
+
+内部计算辅助；输入输出见对应组件的调用定义。
+
+[定义](../../manipulation/preference_planner/backend.py#L233)。直接调用：`batches.append`, `evaluate`, `tuple`。
 
 ### `PreferencePlanner.evaluate_candidate(self, trajectory, *, record_work, candidate_scene=None, objective=None)`
 
 Keep original task/domain qualification and capture its row discoveries.
 
-[定义](../../manipulation/preference_planner/backend.py#L248)。直接调用：`deepcopy`, `dict`, `self._current_full_controls.tolist`, `self.candidate_history.append`, `super`, `super().evaluate_candidate`。
+[定义](../../manipulation/preference_planner/backend.py#L249)。直接调用：`completed_evidence`, `deepcopy`, `dict`, `self._current_full_controls.tolist`, `self.candidate_history.append`, `super`, `super().evaluate_candidate`。
 
 ### `PreferencePlanner.optimize(self, seed, *, iterations=None)`
 
 Solve reduced variables and exchange entity witnesses within the ledger.
 
-[定义](../../manipulation/preference_planner/backend.py#L273)。直接调用：`ConstrainedSolution`, `_planning_workspace_bytes`, `deepcopy`, `dict`, `enumerate`, `geometry_workspace.values`, `len`, `next`, `np.asarray`, `np.asarray(full).copy`, `np.isfinite`, `np.isfinite(snapshot['controls']).all`, `row.detach`, `row.detach().cpu`, `row.detach().cpu().numpy`, `runtime.get`, `runtime.update`, `self._controls_curve`, `self._expand_snapshots`, `self.check_request`, `self.geometry_constraints.workspace_bytes`, `self.last_optimizer_diagnostics.append`, `self.last_optimizer_runtime.append`, `self.request_work_baseline.get`, `self.seed_strategies.append`, `self.solve_history.append`, `self.terminal.expand`, `self.terminal.reduce`, `solve_trajectory`, `str`, `sum`, `tuple`, `type`。
+[定义](../../manipulation/preference_planner/backend.py#L284)。直接调用：`ConstrainedSolution`, `_planning_workspace_bytes`, `deepcopy`, `dict`, `enumerate`, `geometry_workspace.values`, `len`, `next`, `np.asarray`, `np.asarray(full).copy`, `np.isfinite`, `np.isfinite(snapshot['controls']).all`, `row.detach`, `row.detach().cpu`, `row.detach().cpu().numpy`, `runtime.get`, `runtime.update`, `self._controls_curve`, `self._expand_snapshots`, `self.check_request`, `self.geometry_constraints.workspace_bytes`, `self.last_optimizer_diagnostics.append`, `self.last_optimizer_runtime.append`, `self.request_work_baseline.get`, `self.seed_strategies.append`, `self.solve_history.append`, `self.terminal.expand`, `self.terminal.reduce`, `solve_trajectory`, `str`, `sum`, `tuple`, `type`。
 
 ### `PreferencePlanner._expand_snapshots(self, runtime)`
 
 Convert diagnostic coordinates once before original curve export.
 
-[定义](../../manipulation/preference_planner/backend.py#L360)。直接调用：`np.asarray`, `runtime.get`, `self.terminal.expand`, `self.terminal.expand(reduced).tolist`。
+[定义](../../manipulation/preference_planner/backend.py#L371)。直接调用：`np.asarray`, `runtime.get`, `self.terminal.expand`, `self.terminal.expand(reduced).tolist`。
 
 ### `PreferencePlanner.diagnostic_snapshot(self)`
 
 Return owned CPU evidence for this request, after its planning verdict.
 
-[定义](../../manipulation/preference_planner/backend.py#L371)。直接调用：`deepcopy`, `dict`, `self.geometry_constraints.describe`。
+[定义](../../manipulation/preference_planner/backend.py#L382)。直接调用：`deepcopy`, `dict`, `self.geometry_constraints.describe`。
 
 ### `PreferenceMotionBackend.__init__(self, robot, *, robot_validator, budget=None, incoming_terminal_contract=None, device='cuda:0')`
 
 内部计算辅助；输入输出见对应组件的调用定义。
 
-[定义](../../manipulation/preference_planner/backend.py#L390)。直接调用：`super`, `super().__init__`。
+[定义](../../manipulation/preference_planner/backend.py#L401)。直接调用：`super`, `super().__init__`。
 
 ### `PreferenceMotionBackend.bind_request(self, problem, scene, *, budget, continuation=None, goal_identities=None)`
 
 Retain original ownership/capacity rules and choose the local class.
 
-[定义](../../manipulation/preference_planner/backend.py#L395)。直接调用：`MotionPlanningError`, `PreferencePlanner`, `get_ident`, `getattr`, `self._planner.rebind`。
+[定义](../../manipulation/preference_planner/backend.py#L406)。直接调用：`MotionPlanningError`, `PreferencePlanner`, `get_ident`, `getattr`, `self._planner.rebind`。
 
 ### `PreferenceMotionBackend.plan(self, problem, scene, *, continuation=None, request_ledger=None, rebind=None, cancelled=None, deadline=None, joint_reference=None)`
 
 Call this planner's lifecycle while retaining resident native models.
 
-[定义](../../manipulation/preference_planner/backend.py#L415)。直接调用：`plan_trajectory`。
+[定义](../../manipulation/preference_planner/backend.py#L426)。直接调用：`plan_trajectory`。
 
 ## lifecycle.py
 

@@ -1,11 +1,11 @@
 # `tests/planning/recorded_task_planning.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`本轮实现提交待回填`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_json_value`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L23)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L24)。
 
 输入签名：
 
@@ -46,7 +46,7 @@ type
 
 ## `_diagnostic_value`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L32)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L33)。
 
 输入签名：
 
@@ -100,19 +100,19 @@ np.isfinite
 np.isnan
 ```
 
-## `_write_diagnostic_json`
+## `_write_json_value`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L47)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L48)。
 
 输入签名：
 
 ```python
-def _write_diagnostic_json(path, document):
+def _write_json_value(path, document):
 ```
 
 实现说明：
 
-> Replace a complete JSON document; a failed write keeps the last one.
+> Replace one complete value document using the existing numeric rules.
 
 显式输出分支：
 
@@ -149,9 +149,47 @@ temporary.replace
 temporary.unlink
 ```
 
+## `_write_diagnostic_json`
+
+[定义位置](../../../tests/planning/recorded_task_planning.py#L65)。
+
+输入签名：
+
+```python
+def _write_diagnostic_json(path, document):
+```
+
+实现说明：
+
+> Write a report and relative references to its full shared evidence.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+path.parent
+```
+
+写入目标：
+
+```python
+path
+```
+
+直接调用符号：
+
+```python
+Path
+_write_json_value
+externalize_evidence
+```
+
 ## `save_curve`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L63)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L72)。
 
 输入签名：
 
@@ -192,15 +230,17 @@ fingers.joint_names
 fingers.times
 fingers.position
 fingers.velocity
+binding.get
 curve.executable_until
-json.dumps
+curve.duration
 fingers.describe
 curve.satisfied_dependencies
 curve.events
 curve.conditions
 curve.residuals
-curve.duration
 curve.next_verification
+path.parent
+json.dumps
 np.savez_compressed
 path.with_suffix('.json').write_text
 path.with_suffix
@@ -216,6 +256,9 @@ planning_result.execution_binding
 arrays
 fingers
 derivative_metadata
+full
+prefix
+metadata
 rendered
 ```
 
@@ -226,14 +269,16 @@ ValueError
 ExecutionLimits.from_mapping
 check_result
 limits.describe
-deepcopy
 dict
 np.asarray
 arrays.update
+binding.get
 cubic_derivative_report
-json.dumps
+deepcopy
 fingers.describe
 list
+externalize_evidence
+json.dumps
 len
 np.savez_compressed
 path.with_suffix('.json').write_text
@@ -242,7 +287,7 @@ path.with_suffix
 
 ## `plan_and_record`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L140)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L160)。
 
 输入签名：
 

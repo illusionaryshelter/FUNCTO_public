@@ -26,6 +26,7 @@
 | [API 契约](docs/planner-architecture/06-api-contracts.md) | 各接口的必要输入、输出及实际消费者 |
 | [实现索引](docs/planner-architecture/07-implementation-index.md) | 当前源码定义、精确签名、读取属性及直接调用 |
 | [文件语义](docs/planner-architecture/08-external-files-and-data-roles.md) | 技能、观测、模型、控制和评价文件的职责 |
+| [完成证据与归档](docs/planner-architecture/09-completed-evidence-and-archives.md) | 已完成区间记录的只读共享、正式转换、单份 JSON 证据与完整读取 |
 
 ```mermaid
 flowchart TD

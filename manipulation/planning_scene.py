@@ -74,6 +74,9 @@ class ObservedSpace:
         self.reference_frame = _text(reference_frame, "observation reference frame")
         self._known = mask.copy()
         self._known.flags.writeable = False
+        # BEGIN fixed observed-free samples share their completed archive bytes.
+        self._known_record = None
+        # END coordinate headers and observation IDs remain ordinary input values.
 
     @property
     def known_free(self):
@@ -84,6 +87,17 @@ class ObservedSpace:
     def clone_for_rollout(self):
         """Return the fixed evidence shared by all candidate trajectories."""
         return self
+
+    # BEGIN bind immutable measured-free samples without copying/reencoding the grid.
+    def record(self):
+        """Return the complete original coverage record with shared array bytes."""
+        from .collision_records import encode_array
+        from .completed_evidence import completed_evidence
+        if self._known_record is None:
+            self._known_record = completed_evidence(encode_array(self._known))
+        return {"known_free": self._known_record, "origin": self.origin.tolist(),
+                "voxel_size": self.voxel_size, "observation_ids": list(self.observation_ids)}
+    # END the grid's geometric meaning and each mutable header retain their original values.
 
 
 @dataclass

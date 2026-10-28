@@ -374,7 +374,10 @@ def run_prepared(args, *, problem, provenance):
         execution_limits = ExecutionLimits.from_mapping(json.loads(args.execution_limits.read_text()))
         report["execution_limits_path"] = str(args.execution_limits.resolve())
         # BEGIN retain prior fixed targets and the last actually applied protection interval.
-        continuation = None if args.continuation is None else json.loads(args.continuation.read_text())
+        # BEGIN resolve the complete evidence referenced by an execution continuation.
+        from manipulation.evidence_archive import read_evidence_json
+        continuation = None if args.continuation is None else read_evidence_json(args.continuation)
+        # END request history retains all original values before continuation validation.
         rebind = None if args.rebind is None else json.loads(args.rebind.read_text())
         request_ledger = None if args.request_ledger is None else json.loads(args.request_ledger.read_text())
         if args.request_ledger is not None and not isinstance(request_ledger, dict):

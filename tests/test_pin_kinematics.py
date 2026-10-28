@@ -85,6 +85,34 @@ def test_poses_and_full_states_have_correct_analytic_gradients(robot):
                                     (q, dq), eps=1e-6, atol=2e-8, rtol=2e-6, check_batched_grad=True)
 
 
+# BEGIN forward-only evaluation must preserve exact values without derivative work.
+@pytest.mark.parametrize("enabled_requires_grad", [False, True])
+def test_forward_queries_preserve_values_and_skip_unused_derivatives(robot, monkeypatch, enabled_requires_grad):
+    import manipulation.pin_kinematics as module
+    _, bridge, _ = robot
+    names, q, dq = sample()
+    q.requires_grad_()
+    dq.requires_grad_()
+    expected_poses = packed(bridge.poses(q, names)).detach()
+    expected_states = packed(*bridge.states(q, dq, names)).detach()
+
+    def unused(*args, **kwargs):
+        raise AssertionError("Forward-only query constructed an unused derivative")
+
+    for name in ("computeJointJacobians", "computeForwardKinematicsDerivatives",
+                 "getFrameJacobian", "getFrameVelocityDerivatives"):
+        monkeypatch.setattr(module.pin, name, unused)
+    if enabled_requires_grad:
+        with torch.no_grad():
+            actual_poses, actual_states = packed(bridge.poses(q, names)), packed(*bridge.states(q, dq, names))
+    else:
+        actual_poses = packed(bridge.poses(q.detach(), names))
+        actual_states = packed(*bridge.states(q.detach(), dq.detach(), names))
+    torch.testing.assert_close(actual_poses, expected_poses, rtol=0, atol=0)
+    torch.testing.assert_close(actual_states, expected_states, rtol=0, atol=0)
+# END calibrated poses and nonzero LOCAL velocities use the original numerical values.
+
+
 def test_world_twists_match_time_derivatives_of_poses(robot):
     _, bridge, _ = robot
     names, q, dq = sample()

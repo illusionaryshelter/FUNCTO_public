@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from .collision_records import encode_array, decode_array, MAX_ARRAY_BYTES
+from .completed_evidence import completed_evidence
 from .implicit_distance import ObservedField
 from .resource_admission import (
     DEFAULT_MAX_HOST_RSS_BYTES, DEFAULT_MAX_DEVICE_USED_BYTES, require_host_memory,
@@ -35,6 +36,9 @@ class FrozenObservedField(ObservedField):
         self.name, self.source = str(name), str(source)
         self.owner_ids = frozenset((self.name,))
         self.storage_nbytes += self.weights.nbytes
+        # BEGIN immutable observation arrays own one reusable encoded record.
+        self._array_records = None
+        # END candidate poses and mutable binding metadata remain separate.
 
     def clone_for_rollout(self):
         """A rollout changes rigid poses while sharing immutable observations."""
@@ -42,10 +46,17 @@ class FrozenObservedField(ObservedField):
 
     def record(self):
         """Store the samples defining the set; indexes are reconstructed."""
+        # BEGIN encode the fixed TSDF/support/weight samples once per field.
+        # These arrays are owned and read-only after construction. A rollout
+        # changes the field pose, never these samples, so every binding may
+        # share their complete immutable byte records without another encode.
+        if self._array_records is None:
+            self._array_records = {name: completed_evidence(encode_array(getattr(self, name)))
+                                   for name in ("values", "observed", "weights")}
+        # END each call still returns independently mutable coordinate metadata.
         return {
             "kind": "observed_trilinear_field_v1", "name": self.name, "source": self.source,
-            "values": encode_array(self.values), "observed": encode_array(self.observed),
-            "weights": encode_array(self.weights), "origin": self.origin.tolist(),
+            **self._array_records, "origin": self.origin.tolist(),
             "voxel_size": self.voxel_size,
         }
 
