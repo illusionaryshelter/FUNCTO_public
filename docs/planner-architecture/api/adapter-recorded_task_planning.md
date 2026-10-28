@@ -1,6 +1,6 @@
 # `tests/planning/recorded_task_planning.py` 实现契约
 
-代码基线：`本轮实现提交待回填`。
+代码基线：`c289890`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_json_value`
@@ -280,6 +280,7 @@ list
 externalize_evidence
 json.dumps
 len
+referenced_evidence_bytes
 np.savez_compressed
 path.with_suffix('.json').write_text
 path.with_suffix
@@ -287,7 +288,7 @@ path.with_suffix
 
 ## `plan_and_record`
 
-[定义位置](../../../tests/planning/recorded_task_planning.py#L160)。
+[定义位置](../../../tests/planning/recorded_task_planning.py#L162)。
 
 输入签名：
 

@@ -1,6 +1,6 @@
 # `manipulation/observed_mapping.py` 实现契约
 
-代码基线：`本轮实现提交待回填`。
+代码基线：`c289890`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `FrozenObservedField`

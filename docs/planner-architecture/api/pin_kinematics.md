@@ -1,6 +1,6 @@
 # `manipulation/pin_kinematics.py` 实现契约
 
-代码基线：`本轮实现提交待回填`。
+代码基线：`c289890`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_pose_vjp`

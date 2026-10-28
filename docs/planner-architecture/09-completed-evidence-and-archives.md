@@ -1,6 +1,6 @@
 # 完成证据的所有权与归档
 
-本组件对应本轮实现提交，代码编号在实现提交后回填。修改前代码基线为 `4dbaef7`。本文说明 `completed_evidence.py`、`evidence_archive.py` 及其规划、记录和执行消费者的当前实现。
+代码基线为 `c289890`；本次文档提交仅回填该实际实现编号，代码内容相同。本文说明 `completed_evidence.py`、`evidence_archive.py` 及其规划、记录和执行消费者的当前实现。
 
 ## 研究对象、输入与输出
 

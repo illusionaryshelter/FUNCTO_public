@@ -1,6 +1,6 @@
 # FUNCTO 声明位姿偏好规划器
 
-代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`c289890`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 本组件将完整技能表示、当前 RGB-D 观测场、标定、具名关节位置和速度，以及固定机器人官方模型，计算为通过声明条件验收的关节轨迹。`PreferencePlanner` 中的 preference 指事件位姿可以被明确声明为 `required` 或 `prior`。前者保留原几何硬条件；后者按显式物理尺度进入成本。其他任务条件、关节域及观测几何继续由各自接口处理。
 

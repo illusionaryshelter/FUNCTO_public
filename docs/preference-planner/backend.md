@@ -1,6 +1,6 @@
 # 驻留后端、联合计算与候选证据
 
-代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`c289890`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 `backend.py` 接收已经绑定显式角色的 `PlanningProblem`、观测场景、固定官方机器人模型、机器人验证接口和 `PlanningBudget`。输出为原 `JointTrajectory`、同曲线验收记录及 CPU 诊断。原 `MotionBackend` 继续持有机器人模型、容量、设备、锁和原生资源。
 
