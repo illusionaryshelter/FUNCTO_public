@@ -12,7 +12,7 @@
 
 原 `manipulation.planning.plan_trajectory` 继续使用 `MotionBackend` 和 `_ConstrainedPlanner`。新增 `manipulation.preference_planner.plan_trajectory` 使用 `PreferenceMotionBackend` 和 `PreferencePlanner`，根据显式事件角色处理位姿硬要求与偏好，并使用末段静止消元和原实体证据产生的几何必要条件。两路共享原任务、机器人、场景和执行接口；原分支源码保持原基线。
 
-新增组件代码基线为 `PREFERENCE_IMPLEMENTATION_COMMIT`，详细输入、坐标、API 和调用关系见 [声明位姿偏好规划器](docs/preference-planner/README.md)。以下原组件章节继续描述原入口；新增组件的覆盖方法与独立生命周期由其文档列明。
+新增组件代码基线为 `1323d81`，详细输入、坐标、API 和调用关系见 [声明位姿偏好规划器](docs/preference-planner/README.md)。以下原组件章节继续描述原入口；新增组件的覆盖方法与独立生命周期由其文档列明。
 
 ## 组件与调用关系
 

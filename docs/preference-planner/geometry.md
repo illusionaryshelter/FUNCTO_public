@@ -2,7 +2,7 @@
 
 ## 实现范围与代码基线
 
-代码基线：`PREFERENCE_IMPLEMENTATION_COMMIT`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 ## 研究对象、坐标与职责
 

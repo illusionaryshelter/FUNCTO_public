@@ -2,7 +2,7 @@
 
 本文说明 `pose_roles.py` 的实际接口及其在现有 FUNCTO 数据结构中的职责。
 
-代码基线：`PREFERENCE_IMPLEMENTATION_COMMIT`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 研究对象是一个完整 `PlanningProblem` 中已经编译的 `pose_events`。每条事件保留原注册表索引、进度、工具到功能坐标的变换、目标变换、位置与旋转诊断范围、目标坐标中的可选 yaw 轴，以及 `actual_relation` 所声明的对象与功能坐标关系。`bind_pose_objectives` 在请求账本建立和运动块筛选之前接收完整问题及覆盖全部位姿事件的显式声明，返回原类型问题的副本。
 

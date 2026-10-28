@@ -2,7 +2,7 @@
 
 ## 实现与输入
 
-代码为 `objective.py`、`JointComputation.objective_components` 和 `PreferencePlanner._candidate_objective`，角色数据来自 `pose_roles.py`。代码基线：`PREFERENCE_IMPLEMENTATION_COMMIT`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。输入为同一请求的显式任务声明、原曲线状态q/dq/ddq/dddq、具名完整机器人状态、标定参考系中的TCP位置与wxyz单位四元数、物理时间、事件进度以及现场观测场。
+代码为 `objective.py`、`JointComputation.objective_components` 和 `PreferencePlanner._candidate_objective`，角色数据来自 `pose_roles.py`。代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。输入为同一请求的显式任务声明、原曲线状态q/dq/ddq/dddq、具名完整机器人状态、标定参考系中的TCP位置与wxyz单位四元数、物理时间、事件进度以及现场观测场。
 
 ## 事件成本API
 

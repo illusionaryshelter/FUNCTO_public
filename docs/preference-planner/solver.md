@@ -2,7 +2,7 @@
 
 ## 代码与研究对象
 
-代码基线：`PREFERENCE_IMPLEMENTATION_COMMIT`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 令Z为终止等式消元后的具名关节系数，展平顺序为控制行优先、关节列其次。`JointComputation` 将Z展开为同一完整三次曲线C，产生物理时间上的任务值与显式位姿先验目标。适配器提交的标量不等式统一使用 `g(Z) <= 0`；SciPy SLSQP接口中的不等式采用相反符号。原连续关节条件的极值计算仍由 `CubicJointDomain` 负责。
 

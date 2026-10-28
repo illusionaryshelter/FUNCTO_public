@@ -1,6 +1,6 @@
 # 源时钟终止区间与三次曲线消元
 
-代码基线：`PREFERENCE_IMPLEMENTATION_COMMIT`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 本组件由 `termination_clock.py` 和 `terminal.py` 构成。输入为已经绑定的源参考时间映射、归一化物理时间、原三次曲线仿射映射、测得入口关节位置/速度，以及可选的原正式终止合同。输出为保持原时间与关节语义的控制系数仿射映射。
 

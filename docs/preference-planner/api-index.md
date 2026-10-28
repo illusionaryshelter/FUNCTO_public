@@ -1,6 +1,6 @@
 # 实际 API 定义及调用索引
 
-代码基线：`PREFERENCE_IMPLEMENTATION_COMMIT`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 签名和直接调用来自当前源文件 AST；数据前置条件、坐标与结果含义由对应组件正文定义。内部辅助函数保留具体名称以定位计算。
 
