@@ -8,6 +8,12 @@
 
 系统将完整技能表示、标定 RGB-D 观测场、具名机器人反馈、固定机器人官方模型和任务声明转化为关节曲线及模型验收报告。规划、设备执行和仿真事后评价分别处理名义模型、机器人反馈和实际任务效果。
 
+## 独立规划入口
+
+原 `manipulation.planning.plan_trajectory` 继续使用 `MotionBackend` 和 `_ConstrainedPlanner`。新增 `manipulation.preference_planner.plan_trajectory` 使用 `PreferenceMotionBackend` 和 `PreferencePlanner`，根据显式事件角色处理位姿硬要求与偏好，并使用末段静止消元和原实体证据产生的几何必要条件。两路共享原任务、机器人、场景和执行接口；原分支源码保持原基线。
+
+新增组件代码基线为 `PREFERENCE_IMPLEMENTATION_COMMIT`，详细输入、坐标、API 和调用关系见 [声明位姿偏好规划器](docs/preference-planner/README.md)。以下原组件章节继续描述原入口；新增组件的覆盖方法与独立生命周期由其文档列明。
+
 ## 组件与调用关系
 
 | 组件 | 输入、计算和输出 |
