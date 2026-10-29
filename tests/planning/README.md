@@ -34,6 +34,8 @@
 
 材料身份绑定的实际代码基线为 `5adbdd699846de4f98a50eb33e1f532347150142`；本次仅文档提交保持该实现内容。
 
+源实体编号解析基线：本次实现提交，提交后登记实际代码身份。`run_recorded_simulation.run` 将 program 中参照角色的 `body_id` 交给源 manifest 同目录的 `model_catalog.json` 解析，得到源实体名称。`NativeSkillPhysicsEvaluator` 再用该名称查询当前 catalog 和当前原生模型，得到本次测量的 body ID。数字编号只在生成它的录制目录中有效；固定机器人配置重建导致的 body 重编号由这两次名称解析衔接。载体名称来自源 evidence，显式材料对应仍由 `evaluation_owner_bindings` 提供。该解析仅决定独立物理评价的测量对象。
+
 `run_recorded_simulation` 将正式曲线交给既有执行器，并把原生仿真采样送入独立记录回调。`recorded_skill_evaluation.NativeSkillPhysicsEvaluator` 消费正式执行绑定、显式原生实体对应、任务声明和每一步采样；输入中的真实TCP位姿、物体位姿、接触只用于结果分析。世界位姿 `T_W_B` 将物体本体坐标B映射到标定世界W，固定 `T_B_C` 将技能/观测实体坐标C映射到B，支持任务的材料点按 `T_W_C=T_W_B T_B_C` 转入世界坐标。每个效果在其原声明进度对应的设备时刻计算，记录保留原始样本与独立时钟。
 
 `_FunctionalGoalEvaluator` 的材料身份集合来自正式任务的位姿事件 `actual_relation`、支持要求的载体绑定，以及场景已注册实体。调用方以 `evaluation_owner_bindings` 给出材料身份、原生 body 名称和带来源文本的静态 `T_body_owner`。构造器核对材料身份属于该集合、目录与原生 body 身份一致、固定变换为刚体；`observe` 将本次原生 body 位姿与固定材料坐标组合。材料坐标可以属于任务关系而不另设碰撞字段，评价结果保持在独立报告中。

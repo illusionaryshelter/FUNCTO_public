@@ -73,6 +73,43 @@ def _runner_inputs(tmp_path, simulation, curve, targets, initial, *, skill_id="d
 # END no native scene, integration or renderer is constructed by this fixture.
 
 
+# BEGIN renamed numeric body tables retain the source material identity.
+def test_evaluator_reference_name_uses_source_recording_catalog(tmp_path):
+    """A reused numeric ID in the current scene must not select another body."""
+    simulation, curve, targets = _fixture()
+    initial = _initial_feedback(simulation)
+    args, result = _runner_inputs(tmp_path, simulation, curve, targets, initial)
+    (tmp_path / "program.json").write_text(json.dumps({
+        "skill_kind": "grasp", "demo": {"roles": {"reference": {"body_id": 5}}}}))
+    current_catalog = {"bodies": [{"id": 5, "name": "different_native_body"},
+                                   {"id": 9, "name": "source_reference"}]}
+    (tmp_path / "catalog.json").write_text(json.dumps(current_catalog))
+    (tmp_path / "recording/model_catalog.json").write_text(json.dumps({
+        "bodies": [{"id": 5, "name": "source_reference"}]}))
+    primary = RuntimeError("stop after independent evaluator initialization")
+    def stop_execution(*args, **kwargs):
+        raise primary
+
+    executor = SimpleNamespace(last_execution_report=None, execute=stop_execution)
+    evaluator = SimpleNamespace(finalize=lambda *args, **kwargs: {
+        "physics_outcome": "not_evaluated", "physics_success": None,
+        "evidence_coverage": {"complete": False}})
+    args.no_video = True
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(runner, "load_saved_trajectory", return_value=result))
+        stack.enter_context(patch.object(runner, "restore_recorded_simulation", return_value=(simulation, {})))
+        stack.enter_context(patch.object(runner, "build_robot_validator", return_value=object()))
+        stack.enter_context(patch.object(runner, "TrajectoryExecutor", return_value=executor))
+        constructor = stack.enter_context(patch.object(runner, "NativeSkillPhysicsEvaluator", return_value=evaluator))
+        with pytest.raises(RuntimeError) as raised:
+            runner.run(args)
+    assert raised.value is primary
+    assert constructor.call_count == 1
+    assert constructor.call_args.kwargs["reference_body_name"] == "source_reference"
+    assert constructor.call_args.kwargs["catalog"] == current_catalog
+# END the independent evaluator receives names and the current native catalog.
+
+
 @pytest.mark.parametrize("cleanup_failure", [False, True])
 @pytest.mark.parametrize("archive_write_failure", [False, True])
 # BEGIN summary counts distinguish confirmed motion, charged attempts and unknown clocks.

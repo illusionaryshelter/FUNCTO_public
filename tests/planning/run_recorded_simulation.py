@@ -427,7 +427,14 @@ def run(args, *, simulation=None, initial_feedback=None,
             reference_role = program["demo"]["roles"].get("reference")
             reference_name = None
             if reference_role is not None and reference_role["body_id"] is not None:
-                reference_name = _one(catalog["bodies"], "id", reference_role["body_id"])["name"]
+                # BEGIN resolve a source body number in its source recording.
+                # Current robot/model construction may renumber native bodies.
+                # The evaluator subsequently resolves this stable name against
+                # the current catalog and native model, independently of control.
+                source_catalog_path = source_manifest_path.parent / "model_catalog.json"
+                source_catalog = _read(source_catalog_path)
+                reference_name = _one(source_catalog["bodies"], "id", reference_role["body_id"])["name"]
+                # END native numeric IDs never cross recording namespaces.
             evaluator = NativeSkillPhysicsEvaluator(simulation.native_model, catalog=catalog,
                 actor=actor, target_body_name=source_segment["carrier_body_name"],
                 finger_joint_names=fixture["finger_joint_names"], tcp_site=fixture["tcp_site"],
