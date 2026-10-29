@@ -112,6 +112,6 @@
 
 `NativeSkillPhysicsEvaluator` 消费仿真实际运行环境中产生的真值，以及用于解释对象身份、源技能和评价条件的记录，产生物理效果报告。`step_callback` 的返回值不控制机器人指令，记录错误单独保存；外层运行器的 `physics_success` 用于事后输出。源 `evidence.json` 在技能提取中的事件职责与评价器在当前运行中的读取职责分别成立。
 
-源实体编号解析基线：本次实现提交，提交后登记实际代码身份。`run_recorded_simulation.run` 读取 program 的参照角色编号时，使用源 manifest 同目录的 `model_catalog.json` 将源 body ID 解析为实体名称；评价器再以名称在当前模型目录和原生模型中查找当前 body ID。数字编号属于各自模型的局部索引，名称及显式材料坐标对应连接源角色与当前评价对象。这些目录仅供仿真记录和独立评价解释身份，所含本次原生状态不进入规划计算。
+源实体编号解析的实际代码基线为 `0ce190d863989855d796027eed06cf8cd25e7f46`；本次仅文档提交登记该实现。`run_recorded_simulation.run` 读取 program 的参照角色编号时，使用源 manifest 同目录的 `model_catalog.json` 将源 body ID 解析为实体名称；评价器再以名称在当前模型目录和原生模型中查找当前 body ID。数字编号属于各自模型的局部索引，名称及显式材料坐标对应连接源角色与当前评价对象。这些目录仅供仿真记录和独立评价解释身份，所含本次原生状态不进入规划计算。
 
 实验运行器的 `snapshot.feedback_path` 明确指向图像采集时的机器人反馈，规划入口的反馈单独绑定。`owner-mask` 仅用于本次建立的实体；`background-mask` 接收原观测的背景候选。保存的实际积分背景已经过边缘保护，再将它作为候选会多排除一圈，因此后续读取 `background-candidate-mask.npy`。已有实体复用时无需再次提供其 mask；背景世界坐标与原自由射线不随运动实体改变。
