@@ -49,6 +49,7 @@
 | [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 26 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [05](05-acceptance-and-execution.md) |
 | [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 5 | [05](05-acceptance-and-execution.md) |
+| [manipulation/_geometry_kernels.py](api/geometry_kernels.md) | 5 | [02](02-observation-and-collision.md) |
 | [manipulation/implicit_distance.py](api/implicit_distance.md) | 28 | [02](02-observation-and-collision.md) |
 | [manipulation/observed_mapping.py](api/observed_mapping.md) | 10 | [02](02-observation-and-collision.md) |
 | [manipulation/observed_robot.py](api/observed_robot.md) | 4 | [02](02-observation-and-collision.md) |

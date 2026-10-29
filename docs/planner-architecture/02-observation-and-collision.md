@@ -46,6 +46,8 @@
 | `intersection` | 原表示中已确认存在共同占据的开邻域，即体积交叠 |
 | `unresolved` | 未发现上述交叠证据，但仍有域在当前数值精度或许可边界下无法判定 |
 
+`_geometry_kernels` 承担范围距离、半空间分类和方向投影中的三维数值运算。`implicit_distance.box_distance`、`PairPermission._classify` 与 `native_field_distance._projection_gap` 直接消费共同实现，`initial_support` 的既有导入自然使用相同范围距离。输入为同一坐标系内的 float64 端点和半空间；Numba 关闭快速数学重排，保留 x/y/z 运算次序及原 `_GAMMA` 和 `nextafter` 舍入。首次签名编译计入触发请求的耗时，缓存保存编译代码。原空间树、许可域、注册实体、预算回调和证据仍属于原调用者。完整 API、数组布局和公式见[三维数值内核](api/geometry_kernels.md)。
+
 `PairPermission` 描述允许的点对域。完全许可的框对被排除，其余继续查询；混合许可框采用按进入顺序展开，明确未许可框优先细化。见证必须属于未许可域。该顺序不改变原场及许可范围。
 
 `clear` 报告的 `lower_m` 取所有已严格分离分支下界的最小值。空占据集合返回 `lower_m=None`；若全部查询域均被许可移除，则返回有效下界 0。`distance_scope='unpermitted_point_pairs_at_query_pose'` 明确该距离针对本次姿态和本次许可域。若后续姿态或许可域改变，需要相应的运动与域关系才能解释两个时刻之间的距离。

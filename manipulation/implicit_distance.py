@@ -16,13 +16,13 @@ import math
 import numpy as np
 from scipy.spatial import cKDTree
 
+# BEGIN fixed-dimensional arithmetic shares the compiled numerical kernels.
+from ._geometry_kernels import _EPS, _GAMMA, box_distance as _box_distance, classify_box
+# END query callers retain the existing box and permission interfaces.
+
 
 CORNERS = np.asarray([(x, y, z) for x in (0., 1.) for y in (0., 1.)
                       for z in (0., 1.)], dtype=np.float64)
-_EPS = np.finfo(np.float64).eps
-# Each evaluated coordinate uses at most 32 scalar operations.  This is a
-# floating-point forward-error allowance, not a physical/model tolerance.
-_GAMMA = 32 * _EPS / (1 - 32 * _EPS)
 _EDGES = tuple((i, j) for i in range(8) for j in range(i + 1, 8)
                if np.count_nonzero(CORNERS[i] != CORNERS[j]) == 1)
 
@@ -70,14 +70,15 @@ def world_bounds(lower, upper, pose):
 
 
 def box_distance(a, b):
-    gap = np.maximum(0., np.maximum(a[0] - b[1], b[0] - a[1]))
-    value = float(np.linalg.norm(gap))
-    # BEGIN concatenate the four length-three bounds in their original order.
-    # These binary64 ndarray endpoints need only array joining. The reduction,
-    # round-off allowance and outward rounding retain their original order.
-    error = _GAMMA * (value + float(np.max(np.abs(np.concatenate((a[0], a[1], b[0], b[1]))))))
-    # END array joining preserves the existing geometric lower-bound formula.
-    return max(0., float(np.nextafter(value - error, -np.inf)))
+    # BEGIN compile the same lower bound on finite float64 Cartesian boxes.
+    """Return outward-rounded separation of two bounds in the same frame.
+
+    Each input is (lower[3], upper[3]). Read-only and strided arrays are
+    consumed directly; all field, native and initial-support callers share
+    this calculation through their existing imports.
+    """
+    return _box_distance(a[0], a[1], b[0], b[1])
+    # END original geometric semantics and endpoint ownership are retained.
 
 
 def trilinear(values, coordinates):
@@ -117,19 +118,14 @@ class PairPermission:
 
     @staticmethod
     def _classify(box, region):
+        # BEGIN compile the original ordered three-coordinate reductions.
+        """Classify a complete box against conjunctive finite halfspaces."""
         normals, bounds = region
-        normals, bounds = np.asarray(normals, float), np.asarray(bounds, float)
         low, high = box
-        minimum_terms = np.where(normals >= 0, normals * low, normals * high)
-        maximum_terms = np.where(normals >= 0, normals * high, normals * low)
-        minimum, maximum = minimum_terms.sum(-1), maximum_terms.sum(-1)
-        low_error = _GAMMA * np.abs(minimum_terms).sum(-1)
-        high_error = _GAMMA * np.abs(maximum_terms).sum(-1)
-        if np.all(maximum + high_error <= bounds):
-            return "inside"
-        if np.any(minimum - low_error > bounds):
-            return "outside"
-        return "mixed"
+        code = classify_box(np.asarray(low, float), np.asarray(high, float),
+                            np.asarray(normals, float), np.asarray(bounds, float))
+        return "inside" if code == 1 else "outside" if code == -1 else "mixed"
+        # END inclusive inside and strict outside comparisons keep precedence.
 
     def boxes(self, first, second):
         mixed = False

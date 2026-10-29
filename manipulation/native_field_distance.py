@@ -14,6 +14,9 @@ import coal
 import numpy as np
 
 from ._coal_scene_batch import native_projection_bounds, native_feasible_point_bounds
+# BEGIN projection arithmetic shares the field-query numerical implementation.
+from ._geometry_kernels import norm3, projection_lower
+# END Coal continues to supply directions and complete native support bounds.
 from .implicit_distance import (
     _GAMMA, box_corners, box_distance, inverse_points, inverse_point_error,
     transform_points, transform_point_error, world_bounds as _world_bounds,
@@ -63,17 +66,13 @@ def _projection_gap(geometry, transform, box):
     direction = np.asarray(result.normal, dtype=float)
     if not np.isfinite(direction).all():
         raise RuntimeError("Coal supplied a nonfinite native/box search direction")
-    length = float(np.linalg.norm(direction))
+    # BEGIN compile the original sqrt(dot) and outward projection calculation.
+    length = norm3(direction[0], direction[1], direction[2])
     if length == 0:
         return 0.
     native_low, native_high = native_projection_bounds(geometry, transform, direction)
-    minimum = np.where(direction >= 0, box[0], box[1]) * direction
-    maximum = np.where(direction >= 0, box[1], box[0]) * direction
-    box_low = np.nextafter(minimum.sum() - _GAMMA * np.abs(minimum).sum(), -np.inf)
-    box_high = np.nextafter(maximum.sum() + _GAMMA * np.abs(maximum).sum(), np.inf)
-    gap = max(0., float(box_low - native_high), float(native_low - box_high))
-    error = _GAMMA * (abs(box_low) + abs(box_high) + abs(native_low) + abs(native_high))
-    return max(0., float(np.nextafter((gap - error) / (length * (1 + _GAMMA)), -np.inf)))
+    return projection_lower(box[0], box[1], direction, native_low, native_high, length)
+    # END the original full native/box projection supplies the same lower bound.
 
 
 def _local_interval(world, pose):
