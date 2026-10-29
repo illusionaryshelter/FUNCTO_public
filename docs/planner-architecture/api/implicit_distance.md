@@ -1,6 +1,6 @@
 # 观测占据集合的几何查询接口
 
-代码基线：本次通用几何内核实现，完成提交后登记实际代码提交。实现为 [`manipulation/implicit_distance.py`](../../../manipulation/implicit_distance.py)。组件语义见[观测与碰撞](../02-observation-and-collision.md)，共同数值计算见[三维数值内核](geometry_kernels.md)。
+代码基线：`858d011`。本文的后续文档提交登记该代码基线，生产代码与该实现提交相同。实现为 [`manipulation/implicit_distance.py`](../../../manipulation/implicit_distance.py)。组件语义见[观测与碰撞](../02-observation-and-collision.md)，共同数值计算见[三维数值内核](geometry_kernels.md)。
 
 ## 1. 研究对象与坐标
 

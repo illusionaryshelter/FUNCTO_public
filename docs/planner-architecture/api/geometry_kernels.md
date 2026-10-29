@@ -1,6 +1,6 @@
 # 三维几何数值内核
 
-代码基线：本次通用几何内核实现，完成提交后登记实际代码提交。实现为 [`manipulation/_geometry_kernels.py`](../../../manipulation/_geometry_kernels.py)，调用者为 [`implicit_distance`](implicit_distance.md) 与 [`native_field_distance`](native_field_distance.md)。
+代码基线：`858d011`。本文的后续文档提交登记该代码基线，生产代码与该实现提交相同。实现为 [`manipulation/_geometry_kernels.py`](../../../manipulation/_geometry_kernels.py)，调用者为 [`implicit_distance`](implicit_distance.md) 与 [`native_field_distance`](native_field_distance.md)。
 
 ## 1. 职责、输入与依赖
 

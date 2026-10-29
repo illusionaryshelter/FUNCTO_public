@@ -1,6 +1,6 @@
 # 官方机器人原生形状与观测场查询接口
 
-代码基线：本次通用几何内核实现，完成提交后登记实际代码提交。实现为 [`manipulation/native_field_distance.py`](../../../manipulation/native_field_distance.py)。数据归属见[观测与碰撞](../02-observation-and-collision.md)及[共享验收](../10-shared-candidate-validation.md)。
+代码基线：`858d011`。本文的后续文档提交登记该代码基线，生产代码与该实现提交相同。实现为 [`manipulation/native_field_distance.py`](../../../manipulation/native_field_distance.py)。数据归属见[观测与碰撞](../02-observation-and-collision.md)及[共享验收](../10-shared-candidate-validation.md)。
 
 ## 1. 输入对象与职责
 
