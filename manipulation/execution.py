@@ -981,40 +981,6 @@ class TrajectoryExecutor:
         contact_rows = binding["scene"].get("contacts", ())
         finite_permission_ids = set()
         # END missing scene metadata cannot silently turn a gated rule into an ordinary rule.
-        # BEGIN attachment records retain only their accepted model identity.
-        # These checks match fields in one model; no object measurement,
-        # simulator truth, Holding predicate or observation clock is needed.
-        holding_bindings = {}
-        start_progress = float(trajectory.sample(0.)[3])
-        # BEGIN the accepted attachment owns the complete tool/payload assembly.
-        for condition in binding["problem"].get("conditions", ()):
-            if condition.get("kind") != "declared_attachment":
-                continue
-            condition_id = condition["condition_id"]
-            owners = [row for row in binding["scene"].get("owners", ())
-                      if row.get("owner_id") == condition["carrier_id"]]
-            relations = [row for owner in owners for row in owner.get("attachments", ())
-                         if row.get("condition_id") == condition_id]
-            if len(owners) != 1 or len(relations) != 1:
-                raise ValueError("Declared attachment needs one owner and matching model relation")
-            relation = relations[0]
-            lower, upper = map(float, relation["interval"])
-            if (condition.get("progress") != lower or not lower <= start_progress <= upper
-                    or (start_progress == upper and relation["release_condition_id"] is not None)):
-                raise ValueError("The declared attachment must cover the current trajectory start")
-            expected = np.linalg.inv(_pose_array(condition.get("T_carrier_eef"), "declared attachment transform"))
-            actual = np.eye(4)
-            actual[:3, 3] = relation["position_tool_owner"]
-            actual[:3, :3] = Rotation.from_quat(np.asarray(relation["quaternion_tool_owner"])[[1, 2, 3, 0]]).as_matrix()
-            if not np.allclose(actual, expected, atol=1e-7, rtol=0):
-                raise ValueError("Declared and bound attachment transforms disagree")
-            holding_bindings[condition_id] = {"condition_id": condition_id,
-                "target_owner": condition["carrier_id"], "interval": [lower, upper],
-                "release_condition_id": relation["release_condition_id"],
-                "tool_geometry_names": list(binding["scene"]["tool_geometry_names"]),
-                "source": deepcopy(condition["source"])}
-        # END contact materials and close commands do not define assembly membership.
-        # END these model records are not feedback, effects or completed goals.
         for condition in binding["problem"].get("conditions", ()):
             if condition.get("kind") != "grasp_contact_activation":
                 continue
@@ -1043,7 +1009,18 @@ class TrajectoryExecutor:
                 "rule_ids": rule_ids, "requirement": requirement}
         # BEGIN close-command checks carry no target-pose gate or world permission.
         report["grasp_command_checks"] = []
-        report["declared_attachment_bindings"] = list(holding_bindings.values())
+        # BEGIN record task relations from the already accepted problem.
+        # A material coordinate used by the task need not be a separately
+        # registered collision entity. OnlinePlanningScene.validate_problem
+        # owns the relation checks for registered geometry; check_result above
+        # preserves that accepted problem/scene binding. This report records
+        # the declaration without adding another execution-entry condition.
+        report["declared_attachment_bindings"] = [
+            {**deepcopy(condition),
+             "tool_geometry_names": list(binding["scene"]["tool_geometry_names"])}
+            for condition in binding["problem"].get("conditions", ())
+            if condition.get("kind") == "declared_attachment"]
+        # END physical effects remain independent observations or posthoc data.
         # END model provenance does not imply physical contact success.
         # BEGIN no target-relative metric is evaluated by the executor.
         report["pose_goal_evaluation"] = "simulation_posthoc_only"

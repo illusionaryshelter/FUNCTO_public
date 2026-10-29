@@ -1,6 +1,6 @@
 # `manipulation/execution.py` 实现契约
 
-代码基线：`c289890`。
+代码基线：`本次实现提交；提交后登记实际基线`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pose_goal_schedule`
@@ -1339,19 +1339,12 @@ binding.get('goal_identities', {}).get
 row.get
 binding['scene'].get
 condition.get
-owner.get
-np.linalg.inv
-np.linalg
-np.eye
-Rotation.from_quat(np.asarray(relation['quaternion_tool_owner'])[[1, 2, 3, 0]]).as_matrix
-Rotation.from_quat
 pose_requirements.get
 finite_permission_ids.intersection
 finite_permission_ids.update
 activation.get
 requirement.actual_relation
 requirement.progress
-holding_bindings.values
 mechanism.get
 direction_requirements.items
 np.flatnonzero
@@ -1499,19 +1492,7 @@ contact_bindings
 finite_conditions
 contact_rows
 finite_permission_ids
-holding_bindings
-start_progress
 condition
-condition_id
-owners
-relations
-owner
-relation
-lower
-upper
-actual[:3, 3]
-actual[:3, :3]
-holding_bindings[condition_id]
 activation
 arrival
 commands
@@ -1720,13 +1701,6 @@ PoseEventRequirement
 row.get
 binding['scene'].get
 condition.get
-owner.get
-map
-np.linalg.inv
-_pose_array
-np.eye
-Rotation.from_quat(np.asarray(relation['quaternion_tool_owner'])[[1, 2, 3, 0]]).as_matrix
-Rotation.from_quat
 event_occurrence_key
 pose_requirements.get
 grasp_contact_rule_ids
@@ -1734,7 +1708,6 @@ validate_grasp_contact_arrival
 finite_permission_ids.intersection
 finite_permission_ids.update
 activation.get
-holding_bindings.values
 mechanism.get
 direction_requirements.items
 np.flatnonzero
@@ -2011,7 +1984,7 @@ float
 
 ## `TrajectoryExecutor.execute.dependency_already_observed`
 
-[定义位置](../../../manipulation/execution.py#L1131)。
+[定义位置](../../../manipulation/execution.py#L1108)。
 
 输入签名：
 
@@ -2043,7 +2016,7 @@ float
 
 ## `TrajectoryExecutor.execute.check_directions`
 
-[定义位置](../../../manipulation/execution.py#L1157)。
+[定义位置](../../../manipulation/execution.py#L1134)。
 
 输入签名：
 
@@ -2160,7 +2133,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.effect_timestamp`
 
-[定义位置](../../../manipulation/execution.py#L1262)。
+[定义位置](../../../manipulation/execution.py#L1239)。
 
 输入签名：
 
@@ -2230,7 +2203,7 @@ max
 
 ## `TrajectoryExecutor.execute.witness`
 
-[定义位置](../../../manipulation/execution.py#L1297)。
+[定义位置](../../../manipulation/execution.py#L1274)。
 
 输入签名：
 
@@ -2277,7 +2250,7 @@ report['history'].append
 
 ## `TrajectoryExecutor.execute.timed_witness`
 
-[定义位置](../../../manipulation/execution.py#L1312)。
+[定义位置](../../../manipulation/execution.py#L1289)。
 
 输入签名：
 
@@ -2317,7 +2290,7 @@ witness
 
 ## `TrajectoryExecutor.execute.reject_timing`
 
-[定义位置](../../../manipulation/execution.py#L1324)。
+[定义位置](../../../manipulation/execution.py#L1301)。
 
 输入签名：
 
@@ -2364,7 +2337,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.resolve_pending_timing`
 
-[定义位置](../../../manipulation/execution.py#L1344)。
+[定义位置](../../../manipulation/execution.py#L1321)。
 
 输入签名：
 
@@ -2422,7 +2395,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.check_deadlines`
 
-[定义位置](../../../manipulation/execution.py#L1373)。
+[定义位置](../../../manipulation/execution.py#L1350)。
 
 输入签名：
 
@@ -2482,7 +2455,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observe_timed_effects`
 
-[定义位置](../../../manipulation/execution.py#L1400)。
+[定义位置](../../../manipulation/execution.py#L1377)。
 
 输入签名：
 
@@ -2545,7 +2518,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observation_at`
 
-[定义位置](../../../manipulation/execution.py#L1435)。
+[定义位置](../../../manipulation/execution.py#L1412)。
 
 输入签名：
 
@@ -2663,7 +2636,7 @@ condition.get
 
 ## `TrajectoryExecutor.execute.record`
 
-[定义位置](../../../manipulation/execution.py#L1537)。
+[定义位置](../../../manipulation/execution.py#L1514)。
 
 输入签名：
 
@@ -2722,7 +2695,7 @@ deepcopy
 
 ## `TrajectoryExecutor.execute.check_close_binding`
 
-[定义位置](../../../manipulation/execution.py#L1565)。
+[定义位置](../../../manipulation/execution.py#L1542)。
 
 输入签名：
 
@@ -2781,7 +2754,7 @@ failures.append
 
 ## `TrajectoryExecutor.execute.guard`
 
-[定义位置](../../../manipulation/execution.py#L1600)。
+[定义位置](../../../manipulation/execution.py#L1577)。
 
 输入签名：
 
@@ -2877,7 +2850,7 @@ check_deadlines
 
 ## `TrajectoryExecutor.execute.consume_ordinary_events`
 
-[定义位置](../../../manipulation/execution.py#L1674)。
+[定义位置](../../../manipulation/execution.py#L1651)。
 
 输入签名：
 
@@ -2963,7 +2936,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.release_dependencies`
 
-[定义位置](../../../manipulation/execution.py#L1733)。
+[定义位置](../../../manipulation/execution.py#L1710)。
 
 输入签名：
 
@@ -3038,7 +3011,7 @@ timed_witness
 
 ## `TrajectoryExecutor.execute.emit_independent_evidence`
 
-[定义位置](../../../manipulation/execution.py#L1788)。
+[定义位置](../../../manipulation/execution.py#L1765)。
 
 输入签名：
 
@@ -3081,7 +3054,7 @@ str
 
 ## `TrajectoryExecutor.execute.persist`
 
-[定义位置](../../../manipulation/execution.py#L2165)。
+[定义位置](../../../manipulation/execution.py#L2142)。
 
 输入签名：
 

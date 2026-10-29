@@ -106,7 +106,7 @@
 
 `BoundToolReference` 持有完整名义阶段、显式边界、物理时钟和机器人入口位姿/速度，参考 IK 读取其输出。实验 `reference-bound.npz` 的 `tcp_poses_world` 保存该实例的物理时间参考，`nominal_tcp_poses_world` 保存相同进度上的源名义路径。固定材料点几何目标复用原观测场和官方机器人形状；材料点、原场求值及导数属于计算中间量。场景持久化保存原 TSDF、观测支持和关系声明。
 
-场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存原条件与实体关系的模型对应，独立于实际接触与效果记录。
+场景快照中的 `tool_geometry_names` 保存机器人适配器给出的工具成员，各 owner 的 `attachments` 保存刚性关系及释放边界。运行报告记录同一工具清单；场景查询报告中的 `internal_assembly_pair_count` 是按实际状态排除的组合体内部配对数。执行报告的 `declared_attachment_bindings` 保存任务条件的完整声明及工具成员；独立注册的碰撞关系保存在同一 scene 快照中。任务载体坐标与碰撞实体注册分别承担功能计算与几何查询职责，实际接触与效果另行记录。
 
 仿真器通过 `scene.xml`、`initial-state.npz` 或 `episode.h5` 中的积分状态恢复运行环境；控制适配器向执行器提供机器人反馈。构造环境所用的内部状态不等于规划器可读的输入。相同的 HDF5 可以同时保存机器人编码器和环境对象状态，判断以实际读取的数据列与传递对象为准。
 

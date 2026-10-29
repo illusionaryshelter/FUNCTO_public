@@ -5,21 +5,35 @@ from copy import deepcopy
 from unittest.mock import patch
 
 import pytest
+import numpy as np
 
-from manipulation.execution import (ExecutionGuardError, FixedFingerTargets,
+from manipulation.execution import (ExecutionGuardError, ExecutionLimits, FixedFingerTargets,
     TrajectoryExecutor, _feedback_json)
 from manipulation.execution_binding import rebind_execution_result
-from test_holding_owner_permission import holding_fixture, refresh_validation
-from test_recorded_simulation import _GeometryChecker, _initial_feedback
+from test_recorded_simulation import (_GeometryChecker, _initial_feedback,
+    _fixture, _bind_fingers, _result, _limit_values)
 
 
 def _trial(tmp_path, *, initial_value="absent", observation=None,
-           rejected_stage=None, mutate=None):
+           rejected_stage=None):
     """Use the existing synthetic native backend without object truth."""
-    simulation, _, targets, result, limits = holding_fixture()
-    if mutate is not None:
-        mutate(result)
-        refresh_validation(result)
+    # BEGIN use the current bounded execution fixture without retired geometry.
+    simulation, curve, targets = _fixture()
+    curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
+    _bind_fingers(simulation, curve, targets)
+    result = _result(curve)
+    condition = dict(kind="declared_attachment", carrier_id="material_frame",
+        condition_id="observed_holding", progress=0., T_carrier_eef=np.eye(4).tolist(),
+        source="Explicit synthetic task relation")
+    result.execution_binding["problem"]["conditions"] = [condition]
+    result.execution_binding["scene"].update(tool_geometry_names=[], owners=[dict(
+        owner_id="material_frame", attachments=[dict(interval=[0., 1.],
+            condition_id="observed_holding", release_condition_id=None,
+            position_tool_owner=[0., 0., 0.], quaternion_tool_owner=[1., 0., 0., 0.])])])
+    result.execution_binding["validation"]["inputs"] = deepcopy({
+        key: result.execution_binding[key] for key in ("problem", "scene")})
+    limits = ExecutionLimits.from_mapping(_limit_values(simulation, curve))
+    # END the fixture's accepted inputs remain separate from later mutations.
     fingers = FixedFingerTargets.from_mapping(targets)
     result = rebind_execution_result(result,
         controller_policy=simulation.describe()["controller_policy"],
@@ -81,18 +95,19 @@ def test_declared_attachment_does_not_relax_robot_guard(tmp_path):
 
 @pytest.mark.parametrize("change", ["owner", "interval", "transform", "kind"])
 def test_declared_attachment_keeps_model_identity_and_geometry(tmp_path, change):
-    def mutate(result):
-        condition = result.execution_binding["problem"]["conditions"][0]
-        if change == "owner":
-            condition["carrier_id"] = "different_owner"
-        elif change == "interval":
-            result.execution_binding["scene"]["owners"][0]["attachments"][0]["interval"] = [0., .5]
-        elif change == "transform":
-            condition["T_carrier_eef"][0][3] = .1
-        else:
-            condition["kind"] = "candidate_attachment"
-    run, _, simulation, *_ = _trial(tmp_path, mutate=mutate)
+    # BEGIN check_result rejects modifications to the accepted formal binding.
+    run, _, simulation, result, *_ = _trial(tmp_path)
+    condition = result.execution_binding["problem"]["conditions"][0]
+    if change == "owner":
+        condition["carrier_id"] = "different_owner"
+    elif change == "interval":
+        result.execution_binding["scene"]["owners"][0]["attachments"][0]["interval"] = [0., .5]
+    elif change == "transform":
+        condition["T_carrier_eef"][0][3] = .1
+    else:
+        condition["kind"] = "candidate_attachment"
     with pytest.raises(ValueError):
         run()
     assert simulation.arm_goals == []
+    # END accepted input identity is checked once by the formal result API.
 # END no successful CPU sequence certifies a physical attachment.

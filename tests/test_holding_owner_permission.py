@@ -94,7 +94,11 @@ def test_declared_attachment_runs_without_physical_proof_and_keeps_release_inter
     assert all("active_contact_rule_ids" not in row for row in gate.states)
     attachment = report["declared_attachment_bindings"][0]
     assert attachment["source"] == {"source": "Explicit synthetic nominal attachment model"}
-    assert attachment["interval"] == [0., .75 if release else 1.]
+    # BEGIN the report records the task declaration; geometry owns its interval.
+    assert attachment["progress"] == 0.
+    relation = fixture[3].execution_binding["scene"]["owners"][0]["attachments"][0]
+    assert relation["interval"] == [0., .75 if release else 1.]
+    # END execution does not infer task coordinates from geometry membership.
     assert "active_contact_rule_ids" not in report
     assert "holding_contact_permission_changes" not in report
 # END the report identifies a declaration without promoting it to an observation.

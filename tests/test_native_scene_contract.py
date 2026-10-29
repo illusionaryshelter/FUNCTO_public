@@ -63,6 +63,42 @@ def evaluate(scene):
         trajectory_time=torch.zeros((1, 1)))
 
 
+# BEGIN registered attachments keep their original scene-owned validation.
+@pytest.mark.parametrize("change", [None, "carrier", "transform", "start", "release"])
+def test_registered_attachment_matches_the_task_declaration(tmp_path, change):
+    from manipulation.planning_scene import Attachment
+
+    world = make_scene(tmp_path)
+    transform = np.eye(4)
+    transform[0, 3] = -.1
+    condition = dict(kind="declared_attachment", condition_id="relation",
+        carrier_id="material", progress=0., T_carrier_eef=transform)
+    release = dict(kind="predicted_release", condition_id="release", progress=1.)
+    field = FrozenObservedField(np.zeros((2, 2, 2)), np.zeros((2, 2, 2), bool),
+        weights=np.zeros((2, 2, 2)), origin=[0.] * 3, voxel_size=.01,
+        name="material", source="empty observed support")
+    world.owners = (CollisionOwner("material", field,
+        PosePath(np.array([0., 1.]), np.stack((np.eye(4), np.eye(4))), "declared path"),
+        "observed field", attachments=(Attachment((0., 1.), [.1, 0., 0.],
+            [1., 0., 0., 0.], "relation", "release"),)),)
+    if change == "carrier":
+        condition["carrier_id"] = "another_material"
+    elif change == "transform":
+        condition["T_carrier_eef"][0, 3] = -.2
+    elif change == "start":
+        condition["progress"] = .1
+    elif change == "release":
+        release["progress"] = .9
+    problem = SimpleNamespace(reference_frame="world", conditions=(condition, release),
+        pose_events=(), events=())
+    if change is None:
+        world.validate_problem(problem)
+    else:
+        with pytest.raises(ValueError):
+            world.validate_problem(problem)
+# END execution consumes the accepted scene instead of repeating these checks.
+
+
 def test_native_structure_gap_is_independent_of_task_acceptance_margin(tmp_path):
     scene = make_scene(tmp_path)
     costs = evaluate(scene)

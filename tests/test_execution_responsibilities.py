@@ -73,7 +73,8 @@ def test_actual_execution_never_queries_frozen_fields_or_requires_holding_proof(
 
 # BEGIN accepted attachment provenance carries the complete tool component.
 @pytest.mark.parametrize("physical_holding", [None, False, True])
-def test_execution_uses_attachment_record_without_material_rules(tmp_path, physical_holding):
+@pytest.mark.parametrize("geometry_registered", [False, True])
+def test_execution_uses_attachment_record_without_material_rules(tmp_path, physical_holding, geometry_registered):
     simulation, curve, targets = _fixture()
     curve.events[2].update(kind="effect", requires_evidence=None, stop=False)
     _bind_fingers(simulation, curve, targets)
@@ -82,10 +83,13 @@ def test_execution_uses_attachment_record_without_material_rules(tmp_path, physi
         carrier_id="payload", progress=0., T_carrier_eef=np.eye(4).tolist(),
         source="declared synthetic attachment model")
     result.execution_binding["problem"]["conditions"] = [condition]
-    result.execution_binding["scene"].update(tool_geometry_names=["palm", "finger", "pad"],
-        owners=[dict(owner_id="payload", attachments=[dict(
+    # BEGIN task coordinates and separately registered geometry are independent.
+    owners = [dict(owner_id="payload", attachments=[dict(
             condition_id="attached", interval=[0., 1.], release_condition_id=None,
-            position_tool_owner=[0., 0., 0.], quaternion_tool_owner=[1., 0., 0., 0.])])])
+            position_tool_owner=[0., 0., 0.], quaternion_tool_owner=[1., 0., 0., 0.])])]
+    result.execution_binding["scene"].update(tool_geometry_names=["palm", "finger", "pad"],
+        owners=owners if geometry_registered else [])
+    # END both inputs retain the same task declaration and robot supervision.
     result.execution_binding["validation"]["inputs"] = deepcopy({
         key: result.execution_binding[key] for key in ("problem", "scene")})
     initial = _initial_feedback(simulation)
@@ -102,6 +106,8 @@ def test_execution_uses_attachment_record_without_material_rules(tmp_path, physi
     row, = report["declared_attachment_bindings"]
     assert row["condition_id"] == "attached"
     assert row["tool_geometry_names"] == ["palm", "finger", "pad"]
+    assert row["carrier_id"] == condition["carrier_id"]
+    assert row["T_carrier_eef"] == condition["T_carrier_eef"]
     assert "rule_id" not in row
 # END sensed Holding values do not redefine the accepted assembly model.
 # END current owner coordinates do not make a failed required Holding effect true.

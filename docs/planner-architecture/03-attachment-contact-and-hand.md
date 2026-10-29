@@ -38,7 +38,7 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 `validate_problem` 将每个 `Attachment` 对应到原 `declared_attachment` 或 `candidate_attachment` 条件，核对实体身份、生效事件与固定变换；显式释放对应同一 `predicted_release` 条件及区间终点。组合体成员由实际 `progress` 确定，有限任务接触所用的 `contact_permission_progress` 不提前建立附着。`ContactRule` 保留原特征、区域、间隙和法向计算，分别表达任务要求的有限接触。
 
-场景快照保存工具成员与各实体的 `Attachment`。执行入口从原 `declared_attachment` 条件及对应实体关系记录 `declared_attachment_bindings`，包含条件、实体、活动区间、释放身份、工具成员和来源。该记录表达候选采用的模型关系，物理接触与任务效果由各自的观察或事后评价记录。
+场景快照保存工具成员与各注册实体的 `Attachment`，包括活动区间与释放身份。任务的 `declared_attachment` 还可为功能关系提供载体坐标；是否建立独立碰撞实体由观测场景的实体注册表达。执行入口在完整结果绑定核对后，将原条件全部字段及工具成员写入 `declared_attachment_bindings`。模型几何关系由上述 `validate_problem` 处理；物理接触与任务效果由各自的观察或事后评价记录。
 
 ## 4. 初始支撑
 

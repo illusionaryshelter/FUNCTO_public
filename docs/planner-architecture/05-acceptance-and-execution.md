@@ -78,7 +78,7 @@
 
 `check_state.distances_m` 按 `describe().pair_order` 输出原实体对距离，供执行器读取与记录；最小必检间隙单独汇总。数值边界与原模型穿透分别保留。未来手指状态未建模时的条件状态，与机器人模型缺失不是同一含义。
 
-执行入口将任务中的每个 `declared_attachment` 与场景中对应实体的 `Attachment` 对照，核对条件身份、当前轨迹入口所处区间及固定变换。`declared_attachment_bindings` 记录这些已接受的模型关系，并保存 `tool_geometry_names`、释放身份和原来源。有限任务接触继续按原 `grasp_contact_activation` 与 close 事件绑定；附着模型记录与任务接触特征分别保留。
+`declared_attachment` 声明任务载体坐标与工具之间的固定关系，任务计算可使用该坐标而不将其单独注册为碰撞实体。`OnlinePlanningScene.validate_problem` 对场景中实际注册的每个 `Attachment` 核对条件身份、生效进度、固定变换及释放边界；`check_result` 在执行入口核对已接受的完整 problem/scene 与曲线绑定。执行报告的 `declared_attachment_bindings` 逐项复制已接受条件的全部字段，并加入 `tool_geometry_names`。注册实体的活动区间及释放关系仍在同一绑定的 scene 记录中。有限任务接触继续按原 `grasp_contact_activation` 与 close 事件绑定；实际关节、机器人模型和独立任务效果继续由原执行接口处理。
 
 ## 4. 控制时钟与每步操作
 
