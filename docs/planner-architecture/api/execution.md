@@ -1,6 +1,6 @@
 # `manipulation/execution.py` 实现契约
 
-代码基线：`本次实现提交；提交后登记实际基线`。
+代码基线：`9486a09ee901e36fdda7e8972942e29deeea91fc`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pose_goal_schedule`

@@ -2,7 +2,7 @@
 
 求解与观测场算法基线为 `be44b54`，官方机器人距离批处理基线为 `12e0ef5`；候选交付、通用包围盒距离与执行绑定数据转换分别以 [planning API](docs/planner-architecture/api/planning.md)、[implicit_distance API](docs/planner-architecture/api/implicit_distance.md) 和 [execution_binding API](docs/planner-architecture/api/execution_binding.md) 所列代码提交为准。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-各组件 API 页记录实际代码基线；仅文档提交保持所引用组件的生产代码内容。
+各组件 API 页记录实际代码基线；仅文档提交保持所引用组件的生产代码内容。当前执行关系声明处理的代码基线为 `9486a09ee901e36fdda7e8972942e29deeea91fc`，详细契约见执行组件与 API 页。
 
 当前时间预算配置对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容。`PlanningBudget.planning_seconds` 的全局默认值为 60 s，记录式 CLI 和诊断准备入口直接读取这一字段。
 
