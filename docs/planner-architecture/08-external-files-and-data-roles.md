@@ -98,7 +98,7 @@
 
 任务快照中的支持要求保存 `hard_components`，续规划义务保留同一字段。`reference_ik_queries` 保存普通单 seed IK 的物理时刻、dt、同时作为唯一 warm seed 的前次 q、前次数值 dq、返回状态、原生成功及位置/完整转角误差。有限近似值的身份为 `SOLVED` 或 `APPROXIMATE_PROPOSAL`；非有限状态记录 `NONFINITE_STATE` 并结束初始化。`reference_initialization` 保存 `sample_fits_completed` 和一次样本拟合；并列的 `initial_seed_strategies` 保存 `local_reference_ik/recorded_joint_samples` 来源。拟合后的第一条曲线在后续求解未返回时也可作为诊断保存，其完整验收单独记录。
 
-独立物理评估由 `tests/planning/recorded_skill_evaluation.py` 消费正式执行绑定中的任务快照。支持要求的几何、容差与 `hard_components` 共同恢复为 `SupportRequirement`；原生物体位姿仅用于本次执行的事后材料点测量。gap、body、footprint、normal 四组测量全部记录，T/F由声明的硬项汇总，空硬集合表达全部为偏好。释放要求使用标准编译器已有的 `actual_release_from_current_feedback`：在原声明设备时刻截取接触记录前缀，核对曾经接触及持续无接触窗口。事件的在线依赖仍由 `requires_evidence` 声明；该独立评分不写入执行反馈或后续动作决策。具体接口与输入输出见[记录入口](../../tests/planning/README.md)。
+独立物理评估由 `tests/planning/recorded_skill_evaluation.py` 消费正式执行绑定中的任务快照。材料身份可由任务位姿关系、支持载体或场景实体声明；评价器通过显式静态材料—body 坐标对应计算物理测量，几何实体注册仍由场景接口表达。支持要求的几何、容差与 `hard_components` 共同恢复为 `SupportRequirement`；原生物体位姿仅用于本次执行的事后材料点测量。gap、body、footprint、normal 四组测量全部记录，T/F由声明的硬项汇总，空硬集合表达全部为偏好。释放要求使用标准编译器已有的 `actual_release_from_current_feedback`：在原声明设备时刻截取接触记录前缀，核对曾经接触及持续无接触窗口。事件的在线依赖仍由 `requires_evidence` 声明；该独立评分不写入执行反馈或后续动作决策。具体接口与输入输出见[记录入口](../../tests/planning/README.md)。
 
 `last_optimizer_runtime` 保存各个已开始的 `scipy.optimize.SLSQP` 调用，包含状态、迭代和求值开始/完成计数、原目标、固定目标归一化尺度、系数更新及内存量。`evaluation_seconds` 记录 objective/task/physical 的累计实际计算时间，包含中断计算且排除缓存命中。`complete_task_equalities/complete_task_inequalities` 为原任务行数，`solver_task_equalities/solver_task_inequalities` 为已核对常量后实际提交的行数，`fixed_task_constraints` 保存被省去行的原键、组内索引、数值与判定。每个候选串行求解并立即验收，原 seed 索引和实际来源随结果保存。
 

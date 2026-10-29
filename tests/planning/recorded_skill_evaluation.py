@@ -270,7 +270,19 @@ class _FunctionalGoalEvaluator:
                     self._unsupported_goals.append({"identity": list(identity), "value": "U",
                         "requirement": deepcopy(row),
                         "reason": "No native coordinate predicate with its original frame/coordinate binding is supplied"})
-        owners = self._binding["scene"].get("owners", [])
+        # BEGIN material identity follows the task and registered geometry.
+        # Functional coordinates can belong to a task entity represented
+        # within a larger observed collision field. The explicit native
+        # binding below supplies only posthoc measurements of those frames.
+        owner_ids = {row["owner_id"] for row in self._binding["scene"].get("owners", [])}
+        for requirement in self._requirements.values():
+            if isinstance(requirement, PoseEventRequirement) and requirement.actual_relation is not None:
+                relation = requirement.actual_relation
+                owner_ids.update(relation[key] for key in ("function_owner_id", "target_owner_id")
+                                 if key in relation)
+        owner_ids.update(row["carrier_id"] for row in self._support_bindings.values()
+                         if "carrier_id" in row)
+        # END runtime geometry and model declarations remain unchanged.
         self._owners = {}
         if not isinstance(owner_bindings, list):
             raise ValueError("evaluation_owner_bindings must be an explicit list")
@@ -285,11 +297,10 @@ class _FunctionalGoalEvaluator:
             identity, name = row["owner_id"], row["native_body_name"]
             if identity in self._owners:
                 raise ValueError("Evaluator owner bindings must be unique")
-            selected = [owner for owner in owners if owner["owner_id"] == identity]
             bodies = [body for body in catalog["bodies"] if body["name"] == name]
-            if (len(selected) != 1 or len(bodies) != 1
+            if (identity not in owner_ids or len(bodies) != 1
                     or model.body(name).id != bodies[0]["id"]):
-                raise ValueError("Evaluator owner/native body identities must match one declared scene/catalog body")
+                raise ValueError("Evaluator material identity must belong to the task/scene and match one catalog/native body")
             transform, source = None, None
             if "T_body_owner" in row:
                 if not isinstance(row["source"], str) or not row["source"].strip():

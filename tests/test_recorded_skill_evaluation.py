@@ -453,6 +453,26 @@ def test_owner_binding_rejects_native_identity_or_nonrigid_static_frame(corrupti
 # END the planned estimated entry pose is never used as a static geometry calibration.
 
 
+# BEGIN functional material frames can be measured without separate collision fields.
+def test_functional_material_mapping_is_independent_of_collision_registration():
+    model, result, _, owner_entry, native_entry, _, catalog, mappings = _fixture()
+    result.execution_binding["scene"]["owners"] = []
+    relation = result.execution_binding["problem"]["pose_events"][0]["actual_relation"]
+    relation.update(function_owner_id="declared_function", T_owner_function=np.eye(4).tolist())
+    mappings.append({**deepcopy(mappings[0]), "owner_id": "declared_function"})
+    before = deepcopy(result.execution_binding)
+    goals = _FunctionalGoalEvaluator(model, catalog, result, mappings)
+    goals.observe(SimpleNamespace(xmat=native_entry[:3, :3].reshape(1, 9),
+                                  xpos=native_entry[:3, 3].reshape(1, 3)))
+    for identity in ("declared_material", "declared_function"):
+        np.testing.assert_allclose(goals._owner_pose_samples[0][identity], owner_entry, atol=1e-14)
+    assert result.execution_binding == before
+    mappings.append({**deepcopy(mappings[0]), "owner_id": "undeclared_coordinate"})
+    with pytest.raises(ValueError, match="material identity"):
+        _FunctionalGoalEvaluator(model, catalog, result, mappings)
+# END evaluator samples never modify the formal planning/execution binding.
+
+
 def test_unimplemented_original_process_cannot_inherit_overall_grasp_success(tmp_path):
     evaluator, result = _history()
     result.execution_binding["problem"]["interiors"] = [{"source": "Original independently scoped interior requirement"}]

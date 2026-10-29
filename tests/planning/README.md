@@ -34,9 +34,13 @@
 
 `run_recorded_simulation` 将正式曲线交给既有执行器，并把原生仿真采样送入独立记录回调。`recorded_skill_evaluation.NativeSkillPhysicsEvaluator` 消费正式执行绑定、显式原生实体对应、任务声明和每一步采样；输入中的真实TCP位姿、物体位姿、接触只用于结果分析。世界位姿 `T_W_B` 将物体本体坐标B映射到标定世界W，固定 `T_B_C` 将技能/观测实体坐标C映射到B，支持任务的材料点按 `T_W_C=T_W_B T_B_C` 转入世界坐标。每个效果在其原声明进度对应的设备时刻计算，记录保留原始样本与独立时钟。
 
+`_FunctionalGoalEvaluator` 的材料身份集合来自正式任务的位姿事件 `actual_relation`、支持要求的载体绑定，以及场景已注册实体。调用方以 `evaluation_owner_bindings` 给出材料身份、原生 body 名称和带来源文本的静态 `T_body_owner`。构造器核对材料身份属于该集合、目录与原生 body 身份一致、固定变换为刚体；`observe` 将本次原生 body 位姿与固定材料坐标组合。材料坐标可以属于任务关系而不另设碰撞字段，评价结果保持在独立报告中。
+
+
 | API | 前置输入与实际作用 | 输出及消费者 |
 |---|---|---|
 | `NativeSkillPhysicsEvaluator.__init__` | 正式执行绑定、原生模型/实体清单、手指接触组与明确坐标对应；恢复原任务及效果声明 | 独立评估对象，由实验运行器持有 |
+| `_FunctionalGoalEvaluator.__init__` | 正式功能/支持要求、场景身份、显式材料—原生 body 对应及静态坐标 | 材料测量绑定与原目标身份，由 `observe/finalize` 消费 |
 | `observe` | 初态及每个正常物理步的原生状态、执行器采样时间 | 连续位姿、关节、接触与原任务测量；回调返回值不参与控制 |
 | `_FunctionalGoalEvaluator._measure_support` | 保存的 `SupportRequirement`、原生物体位姿、材料坐标对应；逐点计算gap/body/footprint/normal | 四项原测量全部保留，`contact_face.valid`仍表示完整几何便利判定；要求的T/F只汇总 `hard_components` 中的项，空集表达全部为偏好 |
 | `NativeSkillPhysicsEvaluator.finalize` | 完整采样序列及执行器的正常步账本 | `physics-evidence.npz`、`evaluation-report.json`；覆盖缺失保留U，原始目标时刻与末帧诊断分别保存 |
