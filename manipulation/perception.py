@@ -714,6 +714,12 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
     outer bounding box. Raw depth and intrinsics are needed for metric output;
     no additional task-specific training or offline motion dataset is used.
     """
+    # BEGIN deprecated combined demonstration/classification entry.
+    # This raw-video path reruns infer_task and dispatches on its task schema.
+    # Current skill grounding loads the preserved representation and binds its
+    # declared entities/regions to observations. Shared perception APIs above
+    # remain independently used; this deprecation is specific to ground_rgbd.
+    # END deprecated combined demonstration/classification entry.
     demo_dir, scene_dir = Path(demo_dir), Path(scene_dir)
     demo_image, demo_depth, demo_camera = load_rgbd(demo_dir)
     scene_image, scene_depth, scene_camera = load_rgbd(scene_dir)
@@ -845,6 +851,10 @@ def ground_rgbd(demo_dir, scene_dir, instruction, *, client=None, detector=None,
 
 def run_rgbd(demo_dir, scene_dir, instruction, output_dir, **dependencies):
     """Execute semantic grounding, observations and trajectory generation once."""
+    # BEGIN deprecated raw-RGB-D orchestration.
+    # This entry owns the old VLM relation/motion/interaction dispatch. It is
+    # not called by the current compiled-skill grounding and planning path.
+    # END deprecated raw-RGB-D orchestration.
     destination = Path(output_dir)
     if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
         raise FileExistsError(f"Use an empty output directory: {destination}")

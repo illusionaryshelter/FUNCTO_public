@@ -24,6 +24,10 @@ INTERACTIONS = {"none", "grasp", "push", "pull", "tool"}
 
 
 def motion_kind(task):
+    # BEGIN deprecated semantic-enum adapter.
+    # Only the old object-stage entry maps a VLM motion label here. Explicit
+    # MotionModel geometry and planning requirements are separate live APIs.
+    # END deprecated semantic-enum adapter.
     # BEGIN semantic constraint selection, independent of candidate diagnostics.
     """Select the applied family from semantic evidence, not trajectory rank.
 
@@ -95,6 +99,12 @@ def run_stage(observation):
     reference frame; object points use a fixed body frame. Optional grasp or
     contact geometry is evidence only, never a fabricated rigid EE transform.
     """
+    # BEGIN deprecated object-stage task dispatch.
+    # This entry consumes the legacy relation/interaction/motion schema from
+    # raw RGB-D or saved object-stage observations. Current skill experiments
+    # bind explicit representation data and typed planning requirements.
+    # Shared geometry helpers in this module remain used by those consumers.
+    # END deprecated object-stage task dispatch.
     task = observation["task"]
     relation, interaction = task["relation"], task["interaction"]
     if relation not in RELATIONS:

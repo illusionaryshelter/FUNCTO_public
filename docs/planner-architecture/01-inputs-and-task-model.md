@@ -223,11 +223,13 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 
 ## 7. 输入辅助模块的调用范围
 
-`pipeline.py` 为数值任务入口提供 `motion_kind`、`run_stage`、`run_sequence` 和 `run_prepared`。`motion_kind` 从已选任务关系决定自由或机构运动类型；`run_stage` 将已绑定观察、目标关系和物体点交给运动适配与目标计算，返回该阶段的数值结果；`run_sequence` 沿明确的阶段顺序传递对象位姿；`run_prepared` 读取已准备输入并保存结果。`serializable/write_json` 将这些结果转为可保存的普通数据。`program` 和 `planning_problem` 复用其中的 `_surface/_interior`，把明确记录构造为有限支撑面或内部区域。
+旧原始 RGB-D 入口的 VLM `relation/interaction/motion` 分类及专用分派已标注废弃，当前保留函数体供原入口及历史记录调用。具体调用为 `manipulate.py` 的 `--demo/--scene/--instruction` 分支，经 `perception.run_rgbd/ground_rgbd` 调用 `grounding.infer_task`，再进入物体阶段或工具入口。当前技能绑定使用已保存的技能语义、完整表示和显式几何要求。此次变更只增加注释，计算内容与 `4d9edc4` 基线相同；实际注释提交在提交后回填。
+
+`pipeline.py` 的 `motion_kind/run_stage` 属于上述废弃分派；`run_sequence` 仍通过 `run_stage` 重放旧物体阶段，`run_prepared` 也保留该输入分支及独立的已编译程序分支。`serializable/write_json` 用于记录序列化。`program` 和 `planning_problem` 继续复用 `_surface/_interior`，把明确记录构造为有限支撑面或内部区域。显式 `MotionModel`、任务事件与规划要求具有各自的计算消费者，不属于 VLM 分类入口的废弃范围。
 
 `observations.py` 定义相机记录 `Camera(K,width,height,depth_scale)`。`load_calibration` 读取针孔内参和深度单位，`load_rgbd` 返回对应图像、米制深度与标定；`backproject` 以 `K⁻¹[u,v,1]` 和深度恢复相机点。`rigid_registration` 从明确的三维对应估计刚体变换和误差；`poses_from_tracks/poses_from_models` 将已有点轨迹或模型姿态组织为具名时间上的物体位姿。`track_rgbd` 通过独立跟踪 worker 取得固定点身份的观测序列，供示教输入准备。`planning_observation` 与机器人自过滤直接复用 `_intrinsics`；观测、区域及支撑输入准备复用 `backproject`。
 
-`grounding.py` 中 `infer_task` 从指令与源/当前图像产生结构化语义任务，`select_roles` 从检测候选选择对象角色，`propose_query_regions` 提出可在图像中核对的区域查询，`match_points` 在指定 masks 内计算对应像素。`selection.select_grounding_candidates` 将已有源语义、当前指令和明确视图候选交给选择器，返回所选候选或未决状态。它们为所选技能与几何绑定提供输入；数值规划从已经确定的任务与场景开始。各接口完整输入和直接返回记录见[实现索引](07-implementation-index.md)。
+`grounding.py` 中已废弃的 `infer_task` 从指令与源/当前图像产生上述分类，原入口的 `select_roles` 消费该任务选择对象角色。`propose_query_regions` 提出可在图像中核对的区域查询，`match_points` 在指定 masks 内计算对应像素。当前 `selection.select_grounding_candidates` 将已有源语义、当前指令和明确视图候选交给选择器，返回所选候选或未决状态；它与 `skill` 复用 `grounding.py` 的图像、mask 和检测记录函数。数值规划从已经确定的任务与场景开始。各接口完整输入和直接返回记录见[实现索引](07-implementation-index.md)。
 
 已有实体模型通过 `observed_owners` 直接进入场景；新实体可以由 mask 和深度建立。事件前表示坐标 C 与事件工具位姿 E_g 确定固定关系 A=E_g⁻¹C_pre，之后工具 FK 给出 C(t)=E(t)A。源任务坐标至 C 的变换 M_D 同时用于任务点重表达，参考生成消费 J=M_D⁻¹。
 

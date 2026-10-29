@@ -139,6 +139,8 @@ Gemini
 
 ## `infer_task`
 
+状态：已废弃的原始 RGB-D 语义分类入口。其 `relation/interaction/motion` 分派保留现有计算；当前技能绑定消费已保存技能语义和显式几何数据。共享图像、检测和区域函数继续由独立消费者使用。调用范围见[输入架构](../01-inputs-and-task-model.md#7-输入辅助模块的调用范围)。
+
 [定义位置](../../../manipulation/grounding.py#L66)。
 
 输入签名：

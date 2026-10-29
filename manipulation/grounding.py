@@ -14,12 +14,19 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 
+# BEGIN deprecated raw-RGB-D semantic dispatch.
+# This relation/interaction/motion schema belongs to the deprecated
+# infer_task -> ground_rgbd -> run_stage/run_tool_use entry. Current compiled
+# skill grounding consumes preserved skill semantics and explicit geometry.
+# This annotation does not deprecate MotionModel, skill events, region geometry,
+# or the image/detection helpers shared by the current grounding interfaces.
 _CHOICES = {
     "relation": {"transfer", "on", "inside", "articulation", "tool_use"},
     "interaction": {"none", "grasp", "push", "pull", "tool"},
     "motion": {"free", "planar", "translation_plane", "revolute", "prismatic", "auto"},
 }
 _ROLES = ("carrier", "reference")
+# END deprecated raw-RGB-D semantic dispatch.
 
 
 def _image(image):
@@ -70,6 +77,11 @@ def infer_task(instruction, demo_image, scene_image, *, demo_final_image=None, c
     a multistage planner: stage splitting and subsequent state updates belong to
     the caller. Motion remains a proposal until validated against observations.
     """
+    # BEGIN deprecated semantic-classification entry.
+    # Retained for the existing raw-RGB-D CLI and its historical tests only.
+    # New skill execution must consume its explicit represented relations;
+    # it must not classify a skill again to choose an algorithmic task branch.
+    # END deprecated semantic-classification entry.
     if not isinstance(instruction, str) or not instruction.strip():
         raise ValueError("instruction must be a nonempty string")
     images = [_image(demo_image), _image(scene_image)]

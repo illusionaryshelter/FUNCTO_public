@@ -41,6 +41,11 @@ def main():
         from manipulation.pipeline import run_prepared
         result = run_prepared(args.prepared, args.output_dir)
     else:
+        # BEGIN deprecated raw-RGB-D CLI branch.
+        # This branch invokes the old VLM task classification and object-stage
+        # dispatch. The annotation is limited to this branch; --prepared and
+        # the reusable geometric/planning interfaces have separate consumers.
+        # END deprecated raw-RGB-D CLI branch.
         if not all((args.demo, args.scene, args.instruction)):
             parser.error("Provide --demo, --scene and --instruction, or use --prepared")
         from manipulation.perception import run_rgbd
