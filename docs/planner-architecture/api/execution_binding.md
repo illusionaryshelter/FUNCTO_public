@@ -1,7 +1,7 @@
 # `manipulation/execution_binding.py` 实现契约
 
-代码基线：`c289890`。
-职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`9cdb433`。
+职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `plain`
 
@@ -463,7 +463,7 @@ def validate_controller_policy(value, *, joint_names):
 
 实现说明：
 
-> Validate the one supported named trajectory-control interpretation.
+> Bind same-time references and the backend's stateful torque contract.
 
 显式输出分支：
 
@@ -479,6 +479,8 @@ gains.shape
 np.isfinite(gains).all
 np.isfinite
 np.any
+bounds.shape
+np.isfinite(bounds).all
 ```
 
 写入目标：
@@ -490,6 +492,7 @@ names
 key
 gains
 dt
+bounds
 ```
 
 直接调用符号：
@@ -505,11 +508,12 @@ len
 np.isfinite(gains).all
 np.isfinite
 np.any
+np.isfinite(bounds).all
 ```
 
 ## `validate_result_only_goal_ids`
 
-[定义位置](../../../manipulation/execution_binding.py#L305)。
+[定义位置](../../../manipulation/execution_binding.py#L313)。
 
 输入签名：
 
@@ -568,7 +572,7 @@ binding['problem'].get
 
 ## `rebind_execution_result`
 
-[定义位置](../../../manipulation/execution_binding.py#L344)。
+[定义位置](../../../manipulation/execution_binding.py#L352)。
 
 输入签名：
 

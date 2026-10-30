@@ -275,21 +275,24 @@ def check_result(result, *, execution_limits=None):
 
 # BEGIN explicit device rebinding preserves the already checked mathematical candidate.
 def validate_controller_policy(value, *, joint_names):
-    """Validate the one supported named trajectory-control interpretation."""
+    """Bind same-time references and the backend's stateful torque contract."""
+    # BEGIN the experimental device has one same-time integral interpretation.
     keys = {"mode", "arm_joint_names", "kp", "kd", "native_timestep_s",
-            "reference_derivatives", "sampling_phase", "acceleration_knot_side"}
+            "reference_derivatives", "sampling_phase", "acceleration_knot_side",
+            "ki", "integral_update", "torque_limits"}
     if not isinstance(value, dict) or set(value) != keys:
         raise ValueError("An execution controller policy must explicitly declare every trajectory-control field")
     result = plain(value)
     names = tuple(joint_names)
-    if (result["mode"] != "joint_trajectory_q_dq_ddq"
+    if (result["mode"] != "joint_trajectory_q_dq_ddq_integral"
             or not isinstance(result["arm_joint_names"], list)
             or tuple(result["arm_joint_names"]) != names
             or result["reference_derivatives"] != ["q", "dq", "ddq"]
-            or result["sampling_phase"] != "clamped_step_endpoint"
-            or result["acceleration_knot_side"] != "right_internal_last_left"):
-        raise ValueError("Execution requires the bound named q/dq/ddq endpoint controller policy")
-    for key in ("kp", "kd"):
+            or result["sampling_phase"] != "step_start"
+            or result["acceleration_knot_side"] != "right_internal_last_left"
+            or result["integral_update"] != "confirmed_native_step_torque_conditional"):
+        raise ValueError("Execution requires same-time named q/dq/ddq and completed-step integral control")
+    for key in ("kp", "kd", "ki"):
         try:
             gains = np.asarray(result[key], dtype=float)
         except (TypeError, ValueError) as error:
@@ -299,6 +302,11 @@ def validate_controller_policy(value, *, joint_names):
     dt = result["native_timestep_s"]
     if isinstance(dt, bool) or not isinstance(dt, (float, int)) or not np.isfinite(dt) or dt <= 0:
         raise ValueError("The controller policy needs its finite positive native timestep")
+    bounds = np.asarray(result["torque_limits"], dtype=float)
+    if (bounds.shape != (len(names), 2) or not np.isfinite(bounds).all()
+            or np.any(bounds[:, 0] >= bounds[:, 1])):
+        raise ValueError("The controller policy needs its effective named total torque intervals")
+    # END device rebinding preserves the existing curve and original limits.
     return result
 
 

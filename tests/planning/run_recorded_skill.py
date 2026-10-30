@@ -122,15 +122,16 @@ def load_joint_reference(path, problem):
 
 
 # BEGIN independent finger reference on the planner's exact physical clock.
-def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ctrlrange,
+def finger_trajectory_factory(problem, feedback, finger_targets, *, incoming_command, timestep, ctrlrange,
                               position_limits, velocity_limits, acceleration_limits):
     """Bind original events once the native formal duration/map are known.
 
     Actual-position protection bounds are deliberately absent from this
     constructor. They continue guarding measured feedback in the executor;
     they cannot predict a hand shape or replace the original position goals.
-    The returned reference starts at measured q/dq and remains a command,
-    including when physical contact prevents a target from being reached.
+    The returned reference continues the explicitly supplied active command.
+    Measured q/dq remain separate entrance observations, including when contact
+    prevents the physical fingers from reaching the issued target.
     """
     from manipulation.gripper_trajectory import FingerTrajectory
 
@@ -154,9 +155,10 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
             finger_joint_names=names, ctrlrange=ctrlrange)
         velocity = np.asarray([velocity_limits[name] for name in names])
         acceleration = np.asarray([acceleration_limits[name] for name in names])
-        return FingerTrajectory.build(joint_names=names,
-            initial_position=[measured[name] for name in names],
-            initial_velocity=[speeds[name] for name in names], commands=commands,
+        # BEGIN separate active device command and measured finger entrance.
+        return FingerTrajectory.build(joint_names=names, incoming_command=incoming_command,
+            measured_initial_position=[measured[name] for name in names],
+            measured_initial_velocity=[speeds[name] for name in names], commands=commands,
             duration=duration_s, executable_until=stop, timestep=timestep,
             position_limits=np.asarray([position_limits[name] for name in names]).T,
             velocity_limits=np.stack((-velocity, velocity)),
@@ -164,6 +166,7 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
             source=(f"Original explicit actuator targets: {finger_targets.source}; C1 command reference "
                     "under native planner acceleration bounds, not calibrated actual acceleration/tracking limits"),
             feedback_id=feedback["feedback_id"], timestamp_s=feedback["sim_time_s"])
+        # END bound events retain their sole native clock.
 
     # BEGIN expose the already bound device tick to the planning clock owner.
     build.timestep = float(timestep)
@@ -445,6 +448,7 @@ def run_prepared(args, *, problem, provenance):
         robot["robot_cfg"]["kinematics"]["lock_joints"] = {
             name: measured[name] for name in feedback["finger_joint_names"]}
         reference_factory = finger_trajectory_factory(problem, feedback, finger_targets,
+            incoming_command=feedback["incoming_finger_command"],
             timestep=fixture["control_timestep_s"], ctrlrange=fixture["finger_control_ranges"],
             position_limits=fixture["position_limits"], velocity_limits=fixture["velocity_limits"],
             acceleration_limits={name: float(robot["robot_cfg"]["kinematics"]["cspace"]["max_acceleration"])

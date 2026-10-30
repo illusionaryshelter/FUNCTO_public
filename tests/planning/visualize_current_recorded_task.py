@@ -411,7 +411,7 @@ def trial_panel(trial, output):
     if execution is not None:
         body.append(f'<p>执行状态：{escape(execution["status"])}；'
                     f'证据通过：{escape(execution["evidence_passed"])}；'
-                    f'屏障命令已采样：{escape(execution["barrier_command_reached"])}</p>')
+                    f'实际记录已覆盖参考边界：{escape(execution["barrier_reference_reached"])}</p>')
         body.append(details("执行时间、未执行命令与待验证事件", execution))
         if "maximum_arm_tracking_error_rad" in execution:
             body.append(f'<p>物理时长：{execution["elapsed_sim_s"]:.3f} s；'

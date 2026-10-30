@@ -1,11 +1,215 @@
 # `manipulation/gripper_trajectory.py` 实现契约
 
-代码基线：`be44b54`。
-职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`9cdb433`。
+职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+
+## `_incoming_values`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L35)。
+
+输入签名：
+
+```python
+def _incoming_values(incoming, names):
+```
+
+实现说明：
+
+> Align command coordinates without changing the source event's ordering.
+
+显式输出分支：
+
+```python
+tuple((np.asarray(incoming[key], dtype=float)[columns] for key in ('position', 'velocity', 'target_position')))
+```
+
+读取的对象属性：
+
+```python
+tuple(incoming['joint_names']).index
+np.asarray
+```
+
+写入目标：
+
+```python
+columns
+name
+key
+```
+
+直接调用符号：
+
+```python
+tuple(incoming['joint_names']).index
+tuple
+np.asarray
+```
+
+## `_validated_incoming`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L42)。
+
+输入签名：
+
+```python
+def _validated_incoming(value, names, timestamp_s):
+```
+
+实现说明：
+
+> Own the explicit active-command state and its temporal provenance.
+
+显式输出分支：
+
+```python
+result
+```
+
+读取的对象属性：
+
+```python
+_array(result[key], (len(names),), 'Incoming command ' + key).tolist
+np.asarray
+np.isfinite(timing).all
+np.isfinite
+np.array_equal
+np.any
+```
+
+写入目标：
+
+```python
+required
+result
+incoming_names
+key
+result[key]
+timing
+event
+q
+dq
+target
+```
+
+直接调用符号：
+
+```python
+isinstance
+set
+ValueError
+deepcopy
+tuple
+len
+_array(result[key], (len(names),), 'Incoming command ' + key).tolist
+_array
+_text
+np.asarray
+np.isfinite(timing).all
+np.isfinite
+event_occurrence_key
+np.array_equal
+_incoming_values
+np.any
+```
+
+## `_incoming_sampler`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L75)。
+
+输入签名：
+
+```python
+def _incoming_sampler(incoming, names):
+```
+
+实现说明：
+
+> Return the unique remaining cubic followed by its existing target hold.
+>
+> A cubic is uniquely determined by its endpoint positions and velocities.
+> Its initial endpoint is the preceding reference evaluated at the actual
+> handover; its final endpoint is that active command's original zero-speed
+> target. Queries after that ramp continue the same command, not a future
+> event from the preceding skill.
+
+显式输出分支：
+
+```python
+sample
+```
+
+读取的对象属性：
+
+```python
+np.stack
+np.zeros_like
+```
+
+写入目标：
+
+```python
+q
+dq
+target
+finish
+curve
+```
+
+直接调用符号：
+
+```python
+_incoming_values
+float
+CubicHermiteSpline
+np.stack
+np.zeros_like
+```
+
+## `_incoming_sampler.sample`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L90)。
+
+输入签名：
+
+```python
+def sample(time_s):
+```
+
+显式输出分支：
+
+```python
+(q.copy(), dq.copy())
+(target.copy(), np.zeros_like(dq))
+(curve(time_s), curve(time_s, 1))
+```
+
+读取的对象属性：
+
+```python
+q.copy
+dq.copy
+target.copy
+np.zeros_like
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+q.copy
+dq.copy
+target.copy
+np.zeros_like
+curve
+```
 
 ## `_text`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L31)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L102)。
 
 输入签名：
 
@@ -39,7 +243,7 @@ ValueError
 
 ## `_array`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L37)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L108)。
 
 输入签名：
 
@@ -81,7 +285,7 @@ result.copy
 
 ## `_activation`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L44)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L115)。
 
 输入签名：
 
@@ -124,7 +328,7 @@ math.ceil
 
 ## `_extrema`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L62)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L133)。
 
 输入签名：
 
@@ -218,7 +422,7 @@ maxima.append
 
 ## `_segment`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L100)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L171)。
 
 输入签名：
 
@@ -297,7 +501,7 @@ _extrema
 
 ## `_commands`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L150)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L221)。
 
 输入签名：
 
@@ -382,7 +586,7 @@ tuple
 
 ## `FingerTrajectory`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L219)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L290)。
 
 ```python
 class FingerTrajectory():
@@ -406,6 +610,9 @@ segments: tuple[dict, ...]
 source: str
 feedback_id: str
 timestamp_s: float
+incoming_command: dict
+measured_initial_position: np.ndarray
+measured_initial_velocity: np.ndarray
 _curve: CubicHermiteSpline = field(init=False, repr=False)
 _bounds_report: dict = field(init=False, repr=False)
 _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
@@ -417,7 +624,7 @@ _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare
 
 ## `FingerTrajectory.__post_init__`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L243)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L317)。
 
 输入签名：
 
@@ -435,6 +642,9 @@ def __post_init__(self):
 self.joint_names
 name.strip
 object.__setattr__
+self.incoming_command
+self.timestamp_s
+value.setflags
 self.source
 self.feedback_id
 np.isfinite([self.duration, self.executable_until, self.timestep, self.timestamp_s]).all
@@ -442,7 +652,6 @@ np.isfinite
 self.duration
 self.executable_until
 self.timestep
-self.timestamp_s
 math.ceil
 np.any
 np.asarray
@@ -467,6 +676,8 @@ getattr(self, label).setflags
 ```python
 names
 name
+key
+value
 label
 bound
 times
@@ -488,12 +699,14 @@ set
 any
 name.strip
 object.__setattr__
+_validated_incoming
+_array
+getattr
+value.setflags
 _text
 np.isfinite([self.duration, self.executable_until, self.timestep, self.timestamp_s]).all
 np.isfinite
 math.ceil
-_array
-getattr
 np.any
 np.asarray
 np.isfinite(times).all
@@ -510,7 +723,7 @@ getattr(self, label).setflags
 
 ## `FingerTrajectory._limits`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L284)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L366)。
 
 输入签名：
 
@@ -542,27 +755,27 @@ getattr
 
 ## `FingerTrajectory.build`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L288)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L371)。
 
 输入签名：
 
 ```python
-def build(cls, *, joint_names, initial_position, initial_velocity, commands, duration, executable_until, timestep, position_limits, velocity_limits, acceleration_limits, source, feedback_id, timestamp_s):
+def build(cls, *, joint_names, incoming_command, measured_initial_position, measured_initial_velocity, commands, duration, executable_until, timestep, position_limits, velocity_limits, acceleration_limits, source, feedback_id, timestamp_s):
 ```
 
 实现说明：
 
-> Compile explicit event goals without changing their original clock.
+> Compile original next-skill events after the current active command.
 >
-> Before a later first event, a bounded C1 takeover returns to the
-> measured initial coordinate and zero reference velocity. This is an
-> explicit position-hold reference, not fictitious stationary feedback.
-> The initial measured velocity is always preserved as the first slope.
+> If the first new event occurs during the inherited ramp, its q/dq are
+> sampled at that event before constructing the new goal's bounded ramp.
+> If it occurs later, the old target is held until that event. A new
+> event at zero takes over from the incoming command q/dq immediately.
 
 显式输出分支：
 
 ```python
-cls(names, np.asarray(knots), np.asarray(positions), np.asarray(velocities), float(duration), float(executable_until), float(timestep), bounds['position'], bounds['velocity'], bounds['acceleration'], events, tuple(segments), source, feedback_id, float(timestamp_s))
+cls(joint_names=names, times=np.asarray(knots), position=np.asarray(positions), velocity=np.asarray(velocities), duration=float(duration), executable_until=float(executable_until), timestep=float(timestep), position_limits=bounds['position'], velocity_limits=bounds['velocity'], acceleration_limits=bounds['acceleration'], events=events, segments=tuple(segments), source=source, feedback_id=feedback_id, timestamp_s=float(timestamp_s), incoming_command=incoming, measured_initial_position=measured_initial_position, measured_initial_velocity=measured_initial_velocity)
 ```
 
 读取的对象属性：
@@ -571,11 +784,11 @@ cls(names, np.asarray(knots), np.asarray(positions), np.asarray(velocities), flo
 np.isfinite([duration, executable_until, timestep]).all
 np.isfinite
 np.any
-windows.append
 q.copy
-np.asarray
 dq.copy
 segments.append
+active_target.tolist
+np.asarray
 goal.tolist
 np.zeros
 goal.copy
@@ -585,49 +798,57 @@ goal.copy
 
 ```python
 names
-count
+incoming
 q
 dq
+active_target
 bounds
 label
 value
 events
 active
-row
-windows
-index
 event
-end
 knots
 positions
 velocities
 segments
+end
+finish
+sample
+identity
+index
 begin
 goal
-finish
 ```
 
 直接调用符号：
 
 ```python
 tuple
-len
+_validated_incoming
+_incoming_values
 _array
+len
 np.isfinite([duration, executable_until, timestep]).all
 np.isfinite
 ValueError
 np.any
 _commands
-windows.append
 q.copy
+dq.copy
+float
+min
+_incoming_sampler
+event_occurrence_key
+segments.append
+dict
+active_target.tolist
+append
+sample
 enumerate
 np.asarray
-dq.copy
 _segment
-segments.append
-float
 goal.tolist
-append
 np.zeros
 goal.copy
 cls
@@ -635,12 +856,12 @@ cls
 
 ## `FingerTrajectory.build.append`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L325)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L401)。
 
 输入签名：
 
 ```python
-def append(time_s, value, rate):
+def append(moment, value, rate):
 ```
 
 显式输出分支：
@@ -677,7 +898,7 @@ ValueError
 
 ## `FingerTrajectory._validate_segments`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L356)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L441)。
 
 输入签名：
 
@@ -687,11 +908,12 @@ def _validate_segments(self):
 
 实现说明：
 
-> Validate saved phase boundaries without regenerating or retiming.
+> Reconstruct saved knots from the active prefix and original events.
 >
-> Reconstruct only the explicitly saved knots from event targets and
-> ramp endpoints. A changed archive cannot hide motion before an event,
-> replace the initial slope, or omit conditional commands in the suffix.
+> Only the incoming prefix may end with nonzero command velocity: a new
+> event can supersede an unfinished prior ramp. All newly generated goal
+> ramps retain the existing zero terminal slope and original deadline.
+> This audit never regenerates or retimes a saved trajectory.
 
 显式输出分支：
 
@@ -700,71 +922,112 @@ def _validate_segments(self):
 读取的对象属性：
 
 ```python
-self.position
-self.velocity
+self.incoming_command
+self.joint_names
 self.events
 self.segments
-np.isfinite([begin, finish, stop]).all
+np.isfinite([begin, finish, end]).all
 np.isfinite
 self.duration
-self.joint_names
+active.values
 np.array_equal
 used.add
-expected_times.append
-expected_q.append
-goal.copy
-expected_dq.append
 np.zeros
-np.any
 self.times
+self.position
+self.velocity
 ```
 
 写入目标：
 
 ```python
+q0
+dq0
+active_target
 expected_times
 expected_q
 expected_dq
 active
 row
 used
-end
+previous_end
 segment
 begin
 finish
-stop
+end
 key
 goal
+incoming_event
 identity
+first_event
+sample
 event
-moment
 ```
 
 直接调用符号：
 
 ```python
+_incoming_values
 event_occurrence_key
 set
 isinstance
 ValueError
 float
-np.isfinite([begin, finish, stop]).all
+np.isfinite([begin, finish, end]).all
 np.isfinite
 _array
 len
+min
+active.values
+tuple
 np.array_equal
+_incoming_sampler
+append
+sample
 used.add
+np.zeros
+```
+
+## `FingerTrajectory._validate_segments.append`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L454)。
+
+输入签名：
+
+```python
+def append(moment, value, rate):
+```
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
 expected_times.append
 expected_q.append
-goal.copy
 expected_dq.append
-np.zeros
-np.any
+np.array_equal
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+expected_times.append
+expected_q.append
+expected_dq.append
+np.array_equal
+ValueError
 ```
 
 ## `FingerTrajectory.sample`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L406)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L503)。
 
 输入签名：
 
@@ -812,7 +1075,7 @@ self._curve
 
 ## `FingerTrajectory.sample_torch`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L413)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L510)。
 
 输入签名：
 
@@ -891,7 +1154,7 @@ len
 
 ## `FingerTrajectory.torch_storage_bytes`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L442)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L539)。
 
 输入签名：
 
@@ -929,7 +1192,7 @@ self._curve
 
 ## `FingerTrajectory.describe`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L447)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L544)。
 
 输入签名：
 
@@ -944,7 +1207,7 @@ def describe(self):
 显式输出分支：
 
 ```python
-{'joint_names': list(self.joint_names), 'source': self.source, 'feedback_id': self.feedback_id, 'timestamp_s': self.timestamp_s, 'duration': self.duration, 'executable_until': self.executable_until, 'timestep': self.timestep, 'times': self.times.tolist(), 'position': self.position.tolist(), 'velocity': self.velocity.tolist(), 'position_limits': self.position_limits.tolist(), 'velocity_limits': self.velocity_limits.tolist(), 'acceleration_limits': self.acceleration_limits.tolist(), 'events': deepcopy(list(self.events)), 'segments': deepcopy(list(self.segments)), 'scope': _SCOPE, 'limits_scope': _LIMITS_SCOPE, 'bounds_report': deepcopy(self._bounds_report)}
+{'joint_names': list(self.joint_names), 'source': self.source, 'feedback_id': self.feedback_id, 'timestamp_s': self.timestamp_s, 'duration': self.duration, 'executable_until': self.executable_until, 'timestep': self.timestep, 'times': self.times.tolist(), 'position': self.position.tolist(), 'velocity': self.velocity.tolist(), 'position_limits': self.position_limits.tolist(), 'velocity_limits': self.velocity_limits.tolist(), 'acceleration_limits': self.acceleration_limits.tolist(), 'events': deepcopy(list(self.events)), 'segments': deepcopy(list(self.segments)), 'schema': _SCHEMA, 'incoming_command': deepcopy(self.incoming_command), 'measured_initial_position': self.measured_initial_position.tolist(), 'measured_initial_velocity': self.measured_initial_velocity.tolist(), 'scope': _SCOPE, 'limits_scope': _LIMITS_SCOPE, 'bounds_report': deepcopy(self._bounds_report)}
 ```
 
 读取的对象属性：
@@ -971,6 +1234,11 @@ self.acceleration_limits.tolist
 self.acceleration_limits
 self.events
 self.segments
+self.incoming_command
+self.measured_initial_position.tolist
+self.measured_initial_position
+self.measured_initial_velocity.tolist
+self.measured_initial_velocity
 self._bounds_report
 ```
 
@@ -989,11 +1257,13 @@ self.position_limits.tolist
 self.velocity_limits.tolist
 self.acceleration_limits.tolist
 deepcopy
+self.measured_initial_position.tolist
+self.measured_initial_velocity.tolist
 ```
 
 ## `FingerTrajectory.from_mapping`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L458)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L559)。
 
 输入签名：
 
@@ -1003,7 +1273,7 @@ def from_mapping(cls, value):
 
 实现说明：
 
-> Load the archived reference exactly, validating all saved claims.
+> Load only the current schema, without converting old archives.
 
 显式输出分支：
 
@@ -1014,18 +1284,16 @@ result
 读取的对象属性：
 
 ```python
-cls.__dataclass_fields__.items
-cls.__dataclass_fields__
-definition.init
+item.name
+item.init
 result.describe
 ```
 
 写入目标：
 
 ```python
-fields
-name
-definition
+arguments
+item
 result
 key
 ```
@@ -1033,7 +1301,7 @@ key
 直接调用符号：
 
 ```python
-cls.__dataclass_fields__.items
+fields
 isinstance
 set
 ValueError
@@ -1044,7 +1312,7 @@ result.describe
 
 ## `FingerTrajectory.validate_execution`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L468)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L572)。
 
 输入签名：
 
@@ -1054,7 +1322,15 @@ def validate_execution(self, trajectory, commands, *, initial_feedback, timestep
 
 实现说明：
 
-> Bind a saved reference to current actual feedback and the arm clock.
+> Check actual entrance and freshly read command state independently.
+>
+> The executor supplies ``actuator_ctrl`` from
+> ``executor.backend.proprioception()`` immediately before this call.
+> It preserves the archived entrance identity and actual q/dq for the
+> original executor's complete numeric-state comparison. A saved ctrl
+> value cannot substitute for this live command observation. The device
+> exposes no command-derivative sensor: that derivative is retained from
+> the preceding saved active polynomial, independently of encoder dq.
 
 显式输出分支：
 
@@ -1075,9 +1351,11 @@ self.feedback_id
 self.timestamp_s
 tuple(initial_feedback['joint_names']).index
 np.array_equal
-self.position
+self.measured_initial_position
 np.asarray
-self.velocity
+self.measured_initial_velocity
+tuple(observation['joint_names']).index
+self.position
 self.position_limits.shape
 self.position_limits
 self.velocity_limits.shape
@@ -1092,6 +1370,9 @@ self._bounds_report
 ```python
 columns
 name
+observation
+command_columns
+live_command
 native_position
 native_velocity
 expected
@@ -1105,15 +1386,105 @@ ValueError
 tuple(initial_feedback['joint_names']).index
 np.array_equal
 np.asarray
+tuple(observation['joint_names']).index
 _array
 np.any
 _commands
 deepcopy
 ```
 
+## `_free_finger_geometry`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L622)。
+
+输入签名：
+
+```python
+def _free_finger_geometry(reference):
+```
+
+实现说明：
+
+> Generate the established nominal free-hand model from measured q/dq.
+>
+> The model follows the original event targets using the existing bounded
+> Hermite interpolation. Its entrance is the actual measured shape; the
+> independent actuator curve continues its incoming command instead. This
+> is a declared free-motion hypothesis ending at the first contact boundary.
+
+显式输出分支：
+
+```python
+(np.asarray(times), np.asarray(positions), np.asarray(velocities))
+```
+
+读取的对象属性：
+
+```python
+reference.measured_initial_position.copy
+reference.measured_initial_position
+reference.measured_initial_velocity.copy
+reference.measured_initial_velocity
+reference.events
+windows.append
+reference.duration
+q.copy
+np.asarray
+dq.copy
+reference.timestep
+reference.joint_names
+reference._limits
+times.append
+positions.append
+goal.copy
+velocities.append
+np.zeros_like
+```
+
+写入目标：
+
+```python
+q
+dq
+active
+row
+windows
+index
+event
+end
+times
+positions
+velocities
+begin
+goal
+finish
+moment
+```
+
+直接调用符号：
+
+```python
+reference.measured_initial_position.copy
+reference.measured_initial_velocity.copy
+windows.append
+q.copy
+enumerate
+len
+np.asarray
+dq.copy
+_segment
+reference._limits
+times.append
+float
+positions.append
+goal.copy
+velocities.append
+np.zeros_like
+```
+
 ## `NominalFingerGeometry`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L500)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L653)。
 
 ```python
 class NominalFingerGeometry():
@@ -1145,7 +1516,7 @@ _torch_cache: dict = field(default_factory=dict, init=False, repr=False, compare
 
 ## `NominalFingerGeometry.__post_init__`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L520)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L673)。
 
 输入签名：
 
@@ -1215,7 +1586,7 @@ CubicHermiteSpline
 
 ## `NominalFingerGeometry.valid_mask`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L542)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L695)。
 
 输入签名：
 
@@ -1269,7 +1640,7 @@ ValueError
 
 ## `NominalFingerGeometry.valid_mask_torch`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L556)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L709)。
 
 输入签名：
 
@@ -1314,7 +1685,7 @@ admitted.all
 
 ## `NominalFingerGeometry.sample`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L566)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L719)。
 
 输入签名：
 
@@ -1346,7 +1717,7 @@ FingerTrajectory.sample
 
 ## `NominalFingerGeometry.sample_torch`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L569)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L722)。
 
 输入签名：
 
@@ -1378,7 +1749,7 @@ FingerTrajectory.sample_torch
 
 ## `NominalFingerGeometry.torch_storage_bytes`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L574)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L727)。
 
 输入签名：
 
@@ -1411,7 +1782,7 @@ FingerTrajectory.torch_storage_bytes.fget
 
 ## `NominalFingerGeometry.describe`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L577)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L730)。
 
 输入签名：
 
@@ -1455,7 +1826,7 @@ self.velocity.tolist
 
 ## `NominalFingerGeometry.from_reference`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L584)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L737)。
 
 输入签名：
 
@@ -1495,7 +1866,7 @@ cls
 
 ## `NominalFingerGeometry.from_mapping`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L590)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L743)。
 
 输入签名：
 
@@ -1542,7 +1913,7 @@ result.describe
 
 ## `bind_nominal_finger_geometry`
 
-[定义位置](../../../manipulation/gripper_trajectory.py#L600)。
+[定义位置](../../../manipulation/gripper_trajectory.py#L753)。
 
 输入签名：
 
@@ -1579,11 +1950,9 @@ boundaries.append
 np.array
 reference.duration
 np.tile
-reference.position
+reference.measured_initial_position
 np.zeros_like
 reference.feedback_id
-reference.times
-reference.velocity
 reference.joint_names
 ```
 
@@ -1624,6 +1993,153 @@ np.array
 np.tile
 np.zeros_like
 repr
+_free_finger_geometry
 min
 NominalFingerGeometry
+```
+
+## `stationary_finger_command`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L823)。
+
+输入签名：
+
+```python
+def stationary_finger_command(*, joint_names, position, timestamp_s, source, feedback_id):
+```
+
+实现说明：
+
+> Declare an already issued stationary command in named joint coordinates.
+>
+> This producer is for a device holding a fixed target without an unfinished
+> command ramp. Position comes from actuator command feedback, not encoders.
+> A continuation of a moving reference uses ``capture_active_command``.
+
+显式输出分支：
+
+```python
+_validated_incoming(dict(schema=_INCOMING_SCHEMA, joint_names=list(names), position=q.tolist(), velocity=np.zeros_like(q).tolist(), target_position=q.tolist(), remaining_ramp_s=0.0, timestamp_s=float(timestamp_s), source=source, source_feedback_id=feedback_id, source_curve_time_s=0.0, active_event=None), names, float(timestamp_s))
+```
+
+读取的对象属性：
+
+```python
+q.tolist
+np.zeros_like(q).tolist
+np.zeros_like
+```
+
+写入目标：
+
+```python
+names
+q
+```
+
+直接调用符号：
+
+```python
+tuple
+_array
+len
+_validated_incoming
+dict
+list
+q.tolist
+np.zeros_like(q).tolist
+np.zeros_like
+float
+```
+
+## `capture_active_command`
+
+[定义位置](../../../manipulation/gripper_trajectory.py#L840)。
+
+输入签名：
+
+```python
+def capture_active_command(reference, *, curve_time_s, last_dispatch_time_s, boundary_timestamp_s, source):
+```
+
+实现说明：
+
+> Extract one already active command from an explicitly loaded reference.
+>
+> The caller loads the previous archive using that archive's own component.
+> This function consumes a validated object, not an alternate input schema.
+> Only the active segment's target and remaining cubic are returned; later
+> events remain in the preceding archive. ``last_dispatch_time_s`` comes
+> from the completed execution's last control_elapsed entry: an event at a
+> step endpoint has not yet activated in that preceding step. The command
+> q/dq are nevertheless the step-end reference sample at ``curve_time_s``.
+> ``boundary_timestamp_s`` is the actual sample time, distinct from this
+> possibly clamped reference clock. This interface describes a completed
+> normal dispatch; an interrupted dispatch/hold needs its own command record.
+
+显式输出分支：
+
+```python
+_validated_incoming(result, reference.joint_names, float(boundary_timestamp_s))
+```
+
+读取的对象属性：
+
+```python
+np.isfinite([moment, dispatched]).all
+np.isfinite
+reference.executable_until
+reference.segments
+reference.sample
+reference.joint_names
+reference.incoming_command
+reference.joint_names.index
+np.asarray
+reference.events
+q.tolist
+dq.tolist
+target.tolist
+reference.feedback_id
+```
+
+写入目标：
+
+```python
+moment
+dispatched
+segment
+row
+q
+dq
+command_names
+incoming
+columns
+name
+target
+remaining
+event
+result
+```
+
+直接调用符号：
+
+```python
+float
+np.isfinite([moment, dispatched]).all
+np.isfinite
+ValueError
+reference.sample
+tuple
+reference.joint_names.index
+np.asarray
+max
+deepcopy
+next
+event_occurrence_key
+dict
+list
+q.tolist
+dq.tolist
+target.tolist
+_validated_incoming
 ```

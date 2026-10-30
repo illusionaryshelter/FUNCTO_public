@@ -456,7 +456,9 @@ class PrismaticGripper:
             trajectory = self.finger_trajectory_factory(duration, progress_map)
             if (tuple(trajectory.joint_names) != self.joint_names
                     or trajectory.duration != duration
-                    or not np.array_equal(trajectory.sample(np.array([0.]))[0][0], self.current_positions)):
+                    # BEGIN command q(0) and measured entrance have independent values.
+                    or not np.array_equal(trajectory.measured_initial_position, self.current_positions)):
+                # END the geometry check below still uses actual entrance shape.
                 raise ValueError("Finger reference must preserve named measured entrance and formal duration")
             self.finger_trajectory = trajectory
         if self.nominal_finger_trajectory_factory is not None:

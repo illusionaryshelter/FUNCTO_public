@@ -10,6 +10,8 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 
 初始化接口另以 `K=trajectory_seeds` 表示每批实际轨迹候选上限，以 `S=ik_seeds` 表示功能事件原生 IK 的候选容量；普通参考 IK 容量固定为 1，以 `M` 表示三次基自由系数数，以 `D` 表示活动关节数。
 
+设备控制、命令衔接、完整状态和仿真评价的参数、公式及调用关系由[设备控制组件](11-device-control-and-evaluation.md)定义。`RobosuiteExecutionBackend` 必须接收独立 RobotGravity，手指参考必须接收 incoming_command 及独立测量入口。
+
 ## 1. 参考表示与任务编译
 
 以下接口对应[输入组件](01-inputs-and-task-model.md)。示教表示和当前任务关系提供参考，机器人反馈提供本次入口；最终 `PlanningProblem` 是数值求解统一读取的任务对象。

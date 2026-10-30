@@ -1,6 +1,6 @@
 # `manipulation/planning_scene.py` 实现契约
 
-代码基线：`c289890`。
+代码基线：`9cdb433`。
 职责和数据语义见[组件说明](../03-attachment-contact-and-hand.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_array`
@@ -1133,14 +1133,14 @@ trajectory.joint_names
 self.joint_names
 trajectory.duration
 np.array_equal
-trajectory.sample
-np.array
+trajectory.measured_initial_position
 self.current_positions
 self.nominal_finger_trajectory_factory
 self.finger_trajectory
 nominal.joint_names
 nominal.duration
 nominal.sample
+np.array
 ```
 
 写入目标：
@@ -1158,17 +1158,16 @@ self.nominal_finger_trajectory
 self.finger_trajectory_factory
 tuple
 np.array_equal
-trajectory.sample
-np.array
 ValueError
 self.nominal_finger_trajectory_factory
 isinstance
 nominal.sample
+np.array
 ```
 
 ## `PrismaticGripper.state`
 
-[定义位置](../../../manipulation/planning_scene.py#L473)。
+[定义位置](../../../manipulation/planning_scene.py#L475)。
 
 输入签名：
 

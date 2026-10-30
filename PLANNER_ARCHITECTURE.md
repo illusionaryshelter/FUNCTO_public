@@ -2,7 +2,7 @@
 
 求解与观测场算法基线为 `be44b54`，官方机器人距离批处理基线为 `12e0ef5`；候选交付、通用三维几何数值核与执行绑定数据转换分别以 [planning API](docs/planner-architecture/api/planning.md)、[几何内核 API](docs/planner-architecture/api/geometry_kernels.md) 和 [execution_binding API](docs/planner-architecture/api/execution_binding.md) 所列代码提交为准。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-各组件 API 页记录实际代码基线；仅文档提交保持所引用组件的生产代码内容。当前执行关系声明处理的代码基线为 `9486a09ee901e36fdda7e8972942e29deeea91fc`，详细契约见执行组件与 API 页。
+各组件 API 页记录实际代码基线；仅文档提交保持所引用组件的生产代码内容。设备执行、手指命令衔接及仿真评价的当前调用、控制公式和数据职责见[设备控制组件](docs/planner-architecture/11-device-control-and-evaluation.md)，各 API 页登记实际代码引用。
 
 当前时间预算配置对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容。`PlanningBudget.planning_seconds` 的全局默认值为 60 s，记录式 CLI 和诊断准备入口直接读取这一字段。
 
@@ -22,6 +22,7 @@
 | [观测与碰撞](docs/planner-architecture/02-observation-and-collision.md) | RGB-D 建立实体 TSDF 及观测支持域；官方机器人实体和任务原场提供几何目标及独立验收证据 |
 | [关系、接触与手指](docs/planner-architecture/03-attachment-contact-and-hand.md) | 声明关系使用事件固定锚点预测原场运动；有限接触、工具成员和手指曲线共用物理时钟 |
 | [求解与搜索](docs/planner-architecture/04-solver-and-search.md) | cuRobo IK 产生参考关节样本，最小二乘转为三次系数；SciPy SLSQP 联合求解任务和连续关节约束，OMPL 提供预算内几何路径提议 |
+| [设备控制与评价](docs/planner-architecture/11-device-control-and-evaluation.md) | 同刻轨迹控制、积分与统一力限、固定机器人重力、命令/测量衔接、完整状态和独立评价 |
 | [验收与执行](docs/planner-architecture/05-acceptance-and-execution.md) | 保存多项式接受原任务、连续关节和原场检查；合格曲线绑定后交给设备执行 |
 | [API 契约](docs/planner-architecture/06-api-contracts.md) | 各接口的必要输入、输出及实际消费者 |
 | [实现索引](docs/planner-architecture/07-implementation-index.md) | 当前源码定义、精确签名、读取属性及直接调用 |

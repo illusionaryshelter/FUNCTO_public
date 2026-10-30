@@ -154,7 +154,7 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
     measured-state probe; it makes no claim of actual actuator tracking or
     mechanically fixed hardware. Source mechanical ranges remain unchanged.
     """
-    from manipulation.gripper_trajectory import FingerTrajectory
+    from manipulation.gripper_trajectory import FingerTrajectory, stationary_finger_command
     from manipulation.planning_scene import PrismaticGripper
     from robot_fixture import create_fixed_installation_owners
 
@@ -185,8 +185,11 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
     def nominal(duration, progress_map, command_reference):
         # This continuous hypothesis has no future command-derived transitions.
         # Any actual command intentions remain in the separate formal event clock.
-        reference = FingerTrajectory.build(joint_names=fingers, initial_position=current,
-            initial_velocity=np.zeros(len(fingers)), commands=(), duration=duration,
+        reference = FingerTrajectory.build(joint_names=fingers, measured_initial_position=current,
+            measured_initial_velocity=np.zeros(len(fingers)),
+            incoming_command=stationary_finger_command(joint_names=fingers, position=current,
+                timestamp_s=0., feedback_id="explicit named initial posture for a fixed-geometry probe",
+                source="Explicit constant synthetic geometry coordinates"), commands=(), duration=duration,
             executable_until=duration, timestep=control_timestep_s,
             position_limits=geometry["joint_limits"].T, velocity_limits=np.stack((-speed, speed)),
             acceleration_limits=np.stack((-acceleration, acceleration)), source=source,

@@ -36,6 +36,7 @@ def build_native(output):
     from robosuite.utils.binding_utils import MjSim
     from manipulation.execution import ExecutionLimits, FixedFingerTargets
     from manipulation.robosuite_execution import RobosuiteExecutionBackend
+    from manipulation.robot_gravity import RobotGravity
     from manipulation.robot_geometry_check import NativePrimitive, PairQuery, RobotGeometryChecker
     from manipulation.robot_validation import RobotStateValidator
 
@@ -50,7 +51,8 @@ def build_native(output):
     mujoco.mj_forward(model, sim.data._data)
     backend = RobosuiteExecutionBackend(sim, base_link="base", tcp_site="tcp",
         arm_joint_names=NAMES[:1], finger_joint_names=NAMES[1:], arm_kp=500., arm_kd=20.,
-        velocity_limits=dict.fromkeys(NAMES, 1.), source="explicit native press fixture actual feedback")
+        velocity_limits=dict.fromkeys(NAMES, 1.),
+        robot_gravity=RobotGravity(mujoco.MjModel.from_xml_string(xml), NAMES, source="Synthetic fixed robot fixture"), source="explicit native press fixture actual feedback")
     checker = RobotGeometryChecker(urdf, base_frame="base", geometries=[
         NativePrimitive("pad", "arm", "box", (PAD_WIDTH, PAD_WIDTH, .1), np.eye(4), "explicit native thin pad"),
         NativePrimitive("left_pad", "left", "box", (.02, .02, .02), np.eye(4), "explicit native left finger"),
@@ -112,6 +114,7 @@ def build_scene(device, robot, backend, targets, problem):
     from manipulation.online_geometry import FrozenPrimitives, OnlinePlanningScene
     from manipulation.planning_scene import CollisionOwner, ContactRule, ObservedSpace, PrismaticGripper
     from run_recorded_skill import finger_trajectory_factory
+    from manipulation.gripper_trajectory import stationary_finger_command
 
     kinematics = Kinematics(KinematicsCfg.from_robot_yaml_file(deepcopy(robot), device_cfg=device))
     config = kinematics.config.kinematics_config
@@ -123,6 +126,9 @@ def build_scene(device, robot, backend, targets, problem):
     actual = backend.proprioception()
     factory_feedback = {**actual, "start_q": actual["q"], "start_dq": actual["dq"], "sim_time_s": actual["sim_time"]}
     factory = finger_trajectory_factory(problem, factory_feedback, targets, timestep=DT,
+        incoming_command=stationary_finger_command(joint_names=backend.finger_joint_names,
+            position=backend.finger_control, timestamp_s=actual["timestamp_s"],
+            feedback_id=actual["feedback_id"], source="Explicit stationary synthetic hand command"),
         ctrlrange=backend.finger_ctrlrange, position_limits={"left_q": [0., .04], "right_q": [-.04, 0.]},
         velocity_limits={"left_q": 1., "right_q": 1.}, acceleration_limits={"left_q": 1., "right_q": 1.})
     # The fingers remain remote from every contact. This is an explicit free

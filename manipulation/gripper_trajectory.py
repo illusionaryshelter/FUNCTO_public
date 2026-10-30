@@ -1,15 +1,15 @@
-"""Named finger command references on the arm trajectory's physical clock.
+"""Native-time finger command curves with independent measured entrances.
 
-The reference starts from actual measured q/dq and retains original command
-identities. It predicts neither contact nor actual servo tracking. In
-particular, a zero closing target is not a measured zero finger position.
+The current active command supplies position, analytic velocity, target and
+remaining ramp. Encoder q/dq are separate observations. New events retain their
+original bound clock; nominal geometry has its own measured-state declaration.
 """
 
 # BEGIN one saved C1 finger reference shared by planning and physical execution.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 import math
 
 import numpy as np
@@ -20,12 +20,83 @@ from .planning_problem import event_occurrence_key
 # END a repeated source event is not the same physical command occurrence.
 
 
-_SCOPE = ("Named nominal command reference, not measured finger motion or a contact prediction; "
-          "the full original duration retains every conditional command. The executable prefix "
-          "limits current authorization; later commands require the original dependency evidence.")
+_SCOPE = (
+    "Named actuator command reference continuing the incoming active command. "
+    "Measured entrance q/dq are separate observations; original event clocks "
+    "and executable authorization prefixes are preserved.")
 _LIMITS_SCOPE = ("Continuous reference q/dq/ddq bounds; acceleration is the supplied native "
                  "planning bound, not a calibrated actual hardware acceleration allowance.")
 _EVENT_FIELDS = {"activation_step", "applied_time_s", "application_delay_s", "in_executable_prefix", "superseded"}
+
+
+# BEGIN one command schema records actual command state and measured entrance.
+_SCHEMA = "named-command-reference-with-measured-entrance-v1"
+_INCOMING_SCHEMA = "active-finger-command-v1"
+def _incoming_values(incoming, names):
+    """Align command coordinates without changing the source event's ordering."""
+    columns = [tuple(incoming["joint_names"]).index(name) for name in names]
+    return tuple(np.asarray(incoming[key], dtype=float)[columns] for key in
+                 ("position", "velocity", "target_position"))
+
+
+def _validated_incoming(value, names, timestamp_s):
+    """Own the explicit active-command state and its temporal provenance."""
+    required = {"schema", "joint_names", "position", "velocity", "target_position",
+                "remaining_ramp_s", "timestamp_s", "source", "source_feedback_id",
+                "source_curve_time_s", "active_event"}
+    if not isinstance(value, dict) or set(value) != required or value["schema"] != _INCOMING_SCHEMA:
+        raise ValueError("An incoming command requires the complete active-command schema")
+    result = deepcopy(value)
+    incoming_names = tuple(result["joint_names"])
+    if len(incoming_names) != len(names) or set(incoming_names) != set(names):
+        raise ValueError("Incoming command coordinates must name exactly the current finger joints")
+    for key in ("position", "velocity", "target_position"):
+        result[key] = _array(result[key], (len(names),), "Incoming command " + key).tolist()
+    for key in ("source", "source_feedback_id"):
+        _text(result[key], "Incoming command " + key)
+    timing = np.asarray([result["remaining_ramp_s"], result["timestamp_s"],
+                         result["source_curve_time_s"]], dtype=float)
+    if (not np.isfinite(timing).all() or timing[0] < 0. or timing[2] < 0.
+            or timing[1] != timestamp_s):
+        raise ValueError("Incoming command and measured entrance require the same finite boundary time")
+    event = result["active_event"]
+    if event is not None:
+        event_occurrence_key(event)
+        if event["kind"] not in ("open", "close", "hold"):
+            raise ValueError("The inherited active event must be an original finger command")
+        if not np.array_equal(result["target_position"], event["finger_positions"]):
+            raise ValueError("The incoming target must remain the active source event's named target")
+    q, dq, target = _incoming_values(result, names)
+    if timing[0] == 0. and (not np.array_equal(q, target) or np.any(dq != 0.)):
+        raise ValueError("A completed active ramp must already hold its target with zero command velocity")
+    return result
+
+
+def _incoming_sampler(incoming, names):
+    """Return the unique remaining cubic followed by its existing target hold.
+
+    A cubic is uniquely determined by its endpoint positions and velocities.
+    Its initial endpoint is the preceding reference evaluated at the actual
+    handover; its final endpoint is that active command's original zero-speed
+    target. Queries after that ramp continue the same command, not a future
+    event from the preceding skill.
+    """
+    q, dq, target = _incoming_values(incoming, names)
+    finish = float(incoming["remaining_ramp_s"])
+    curve = (CubicHermiteSpline([0., finish], np.stack((q, target)),
+                               np.stack((dq, np.zeros_like(dq))), axis=0)
+             if finish > 0. else None)
+
+    def sample(time_s):
+        if time_s == 0.:
+            return q.copy(), dq.copy()
+        if time_s >= finish:
+            return target.copy(), np.zeros_like(dq)
+        return curve(time_s), curve(time_s, 1)
+
+    return sample
+
+# END current source events retain their existing device clock.
 
 
 def _text(value, label):
@@ -234,6 +305,9 @@ class FingerTrajectory:
     source: str
     feedback_id: str
     timestamp_s: float
+    incoming_command: dict
+    measured_initial_position: np.ndarray
+    measured_initial_velocity: np.ndarray
     _curve: CubicHermiteSpline = field(init=False, repr=False)
     _bounds_report: dict = field(init=False, repr=False)
     # BEGIN reuse immutable polynomial tensors across repeated rollout queries.
@@ -247,6 +321,14 @@ class FingerTrajectory:
         if not names or len(set(names)) != len(names) or any(not isinstance(name, str) or not name.strip() for name in names):
             raise ValueError("Finger reference joint names must be complete and unique")
         object.__setattr__(self, "joint_names", names)
+        # BEGIN the active command and encoder sample share a time, not values.
+        object.__setattr__(self, "incoming_command",
+            _validated_incoming(self.incoming_command, names, self.timestamp_s))
+        for key in ("measured_initial_position", "measured_initial_velocity"):
+            value = _array(getattr(self, key), (len(names),), key)
+            value.setflags(write=False)
+            object.__setattr__(self, key, value)
+        # END bounds below qualify the command polynomial only.
         _text(self.source, "Finger reference source")
         _text(self.feedback_id, "Initial measured feedback identity")
         if (not np.isfinite([self.duration, self.executable_until, self.timestep, self.timestamp_s]).all()
@@ -284,124 +366,139 @@ class FingerTrajectory:
     def _limits(self):
         return {label: getattr(self, label + "_limits") for label in ("position", "velocity", "acceleration")}
 
+    # BEGIN command and measured entrance use separate explicit records.
     @classmethod
-    def build(cls, *, joint_names, initial_position, initial_velocity, commands, duration,
-              executable_until, timestep, position_limits, velocity_limits, acceleration_limits,
+    def build(cls, *, joint_names, incoming_command, measured_initial_position,
+              measured_initial_velocity, commands, duration, executable_until,
+              timestep, position_limits, velocity_limits, acceleration_limits,
               source, feedback_id, timestamp_s):
-        """Compile explicit event goals without changing their original clock.
+        """Compile original next-skill events after the current active command.
 
-        Before a later first event, a bounded C1 takeover returns to the
-        measured initial coordinate and zero reference velocity. This is an
-        explicit position-hold reference, not fictitious stationary feedback.
-        The initial measured velocity is always preserved as the first slope.
+        If the first new event occurs during the inherited ramp, its q/dq are
+        sampled at that event before constructing the new goal's bounded ramp.
+        If it occurs later, the old target is held until that event. A new
+        event at zero takes over from the incoming command q/dq immediately.
         """
         names = tuple(joint_names)
-        count = len(names)
-        q = _array(initial_position, (count,), "Actual initial finger q")
-        dq = _array(initial_velocity, (count,), "Actual initial finger dq")
-        bounds = {label: _array(value, (2, count), "Native " + label + " limits") for label, value in (
-            ("position", position_limits), ("velocity", velocity_limits), ("acceleration", acceleration_limits))}
-        if (not count or not np.isfinite([duration, executable_until, timestep]).all()
+        incoming = _validated_incoming(incoming_command, names, timestamp_s)
+        q, dq, active_target = _incoming_values(incoming, names)
+        bounds = {label: _array(value, (2, len(names)), "Command " + label + " limits")
+                  for label, value in (("position", position_limits),
+                    ("velocity", velocity_limits), ("acceleration", acceleration_limits))}
+        if (not names or not np.isfinite([duration, executable_until, timestep]).all()
                 or duration <= 0. or timestep <= 0. or not 0. <= executable_until <= duration):
-            raise ValueError("A finger reference needs a finite named original trajectory clock")
+            raise ValueError("A command reference requires a finite original clock and authorization prefix")
         for label in ("velocity", "acceleration"):
             if np.any(bounds[label][0] >= 0.) or np.any(bounds[label][1] <= 0.):
-                raise ValueError("Reference rate bounds must contain zero between finite signed limits")
+                raise ValueError("Command rate bounds must contain zero between signed limits")
         if (np.any(q < bounds["position"][0]) or np.any(q > bounds["position"][1])
                 or np.any(dq < bounds["velocity"][0]) or np.any(dq > bounds["velocity"][1])):
-            raise ValueError("Actual initial finger q/dq violate the declared native reference bounds")
-        # BEGIN conditional authorization never truncates the nominal polynomial.
+            raise ValueError("Incoming command q/dq violate the declared reference bounds")
         events = _commands(commands, names, duration, executable_until, timestep, bounds["position"])
-        active = [row for row in events if not row["superseded"]]
-        windows = []
-        if not active or active[0]["applied_time_s"] > 0.:
-            windows.append((None, 0., active[0]["applied_time_s"] if active else duration, q.copy()))
-        for index, event in enumerate(active):
-            end = active[index + 1]["applied_time_s"] if index + 1 < len(active) else duration
-            windows.append((event, event["applied_time_s"], end, np.asarray(event["finger_positions"], float)))
-        # END the executor consumes only authorized parts of this same curve.
+        active = [event for event in events if not event["superseded"]]
         knots, positions, velocities, segments = [0.], [q.copy()], [dq.copy()], []
 
-        def append(time_s, value, rate):
-            if time_s > knots[-1]:
-                knots.append(float(time_s))
-                positions.append(value.copy())
-                velocities.append(rate.copy())
-            elif time_s != knots[-1] or not np.array_equal(value, positions[-1]) or not np.array_equal(rate, velocities[-1]):
-                raise ValueError("Finger command windows must have one continuous q/dq at each shared time")
+        def append(moment, value, rate):
+            if moment > knots[-1]:
+                knots.append(float(moment)); positions.append(value.copy()); velocities.append(rate.copy())
+            elif (moment != knots[-1] or not np.array_equal(value, positions[-1])
+                  or not np.array_equal(rate, velocities[-1])):
+                raise ValueError("Adjacent command pieces require one continuous q/dq boundary")
 
-        for event, begin, end, goal in windows:
-            if end == begin:
-                if np.any(dq != 0.):
-                    raise ValueError("A zero-length command window cannot discard actual initial finger velocity")
-                continue
+        if not active or active[0]["applied_time_s"] > 0.:
+            end = float(active[0]["applied_time_s"] if active else duration)
+            finish = min(float(incoming["remaining_ramp_s"]), end)
+            sample = _incoming_sampler(incoming, names)
+            identity = (None, None, None) if incoming["active_event"] is None else event_occurrence_key(incoming["active_event"])
+            segments.append(dict(kind="incoming_command", skill_id=identity[0], event_id=identity[1],
+                occurrence=identity[2], start_time_s=0., ramp_end_time_s=finish,
+                end_time_s=end, target_positions=active_target.tolist()))
+            append(finish, *sample(finish))
+            q, dq = sample(end)
+            append(end, q, dq)
+        for index, event in enumerate(active):
+            begin = float(event["applied_time_s"])
+            end = float(active[index + 1]["applied_time_s"] if index + 1 < len(active) else duration)
+            goal = np.asarray(event["finger_positions"], dtype=float)
             finish = _segment(q, dq, goal, begin, end, timestep, names, bounds)
-            segments.append({"kind": "initial_hold" if event is None else "command",
-                "skill_id": None if event is None else event["skill_id"],
-                "event_id": None if event is None else event["event_id"],
-                # BEGIN each ramp is bound to the exact command occurrence.
-                "occurrence": None if event is None else event["occurrence"],
-                # END an initial hold is not a retry of a source operation.
-                "start_time_s": float(begin), "ramp_end_time_s": float(finish),
-                "end_time_s": float(end), "target_positions": goal.tolist()})
-            append(finish, goal, np.zeros(count))
-            append(end, goal, np.zeros(count))
-            q, dq = goal.copy(), np.zeros(count)
-        append(duration, q, dq)
-        return cls(names, np.asarray(knots), np.asarray(positions), np.asarray(velocities),
-                   float(duration), float(executable_until), float(timestep), bounds["position"],
-                   bounds["velocity"], bounds["acceleration"], events, tuple(segments),
-                   source, feedback_id, float(timestamp_s))
+            identity = event_occurrence_key(event)
+            segments.append(dict(kind="command", skill_id=identity[0], event_id=identity[1],
+                occurrence=identity[2], start_time_s=begin, ramp_end_time_s=float(finish),
+                end_time_s=end, target_positions=goal.tolist()))
+            append(finish, goal, np.zeros(len(names)))
+            append(end, goal, np.zeros(len(names)))
+            q, dq = goal.copy(), np.zeros(len(names))
+        return cls(joint_names=names, times=np.asarray(knots), position=np.asarray(positions),
+            velocity=np.asarray(velocities), duration=float(duration), executable_until=float(executable_until),
+            timestep=float(timestep), position_limits=bounds["position"], velocity_limits=bounds["velocity"],
+            acceleration_limits=bounds["acceleration"], events=events, segments=tuple(segments),
+            source=source, feedback_id=feedback_id, timestamp_s=float(timestamp_s),
+            incoming_command=incoming, measured_initial_position=measured_initial_position,
+            measured_initial_velocity=measured_initial_velocity)
+    # END no measured derivative substitutes for an active command.
 
+    # BEGIN command and measured entrance use separate explicit records.
     def _validate_segments(self):
-        """Validate saved phase boundaries without regenerating or retiming.
+        """Reconstruct saved knots from the active prefix and original events.
 
-        Reconstruct only the explicitly saved knots from event targets and
-        ramp endpoints. A changed archive cannot hide motion before an event,
-        replace the initial slope, or omit conditional commands in the suffix.
+        Only the incoming prefix may end with nonzero command velocity: a new
+        event can supersede an unfinished prior ramp. All newly generated goal
+        ramps retain the existing zero terminal slope and original deadline.
+        This audit never regenerates or retimes a saved trajectory.
         """
-        expected_times, expected_q, expected_dq = [0.], [self.position[0]], [self.velocity[0]]
-        # BEGIN archive validation matches each ramp to its own occurrence.
-        active = {event_occurrence_key(row): row for row in self.events
-                  if not row["superseded"]}
-        # END equal source names cannot cause a retry to overwrite an old ramp.
-        used = set()
-        end = 0.
+        q0, dq0, active_target = _incoming_values(self.incoming_command, self.joint_names)
+        expected_times, expected_q, expected_dq = [0.], [q0], [dq0]
+        active = {event_occurrence_key(row): row for row in self.events if not row["superseded"]}
+        used, previous_end = set(), 0.
+
+        def append(moment, value, rate):
+            if moment > expected_times[-1]:
+                expected_times.append(moment); expected_q.append(value); expected_dq.append(rate)
+            elif (moment != expected_times[-1] or not np.array_equal(value, expected_q[-1])
+                  or not np.array_equal(rate, expected_dq[-1])):
+                raise ValueError("A saved zero-time boundary changed command position or velocity")
+
         for segment in self.segments:
             if not isinstance(segment, dict) or set(segment) != {
-                    "kind", "skill_id", "event_id", "occurrence", "start_time_s", "ramp_end_time_s", "end_time_s", "target_positions"}:
-                raise ValueError("Every saved finger segment needs its exact source command and clock boundaries")
-            begin, finish, stop = (float(segment[key]) for key in ("start_time_s", "ramp_end_time_s", "end_time_s"))
-            if not np.isfinite([begin, finish, stop]).all() or begin != end or not begin <= finish <= stop <= self.duration or stop <= begin:
-                raise ValueError("Saved finger segments must partition the full original duration")
-            goal = _array(segment["target_positions"], (len(self.joint_names),), "Saved finger segment goal")
-            # BEGIN initial holds have no source operation; commands use the strict key.
-            identity = ((segment["skill_id"], segment["event_id"], segment["occurrence"])
-                        if segment["kind"] == "initial_hold" else event_occurrence_key(segment))
-            if segment["kind"] == "initial_hold":
-                if begin != 0. or identity != (None, None, None) or not np.array_equal(goal, self.position[0]):
-                    raise ValueError("The initial hold must retain actual initial finger coordinates")
-            # END segment identities cannot silently revert to source-only matching.
-            elif segment["kind"] == "command" and identity in active and identity not in used:
+                    "kind", "skill_id", "event_id", "occurrence", "start_time_s",
+                    "ramp_end_time_s", "end_time_s", "target_positions"}:
+                raise ValueError("Saved command pieces require complete identities and clock boundaries")
+            begin, finish, end = (float(segment[key]) for key in
+                                 ("start_time_s", "ramp_end_time_s", "end_time_s"))
+            if (not np.isfinite([begin, finish, end]).all() or begin != previous_end
+                    or not begin <= finish <= end <= self.duration or end <= begin):
+                raise ValueError("Saved command pieces must partition the original duration")
+            goal = _array(segment["target_positions"], (len(self.joint_names),), "Saved command target")
+            if segment["kind"] == "incoming_command":
+                incoming_event = self.incoming_command["active_event"]
+                identity = (None, None, None) if incoming_event is None else event_occurrence_key(incoming_event)
+                first_event = min((row["applied_time_s"] for row in active.values()), default=self.duration)
+                if (begin != 0. or end != first_event
+                        or tuple(segment[key] for key in ("skill_id", "event_id", "occurrence")) != identity
+                        or finish != min(float(self.incoming_command["remaining_ramp_s"]), end)
+                        or not np.array_equal(goal, active_target)):
+                    raise ValueError("The saved incoming prefix must retain its active command until the first new event")
+                sample = _incoming_sampler(self.incoming_command, self.joint_names)
+                append(finish, *sample(finish)); append(end, *sample(end))
+            elif segment["kind"] == "command":
+                identity = event_occurrence_key(segment)
+                if identity not in active or identity in used:
+                    raise ValueError("A saved command piece cannot introduce or repeat a new event")
                 event = active[identity]
                 if begin != event["applied_time_s"] or not np.array_equal(goal, event["finger_positions"]):
-                    raise ValueError("A saved finger ramp must begin at its original native command tick and retain its target")
+                    raise ValueError("Saved commands must retain the original event activation and target")
                 used.add(identity)
+                append(finish, goal, np.zeros(len(self.joint_names)))
+                append(end, goal, np.zeros(len(self.joint_names)))
             else:
-                raise ValueError("A saved finger segment cannot introduce or duplicate a command")
-            for moment in (finish, stop):
-                if moment > expected_times[-1]:
-                    expected_times.append(moment)
-                    expected_q.append(goal.copy())
-                    expected_dq.append(np.zeros(len(self.joint_names)))
-                elif not np.array_equal(expected_q[-1], goal) or np.any(expected_dq[-1] != 0.):
-                    raise ValueError("A zero-time finger ramp cannot jump q or discard measured dq")
-            end = stop
-        if used != set(active) or end != self.duration:
-            raise ValueError("Saved finger segments must preserve every original command over the complete duration")
+                raise ValueError("A command piece is an incoming active command or an original new event")
+            previous_end = end
+        if used != set(active) or previous_end != self.duration:
+            raise ValueError("Saved command pieces must retain all new events and the complete duration")
         if (not np.array_equal(self.times, expected_times) or not np.array_equal(self.position, expected_q)
                 or not np.array_equal(self.velocity, expected_dq)):
-            raise ValueError("Saved finger arrays differ from their exact original event/reference contract")
+            raise ValueError("Saved arrays changed the incoming command state or original event pieces")
+    # END no measured derivative substitutes for an active command.
 
     def sample(self, times):
         """Return commanded q/dq at the supplied shared physical times."""
@@ -452,40 +549,65 @@ class FingerTrajectory:
                 "velocity": self.velocity.tolist(), "position_limits": self.position_limits.tolist(),
                 "velocity_limits": self.velocity_limits.tolist(), "acceleration_limits": self.acceleration_limits.tolist(),
                 "events": deepcopy(list(self.events)), "segments": deepcopy(list(self.segments)),
+                "schema": _SCHEMA, "incoming_command": deepcopy(self.incoming_command),
+                "measured_initial_position": self.measured_initial_position.tolist(),
+                "measured_initial_velocity": self.measured_initial_velocity.tolist(),
                 "scope": _SCOPE, "limits_scope": _LIMITS_SCOPE, "bounds_report": deepcopy(self._bounds_report)}
 
+    # BEGIN command and measured entrance use separate explicit records.
     @classmethod
     def from_mapping(cls, value):
-        """Load the archived reference exactly, validating all saved claims."""
-        fields = {name for name, definition in cls.__dataclass_fields__.items() if definition.init}
-        if not isinstance(value, dict) or set(value) != fields | {"scope", "limits_scope", "bounds_report"}:
-            raise ValueError("A saved finger reference requires its complete original polynomial and named contract")
-        result = cls(**{key: deepcopy(value[key]) for key in fields})
+        """Load only the current schema, without converting old archives."""
+        arguments = {item.name for item in fields(cls) if item.init}
+        if (not isinstance(value, dict) or set(value) != arguments | {"schema", "scope", "limits_scope", "bounds_report"}
+                or value["schema"] != _SCHEMA):
+            raise ValueError("A command reference requires its complete new measured-entrance schema")
+        result = cls(**{key: deepcopy(value[key]) for key in arguments})
         if result.describe() != value:
-            raise ValueError("Saved finger reference metadata differs from the validated original polynomial")
+            raise ValueError("Saved command-reference metadata differs from its reconstructed contract")
         return result
+    # END no measured derivative substitutes for an active command.
 
+    # BEGIN command and measured entrance use separate explicit records.
     def validate_execution(self, trajectory, commands, *, initial_feedback, timestep,
                            position_limits, velocity_limits):
-        """Bind a saved reference to current actual feedback and the arm clock."""
+        """Check actual entrance and freshly read command state independently.
+
+        The executor supplies ``actuator_ctrl`` from
+        ``executor.backend.proprioception()`` immediately before this call.
+        It preserves the archived entrance identity and actual q/dq for the
+        original executor's complete numeric-state comparison. A saved ctrl
+        value cannot substitute for this live command observation. The device
+        exposes no command-derivative sensor: that derivative is retained from
+        the preceding saved active polynomial, independently of encoder dq.
+        """
         if (trajectory.duration != self.duration or trajectory.executable_until != self.executable_until
                 or timestep != self.timestep or tuple(initial_feedback["finger_joint_names"]) != self.joint_names
                 or initial_feedback["feedback_id"] != self.feedback_id
                 or initial_feedback["timestamp_s"] != self.timestamp_s):
-            raise ValueError("Saved fingers, actual feedback and arm trajectory must share one exact original clock and identity")
+            raise ValueError("Saved commands, actual entrance and arm trajectory require one original clock and identity")
         columns = [tuple(initial_feedback["joint_names"]).index(name) for name in self.joint_names]
-        if (not np.array_equal(self.position[0], np.asarray(initial_feedback["q"])[columns])
-                or not np.array_equal(self.velocity[0], np.asarray(initial_feedback["dq"])[columns])):
-            raise ValueError("Finger reference must retain the actual measured initial q/dq without resetting velocity")
+        if (not np.array_equal(self.measured_initial_position, np.asarray(initial_feedback["q"])[columns])
+                or not np.array_equal(self.measured_initial_velocity, np.asarray(initial_feedback["dq"])[columns])):
+            raise ValueError("Measured finger entrance q/dq differ from the saved independent observations")
+        observation = initial_feedback["actuator_ctrl"]
+        command_columns = [tuple(observation["joint_names"]).index(name) for name in self.joint_names]
+        live_command = np.asarray(observation["values"], dtype=float)[command_columns]
+        if (observation["sim_time"] != initial_feedback["sim_time"]
+                or observation["timestamp_s"] != initial_feedback["timestamp_s"]
+                or not np.array_equal(live_command, self.position[0])):
+            raise ValueError("The live incoming actuator command differs from the saved command entrance")
         native_position = _array(position_limits, self.position_limits.shape, "Native finger position bounds")
         native_velocity = _array(velocity_limits, self.velocity_limits.shape, "Hardware finger velocity bounds")
         if (np.any(self.position_limits[0] < native_position[0]) or np.any(self.position_limits[1] > native_position[1])
                 or np.any(self.velocity_limits[0] < native_velocity[0]) or np.any(self.velocity_limits[1] > native_velocity[1])):
-            raise ValueError("Saved reference bounds cannot exceed native finger position or hardware speed limits")
-        expected = _commands(commands, self.joint_names, self.duration, self.executable_until, self.timestep, self.position_limits)
+            raise ValueError("Saved command bounds cannot exceed native position or hardware speed limits")
+        expected = _commands(commands, self.joint_names, self.duration, self.executable_until,
+                             self.timestep, self.position_limits)
         if expected != self.events:
-            raise ValueError("Saved finger reference must retain every exact original timed event and target")
+            raise ValueError("Saved commands must retain every original timed event and target")
         return deepcopy(self._bounds_report)
+    # END no measured derivative substitutes for an active command.
 # END nominal finger references remain separate from measured motion and contact.
 
 
@@ -494,6 +616,37 @@ _GEOMETRY_SCOPE = (
     "Nominal collision geometry only on [0, valid_until_s], including the exact "
     "typed endpoint. Later contact-dependent fingers remain unknown. This model "
     "does not predict measured tracking or change command/execution authorization.")
+
+
+# BEGIN preserve measured-origin free-motion geometry independently of commands.
+def _free_finger_geometry(reference):
+    """Generate the established nominal free-hand model from measured q/dq.
+
+    The model follows the original event targets using the existing bounded
+    Hermite interpolation. Its entrance is the actual measured shape; the
+    independent actuator curve continues its incoming command instead. This
+    is a declared free-motion hypothesis ending at the first contact boundary.
+    """
+    q, dq = reference.measured_initial_position.copy(), reference.measured_initial_velocity.copy()
+    active = [row for row in reference.events if not row["superseded"]]
+    windows = []
+    if not active or active[0]["applied_time_s"] > 0.:
+        windows.append((0., active[0]["applied_time_s"] if active else reference.duration, q.copy()))
+    for index, event in enumerate(active):
+        end = active[index+1]["applied_time_s"] if index+1 < len(active) else reference.duration
+        windows.append((event["applied_time_s"], end, np.asarray(event["finger_positions"], float)))
+    times, positions, velocities = [0.], [q.copy()], [dq.copy()]
+    for begin, end, goal in windows:
+        finish = _segment(q, dq, goal, begin, end, reference.timestep,
+                          reference.joint_names, reference._limits())
+        for moment in (finish, end):
+            if moment > times[-1]:
+                times.append(float(moment))
+                positions.append(goal.copy())
+                velocities.append(np.zeros_like(dq))
+        q, dq = goal.copy(), np.zeros_like(dq)
+    return np.asarray(times), np.asarray(positions), np.asarray(velocities)
+# END this model is consumed by geometry alone, never by physical actuation.
 
 
 @dataclass(frozen=True)
@@ -632,7 +785,9 @@ def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress
                     raise ValueError("A release inside this motion block requires its original bound event occurrence")
                 boundaries.extend(matched)
         times = np.array([0., reference.duration])
-        positions = np.tile(reference.position[0], (2, 1))
+        # BEGIN held geometry uses measured shape, independently of actuator target.
+        positions = np.tile(reference.measured_initial_position, (2, 1))
+        # END the same declared relation owns its physical validity interval.
         velocities = np.zeros_like(positions)
         origin = ("Declared attachment model; frozen measured entrance q, geometric dq=0 (not measured dq); "
                   f"feedback={reference.feedback_id}; conditions="
@@ -652,11 +807,79 @@ def bind_nominal_finger_geometry(reference, conditions, event_clock, *, progress
                 raise ValueError("Contact activation inside this motion block requires its original bound event occurrence")
             else:
                 boundaries.append((event_clock[identity]["activation_time_s"], identity))
-        times, positions, velocities = reference.times, reference.position, reference.velocity
-        origin = f"Free-motion original C1 command geometry; feedback={reference.feedback_id}"
+        # BEGIN free geometry retains its measured-origin interpolation model.
+        times, positions, velocities = _free_finger_geometry(reference)
+        origin = f"Free-motion measured-origin Hermite geometry; feedback={reference.feedback_id}"
+        # END event targets and timing are shared; command entrance is independent.
     cutoff = min((time for time, _ in boundaries), default=reference.duration)
     source = origin + "; original invalidating occurrences=" + repr(
         [identity for time, identity in boundaries if time == cutoff])
     return NominalFingerGeometry(reference.joint_names, times, positions, velocities,
                                  reference.duration, cutoff, source)
 # END nominal scope never shortens or edits the executable command curve.
+
+
+# BEGIN explicit stationary device command at a new controller entrance.
+def stationary_finger_command(*, joint_names, position, timestamp_s, source, feedback_id):
+    """Declare an already issued stationary command in named joint coordinates.
+
+    This producer is for a device holding a fixed target without an unfinished
+    command ramp. Position comes from actuator command feedback, not encoders.
+    A continuation of a moving reference uses ``capture_active_command``.
+    """
+    names = tuple(joint_names)
+    q = _array(position, (len(names),), "Stationary command position")
+    return _validated_incoming(dict(schema=_INCOMING_SCHEMA, joint_names=list(names),
+        position=q.tolist(), velocity=np.zeros_like(q).tolist(), target_position=q.tolist(),
+        remaining_ramp_s=0., timestamp_s=float(timestamp_s), source=source,
+        source_feedback_id=feedback_id, source_curve_time_s=0., active_event=None),
+        names, float(timestamp_s))
+# END no encoder velocity supplies an unobserved command derivative.
+
+
+def capture_active_command(reference, *, curve_time_s, last_dispatch_time_s,
+                           boundary_timestamp_s, source):
+    """Extract one already active command from an explicitly loaded reference.
+
+    The caller loads the previous archive using that archive's own component.
+    This function consumes a validated object, not an alternate input schema.
+    Only the active segment's target and remaining cubic are returned; later
+    events remain in the preceding archive. ``last_dispatch_time_s`` comes
+    from the completed execution's last control_elapsed entry: an event at a
+    step endpoint has not yet activated in that preceding step. The command
+    q/dq are nevertheless the step-end reference sample at ``curve_time_s``.
+    ``boundary_timestamp_s`` is the actual sample time, distinct from this
+    possibly clamped reference clock. This interface describes a completed
+    normal dispatch; an interrupted dispatch/hold needs its own command record.
+    """
+    moment = float(curve_time_s)
+    dispatched = float(last_dispatch_time_s)
+    if (not np.isfinite([moment, dispatched]).all()
+            or not 0. <= dispatched <= moment <= reference.executable_until
+            or dispatched >= reference.executable_until):
+        raise ValueError("The command handover requires an actual dispatch inside the original executable prefix")
+    segment = [row for row in reference.segments
+               if row["start_time_s"] <= dispatched <= row["end_time_s"]][-1]
+    q, dq = reference.sample(moment)
+    command_names = reference.joint_names
+    if segment["kind"] == "incoming_command":
+        incoming = reference.incoming_command
+        # Preserve the active source event's coordinate order through another
+        # handover; the next builder independently aligns these named arrays.
+        command_names = tuple(incoming["joint_names"])
+        columns = [reference.joint_names.index(name) for name in command_names]
+        q, dq = q[columns], dq[columns]
+        target = np.asarray(incoming["target_position"], dtype=float)
+        remaining = max(0., float(incoming["remaining_ramp_s"]) - moment)
+        event = deepcopy(incoming["active_event"])
+    else:
+        target = np.asarray(segment["target_positions"], dtype=float)
+        remaining = max(0., float(segment["ramp_end_time_s"]) - moment)
+        event = deepcopy(next(
+            row for row in reference.events if event_occurrence_key(row) == event_occurrence_key(segment)))
+    result = dict(schema=_INCOMING_SCHEMA, joint_names=list(command_names),
+        position=q.tolist(), velocity=dq.tolist(), target_position=target.tolist(),
+        remaining_ramp_s=remaining, timestamp_s=float(boundary_timestamp_s),
+        source=f"{source}; last actual control dispatch at reference time {dispatched!r} s",
+        source_feedback_id=reference.feedback_id, source_curve_time_s=moment, active_event=event)
+    return _validated_incoming(result, reference.joint_names, float(boundary_timestamp_s))

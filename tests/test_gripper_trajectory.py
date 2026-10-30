@@ -12,9 +12,9 @@ from manipulation.gripper_trajectory import FingerTrajectory
 
 
 def _arguments():
-    return {
+    arguments = {
         "joint_names": ("finger_a", "finger_b"),
-        "initial_position": [.03, -.025], "initial_velocity": [.0006, -.0003],
+        "measured_initial_position": [.03, -.025], "measured_initial_velocity": [.0006, -.0003],
         "commands": [
             {"skill_id": "s", "event_id": "open", "occurrence": 0, "kind": "open", "time": 0., "progress": 0.,
              "finger_positions": [.035, -.034], "target_source": "explicit CPU test command"},
@@ -29,6 +29,14 @@ def _arguments():
         "source": "Declared CPU nominal reference; no physical tracking claim",
         "feedback_id": "same measured entrance", "timestamp_s": 42.,
     }
+    # BEGIN this polynomial fixture explicitly declares matching command q/dq.
+    arguments["incoming_command"] = dict(schema="active-finger-command-v1",
+        joint_names=list(arguments["joint_names"]), position=arguments["measured_initial_position"],
+        velocity=arguments["measured_initial_velocity"], target_position=arguments["measured_initial_position"],
+        remaining_ramp_s=.1, timestamp_s=42., source="Declared in-flight synthetic command",
+        source_feedback_id=arguments["feedback_id"], source_curve_time_s=0., active_event=None)
+    return arguments
+    # END separate-measurement counterexamples live in test_command_reference.
 
 
 class FingerTrajectoryTests(unittest.TestCase):
@@ -36,11 +44,11 @@ class FingerTrajectoryTests(unittest.TestCase):
         arguments = _arguments()
         reference = FingerTrajectory.build(**arguments)
         q, dq = reference.sample(0.)
-        np.testing.assert_array_equal(q, arguments["initial_position"])
-        np.testing.assert_array_equal(dq, arguments["initial_velocity"])
+        np.testing.assert_array_equal(q, arguments["measured_initial_position"])
+        np.testing.assert_array_equal(dq, arguments["measured_initial_velocity"])
         self.assertFalse(np.array_equal(q, arguments["commands"][0]["finger_positions"]))
         self.assertFalse(np.isclose(q.sum(), 0.))
-        self.assertIn("not measured", reference.describe()["scope"])
+        self.assertIn("separate observations", reference.describe()["scope"])
         self.assertIn("not a calibrated", reference.describe()["limits_scope"])
 
     def test_non_grid_event_is_not_moved_or_issued_early(self):
@@ -71,7 +79,8 @@ class FingerTrajectoryTests(unittest.TestCase):
         from scipy.interpolate import CubicHermiteSpline
 
         arguments = _arguments()
-        arguments.update(initial_position=[.039, -.039], duration=14., executable_until=14.)
+        arguments.update(measured_initial_position=[.039, -.039], duration=14., executable_until=14.)
+        arguments["incoming_command"].update(position=[.039, -.039], target_position=[.039, -.039])
         arguments["commands"] = arguments["commands"][:2]
         arguments["commands"][0]["finger_positions"] = [.038, -.038]
         arguments["commands"][1].update(time=13.378, finger_positions=[.002, -.002])
@@ -94,8 +103,8 @@ class FingerTrajectoryTests(unittest.TestCase):
         self.assertEqual(event["applied_time_s"], 6689*arguments["timestep"])
         self.assertEqual(segment["ramp_end_time_s"], 6825*arguments["timestep"])
         self.assertEqual(segment["end_time_s"], arguments["duration"])
-        np.testing.assert_array_equal(reference.position[0], arguments["initial_position"])
-        np.testing.assert_array_equal(reference.velocity[0], arguments["initial_velocity"])
+        np.testing.assert_array_equal(reference.position[0], arguments["measured_initial_position"])
+        np.testing.assert_array_equal(reference.velocity[0], arguments["measured_initial_velocity"])
         self.assertTrue(reference.describe()["bounds_report"]["bounds_satisfied"])
         for row in reference.describe()["bounds_report"]["joint_extrema"].values():
             self.assertGreaterEqual(row["velocity"]["minimum"], -.2)
@@ -153,10 +162,10 @@ class FingerTrajectoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "activate before.*barrier"):
             FingerTrajectory.build(**arguments)
 
-    def test_initial_velocity_is_not_zeroed_to_make_a_bound_pass(self):
+    def test_measured_initial_velocity_is_not_zeroed_to_make_a_bound_pass(self):
         arguments = _arguments()
-        arguments["initial_velocity"][0] = .21
-        with self.assertRaisesRegex(ValueError, "initial finger q/dq"):
+        arguments["measured_initial_velocity"][0] = .21
+        with self.assertRaisesRegex(ValueError, "Incoming command q/dq"):
             FingerTrajectory.build(**arguments)
 
     # BEGIN device quantization preserves required command semantics.
@@ -171,7 +180,7 @@ class FingerTrajectoryTests(unittest.TestCase):
         reference = FingerTrajectory.build(**arguments)
         self.assertTrue(reference.events[0]["superseded"])
         self.assertFalse(reference.events[1]["superseded"])
-        np.testing.assert_array_equal(reference.sample(0.)[1], arguments["initial_velocity"])
+        np.testing.assert_array_equal(reference.sample(0.)[1], arguments["measured_initial_velocity"])
 
     def test_continuation_preserves_original_integer_tick_despite_float_subtraction(self):
         from manipulation.gripper_trajectory import _commands
@@ -201,7 +210,7 @@ class FingerTrajectoryTests(unittest.TestCase):
         self.assertEqual(FingerTrajectory.from_mapping(mapping).describe(), mapping)
         changed = deepcopy(mapping)
         changed["segments"][-1]["occurrence"] = 0
-        with self.assertRaisesRegex(ValueError, "introduce or duplicate"):
+        with self.assertRaisesRegex(ValueError, "introduce or repeat"):
             FingerTrajectory.from_mapping(changed)
 
     def test_missing_duplicate_or_invalid_occurrence_cannot_identify_a_retry(self):
@@ -257,17 +266,19 @@ class FingerTrajectoryTests(unittest.TestCase):
         feedback = {"joint_names": ["arm", "finger_b", "finger_a"],
                     "finger_joint_names": ["finger_a", "finger_b"],
                     "q": [1., -.025, .03], "dq": [0., -.0003, .0006],
-                    "feedback_id": arguments["feedback_id"], "timestamp_s": 42.}
+                    "feedback_id": arguments["feedback_id"], "timestamp_s": 42., "sim_time": 42.,
+                    "actuator_ctrl": {"joint_names": ["finger_a", "finger_b"], "values": [.03, -.025],
+                                      "timestamp_s": 42., "sim_time": 42.}}
         options = dict(initial_feedback=feedback, timestep=.002,
                        position_limits=arguments["position_limits"], velocity_limits=arguments["velocity_limits"])
         self.assertTrue(reference.validate_execution(trajectory, arguments["commands"], **options)["bounds_satisfied"])
         feedback["dq"][2] = 0.
-        with self.assertRaisesRegex(ValueError, "measured initial q/dq"):
+        with self.assertRaisesRegex(ValueError, "Measured finger entrance q/dq"):
             reference.validate_execution(trajectory, arguments["commands"], **options)
         feedback["dq"][2] = .0006
         wrong = deepcopy(arguments["commands"])
         wrong[1]["finger_positions"][0] += .001
-        with self.assertRaisesRegex(ValueError, "every exact original"):
+        with self.assertRaisesRegex(ValueError, "every original"):
             reference.validate_execution(trajectory, wrong, **options)
         options["timestep"] = .001
         with self.assertRaisesRegex(ValueError, "clock and identity"):

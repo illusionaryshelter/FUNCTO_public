@@ -1,7 +1,7 @@
 # `manipulation/execution.py` 实现契约
 
-代码基线：`9486a09ee901e36fdda7e8972942e29deeea91fc`。
-职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`9cdb433`。
+职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `pose_goal_schedule`
 
@@ -1223,11 +1223,14 @@ def execute(self, result, *, finger_targets, initial_feedback, execution_limits,
 > to execute that model. Independent task effects still enter through
 > ``observation_callback`` with their acquisition time and provenance.
 > # END a nominal attachment is never promoted to physical Holding.
-> The last native step can finish less than one timestep after the
-> barrier's clock time, but its commanded q/dq/progress is clamped to the
-> barrier itself. Finger events use the archived reference's original
-> bound times and native activation ticks, without changing the arm
-> cubic. The same saved C1 finger reference is sampled at each arm query.
+> # BEGIN same-time arm feedback and independent original finger clock.
+> Arm control samples analytic q/dq/ddq at the current step start. The
+> post-step reference and the saved C1 finger command use the clamped
+> step endpoint. The last native step can therefore finish less than
+> one timestep after the barrier's clock time. Finger events retain
+> their original bound times and activation ticks; the arm cubic and
+> event clock are unchanged by the control sampling phase.
+> # END reference evaluation and actual control input have distinct times.
 > The complete measured entrance is checked independently of all goals.
 > No goal from the later curve is sent to an actuator. Physical tracking
 > and actual finger intervals require an explicit ``ExecutionLimits``;
@@ -1377,6 +1380,9 @@ control['requested_arm_torque'].copy
 saturated_torques.append
 control['arm_torque_saturated'].copy
 control_terms[name].append
+integral_rebased.append
+finger_control_terms[name].append
+finger_force_saturated.append
 type(error).__name__
 report.setdefault('cleanup_errors', []).append
 report.setdefault
@@ -1401,6 +1407,8 @@ continuation_path.name
 np.savez_compressed
 np.asarray(values).reshape
 control_terms.items
+finger_control_terms.items
+np.asarray(finger_force_saturated, dtype=bool).reshape
 np.full
 self._geometry_pair_count
 np.nan
@@ -1538,6 +1546,9 @@ saturated_torques
 samples
 event_index
 control_terms
+integral_rebased
+finger_control_terms
+finger_force_saturated
 command
 satisfied_dependencies
 barriers
@@ -1574,6 +1585,9 @@ next_finger_positions
 next_finger_state
 checks
 next_time
+control_q
+control_dq
+control_ddq
 control
 contact_check['control_applied']
 upcoming
@@ -1594,7 +1608,7 @@ final_elapsed
 accounting['step_accounting_exact']
 applied_ids
 consumed_ids
-barrier_command_reached
+barrier_reference_reached
 observed
 effects
 required_effects
@@ -1754,6 +1768,9 @@ control['requested_arm_torque'].copy
 saturated_torques.append
 control['arm_torque_saturated'].copy
 control_terms[name].append
+integral_rebased.append
+finger_control_terms[name].append
+finger_force_saturated.append
 normal_step
 run_hold
 report.setdefault('cleanup_errors', []).append
@@ -1778,6 +1795,8 @@ _write_execution_json
 np.savez_compressed
 np.asarray(values).reshape
 control_terms.items
+finger_control_terms.items
+np.asarray(finger_force_saturated, dtype=bool).reshape
 np.full
 np.asarray(controls).reshape
 np.asarray(requested_torques).reshape
@@ -1792,7 +1811,7 @@ _feedback_json
 
 ## `TrajectoryExecutor.execute.mark_wallclock`
 
-[定义位置](../../../manipulation/execution.py#L632)。
+[定义位置](../../../manipulation/execution.py#L635)。
 
 输入签名：
 
@@ -1826,7 +1845,7 @@ time.monotonic
 
 ## `TrajectoryExecutor.execute.step_accounting`
 
-[定义位置](../../../manipulation/execution.py#L875)。
+[定义位置](../../../manipulation/execution.py#L885)。
 
 输入签名：
 
@@ -1867,7 +1886,7 @@ max
 
 ## `TrajectoryExecutor.execute.run_hold`
 
-[定义位置](../../../manipulation/execution.py#L887)。
+[定义位置](../../../manipulation/execution.py#L897)。
 
 输入签名：
 
@@ -1919,7 +1938,7 @@ ValueError
 
 ## `TrajectoryExecutor.execute.normal_step`
 
-[定义位置](../../../manipulation/execution.py#L912)。
+[定义位置](../../../manipulation/execution.py#L922)。
 
 输入签名：
 
@@ -1984,7 +2003,7 @@ float
 
 ## `TrajectoryExecutor.execute.dependency_already_observed`
 
-[定义位置](../../../manipulation/execution.py#L1108)。
+[定义位置](../../../manipulation/execution.py#L1125)。
 
 输入签名：
 
@@ -2016,7 +2035,7 @@ float
 
 ## `TrajectoryExecutor.execute.check_directions`
 
-[定义位置](../../../manipulation/execution.py#L1134)。
+[定义位置](../../../manipulation/execution.py#L1151)。
 
 输入签名：
 
@@ -2133,7 +2152,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.effect_timestamp`
 
-[定义位置](../../../manipulation/execution.py#L1239)。
+[定义位置](../../../manipulation/execution.py#L1256)。
 
 输入签名：
 
@@ -2203,7 +2222,7 @@ max
 
 ## `TrajectoryExecutor.execute.witness`
 
-[定义位置](../../../manipulation/execution.py#L1274)。
+[定义位置](../../../manipulation/execution.py#L1291)。
 
 输入签名：
 
@@ -2250,7 +2269,7 @@ report['history'].append
 
 ## `TrajectoryExecutor.execute.timed_witness`
 
-[定义位置](../../../manipulation/execution.py#L1289)。
+[定义位置](../../../manipulation/execution.py#L1306)。
 
 输入签名：
 
@@ -2290,7 +2309,7 @@ witness
 
 ## `TrajectoryExecutor.execute.reject_timing`
 
-[定义位置](../../../manipulation/execution.py#L1301)。
+[定义位置](../../../manipulation/execution.py#L1318)。
 
 输入签名：
 
@@ -2337,7 +2356,7 @@ ExecutionGuardError
 
 ## `TrajectoryExecutor.execute.resolve_pending_timing`
 
-[定义位置](../../../manipulation/execution.py#L1321)。
+[定义位置](../../../manipulation/execution.py#L1338)。
 
 输入签名：
 
@@ -2395,7 +2414,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.check_deadlines`
 
-[定义位置](../../../manipulation/execution.py#L1350)。
+[定义位置](../../../manipulation/execution.py#L1367)。
 
 输入签名：
 
@@ -2455,7 +2474,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observe_timed_effects`
 
-[定义位置](../../../manipulation/execution.py#L1377)。
+[定义位置](../../../manipulation/execution.py#L1394)。
 
 输入签名：
 
@@ -2518,7 +2537,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.observation_at`
 
-[定义位置](../../../manipulation/execution.py#L1412)。
+[定义位置](../../../manipulation/execution.py#L1429)。
 
 输入签名：
 
@@ -2636,7 +2655,7 @@ condition.get
 
 ## `TrajectoryExecutor.execute.record`
 
-[定义位置](../../../manipulation/execution.py#L1514)。
+[定义位置](../../../manipulation/execution.py#L1531)。
 
 输入签名：
 
@@ -2695,7 +2714,7 @@ deepcopy
 
 ## `TrajectoryExecutor.execute.check_close_binding`
 
-[定义位置](../../../manipulation/execution.py#L1542)。
+[定义位置](../../../manipulation/execution.py#L1559)。
 
 输入签名：
 
@@ -2754,7 +2773,7 @@ failures.append
 
 ## `TrajectoryExecutor.execute.guard`
 
-[定义位置](../../../manipulation/execution.py#L1577)。
+[定义位置](../../../manipulation/execution.py#L1594)。
 
 输入签名：
 
@@ -2850,7 +2869,7 @@ check_deadlines
 
 ## `TrajectoryExecutor.execute.consume_ordinary_events`
 
-[定义位置](../../../manipulation/execution.py#L1651)。
+[定义位置](../../../manipulation/execution.py#L1668)。
 
 输入签名：
 
@@ -2936,7 +2955,7 @@ reject_timing
 
 ## `TrajectoryExecutor.execute.release_dependencies`
 
-[定义位置](../../../manipulation/execution.py#L1710)。
+[定义位置](../../../manipulation/execution.py#L1727)。
 
 输入签名：
 
@@ -3011,7 +3030,7 @@ timed_witness
 
 ## `TrajectoryExecutor.execute.emit_independent_evidence`
 
-[定义位置](../../../manipulation/execution.py#L1765)。
+[定义位置](../../../manipulation/execution.py#L1782)。
 
 输入签名：
 
@@ -3054,7 +3073,7 @@ str
 
 ## `TrajectoryExecutor.execute.persist`
 
-[定义位置](../../../manipulation/execution.py#L2142)。
+[定义位置](../../../manipulation/execution.py#L2178)。
 
 输入签名：
 

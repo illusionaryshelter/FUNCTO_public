@@ -6,7 +6,7 @@
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **62 个文件、994 个定义**。
+覆盖 **70 个文件、1076 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -27,13 +27,13 @@
 | [manipulation/planning_observation.py](api/planning_observation.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/robot_self_filter.py](api/robot_self_filter.md) | 6 | [02](02-observation-and-collision.md) |
 | [manipulation/online_geometry.py](api/online_geometry.md) | 24 | [02](02-observation-and-collision.md) |
-| [manipulation/planning_scene.py](api/planning_scene.md) | 26 | [02](02-observation-and-collision.md) |
+| [manipulation/planning_scene.py](api/planning_scene.md) | 27 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/collision_records.py](api/collision_records.md) | 4 | [02](02-observation-and-collision.md) |
 | [manipulation/observations.py](api/observations.md) | 16 | [02](02-observation-and-collision.md) |
 | [manipulation/contact_binding.py](api/contact_binding.md) | 2 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 29 | [03](03-attachment-contact-and-hand.md) |
+| [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 37 | [11](11-device-control-and-evaluation.md) |
 | [manipulation/planning.py](api/planning.md) | 161 | [05](05-acceptance-and-execution.md) |
 | [manipulation/planning_ik.py](api/planning_ik.md) | 5 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_trajectory.py](api/cubic_trajectory.md) | 6 | [04](04-solver-and-search.md) |
@@ -42,12 +42,12 @@
 | [manipulation/resource_admission.py](api/resource_admission.md) | 5 | [04](04-solver-and-search.md) |
 | [manipulation/tensor_cpu_snapshot.py](api/tensor_cpu_snapshot.md) | 1 | [04](04-solver-and-search.md) |
 | [manipulation/runtime_profiling.py](api/runtime_profiling.md) | 2 | [04](04-solver-and-search.md) |
-| [manipulation/execution.py](api/execution.md) | 44 | [05](05-acceptance-and-execution.md) |
-| [manipulation/execution_binding.py](api/execution_binding.md) | 9 | [05](05-acceptance-and-execution.md) |
+| [manipulation/execution.py](api/execution.md) | 45 | [11](11-device-control-and-evaluation.md) |
+| [manipulation/execution_binding.py](api/execution_binding.md) | 9 | [11](11-device-control-and-evaluation.md) |
 | [manipulation/robot_validation.py](api/robot_validation.md) | 11 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 19 | [02](02-observation-and-collision.md) |
-| [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 26 | [05](05-acceptance-and-execution.md) |
-| [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [05](05-acceptance-and-execution.md) |
+| [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 30 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 5 | [05](05-acceptance-and-execution.md) |
 | [manipulation/_geometry_kernels.py](api/geometry_kernels.md) | 5 | [02](02-observation-and-collision.md) |
 | [manipulation/implicit_distance.py](api/implicit_distance.md) | 28 | [02](02-observation-and-collision.md) |
@@ -75,3 +75,10 @@
 原生固定配对数值接口与舍入语义见 [NativePairTable](api/native_pair_table.md)，实现位于 `manipulation/_coal_scene_batch.cpp`。
 | [manipulation/pair_evidence.py](api/pair_evidence.md) | 22 | [05](05-acceptance-and-execution.md) |
 | [manipulation/validation_kinematics.py](api/validation_kinematics.md) | 9 | [05](05-acceptance-and-execution.md) |
+| [manipulation/robot_gravity.py](api/robot_gravity.md) | 3 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/run_recorded_simulation.py](api/adapter-run_recorded_simulation.md) | 11 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/recorded_simulation.py](api/adapter-recorded_simulation.md) | 3 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/recorded_skill_evaluation.py](api/adapter-recorded_skill_evaluation.md) | 23 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/continuous_simulation.py](api/adapter-continuous_simulation.md) | 7 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/simulation_snapshot.py](api/adapter-simulation_snapshot.md) | 2 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/prepare_recorded_task.py](api/adapter-prepare_recorded_task.md) | 14 | [11](11-device-control-and-evaluation.md) |

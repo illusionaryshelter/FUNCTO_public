@@ -157,7 +157,8 @@ class _TrialVideos:
 
 # BEGIN one skill may borrow an already running physical session without reset.
 def run(args, *, simulation=None, initial_feedback=None,
-        observation_callback=None, step_callback=None, on_simulation_ready=None, planning_result=None):
+        observation_callback=None, step_callback=None, on_simulation_ready=None, planning_result=None,
+        reference_feedback=None, diagnostic_evidence_ids=()):
     """Execute one skill from a recorded entrance or an explicit live handoff.
 
     The native physics evaluator remains independent and never authorizes a
@@ -236,6 +237,7 @@ def run(args, *, simulation=None, initial_feedback=None,
         "physics_success": None, "videos": [], "video_requested": not args.no_video,
         # BEGIN explicit scoring roles remain distinct from execution gates.
         "diagnostic_goal_ids": deepcopy(args.diagnostic_goal_ids),
+        "diagnostic_evidence_ids": deepcopy(list(diagnostic_evidence_ids)),
         # END only the independent evaluator consumes this goal-role declaration.
         "execution_report_path": str(output/"execution"/"execution-report.json"),
         "physical_trajectory_path": str(output/"execution"/"physical-trajectory.npz"),
@@ -358,7 +360,8 @@ def run(args, *, simulation=None, initial_feedback=None,
                 catalog_path=fixture["catalog_path"], episode_path=fixture["episode_path"],
                 frame_index=feedback["entry_frame"], base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
                 arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
-                arm_kp=arm_config["kp"], arm_kd=arm_config["kd"], velocity_limits=fixture["velocity_limits"])
+                arm_kp=arm_config["kp"], arm_kd=arm_config["kd"], velocity_limits=fixture["velocity_limits"],
+                robot_mjcf_path=fixture["robot_mjcf_path"])
         current = simulation.proprioception()
         report.update(trial_id=simulation.trial_id, native_start_time_s=float(current["sim_time"]))
         if borrowed_simulation and any(initial_feedback.get(key) != current[key]
@@ -442,6 +445,7 @@ def run(args, *, simulation=None, initial_feedback=None,
                 planning_result=planning_result, evaluation_owner_bindings=evidence["evaluation_owner_bindings"],
                 # BEGIN retained goal metrics can be explicitly diagnostic.
                 diagnostic_goal_ids=args.diagnostic_goal_ids,
+                diagnostic_evidence_ids=diagnostic_evidence_ids,
                 # END required effects and execution arrival gates remain separate.
                 binding_source={"path": str(args.evaluator_evidence.resolve()),
                     "source_segment_id": segment["source_library_segment"],
@@ -511,12 +515,21 @@ def run(args, *, simulation=None, initial_feedback=None,
         # BEGIN timestamp before admission, including cases rejected before executor report creation.
         mark_wallclock("executor_call_started")
         # END this is not the first physical step.
+        # BEGIN archived reference identity and live trial identity are distinct.
+        # The executor compares every numeric entrance coordinate with fresh
+        # robot feedback and reads current actuator commands independently.
+        entrance = initial_feedback if reference_feedback is None else reference_feedback
+        if not borrowed_simulation:
+            # Restoring a recorded trial explicitly hands control from its
+            # recorded policy to this newly constructed trajectory controller.
+            simulation.request_control_rebase()
         execution = executor.execute(planning_result,
-            finger_targets=finger_targets, initial_feedback=initial_feedback,
+            finger_targets=finger_targets, initial_feedback=entrance,
             execution_limits=execution_limits,
             output=output/"execution", step_callback=observe,
             # BEGIN pass real upstream observations without reading evaluator truth.
             observation_callback=observation_callback,
+            # END the explicit reference entrance never replaces live feedback.
             # END the production executor owns validation and dependency gates.
             max_physics_steps=args.max_physics_steps,
             start_position_tolerance=args.start_position_tolerance,

@@ -79,6 +79,7 @@ def _history(*, mapped=True, material_frame=True, goal_progress=1., duration=.4,
     evaluator = NativeSkillPhysicsEvaluator.__new__(NativeSkillPhysicsEvaluator)
     evaluator._model, evaluator._planning_result, evaluator._goals = model, result, goals
     # BEGIN match constructor role validation in this explicit non-physics double.
+    evaluator._diagnostic_evidence_ids = []
     evaluator._diagnostic_goal_ids = validate_diagnostic_goal_ids(
         result.execution_binding, diagnostic_goal_ids)
     # END tests cannot bypass the same bound eligibility checks.
@@ -113,7 +114,7 @@ def _complete_collection():
 
 def _completed(evaluator):
     return {"status": "curve_finished", "executed_steps": len(evaluator._samples)-1,
-            "barrier_command_reached": True, "history": [], "completed_goal_ids": [],
+            "barrier_reference_reached": True, "history": [], "completed_goal_ids": [],
             "normal_step_accounting": {"step_accounting_exact": True},
             "independent_evidence_sink": {"completed": True}}
 
@@ -361,7 +362,7 @@ def test_missing_explicit_owner_mapping_keeps_goal_and_whole_result_unknown(tmp_
 def test_early_hold_cannot_supply_unobserved_future_goal_or_stability_window(tmp_path):
     evaluator, _ = _history(until=.2)
     execution = {**_completed(evaluator), "status": "feedback_rejected", "executed_steps": 100,
-        "barrier_command_reached": False, "history": [], "elapsed_sim_s": .5,
+        "barrier_reference_reached": False, "history": [], "elapsed_sim_s": .5,
         "abort_hold": {"physical_steps": 150, "physical_stop_confirmed": True},
         "continuation": {"actual_feedback": {"sim_time": 10.5, "tool_pose": evaluator._samples[-1][2].tolist()}}}
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=execution)
@@ -434,7 +435,7 @@ def test_incomplete_arrival_window_retains_unknown_instead_of_premature_failure(
         "window_s": [.1, .4], "time_basis": "request_physical", "origin_time_s": 0.,
         "goal_id": ["pose_events", 7], "source": "Original explicit arrival window"}]}]
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report={**_completed(evaluator), "status": "feedback_rejected",
-        "executed_steps": 100, "barrier_command_reached": False, "history": []})
+        "executed_steps": 100, "barrier_reference_reached": False, "history": []})
     goal = report["functional_goal_evidence"][0]
     assert goal["measurement"]["value"] == "F" and goal["value"] == "U"
     assert report["physics_outcome"] == "not_evaluated"
@@ -584,6 +585,7 @@ def _support_history(*, delta=None, until=None, mapped=True, material_frame=True
     goals = _FunctionalGoalEvaluator(model, {"bodies": [{"name": "native_subject", "id": 0}]}, result, mappings)
     evaluator._goals, evaluator._skill_kind = goals, "manipulation"
     evaluator._task_contract = {"skill_kind": "manipulation", "task": {"relation": "on", "motion": "free"}}
+    evaluator._diagnostic_evidence_ids = []
     evaluator._diagnostic_goal_ids = []
     for index, row in enumerate(evaluator._samples):
         time, elapsed = row[:2]
@@ -747,7 +749,7 @@ def test_support_declared_arrival_window_preserves_actual_opportunity(tmp_path, 
 
 def test_support_unobserved_original_time_remains_unknown_and_final_row_names_partial_curve(tmp_path):
     evaluator, _ = _support_history(until=.05)
-    execution = {**_completed(evaluator), "status": "feedback_rejected", "barrier_command_reached": False}
+    execution = {**_completed(evaluator), "status": "feedback_rejected", "barrier_reference_reached": False}
     report = evaluator.finalize(tmp_path, collection_report=_complete_collection(), execution_report=execution)
     assert report["functional_goal_evidence"][0]["value"] == "U"
     assert report["functional_goal_evidence"][0]["query_count"] == 0
@@ -867,3 +869,39 @@ def test_initial_observed_pose_error_cannot_be_fitted_out_of_static_support_geom
     np.testing.assert_allclose(actual_goal @ error, actual_entry, atol=1e-14, rtol=0)
     assert result.execution_binding == before and declared[0]["T_body_owner"] == np.eye(4).tolist()
 # END all transforms and samples are explicit CPU math; no native physics or GPU work.
+
+
+# BEGIN generic diagnostic roles preserve failed measurements for sequence analysis.
+def test_explicit_effect_and_terminal_diagnostics_preserve_false_values():
+    report, result = _saved_components()
+    report["functional_goal_evidence"][0]["value"] = "T"
+    report["effect_evidence"][0]["value"] = "F"
+    report["terminal_evidence"][0]["value"] = "F"
+    original = deepcopy(report)
+    identities = [["effect_evidence", "declared_stability"],
+                  ["terminal_evidence", "stable_grasp_at_final_stop"]]
+    grade = summarize_skill_evidence(report, binding=result.execution_binding,
+        trajectory=result.trajectory, diagnostic_evidence_ids=identities)
+    assert grade["physics_success"] is True
+    assert grade["effect_evidence"][0]["value"] == "F"
+    assert grade["terminal_evidence"][0]["value"] == "F"
+    assert grade["effect_evidence"][0]["evaluation_role"] == "diagnostic"
+    assert report == original
+    # A stage containing only diagnostics has no standalone task-effect grade.
+    diagnostic = summarize_skill_evidence(report, binding=result.execution_binding,
+        trajectory=result.trajectory, diagnostic_goal_ids=[["pose_events", 7]],
+        diagnostic_evidence_ids=identities)
+    assert diagnostic["physics_success"] is None
+    assert diagnostic["physics_outcome"] == "unverified"
+
+
+@pytest.mark.parametrize("identities", [
+    [["effect_evidence", "missing"]],
+    [["effect_evidence", "declared_stability"]]*2,
+])
+def test_diagnostic_evidence_selector_retains_original_unique_identity(identities):
+    report, result = _saved_components()
+    with pytest.raises(ValueError, match="unique current evidence"):
+        summarize_skill_evidence(report, binding=result.execution_binding,
+            trajectory=result.trajectory, diagnostic_evidence_ids=identities)
+# END evaluator results remain independent output rather than runtime observations.

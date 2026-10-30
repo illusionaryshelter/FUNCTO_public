@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from manipulation.execution import ExecutionLimits, TrajectoryExecutor
 from manipulation.execution_binding import check_result
-from manipulation.gripper_trajectory import FingerTrajectory
+from manipulation.gripper_trajectory import FingerTrajectory, stationary_finger_command
 from recorded_simulation import load_saved_trajectory
 
 
@@ -459,7 +459,10 @@ def make_finger_reference(source, case, candidate, initial_q, initial_dq, dt, ti
                  "finger_positions": candidate["targets"][kind].tolist()}
                 for index, kind in enumerate(case["order"])]
     return FingerTrajectory.build(joint_names=source.joint_names,
-        initial_position=initial_q, initial_velocity=initial_dq, commands=commands,
+        measured_initial_position=initial_q, measured_initial_velocity=initial_dq,
+        incoming_command=stationary_finger_command(joint_names=source.joint_names, position=initial_q,
+            timestamp_s=timestamp, feedback_id="synthetic_bench_initialization_from_named_finger_feedback",
+            source="Bench setup explicitly initialized ctrl to the same named q"), commands=commands,
         duration=duration, executable_until=duration, timestep=dt,
         position_limits=source.position_limits, velocity_limits=source.velocity_limits,
         acceleration_limits=source.acceleration_limits,
@@ -689,6 +692,7 @@ def run(args):
     from robosuite.utils.binding_utils import MjSim
     from manipulation.contact_binding import calibrate_box_material_features
     from manipulation.robosuite_execution import RobosuiteExecutionBackend
+    from manipulation.robot_gravity import RobotGravity
 
     args.output.mkdir(parents=True, exist_ok=False)
     ledger = StepLedger(journal=args.output/"step-ledger.jsonl")
@@ -792,7 +796,9 @@ def run(args):
                 mujoco.mj_forward(model, data)
                 backend = RobosuiteExecutionBackend(sim, base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
                     arm_joint_names=names[:narm], finger_joint_names=names[narm:], arm_kp=part["kp"], arm_kd=part["kd"],
-                    velocity_limits=fixture["velocity_limits"], source="Fresh isolated robot command-domain device bench")
+                    velocity_limits=fixture["velocity_limits"],
+                    robot_gravity=RobotGravity(mujoco.MjModel.from_xml_path(fixture["robot_mjcf_path"]),
+                        names, source=fixture["robot_mjcf_path"]), source="Fresh isolated robot command-domain device bench")
                 case_report = bench_case(backend, curve, row["case"], row["fingers"], limits, protection, materials,
                     ledger, args.output/f"candidate-{candidate_index+1}-{row['case']['name']}")
                 candidate_report["cases"].append(case_report)

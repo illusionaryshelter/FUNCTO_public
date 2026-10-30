@@ -5,7 +5,9 @@ state. Absolute arm q/dq/ddq from one trajectory sample and independent native
 finger positions go to mature controllers once per native physics step. The
 arm adapter adds analytic trajectory feedforward using the controller's own
 native mass matrix; no second interpolator or full-scene inverse dynamics runs.
-Only actuator ctrl is written after binding; FK uses separate MjData.
+The backend owns the integral acceleration state and commits it only after a
+confirmed native interval. Finger gravity updates the affine actuator bias
+before original total force clipping; FK uses separate data.
 """
 
 # BEGIN native robosuite execution backend without recording dependencies.
@@ -24,7 +26,7 @@ class RobosuiteExecutionBackend:
     """One named robot control binding in an existing native simulation."""
 
     def __init__(self, sim, *, base_link, tcp_site, arm_joint_names, finger_joint_names,
-                 arm_kp, arm_kd, velocity_limits, source):
+                 arm_kp, arm_kd, velocity_limits, robot_gravity, source):
         from robosuite.controllers.parts.generic.joint_pos import JointPositionController
         from robosuite.controllers.parts.gripper.simple_grip import SimpleGripController
 
@@ -41,6 +43,11 @@ class RobosuiteExecutionBackend:
         self._trial_id = str(uuid4())
         self.arm_joint_names, self.finger_joint_names = tuple(arm_joint_names), tuple(finger_joint_names)
         self.joint_names = self.arm_joint_names + self.finger_joint_names
+        # BEGIN fixed-robot gravity is an explicit independent model input.
+        if tuple(robot_gravity.joint_names) != self.joint_names:
+            raise ValueError("Robot gravity must use this backend's named encoder order")
+        self._robot_gravity = robot_gravity
+        # END the live task model never supplies finger compensation forces.
         if not self.arm_joint_names or not self.finger_joint_names or len(set(self.joint_names)) != len(self.joint_names):
             raise ValueError("Arm and finger feedback names must be nonempty and disjoint")
         # BEGIN preserve the explicit named hardware velocity limits.
@@ -91,6 +98,24 @@ class RobosuiteExecutionBackend:
                 or np.any(model.actuator_gainprm[self._arm_actuators, 0] != 1)
                 or np.any(model.actuator_biastype[self._arm_actuators] != mujoco.mjtBias.mjBIAS_NONE)):
             raise ValueError("Joint torque controller requires native unit-gain torque motors")
+        # BEGIN one effective torque domain for this unit-transmission binding.
+        # All active native limits act on the same N m coordinate because this
+        # backend already requires exactly one unit-gain motor per arm joint.
+        # Unused force-range fields are often [0, 0]; their flags determine
+        # whether they participate. Fixed robot model limits are task invariant.
+        effective = model.actuator_ctrlrange[self._arm_actuators].copy()
+        arm_joints = self._joint_ids[:narm]
+        for active, ranges in (
+                (model.actuator_forcelimited[self._arm_actuators],
+                 model.actuator_forcerange[self._arm_actuators]),
+                (model.jnt_actfrclimited[arm_joints], model.jnt_actfrcrange[arm_joints])):
+            selected = np.asarray(active, dtype=bool)
+            effective[selected, 0] = np.maximum(effective[selected, 0], ranges[selected, 0])
+            effective[selected, 1] = np.minimum(effective[selected, 1], ranges[selected, 1])
+        if not np.isfinite(effective).all() or np.any(effective[:, 0] >= effective[:, 1]):
+            raise ValueError("Active native arm torque limits require a finite nonempty intersection")
+        self._arm_torque_bounds = effective
+        # END the final output, conditional integral and saturation share L/U.
         # BEGIN physical finger targets through the existing unscaled GRIP.
         # A unit-gear native position actuator interprets ctrl in the named
         # joint's physical units. A velocity/motor actuator must not be
@@ -122,13 +147,30 @@ class RobosuiteExecutionBackend:
                     "actuators": self._actuator_ids[start:stop].tolist()}
 
         # BEGIN native mass/bias compensation is part of the trajectory law.
-        bounds = model.actuator_ctrlrange[self._arm_actuators]
+        bounds = self._arm_torque_bounds
         # BEGIN joint-space control has no site pose or Jacobian observation.
         self._arm_controller = JointPositionController(self._sim, indexes(0, narm),
             actuator_range=(bounds[:, 0], bounds[:, 1]), ref_name=None,
             input_type="absolute", kp=float(arm_kp), kd=float(arm_kd), damping_ratio=1,
             policy_freq=1/self._dt, lite_physics=False, interpolator=None,
             use_torque_compensation=True)
+        # BEGIN acceleration-domain integral with the declared nominal poles.
+        # The current device supplies positive scalar Kp/Kd. The repeated
+        # slow pole construction requires Kd^2 >= 3*Kp; it is a fixed device
+        # design, not a gain selected from task or contact outcomes.
+        kp, kd = self._arm_controller.kp, self._arm_controller.kd
+        discriminant = kd*kd - 3*kp
+        if np.any(discriminant < 0):
+            raise ValueError("Integral pole construction requires Kd squared >= 3 Kp")
+        slow = (kd - np.sqrt(discriminant))/3
+        self._arm_ki = slow*slow*(kd - 2*slow)
+        if not np.isfinite(self._arm_ki).all() or np.any(self._arm_ki <= 0):
+            raise ValueError("Integral pole construction must produce finite positive Ki")
+        self._integral_acceleration = np.zeros(narm)
+        self._integral_sim_time = self.sim_time
+        self._pending_integral_interval = None
+        self._control_rebase_requested = False
+        # END z is backend state; q/dq feedback remains a sensor-only contract.
         # END ref_name=None disables the mature controller's unused site reads.
         # END derivative feedforward uses this same compensated controller.
         bounds = model.actuator_ctrlrange[self._finger_actuators]
@@ -147,6 +189,15 @@ class RobosuiteExecutionBackend:
         if not np.array_equal(self._grip_controller.run_controller(), restored_ctrl):
             raise ValueError("Unscaled GRIP must reproduce restored native position controls exactly")
         # END resume raw native command state without binary action memory.
+        # BEGIN one gravity law for ordinary control, recovery and stopping.
+        self._finger_gain = model.actuator_gainprm[self._finger_actuators, 0].copy()
+        self._finger_velocity_bias = model.actuator_biasprm[self._finger_actuators, 2].copy()
+        self._finger_force_bounds = model.actuator_forcerange[self._finger_actuators].copy()
+        if not model.actuator_forcelimited[self._finger_actuators].all():
+            raise ValueError("Gravity-compensated fingers require their declared total force limits")
+        self._update_finger_gravity(restored_ctrl)
+        mujoco.mj_forward(model, self.native_data)
+        # END initialization preserves native q/dq/time and the held command.
         # BEGIN model FK uses measured arm q, never a live TCP observation.
         self._prepare_reference_fk()
         # END the same calibrated model supplies reference and measured-q FK.
@@ -167,26 +218,45 @@ class RobosuiteExecutionBackend:
             "actuator_ctrlrange": model.actuator_ctrlrange[self._actuator_ids].tolist(),
             "actuator_forcelimited": model.actuator_forcelimited[self._actuator_ids].astype(bool).tolist(),
             "actuator_forcerange": model.actuator_forcerange[self._actuator_ids].tolist(),
+            # BEGIN publish the limits used by every arm output computation.
+            "joint_actuator_forcelimited": model.jnt_actfrclimited[self._joint_ids].astype(bool).tolist(),
+            "joint_actuator_forcerange": model.jnt_actfrcrange[self._joint_ids].tolist(),
+            "effective_arm_torque_range": self._arm_torque_bounds.tolist(),
+            "arm_torque_limit_source": "Intersection of ctrlrange, active actuator forcerange and active joint actuatorfrcrange under one-to-one unit transmission",
+            # END ranges are model declarations, not measured force signals.
             # BEGIN bind the complete trajectory-control contract by joint name.
-            "arm_controller": "robosuite JointPositionController plus same-curve dq/ddq feedforward, native torque actuators",
+            "arm_controller": "robosuite JointPositionController plus same-curve dq/ddq feedforward and acceleration integral, native torque actuators",
             # BEGIN model terms are not measured object/contact forces.
             "arm_dynamics_source": "Known fixed robot model M(q) and bias C(q,dq)+g at measured robot q/dq; no target-pose or contact-force feedback",
-            # END no change to the controller gains or torque equation.
+            # END robot model terms retain their own source and units.
             "arm_kp": float(arm_kp), "arm_kd": float(arm_kd),
             "effective_arm_kp": self._arm_controller.kp.tolist(),
             "effective_arm_kd": self._arm_controller.kd.tolist(),
             "arm_interpolator": None, "desired_velocity_feedforward": True,
             "desired_acceleration_feedforward": True,
             "controller_policy": {
-                "mode": "joint_trajectory_q_dq_ddq",
+                "mode": "joint_trajectory_q_dq_ddq_integral",
                 "arm_joint_names": list(self.arm_joint_names),
                 "kp": self._arm_controller.kp.tolist(), "kd": self._arm_controller.kd.tolist(),
+                "ki": self._arm_ki.tolist(),
                 "native_timestep_s": self.timestep,
                 "reference_derivatives": ["q", "dq", "ddq"],
-                "sampling_phase": "clamped_step_endpoint",
+                "sampling_phase": "step_start",
+                "integral_update": "confirmed_native_step_torque_conditional",
+                "torque_limits": self._arm_torque_bounds.tolist(),
                 "acceleration_knot_side": "right_internal_last_left"},
+            "integral_state": "Named acceleration state z [rad/s^2]; retained across continuous segments and stop; explicit rebase matches the next control output once",
+            "integral_snapshot": "Completed native-step boundary: named z, native time and controller policy; saved separately from encoder feedback",
             # END this policy cannot be inferred from a q-only authorization.
-            "gripper_controller": "robosuite SimpleGripController, use_action_scaling=False",
+            "gripper_controller": "Unscaled SimpleGripController position target plus fixed-robot gravity feedforward",
+            "finger_gravity_control": {
+                "source": self._robot_gravity.source,
+                "robot_joint_names": list(self._robot_gravity.joint_names),
+                "gravity_world_m_s2": self._robot_gravity.model.opt.gravity.tolist(),
+                "force_law": "clip(Kp*(u-q)+velocity_bias*dq+g(q), original actuator forcerange)",
+                "force_range": self._finger_force_bounds.tolist(),
+                "application": "Same pre-step robot q; affine bias before native total force clipping",
+                "model_scope": "Official fixed robot and installed end effector; reused across tasks"},
             "gripper_command_frequency_hz": 1/self.timestep,
             "initial_finger_position_ctrl": restored_ctrl.tolist(),
             "gripper_initialization": "Current native ctrl is preserved independently of measured finger q"}
@@ -257,21 +327,92 @@ class RobosuiteExecutionBackend:
     def describe(self):
         return deepcopy(self._description)
 
+    # BEGIN explicit controller ownership and completed-boundary state APIs.
+    def request_control_rebase(self):
+        """Match the next actual control write to the current effective ctrl.
+
+        Call only for explicit control takeover or reference rebasing. A
+        continuous segment boundary needs no operation. The next successful
+        apply consumes this request; repeated evaluations at that same time
+        then retain z. A stop cancels a request that has not yet been applied.
+        """
+        self._control_rebase_requested = True
+
+    def snapshot_control_state(self):
+        """Return named integral state at a completed control boundary.
+
+        A prepared, unexecuted control interval contains e/M/u which are not
+        part of this boundary format. Native integration state is persisted
+        by the caller with MuJoCo's existing getState API at this same time.
+        """
+        if self._pending_integral_interval is not None or self._control_rebase_requested:
+            raise ValueError("Control snapshots require a completed step with no pending rebase")
+        if self._integral_sim_time != self.sim_time:
+            raise ValueError("Control snapshot time must equal the native integration boundary")
+        return {"arm_joint_names": list(self.arm_joint_names),
+                "integral_acceleration": self._integral_acceleration.tolist(),
+                "sim_time": self._integral_sim_time,
+                "controller_policy": deepcopy(self._description["controller_policy"])}
+
+    def restore_control_state(self, state):
+        """Restore z after the caller restores the matching native state.
+
+        Names, time and policy define the saved state's coordinates and
+        control law. A complete state resumes directly and does not request
+        an output rebase; initial takeover from a legacy controller is an
+        explicit request_control_rebase call instead.
+        """
+        if self._pending_integral_interval is not None or self._control_rebase_requested:
+            raise ValueError("Restore control state before preparing a control interval")
+        if (tuple(state["arm_joint_names"]) != self.arm_joint_names
+                or state["controller_policy"] != self._description["controller_policy"]):
+            raise ValueError("Control state must use this binding's named coordinates and policy")
+        stamp = float(state["sim_time"])
+        if not np.isfinite(stamp) or stamp != self.sim_time:
+            raise ValueError("Control state time must equal restored native time")
+        values = _finite_array(state["integral_acceleration"], (len(self.arm_joint_names),),
+                               "Named restored integral acceleration")
+        self._integral_acceleration = values.copy()
+        self._integral_sim_time = stamp
+    # END exact state restoration is independent of measured q/dq feedback.
+
+    # BEGIN measured robot state and fixed model define the finger feedforward.
+    def _update_finger_gravity(self, targets):
+        """Update this interval's force; return pre-step model output terms.
+
+        Actual post-step actuator forces and task contacts belong to separate
+        physical records. They do not supply this model calculation.
+        """
+        narm = len(self.arm_joint_names)
+        q = self.native_data.qpos[self._qpos_ids].copy()
+        dq = self.native_data.qvel[self._qvel_ids].copy()
+        gravity = self._robot_gravity.compute(q)[narm:]
+        self.native_model.actuator_biasprm[self._finger_actuators, 0] = gravity
+        servo = self._finger_gain*(targets-q[narm:]) + self._finger_velocity_bias*dq[narm:]
+        requested = servo + gravity
+        bounded = np.clip(requested, self._finger_force_bounds[:, 0], self._finger_force_bounds[:, 1])
+        return {"finger_gravity_force": gravity, "finger_position_servo_force": servo,
+                "finger_requested_force": requested, "finger_bounded_force": bounded,
+                "finger_force_saturated": bounded != requested}
+    # END native affine actuation clips this same total during physical stepping.
+
     # BEGIN mandatory trajectory derivatives through the native arm controller.
     def apply_control(self, arm_q, arm_dq, arm_ddq, finger_positions):
         """Apply one named q/dq/ddq reference and native finger positions.
 
         Every arm vector follows ``arm_joint_names`` from this binding. The
-        executor samples all three at its declared clamped step endpoint;
+        executor samples all three at the current native interval's start;
         none is substituted by measured velocity or finite differences here.
         Installed robosuite supplies the position/damping torque, mass matrix
         and bias at the same current state. Adding M*(Kd*dq_ref + ddq_ref)
-        yields M*(ddq_ref + Kp*(q_ref-q) + Kd*(dq_ref-dq)) + bias, without
-        changing gains or canceling unknown contact/passive forces.
+        yields M*(ddq_ref + Kp*(q_ref-q) + Kd*(dq_ref-dq)) + bias. The same
+        final calculation adds M*z before total clipping; z is the retained
+        acceleration integral, not an estimate from measured contact forces.
 
         This method writes only actuator ctrl and does not integrate physics.
         Its raw torque components and references belong to the same call;
         saturation is applied only to their total, never to each component.
+        Integral accumulation occurs only in step after physical advancement.
         """
         narm = len(self.arm_joint_names)
         arm_q = _finite_array(arm_q, (narm,), "Named arm reference positions")
@@ -298,17 +439,36 @@ class RobosuiteExecutionBackend:
         velocity_feedback = _finite_array(mass @ (-kd * actual_dq), (narm,), "Arm velocity-feedback torque")
         velocity_feedforward = _finite_array(mass @ (kd * arm_dq), (narm,), "Arm velocity-feedforward torque")
         acceleration_feedforward = _finite_array(mass @ arm_ddq, (narm,), "Arm acceleration-feedforward torque")
-        torque = _finite_array(position_controller_torque + velocity_feedforward + acceleration_feedforward,
-                               (narm,), "Native trajectory-controller torque")
-        bounds = self.native_model.actuator_ctrlrange[self._arm_actuators]
+        # BEGIN one composed arm output, with state used but not integrated.
+        base_torque = _finite_array(position_controller_torque + velocity_feedforward + acceleration_feedforward,
+                                    (narm,), "Native trajectory-controller base torque")
+        bounds = self._arm_torque_bounds
+        rebased = self._control_rebase_requested
+        integral = self._integral_acceleration.copy()
+        if rebased:
+            previous = np.clip(self.native_data.ctrl[self._arm_actuators], bounds[:, 0], bounds[:, 1])
+            integral = np.linalg.solve(mass, previous-base_torque)
+        integral_torque = _finite_array(mass @ integral, (narm,), "Arm integral torque")
+        torque = _finite_array(base_torque + integral_torque, (narm,), "Native trajectory-controller total torque")
         bounded = np.clip(torque, bounds[:, 0], bounds[:, 1])
         finger_ctrl = np.asarray(self._grip_controller.run_controller(), dtype=float)
         if not np.array_equal(finger_ctrl, finger_positions):
             raise RuntimeError("Unscaled GRIP changed an explicit native finger position target")
+        # BEGIN update gravity at the unique actual control write.
+        finger_control = self._update_finger_gravity(finger_ctrl)
+        # END arm and finger model outputs retain their distinct units.
         self.native_data.ctrl[self._arm_actuators] = bounded
         self.native_data.ctrl[self._finger_actuators] = finger_ctrl
+        self._integral_acceleration = integral
+        self._integral_sim_time = self.sim_time
+        self._control_rebase_requested = False
+        # Keep the last command at this native time. Repeated writes replace
+        # the held interval; only step() may integrate its actual duration.
+        self._pending_integral_interval = {"sim_time": self.sim_time,
+            "error": (arm_q-actual_q).copy(), "mass": mass.copy(), "requested_torque": torque.copy()}
+        # END no second arm writer or integration on a function-call clock.
         # BEGIN arm control clipping is separate from native finger force limits.
-        return {"actuator_ctrl": self.actuator_control,
+        return {"actuator_ctrl": self.actuator_control, **finger_control,
                 "requested_arm_torque": torque.copy(), "arm_torque_saturated": bounded != torque,
                 "arm_control_saturated_coordinates": int(np.count_nonzero(bounded != torque)),
                 "reference_arm_q": arm_q.copy(), "reference_arm_dq": arm_dq.copy(),
@@ -317,7 +477,11 @@ class RobosuiteExecutionBackend:
                 "arm_velocity_feedback_torque": velocity_feedback.copy(),
                 "arm_velocity_feedforward_torque": velocity_feedforward.copy(),
                 "arm_acceleration_feedforward_torque": acceleration_feedforward.copy(),
-                "arm_bias_torque": bias.copy()}
+                "arm_bias_torque": bias.copy(),
+                "arm_integral_torque": integral_torque.copy(),
+                "arm_integral_state": integral.copy(),
+                "arm_position_error": (arm_q-actual_q).copy(),
+                "arm_integral_rebased": bool(rebased)}
         # END count only the arm controller's clipped torque coordinates.
     # END no derivative-free fallback or mutation of physical q/dq/qacc.
 
@@ -381,6 +545,42 @@ class RobosuiteExecutionBackend:
             # cannot authorize an exact continuation time. Keep that completed
             # step as a lower bound while explicitly marking the inconsistency.
             report["step_accounting_exact"] = bool(advanced or (stationary and not report["native_step_returned"]))
+            # BEGIN commit one integral update at the confirmed physical edge.
+            # This runs even if native step raises after advancing its clock,
+            # and before later FK/forward refresh can fail. The saved matrix,
+            # error and request belong to the command held over this interval.
+            report["integral_update_committed"] = False
+            if advanced:
+                interval = self._pending_integral_interval
+                if interval is not None:
+                    h = after-before
+                    mass, requested = interval["mass"], interval["requested_torque"]
+                    raw = mass @ (h*self._arm_ki*interval["error"])
+                    bounds = self._arm_torque_bounds
+                    accepted = np.clip(raw, np.minimum(bounds[:, 0]-requested, 0.),
+                                       np.maximum(bounds[:, 1]-requested, 0.))
+                    old_integral = self._integral_acceleration.copy()
+                    try:
+                        delta = np.linalg.solve(mass, accepted)
+                    except Exception as error:
+                        # The native exception remains primary if integration
+                        # already reported one; preserve this separate control
+                        # update failure in the same boundary record.
+                        report["integral_update_error"] = f"{type(error).__name__}: {error}"
+                        if "native_error" not in report:
+                            raise
+                    else:
+                        self._integral_acceleration += delta
+                        self._pending_integral_interval = None
+                        report.update(integral_update_committed=True,
+                            integral_interval_start=interval["sim_time"],
+                            integral_dt_s=h,
+                            integral_requested_torque_increment=raw.tolist(),
+                            integral_accepted_torque_increment=accepted.tolist(),
+                            integral_acceleration_before=old_integral.tolist(),
+                            integral_acceleration_after=self._integral_acceleration.tolist())
+                self._integral_sim_time = after
+            # END completed physical time owns the new control state.
         # mj_step leaves derived positions at its integration stage. Forward
         # refreshes feedback without another integration. Its failure preserves
         # the completed native boundary record and remains the original error.
@@ -451,7 +651,14 @@ class RobosuiteExecutionBackend:
         goal is retained, so an event rejected by supervision is never issued
         by fault handling. Hold telemetry is separate from the failed curve.
         No state reset or claimed zero velocity substitutes for feedback.
+        The current integral state is retained; output matching is cancelled
+        so that the zero desired velocity immediately supplies braking.
         """
+        # BEGIN a stop keeps z and never consumes a pending output rebase.
+        # Entry supervision can fail before the requested first normal write;
+        # the stop still requires its new damping force immediately.
+        self._control_rebase_requested = False
+        # END holding uses the same integral without cancelling its brake.
         # BEGIN fault stopping preserves position faults separately from speed convergence.
         result = {"prepared": False, "native_ctrl_written": False, "physical_steps": 0,
                   "charged_steps": 0, "step_accounting_exact": True, "step_accounting": [],

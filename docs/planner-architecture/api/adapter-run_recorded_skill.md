@@ -1,7 +1,7 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`c289890`。
-职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`9cdb433`。
+职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
 
@@ -229,7 +229,7 @@ JointTrajectory
 输入签名：
 
 ```python
-def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ctrlrange, position_limits, velocity_limits, acceleration_limits):
+def finger_trajectory_factory(problem, feedback, finger_targets, *, incoming_command, timestep, ctrlrange, position_limits, velocity_limits, acceleration_limits):
 ```
 
 实现说明：
@@ -239,8 +239,9 @@ def finger_trajectory_factory(problem, feedback, finger_targets, *, timestep, ct
 > Actual-position protection bounds are deliberately absent from this
 > constructor. They continue guarding measured feedback in the executor;
 > they cannot predict a hand shape or replace the original position goals.
-> The returned reference starts at measured q/dq and remains a command,
-> including when physical contact prevents a target from being reached.
+> The returned reference continues the explicitly supplied active command.
+> Measured q/dq remain separate entrance observations, including when contact
+> prevents the physical fingers from reaching the issued target.
 
 显式输出分支：
 
@@ -272,7 +273,7 @@ float
 
 ## `finger_trajectory_factory.build`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L141)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L142)。
 
 输入签名：
 
@@ -283,7 +284,7 @@ def build(duration_s, progress_map):
 显式输出分支：
 
 ```python
-FingerTrajectory.build(joint_names=names, initial_position=[measured[name] for name in names], initial_velocity=[speeds[name] for name in names], commands=commands, duration=duration_s, executable_until=stop, timestep=timestep, position_limits=np.asarray([position_limits[name] for name in names]).T, velocity_limits=np.stack((-velocity, velocity)), acceleration_limits=np.stack((-acceleration, acceleration)), source=f'Original explicit actuator targets: {finger_targets.source}; C1 command reference under native planner acceleration bounds, not calibrated actual acceleration/tracking limits', feedback_id=feedback['feedback_id'], timestamp_s=feedback['sim_time_s'])
+FingerTrajectory.build(joint_names=names, incoming_command=incoming_command, measured_initial_position=[measured[name] for name in names], measured_initial_velocity=[speeds[name] for name in names], commands=commands, duration=duration_s, executable_until=stop, timestep=timestep, position_limits=np.asarray([position_limits[name] for name in names]).T, velocity_limits=np.stack((-velocity, velocity)), acceleration_limits=np.stack((-acceleration, acceleration)), source=f'Original explicit actuator targets: {finger_targets.source}; C1 command reference under native planner acceleration bounds, not calibrated actual acceleration/tracking limits', feedback_id=feedback['feedback_id'], timestamp_s=feedback['sim_time_s'])
 ```
 
 读取的对象属性：
@@ -338,7 +339,7 @@ np.stack
 
 ## `position_controlled_hand`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L176)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L179)。
 
 输入签名：
 
@@ -419,7 +420,7 @@ execution_limits.describe
 
 ## `position_controlled_hand.nominal_geometry`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L203)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L206)。
 
 输入签名：
 
@@ -455,7 +456,7 @@ bind_nominal_finger_geometry
 
 ## `require_feedback_identity`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L230)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L233)。
 
 输入签名：
 
@@ -500,7 +501,7 @@ ValueError
 
 ## `recorded_owner_observation_inputs`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L242)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L245)。
 
 输入签名：
 
@@ -577,7 +578,7 @@ Path
 
 ## `run_prepared`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L305)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L308)。
 
 输入签名：
 
@@ -990,7 +991,7 @@ _write_diagnostic_json
 
 ## `run_prepared.mark_wallclock`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L339)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L342)。
 
 输入签名：
 
@@ -1025,7 +1026,7 @@ print
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L693)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L697)。
 
 输入签名：
 
@@ -1103,7 +1104,7 @@ run_prepared
 
 ## `parse_args`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L722)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L726)。
 
 输入签名：
 

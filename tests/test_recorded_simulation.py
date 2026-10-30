@@ -24,8 +24,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent/"planning"))
 from manipulation.planning import JointTrajectory, PlanningResult
 # BEGIN exercise production execution through the thin recording adapter.
 from manipulation.execution import ExecutionGuardError, ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
-from manipulation.gripper_trajectory import FingerTrajectory
+from manipulation.gripper_trajectory import FingerTrajectory, stationary_finger_command
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
+from manipulation.robot_gravity import RobotGravity
 # BEGIN archive admission precedes JSON allocation and formal result loading.
 from recorded_simulation import load_curve_archive, load_saved_trajectory
 # END both inspection and execution share the same bounded first read.
@@ -60,9 +61,11 @@ def _fixture():
     simulation._description = {"scope": "mocked integration clock only"}
     # BEGIN the sequencing fixture declares the same complete controller contract.
     simulation._description["controller_policy"] = {
-        "mode": "joint_trajectory_q_dq_ddq", "arm_joint_names": list(simulation.arm_joint_names),
+        "mode": "joint_trajectory_q_dq_ddq_integral", "arm_joint_names": list(simulation.arm_joint_names),
         "kp": [1.]*7, "kd": [1.]*7, "native_timestep_s": simulation._dt,
-        "reference_derivatives": ["q", "dq", "ddq"], "sampling_phase": "clamped_step_endpoint",
+        "reference_derivatives": ["q", "dq", "ddq"], "sampling_phase": "step_start",
+        "ki": [.1]*7, "integral_update": "confirmed_native_step_torque_conditional",
+        "torque_limits": [[-10., 10.]]*7,
         "acceleration_knot_side": "right_internal_last_left"}
     # END this declared toy policy is not a physical robot model.
     simulation.native_data = SimpleNamespace(
@@ -71,7 +74,7 @@ def _fixture():
         # BEGIN synthetic native dynamics are independent of mock q/dq/ctrl.
         qacc=np.linspace(-.4, .4, 9), actuator_force=np.arange(1., 10.),
         # END these sentinel arrays do not represent physical integration.
-        ctrl=np.r_[np.zeros(7), .026, -.023], time=1.3,
+        ctrl=np.r_[np.zeros(7), .01205, -.01705], time=1.3,
         xmat=np.eye(3).reshape(1, 9), xpos=np.zeros((1, 3)),
         site_xmat=np.eye(3).reshape(1, 9), site_xpos=np.zeros((1, 3)))
     simulation.native_model = SimpleNamespace(
@@ -123,6 +126,20 @@ def _fixture():
     controller.set_goal = set_goal
     controller.run_controller = lambda: simulation.arm_goals[-1]-controller.joint_pos-controller.joint_vel
     simulation._arm_controller = controller
+    # BEGIN explicit synthetic state for the production integral/gravity law.
+    simulation._arm_ki = np.full(7, .1)
+    simulation._arm_torque_bounds = np.tile([-10., 10.], (7, 1))
+    simulation._integral_acceleration = np.zeros(7)
+    simulation._integral_sim_time = simulation.sim_time
+    simulation._pending_integral_interval = None
+    simulation._control_rebase_requested = False
+    simulation._robot_gravity = SimpleNamespace(compute=lambda q: np.zeros(9))
+    simulation._finger_gain = np.full(2, 1000.)
+    simulation._finger_velocity_bias = np.zeros(2)
+    simulation._finger_force_bounds = np.tile([-20., 20.], (2, 1))
+    simulation.native_model.actuator_biasprm = np.zeros((9, 10))
+    # END this fixture models a clock and control arithmetic, not physical loads.
+
     # END real backend feedforward consumes explicit current matrices and named state.
     q, dq = simulation.native_data.qpos[:7], simulation.native_data.qvel[:7]
     events = (_event("open-original", "open", .001),
@@ -248,7 +265,10 @@ def _bind_fingers(simulation, curve, targets):
                          ctrlrange=simulation.finger_ctrlrange)
     curve.finger_trajectory = FingerTrajectory.build(
         joint_names=simulation.finger_joint_names,
-        initial_position=feedback["q"][7:], initial_velocity=feedback["dq"][7:], commands=commands,
+        measured_initial_position=feedback["q"][7:], measured_initial_velocity=feedback["dq"][7:],
+        incoming_command=stationary_finger_command(joint_names=simulation.finger_joint_names,
+            position=feedback["actuator_ctrl"]["values"][7:], timestamp_s=feedback["timestamp_s"],
+            feedback_id=feedback["feedback_id"], source="Explicit stationary native test command"), commands=commands,
         duration=curve.duration, executable_until=curve.executable_until, timestep=simulation.timestep,
         position_limits=simulation.joint_ranges[7:].T,
         velocity_limits=[[-.2, -.2], [.2, .2]], acceleration_limits=[[-1000., -1000.], [1000., 1000.]],
@@ -496,7 +516,7 @@ class RecordedControlTests(unittest.TestCase):
                         output=output)
                 self.assertFalse(output.exists())
                 self.assertEqual(simulation.sim_time, 1.3)
-                np.testing.assert_array_equal(simulation.finger_control, [.026, -.023])
+                np.testing.assert_array_equal(simulation.finger_control, [.01205, -.01705])
 
     def test_event_free_arm_diagnostic_explicitly_has_no_finger_reference(self):
         simulation, curve, value = _fixture()
@@ -507,7 +527,7 @@ class RecordedControlTests(unittest.TestCase):
                 initial_feedback=_initial_feedback(simulation), execution_limits=_limits(simulation, curve),
                 output=output)
             self.assertIsNone(report["finger_reference"])
-            np.testing.assert_array_equal(simulation.finger_control, [.026, -.023])
+            np.testing.assert_array_equal(simulation.finger_control, [.01205, -.01705])
             with np.load(output/"physical-trajectory.npz") as saved:
                 self.assertFalse(saved["reference_finger_provided"])
                 self.assertTrue(np.isnan(saved["reference_finger_q"]).all())
@@ -545,7 +565,7 @@ class RecordedControlTests(unittest.TestCase):
     def test_installed_unscaled_grip_preserves_asymmetric_raw_native_commands(self):
         simulation, _, _ = _fixture()
         controller = simulation._grip_controller
-        np.testing.assert_array_equal(controller.run_controller(), [.026, -.023])
+        np.testing.assert_array_equal(controller.run_controller(), [.01205, -.01705])
         self.assertFalse(np.array_equal(controller.run_controller(), simulation.native_data.qpos[7:]))
         controller.set_goal(np.array([.004, -.009]))
         np.testing.assert_array_equal(controller.run_controller(), [.004, -.009])
@@ -600,7 +620,7 @@ class RecordedControlTests(unittest.TestCase):
                 np.testing.assert_array_equal(saved["reference_finger_q"], expected_q)
                 np.testing.assert_array_equal(saved["reference_finger_dq"], expected_dq)
                 self.assertTrue(saved["reference_finger_provided"])
-                np.testing.assert_array_equal(saved["command_q"][0, 7:], [.026, -.023])
+                np.testing.assert_array_equal(saved["command_q"][0, 7:], [.01205, -.01705])
                 np.testing.assert_array_equal(saved["actual_dq"][0, 7:], [.03, -.04])
                 np.testing.assert_allclose(saved["control_elapsed"], [0., .002, .004, .006], atol=1e-15)
                 self.assertEqual(saved["curve_time"][-1], .0075)
@@ -1392,7 +1412,7 @@ class GeometryExecutionTests(unittest.TestCase):
             with self.subTest(checker=checker), self.assertRaisesRegex(ValueError, "named independent geometry checker"):
                 TrajectoryExecutor(simulation, geometry_checker=checker)
         self.assertEqual(simulation.native_data.time, 1.3)
-        np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
+        np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.01205, -.01705])
 
     def test_rejected_preflight_keeps_candidate_unapplied_and_records_physical_hold(self):
         simulation, curve, targets = _fixture()
@@ -1431,7 +1451,7 @@ class GeometryExecutionTests(unittest.TestCase):
             self.assertIsNone(executor.last_execution_report)
             # END a rejected new binding cannot leak the prior successful cleanup object.
             self.assertAlmostEqual(simulation.native_data.time, 1.302)
-            np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.026, -.023])
+            np.testing.assert_array_equal(simulation.native_data.ctrl[7:], [.01205, -.01705])
             with np.load(output/"physical-trajectory.npz", allow_pickle=False) as saved:
                 self.assertEqual(saved["actuator_ctrl"].shape, (0, 9))
                 self.assertEqual(saved["actual_q"].shape, (1, 9))
@@ -1579,12 +1599,12 @@ class RobosuiteBackendTests(unittest.TestCase):
               </body></body></worldbody>
               <actuator><general name="arm_motor" joint="arm_q" {arm_attributes}
                 gainprm="1" biastype="none" ctrllimited="true" ctrlrange="-2 2"/>
-                <position name="left_servo" joint="left_q" kp="100" ctrllimited="true" ctrlrange="0 .04"/>
-                <position name="right_servo" joint="right_q" kp="100" ctrllimited="true" ctrlrange="-.04 0"/>
+                <position name="left_servo" joint="left_q" kp="100" ctrllimited="true" ctrlrange="0 .04" forcerange="-20 20"/>
+                <position name="right_servo" joint="right_q" kp="100" ctrllimited="true" ctrlrange="-.04 0" forcerange="-20 20"/>
               </actuator></mujoco>''')
         sim = MjSim(model)
         sim.data._data.qpos[:] = [.2, .012, -.017]
-        sim.data._data.ctrl[:] = [0., .026, -.023]
+        sim.data._data.ctrl[:] = [0., .01205, -.01705]
         mujoco.mj_forward(model, sim.data._data)
         return sim
 
@@ -1592,7 +1612,8 @@ class RobosuiteBackendTests(unittest.TestCase):
     def _bind(sim):
         return RobosuiteExecutionBackend(sim, base_link="base", tcp_site="tcp", arm_joint_names=("arm_q",),
             finger_joint_names=("left_q", "right_q"), arm_kp=1000., arm_kd=200.,
-            velocity_limits={"arm_q": 1., "left_q": .2, "right_q": .2}, source="Explicit tiny native CPU binding test")
+            velocity_limits={"arm_q": 1., "left_q": .2, "right_q": .2},
+            robot_gravity=RobotGravity(sim.model._model, ("arm_q", "left_q", "right_q"), source="CPU robot fixture"), source="Explicit tiny native CPU binding test")
 
     def test_existing_native_state_and_actuator_semantics_survive_binding_and_control(self):
         sim = self._simulator()
@@ -1752,6 +1773,9 @@ class TerminalSourceCommandTests(unittest.TestCase):
         actual = _initial_feedback(simulation)
         input_feedback = {**actual, "start_q": actual["q"], "start_dq": actual["dq"], "sim_time_s": actual["timestamp_s"]}
         factory = finger_trajectory_factory(problem, input_feedback, FixedFingerTargets.from_mapping(targets),
+            incoming_command=stationary_finger_command(joint_names=simulation.finger_joint_names,
+                position=simulation.finger_control, timestamp_s=simulation.sim_time,
+                feedback_id=input_feedback["feedback_id"], source="Explicit stationary synthetic target"),
             timestep=simulation.timestep, ctrlrange=simulation.finger_ctrlrange,
             position_limits=dict(zip(simulation.joint_names, simulation.joint_ranges)),
             velocity_limits=dict(zip(simulation.finger_joint_names, [.2, .2])),

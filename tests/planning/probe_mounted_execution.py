@@ -24,7 +24,7 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution import ExecutionLimits, FixedFingerTargets, TrajectoryExecutor
-from manipulation.gripper_trajectory import FingerTrajectory
+from manipulation.gripper_trajectory import FingerTrajectory, stationary_finger_command
 from manipulation.planning import JointTrajectory
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
 from robot_validation_fixture import build_robot_validator
@@ -110,7 +110,7 @@ def run(args):
             episode_path=fixture["episode_path"], frame_index=args.frame_index,
             base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
             arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
-            arm_kp=part["kp"], arm_kd=part["kd"], velocity_limits=fixture["velocity_limits"])
+            arm_kp=part["kp"], arm_kd=part["kd"], velocity_limits=fixture["velocity_limits"], robot_mjcf_path=fixture["robot_mjcf_path"])
         initial = backend.proprioception()
         narm = len(backend.arm_joint_names)
         q0, dq0 = np.asarray(initial["q"][:narm]), np.asarray(initial["dq"][:narm])
@@ -182,8 +182,11 @@ def run(args):
             selected_acceleration = acceleration[[configured_names.index(name) for name in backend.finger_joint_names]]
             velocity = np.array([backend.velocity_limits[name] for name in backend.finger_joint_names])
             curve.finger_trajectory = FingerTrajectory.build(
-                joint_names=backend.finger_joint_names, initial_position=initial["q"][narm:],
-                initial_velocity=initial["dq"][narm:],
+                joint_names=backend.finger_joint_names, measured_initial_position=initial["q"][narm:],
+                measured_initial_velocity=initial["dq"][narm:],
+                incoming_command=stationary_finger_command(joint_names=backend.finger_joint_names,
+                    position=backend.finger_control, timestamp_s=initial["timestamp_s"],
+                    feedback_id=initial["feedback_id"], source="Restored stationary native finger command"),
                 commands=target_contract.bind(curve, finger_joint_names=backend.finger_joint_names,
                                                ctrlrange=backend.finger_ctrlrange),
                 duration=curve.duration, executable_until=curve.executable_until, timestep=backend.timestep,

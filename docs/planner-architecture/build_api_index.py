@@ -16,6 +16,7 @@ CHAPTERS = {
  '01': '01-inputs-and-task-model.md', '02': '02-observation-and-collision.md',
  '03': '03-attachment-contact-and-hand.md', '04': '04-solver-and-search.md',
  '05': '05-acceptance-and-execution.md',
+ '11': '11-device-control-and-evaluation.md',
 }
 # These modules describe retired task-field conversion and contact bindings.
 # Known robot geometry adapters remain part of the current component call graph.
@@ -26,11 +27,11 @@ RETIRED = {
  'online_contact', 'contact_geometry', 'native_owner_geometry',
  'prismatic_self_collision', 'collision_path', 'holding_contact',
  'robot_coverage', 'online_native_confirmation', 'local_geometry_model',
- 'adapter-prepare_recorded_task', 'adapter-recorded_owner_geometry',
+  'adapter-recorded_owner_geometry',
  'adapter-recorded_observation', 'adapter-robot_coverage_fixture',
- 'adapter-contact_fixture', 'adapter-run_recorded_simulation',
- 'adapter-recorded_simulation', 'adapter-recorded_skill_evaluation',
- 'adapter-continuous_simulation',
+ 'adapter-contact_fixture',
+
+
 }
 
 

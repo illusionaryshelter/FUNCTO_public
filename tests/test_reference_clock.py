@@ -6,7 +6,7 @@ import pytest
 from scipy.interpolate import BSpline
 
 from manipulation.cubic_trajectory import CubicBasis
-from manipulation.gripper_trajectory import FingerTrajectory
+from manipulation.gripper_trajectory import FingerTrajectory, stationary_finger_command
 from manipulation.planning import (
     PlanningBudget, _ProgressMap, _bind_event_clock, _continuation_timing,
     _fixed_spline_grid, _initial_timing, reference_progress_clock,
@@ -70,8 +70,10 @@ def test_late_command_has_original_bounded_window_while_arm_terminal_remains_fre
             command = {**row["event"], **{k: v for k, v in row.items() if k != "event"}}
             command["finger_positions"] = [0.] if command["kind"] == "close" else [.038]
             commands.append(command)
-        return FingerTrajectory.build(joint_names=("finger",), initial_position=[0.],
-            initial_velocity=[0.], commands=commands, duration=grid["duration"],
+        return FingerTrajectory.build(joint_names=("finger",), measured_initial_position=[0.],
+            measured_initial_velocity=[0.],
+            incoming_command=stationary_finger_command(joint_names=("finger",), position=[0.],
+                timestamp_s=0., source="Declared stationary synthetic command", feedback_id="measured entrance"), commands=commands, duration=grid["duration"],
             executable_until=grid["duration"], timestep=.002,
             position_limits=[[0.], [.04]], velocity_limits=[[-.2], [.2]],
             acceleration_limits=[[-15.], [15.]], source="explicit bounded actuator reference",

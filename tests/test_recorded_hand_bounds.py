@@ -14,6 +14,7 @@ from manipulation.execution import FixedFingerTargets
 from manipulation.planning import _ProgressMap, _bind_event_clock
 from manipulation.planning_problem import PlanningEvent
 from run_recorded_skill import finger_trajectory_factory
+from manipulation.gripper_trajectory import stationary_finger_command
 
 
 def inputs():
@@ -26,11 +27,14 @@ def inputs():
     targets = FixedFingerTargets(("left", "right"), "explicit targets", (
         {"skill_id": "s", "event_id": "open", "kind": "open", "positions": [.04, -.04]},
         {"skill_id": "s", "event_id": "close", "kind": "close", "positions": [0., 0.]}))
+    feedback["incoming_finger_command"] = stationary_finger_command(joint_names=["left", "right"],
+        position=[.039, -.0395], timestamp_s=2.5, feedback_id="actual-snapshot",
+        source="Declared stationary target independent of measured finger velocity")
     return SimpleNamespace(events=events, pose_events=(), coordinate_events=(), supports=()), feedback, targets
 
 
 def factory(problem, feedback, targets):
-    build = finger_trajectory_factory(problem, feedback, targets, timestep=.01,
+    build = finger_trajectory_factory(problem, feedback, targets, incoming_command=feedback["incoming_finger_command"], timestep=.01,
         ctrlrange=[[0., .04], [-.04, 0.]],
         position_limits={"left": [0., .04], "right": [-.04, 0.]},
         velocity_limits={"left": .2, "right": .2},
@@ -48,7 +52,8 @@ def test_finger_clock_preserves_measured_entrance_and_original_plateau_event():
     curve = factory(problem, feedback, targets)(3., progress)
     q, dq = curve.sample(0.)
     np.testing.assert_array_equal(q, [.039, -.0395])
-    np.testing.assert_array_equal(dq, [.0001, -.0002])
+    np.testing.assert_array_equal(dq, [0., 0.])
+    np.testing.assert_array_equal(curve.measured_initial_velocity, [.0001, -.0002])
     assert curve.executable_until == 3.
     assert curve.duration == 3.
     assert curve.joint_names == ("left", "right")
@@ -67,7 +72,7 @@ def test_edited_target_identity_is_rejected_before_curve_generation():
 def test_missing_named_reference_limit_cannot_be_replaced_by_actual_hardware_interval():
     problem, feedback, targets = inputs()
     with pytest.raises(KeyError, match="right"):
-        finger_trajectory_factory(problem, feedback, targets, timestep=.01,
+        finger_trajectory_factory(problem, feedback, targets, incoming_command=feedback["incoming_finger_command"], timestep=.01,
             ctrlrange=[[0., .04], [-.04, 0.]],
             position_limits={"left": [0., .04], "right": [-.04, 0.]},
             velocity_limits={"left": .2, "right": .2}, acceleration_limits={"left": 15.})(
@@ -79,7 +84,7 @@ def test_retry_factory_uses_new_occurrence_even_when_source_problem_contains_con
     from dataclasses import replace
     problem, feedback, targets = inputs()
     subset = FixedFingerTargets(targets.joint_names, targets.source, targets.events[1:])
-    build = finger_trajectory_factory(problem, feedback, subset, timestep=.01,
+    build = finger_trajectory_factory(problem, feedback, subset, incoming_command=feedback["incoming_finger_command"], timestep=.01,
         ctrlrange=[[0., .04], [-.04, 0.]], position_limits={"left": [0., .04], "right": [-.04, 0.]},
         velocity_limits={"left": .2, "right": .2}, acceleration_limits={"left": 15., "right": 15.})
     retry = SimpleNamespace(events=[replace(problem.events[1], occurrence=1)],

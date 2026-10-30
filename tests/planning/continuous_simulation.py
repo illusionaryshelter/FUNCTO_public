@@ -77,7 +77,9 @@ class ContinuousSimulationSession:
             "between_stage_timing": "Physics is paused without changing state while perception/planning uses wall time"})
 
     # BEGIN truth scores never participate in stage admission.
-    def execute(self, specification, *, observation_callback=None):
+    def execute(self, specification, *, observation_callback=None,
+                planning_result=None, step_callback=None, reference_feedback=None,
+                diagnostic_evidence_ids=()):
         """Execute from the same backend; physical scores never gate a stage.
 
         Only the independent observation callback can provide online task
@@ -96,7 +98,14 @@ class ContinuousSimulationSession:
         report = None
         primary_error = None
         try:
-            inputs = {"observation_callback": observation_callback}
+            # BEGIN pass existing runner inputs through this session owner.
+            # Planning result and diagnostics have explicit independent roles;
+            # no loader replacement or result-based action selection occurs.
+            inputs = {"observation_callback": observation_callback,
+                      "planning_result": planning_result, "step_callback": step_callback,
+                      "reference_feedback": reference_feedback,
+                      "diagnostic_evidence_ids": diagnostic_evidence_ids}
+            # END the shared runner owns the unchanged execution calculation.
             report = (run(args, on_simulation_ready=self._adopt, **inputs) if self.simulation is None else
                       run(args, simulation=self.simulation, initial_feedback=before, **inputs))
         except BaseException as error:
@@ -172,7 +181,10 @@ class ContinuousSimulationSession:
                 frame = camera.capture(self.simulation.native_data)
                 Image.fromarray(frame["rgb"]).save(folder / "rgb.png")
                 np.save(folder / "depth_m.npy", frame["depth_m"])
+                # BEGIN preserve fixed camera geometry with this acquisition time.
+                calibration["timestamp_s"] = feedback["timestamp_s"]
                 _write(folder / "calibration.json", calibration)
+                # END the original archived camera time is not the new exposure.
             except Exception as error:
                 capture_error = error
             try:

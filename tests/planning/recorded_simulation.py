@@ -123,7 +123,7 @@ def load_saved_trajectory(path):
 
 def restore_recorded_simulation(*, scene_path, catalog_path, episode_path, frame_index,
                                 base_link, tcp_site, arm_joint_names, finger_joint_names,
-                                arm_kp, arm_kd, velocity_limits):
+                                arm_kp, arm_kd, velocity_limits, robot_mjcf_path):
     """Restore once, then return the production backend and setup provenance.
 
     Full world integration state is used only for this explicit setup. The
@@ -162,9 +162,14 @@ def restore_recorded_simulation(*, scene_path, catalog_path, episode_path, frame
               "tool/base poses use known robot FK and the fixed calibrated base; "
               f"restored {Path(episode_path).resolve()} frame {frame_index}")
     # END the setup recording is not a runtime object-pose observation channel.
+    # BEGIN official fixed-robot dynamics are independent of the live scene.
+    from manipulation.robot_gravity import RobotGravity
+    gravity = RobotGravity(mujoco.MjModel.from_xml_path(str(robot_mjcf_path)),
+        tuple(arm_joint_names)+tuple(finger_joint_names), source=str(robot_mjcf_path))
     backend = RobosuiteExecutionBackend(sim, base_link=base_link, tcp_site=tcp_site,
         arm_joint_names=arm_joint_names, finger_joint_names=finger_joint_names,
-        arm_kp=arm_kp, arm_kd=arm_kd, velocity_limits=velocity_limits, source=source)
+        arm_kp=arm_kp, arm_kd=arm_kd, velocity_limits=velocity_limits, robot_gravity=gravity, source=source)
+    # END only native setup owns the world integration state.
     report = {"scene_path": str(Path(scene_path).resolve()), "trial_id": backend.trial_id,
         "episode_path": str(Path(episode_path).resolve()), "frame_index": frame_index,
         "sim_time": recorded_time, "integration_state_spec": deepcopy(state_spec),

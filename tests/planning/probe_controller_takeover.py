@@ -53,7 +53,7 @@ def run(args):
             episode_path=fixture["episode_path"], frame_index=args.frame_index,
             base_link=fixture["base_link"], tcp_site=fixture["tcp_site"],
             arm_joint_names=fixture["arm_joint_names"], finger_joint_names=fixture["finger_joint_names"],
-            arm_kp=part["kp"], arm_kd=part["kd"], velocity_limits=fixture["velocity_limits"])
+            arm_kp=part["kp"], arm_kd=part["kd"], velocity_limits=fixture["velocity_limits"], robot_mjcf_path=fixture["robot_mjcf_path"])
         initial = backend.proprioception()
         narm = len(backend.arm_joint_names)
         if tuple(curve.joint_names) != backend.arm_joint_names:

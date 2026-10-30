@@ -1,11 +1,11 @@
 # `manipulation/robosuite_execution.py` 实现契约
 
-代码基线：`be44b54`。
-职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`9cdb433`。
+职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `RobosuiteExecutionBackend`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L23)。
+[定义位置](../../../manipulation/robosuite_execution.py#L25)。
 
 ```python
 class RobosuiteExecutionBackend():
@@ -21,12 +21,12 @@ class RobosuiteExecutionBackend():
 
 ## `RobosuiteExecutionBackend.__init__`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L26)。
+[定义位置](../../../manipulation/robosuite_execution.py#L28)。
 
 输入签名：
 
 ```python
-def __init__(self, sim, *, base_link, tcp_site, arm_joint_names, finger_joint_names, arm_kp, arm_kd, velocity_limits, source):
+def __init__(self, sim, *, base_link, tcp_site, arm_joint_names, finger_joint_names, arm_kp, arm_kd, velocity_limits, robot_gravity, source):
 ```
 
 显式输出分支：
@@ -49,6 +49,7 @@ sim.data._data
 sim.data
 self.arm_joint_names
 self.finger_joint_names
+robot_gravity.joint_names
 self.joint_names
 speed.tolist
 self.native_model.body(base_link).id
@@ -97,13 +98,30 @@ model.actuator_gainprm
 model.actuator_biastype
 mujoco.mjtBias.mjBIAS_NONE
 mujoco.mjtBias
+model.actuator_ctrlrange[self._arm_actuators].copy
+model.actuator_forcelimited
+model.actuator_forcerange
+model.jnt_actfrclimited
+model.jnt_actfrcrange
+np.maximum
+np.minimum
+np.isfinite(effective).all
 self._finger_actuators
 mujoco.mjtBias.mjBIAS_AFFINE
 model.actuator_biasprm
 model.opt.timestep
 model.opt
 self._dt
+self._arm_torque_bounds
 self._sim
+self._arm_controller.kp
+self._arm_controller
+self._arm_controller.kd
+np.sqrt
+np.isfinite(self._arm_ki).all
+self._arm_ki
+np.zeros
+self.sim_time
 self.native_data.ctrl[self._finger_actuators].copy
 self.native_data.ctrl
 self.native_data
@@ -113,6 +131,12 @@ self._grip_controller
 restored_ctrl.copy
 np.array_equal
 self._grip_controller.run_controller
+model.actuator_gainprm[self._finger_actuators, 0].copy
+model.actuator_biasprm[self._finger_actuators, 2].copy
+model.actuator_forcerange[self._finger_actuators].copy
+model.actuator_forcelimited[self._finger_actuators].all
+self._update_finger_gravity
+mujoco.mj_forward
 self._prepare_reference_fk
 self._trial_id
 self.reference_frame
@@ -124,14 +148,23 @@ self.timestep
 model.actuator_ctrlrange[self._actuator_ids].tolist
 model.actuator_forcelimited[self._actuator_ids].astype(bool).tolist
 model.actuator_forcelimited[self._actuator_ids].astype
-model.actuator_forcelimited
 model.actuator_forcerange[self._actuator_ids].tolist
-model.actuator_forcerange
+model.jnt_actfrclimited[self._joint_ids].astype(bool).tolist
+model.jnt_actfrclimited[self._joint_ids].astype
+model.jnt_actfrcrange[self._joint_ids].tolist
+self._arm_torque_bounds.tolist
 self._arm_controller.kp.tolist
-self._arm_controller.kp
-self._arm_controller
 self._arm_controller.kd.tolist
-self._arm_controller.kd
+self._arm_ki.tolist
+self._robot_gravity.source
+self._robot_gravity
+self._robot_gravity.joint_names
+self._robot_gravity.model.opt.gravity.tolist
+self._robot_gravity.model.opt.gravity
+self._robot_gravity.model.opt
+self._robot_gravity.model
+self._finger_force_bounds.tolist
+self._finger_force_bounds
 restored_ctrl.tolist
 ```
 
@@ -148,6 +181,7 @@ self._trial_id
 self.arm_joint_names
 self.finger_joint_names
 self.joint_names
+self._robot_gravity
 speed
 self._velocity_limits
 self._base_id
@@ -166,6 +200,14 @@ model
 narm
 self._arm_actuators
 self._finger_actuators
+effective
+arm_joints
+active
+ranges
+selected
+effective[selected, 0]
+effective[selected, 1]
+self._arm_torque_bounds
 finger_ids
 finger_gain
 self._dt
@@ -173,9 +215,21 @@ self._step_attempts
 self._last_step_accounting
 bounds
 self._arm_controller
+kp
+kd
+discriminant
+slow
+self._arm_ki
+self._integral_acceleration
+self._integral_sim_time
+self._pending_integral_interval
+self._control_rebase_requested
 restored_ctrl
 widths
 self._grip_controller
+self._finger_gain
+self._finger_velocity_bias
+self._finger_force_bounds
 self._description
 ```
 
@@ -214,9 +268,16 @@ int
 self.native_model.actuator
 model.actuator_ctrllimited[self._actuator_ids].all
 np.isfinite(model.actuator_ctrlrange[self._actuator_ids]).all
+model.actuator_ctrlrange[self._arm_actuators].copy
+np.maximum
+np.minimum
+np.isfinite(effective).all
 float
 JointPositionController
 indexes
+np.sqrt
+np.isfinite(self._arm_ki).all
+np.zeros
 self.native_data.ctrl[self._finger_actuators].copy
 np.isfinite(restored_ctrl).all
 SimpleGripController
@@ -224,6 +285,12 @@ self._grip_controller.set_goal
 restored_ctrl.copy
 np.array_equal
 self._grip_controller.run_controller
+model.actuator_gainprm[self._finger_actuators, 0].copy
+model.actuator_biasprm[self._finger_actuators, 2].copy
+model.actuator_forcerange[self._finger_actuators].copy
+model.actuator_forcelimited[self._finger_actuators].all
+self._update_finger_gravity
+mujoco.mj_forward
 self._prepare_reference_fk
 list
 self.tool_transform.tolist
@@ -231,14 +298,21 @@ model.actuator_ctrlrange[self._actuator_ids].tolist
 model.actuator_forcelimited[self._actuator_ids].astype(bool).tolist
 model.actuator_forcelimited[self._actuator_ids].astype
 model.actuator_forcerange[self._actuator_ids].tolist
+model.jnt_actfrclimited[self._joint_ids].astype(bool).tolist
+model.jnt_actfrclimited[self._joint_ids].astype
+model.jnt_actfrcrange[self._joint_ids].tolist
+self._arm_torque_bounds.tolist
 self._arm_controller.kp.tolist
 self._arm_controller.kd.tolist
+self._arm_ki.tolist
+self._robot_gravity.model.opt.gravity.tolist
+self._finger_force_bounds.tolist
 restored_ctrl.tolist
 ```
 
 ## `RobosuiteExecutionBackend.__init__.indexes`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L118)。
+[定义位置](../../../manipulation/robosuite_execution.py#L143)。
 
 输入签名：
 
@@ -280,7 +354,7 @@ self._actuator_ids[start:stop].tolist
 
 ## `RobosuiteExecutionBackend.timestep`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L195)。
+[定义位置](../../../manipulation/robosuite_execution.py#L265)。
 
 输入签名：
 
@@ -310,7 +384,7 @@ self._dt
 
 ## `RobosuiteExecutionBackend.sim_time`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L199)。
+[定义位置](../../../manipulation/robosuite_execution.py#L269)。
 
 输入签名：
 
@@ -343,7 +417,7 @@ float
 
 ## `RobosuiteExecutionBackend.trial_id`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L203)。
+[定义位置](../../../manipulation/robosuite_execution.py#L273)。
 
 输入签名：
 
@@ -373,7 +447,7 @@ self._trial_id
 
 ## `RobosuiteExecutionBackend.feedback_source`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L207)。
+[定义位置](../../../manipulation/robosuite_execution.py#L277)。
 
 输入签名：
 
@@ -403,7 +477,7 @@ self._feedback_source
 
 ## `RobosuiteExecutionBackend.feedback_id`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L211)。
+[定义位置](../../../manipulation/robosuite_execution.py#L281)。
 
 输入签名：
 
@@ -434,7 +508,7 @@ self.sim_time
 
 ## `RobosuiteExecutionBackend.reference_frame`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L215)。
+[定义位置](../../../manipulation/robosuite_execution.py#L285)。
 
 输入签名：
 
@@ -462,7 +536,7 @@ def reference_frame(self):
 
 ## `RobosuiteExecutionBackend.tool_link`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L222)。
+[定义位置](../../../manipulation/robosuite_execution.py#L292)。
 
 输入签名：
 
@@ -497,7 +571,7 @@ self.native_model.site
 
 ## `RobosuiteExecutionBackend.tool_transform`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L229)。
+[定义位置](../../../manipulation/robosuite_execution.py#L299)。
 
 输入签名：
 
@@ -529,7 +603,7 @@ np.eye
 
 ## `RobosuiteExecutionBackend.actuator_names`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L233)。
+[定义位置](../../../manipulation/robosuite_execution.py#L303)。
 
 输入签名：
 
@@ -559,7 +633,7 @@ self._actuator_names
 
 ## `RobosuiteExecutionBackend.joint_ranges`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L237)。
+[定义位置](../../../manipulation/robosuite_execution.py#L307)。
 
 输入签名：
 
@@ -594,7 +668,7 @@ self.native_model.jnt_range[self._joint_ids].copy
 
 ## `RobosuiteExecutionBackend.velocity_limits`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L241)。
+[定义位置](../../../manipulation/robosuite_execution.py#L311)。
 
 输入签名：
 
@@ -626,7 +700,7 @@ dict
 
 ## `RobosuiteExecutionBackend.finger_ctrlrange`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L245)。
+[定义位置](../../../manipulation/robosuite_execution.py#L315)。
 
 输入签名：
 
@@ -661,7 +735,7 @@ self.native_model.actuator_ctrlrange[self._finger_actuators].copy
 
 ## `RobosuiteExecutionBackend.finger_control`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L249)。
+[定义位置](../../../manipulation/robosuite_execution.py#L319)。
 
 输入签名：
 
@@ -700,7 +774,7 @@ self.native_data.ctrl[self._finger_actuators].copy
 
 ## `RobosuiteExecutionBackend.actuator_control`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L254)。
+[定义位置](../../../manipulation/robosuite_execution.py#L324)。
 
 输入签名：
 
@@ -735,7 +809,7 @@ self.native_data.ctrl[self._actuator_ids].copy
 
 ## `RobosuiteExecutionBackend.describe`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L257)。
+[定义位置](../../../manipulation/robosuite_execution.py#L327)。
 
 输入签名：
 
@@ -765,9 +839,220 @@ self._description
 deepcopy
 ```
 
+## `RobosuiteExecutionBackend.request_control_rebase`
+
+[定义位置](../../../manipulation/robosuite_execution.py#L331)。
+
+输入签名：
+
+```python
+def request_control_rebase(self):
+```
+
+实现说明：
+
+> Match the next actual control write to the current effective ctrl.
+>
+> Call only for explicit control takeover or reference rebasing. A
+> continuous segment boundary needs no operation. The next successful
+> apply consumes this request; repeated evaluations at that same time
+> then retain z. A stop cancels a request that has not yet been applied.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+无显式条目。
+
+写入目标：
+
+```python
+self._control_rebase_requested
+```
+
+直接调用符号：
+
+无显式条目。
+
+## `RobosuiteExecutionBackend.snapshot_control_state`
+
+[定义位置](../../../manipulation/robosuite_execution.py#L341)。
+
+输入签名：
+
+```python
+def snapshot_control_state(self):
+```
+
+实现说明：
+
+> Return named integral state at a completed control boundary.
+>
+> A prepared, unexecuted control interval contains e/M/u which are not
+> part of this boundary format. Native integration state is persisted
+> by the caller with MuJoCo's existing getState API at this same time.
+
+显式输出分支：
+
+```python
+{'arm_joint_names': list(self.arm_joint_names), 'integral_acceleration': self._integral_acceleration.tolist(), 'sim_time': self._integral_sim_time, 'controller_policy': deepcopy(self._description['controller_policy'])}
+```
+
+读取的对象属性：
+
+```python
+self._pending_integral_interval
+self._control_rebase_requested
+self._integral_sim_time
+self.sim_time
+self.arm_joint_names
+self._integral_acceleration.tolist
+self._integral_acceleration
+self._description
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+ValueError
+list
+self._integral_acceleration.tolist
+deepcopy
+```
+
+## `RobosuiteExecutionBackend.restore_control_state`
+
+[定义位置](../../../manipulation/robosuite_execution.py#L357)。
+
+输入签名：
+
+```python
+def restore_control_state(self, state):
+```
+
+实现说明：
+
+> Restore z after the caller restores the matching native state.
+>
+> Names, time and policy define the saved state's coordinates and
+> control law. A complete state resumes directly and does not request
+> an output rebase; initial takeover from a legacy controller is an
+> explicit request_control_rebase call instead.
+
+显式输出分支：
+
+无显式条目。
+
+读取的对象属性：
+
+```python
+self._pending_integral_interval
+self._control_rebase_requested
+self.arm_joint_names
+self._description
+np.isfinite
+self.sim_time
+values.copy
+```
+
+写入目标：
+
+```python
+stamp
+values
+self._integral_acceleration
+self._integral_sim_time
+```
+
+直接调用符号：
+
+```python
+ValueError
+tuple
+float
+np.isfinite
+_finite_array
+len
+values.copy
+```
+
+## `RobosuiteExecutionBackend._update_finger_gravity`
+
+[定义位置](../../../manipulation/robosuite_execution.py#L380)。
+
+输入签名：
+
+```python
+def _update_finger_gravity(self, targets):
+```
+
+实现说明：
+
+> Update this interval's force; return pre-step model output terms.
+>
+> Actual post-step actuator forces and task contacts belong to separate
+> physical records. They do not supply this model calculation.
+
+显式输出分支：
+
+```python
+{'finger_gravity_force': gravity, 'finger_position_servo_force': servo, 'finger_requested_force': requested, 'finger_bounded_force': bounded, 'finger_force_saturated': bounded != requested}
+```
+
+读取的对象属性：
+
+```python
+self.arm_joint_names
+self.native_data.qpos[self._qpos_ids].copy
+self.native_data.qpos
+self.native_data
+self._qpos_ids
+self.native_data.qvel[self._qvel_ids].copy
+self.native_data.qvel
+self._qvel_ids
+self._robot_gravity.compute
+self._robot_gravity
+self.native_model.actuator_biasprm
+self.native_model
+self._finger_actuators
+self._finger_gain
+self._finger_velocity_bias
+np.clip
+self._finger_force_bounds
+```
+
+写入目标：
+
+```python
+narm
+q
+dq
+gravity
+self.native_model.actuator_biasprm[self._finger_actuators, 0]
+servo
+requested
+bounded
+```
+
+直接调用符号：
+
+```python
+len
+self.native_data.qpos[self._qpos_ids].copy
+self.native_data.qvel[self._qvel_ids].copy
+self._robot_gravity.compute
+np.clip
+```
+
 ## `RobosuiteExecutionBackend.apply_control`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L261)。
+[定义位置](../../../manipulation/robosuite_execution.py#L400)。
 
 输入签名：
 
@@ -780,21 +1065,23 @@ def apply_control(self, arm_q, arm_dq, arm_ddq, finger_positions):
 > Apply one named q/dq/ddq reference and native finger positions.
 >
 > Every arm vector follows ``arm_joint_names`` from this binding. The
-> executor samples all three at its declared clamped step endpoint;
+> executor samples all three at the current native interval's start;
 > none is substituted by measured velocity or finite differences here.
 > Installed robosuite supplies the position/damping torque, mass matrix
 > and bias at the same current state. Adding M*(Kd*dq_ref + ddq_ref)
-> yields M*(ddq_ref + Kp*(q_ref-q) + Kd*(dq_ref-dq)) + bias, without
-> changing gains or canceling unknown contact/passive forces.
+> yields M*(ddq_ref + Kp*(q_ref-q) + Kd*(dq_ref-dq)) + bias. The same
+> final calculation adds M*z before total clipping; z is the retained
+> acceleration integral, not an estimate from measured contact forces.
 >
 > This method writes only actuator ctrl and does not integrate physics.
 > Its raw torque components and references belong to the same call;
 > saturation is applied only to their total, never to each component.
+> Integral accumulation occurs only in step after physical advancement.
 
 显式输出分支：
 
 ```python
-{'actuator_ctrl': self.actuator_control, 'requested_arm_torque': torque.copy(), 'arm_torque_saturated': bounded != torque, 'arm_control_saturated_coordinates': int(np.count_nonzero(bounded != torque)), 'reference_arm_q': arm_q.copy(), 'reference_arm_dq': arm_dq.copy(), 'reference_arm_ddq': arm_ddq.copy(), 'arm_position_feedback_torque': position_feedback.copy(), 'arm_velocity_feedback_torque': velocity_feedback.copy(), 'arm_velocity_feedforward_torque': velocity_feedforward.copy(), 'arm_acceleration_feedforward_torque': acceleration_feedforward.copy(), 'arm_bias_torque': bias.copy()}
+{'actuator_ctrl': self.actuator_control, **finger_control, 'requested_arm_torque': torque.copy(), 'arm_torque_saturated': bounded != torque, 'arm_control_saturated_coordinates': int(np.count_nonzero(bounded != torque)), 'reference_arm_q': arm_q.copy(), 'reference_arm_dq': arm_dq.copy(), 'reference_arm_ddq': arm_ddq.copy(), 'arm_position_feedback_torque': position_feedback.copy(), 'arm_velocity_feedback_torque': velocity_feedback.copy(), 'arm_velocity_feedforward_torque': velocity_feedforward.copy(), 'arm_acceleration_feedforward_torque': acceleration_feedforward.copy(), 'arm_bias_torque': bias.copy(), 'arm_integral_torque': integral_torque.copy(), 'arm_integral_state': integral.copy(), 'arm_position_error': (arm_q - actual_q).copy(), 'arm_integral_rebased': bool(rebased)}
 ```
 
 读取的对象属性：
@@ -817,18 +1104,26 @@ controller.kd
 controller.joint_pos
 controller.joint_vel
 controller.torque_compensation
-self.native_model.actuator_ctrlrange
-self.native_model
-self._arm_actuators
+self._arm_torque_bounds
+self._control_rebase_requested
+self._integral_acceleration.copy
+self._integral_acceleration
 np.clip
+self.native_data.ctrl
+self.native_data
+self._arm_actuators
+np.linalg.solve
+np.linalg
 np.asarray
 self._grip_controller.run_controller
 np.array_equal
-self.native_data.ctrl
-self.native_data
+self._update_finger_gravity
 self._finger_actuators
-self.actuator_control
+self.sim_time
+(arm_q - actual_q).copy
+mass.copy
 torque.copy
+self.actuator_control
 np.count_nonzero
 arm_dq.copy
 arm_ddq.copy
@@ -837,6 +1132,8 @@ velocity_feedback.copy
 velocity_feedforward.copy
 acceleration_feedforward.copy
 bias.copy
+integral_torque.copy
+integral.copy
 ```
 
 写入目标：
@@ -860,11 +1157,21 @@ position_feedback
 velocity_feedback
 velocity_feedforward
 acceleration_feedforward
+base_torque
+rebased
+integral
+previous
+integral_torque
 torque
 bounded
 finger_ctrl
+finger_control
 self.native_data.ctrl[self._arm_actuators]
 self.native_data.ctrl[self._finger_actuators]
+self._integral_acceleration
+self._integral_sim_time
+self._control_rebase_requested
+self._pending_integral_interval
 ```
 
 直接调用符号：
@@ -879,11 +1186,16 @@ finger_positions.copy
 self._arm_controller.set_goal
 arm_q.copy
 controller.run_controller
+self._integral_acceleration.copy
 np.clip
+np.linalg.solve
 np.asarray
 self._grip_controller.run_controller
 np.array_equal
 RuntimeError
+self._update_finger_gravity
+(arm_q - actual_q).copy
+mass.copy
 torque.copy
 int
 np.count_nonzero
@@ -894,11 +1206,14 @@ velocity_feedback.copy
 velocity_feedforward.copy
 acceleration_feedforward.copy
 bias.copy
+integral_torque.copy
+integral.copy
+bool
 ```
 
 ## `RobosuiteExecutionBackend.last_step_accounting`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L326)。
+[定义位置](../../../manipulation/robosuite_execution.py#L490)。
 
 输入签名：
 
@@ -934,7 +1249,7 @@ deepcopy
 
 ## `RobosuiteExecutionBackend.step`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L330)。
+[定义位置](../../../manipulation/robosuite_execution.py#L494)。
 
 输入签名：
 
@@ -970,6 +1285,21 @@ type(error).__name__
 self._sim.step
 self._sim
 self.timestep
+self._pending_integral_interval
+self._arm_ki
+self._arm_torque_bounds
+np.clip
+np.minimum
+np.maximum
+self._integral_acceleration.copy
+self._integral_acceleration
+np.linalg.solve
+np.linalg
+report.update
+raw.tolist
+accepted.tolist
+old_integral.tolist
+self._integral_acceleration.tolist
 mujoco.mj_forward
 self.native_model
 self.last_step_accounting
@@ -995,6 +1325,20 @@ stationary
 report['clock_advance_confirmed']
 report['physical_steps']
 report['step_accounting_exact']
+report['integral_update_committed']
+interval
+h
+mass
+requested
+raw
+bounds
+accepted
+old_integral
+delta
+report['integral_update_error']
+self._integral_acceleration
+self._pending_integral_interval
+self._integral_sim_time
 report['feedback_refresh_error']
 ```
 
@@ -1009,12 +1353,22 @@ self._sim.step
 bool
 abs
 int
+np.clip
+np.minimum
+np.maximum
+self._integral_acceleration.copy
+np.linalg.solve
+report.update
+raw.tolist
+accepted.tolist
+old_integral.tolist
+self._integral_acceleration.tolist
 mujoco.mj_forward
 ```
 
 ## `RobosuiteExecutionBackend._prepare_reference_fk`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L397)。
+[定义位置](../../../manipulation/robosuite_execution.py#L597)。
 
 输入签名：
 
@@ -1103,7 +1457,7 @@ self._reference_data.xmat[self._base_id].reshape
 
 ## `RobosuiteExecutionBackend.reference_tool_pose`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L434)。
+[定义位置](../../../manipulation/robosuite_execution.py#L634)。
 
 输入签名：
 
@@ -1159,7 +1513,7 @@ self._reference_data.site_xmat[self._site_id].reshape
 
 ## `RobosuiteExecutionBackend.abort_hold`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L447)。
+[定义位置](../../../manipulation/robosuite_execution.py#L647)。
 
 输入签名：
 
@@ -1175,6 +1529,8 @@ def abort_hold(self, feedback, finger_positions, *, expected_sim_time, stop_velo
 > goal is retained, so an event rejected by supervision is never issued
 > by fault handling. Hold telemetry is separate from the failed curve.
 > No state reset or claimed zero velocity substitutes for feedback.
+> The current integral state is retained; output matching is cancelled
+> so that the zero desired velocity immediately supplies braking.
 
 显式输出分支：
 
@@ -1231,6 +1587,7 @@ self.timestep
 写入目标：
 
 ```python
+self._control_rebase_requested
 result
 feedback
 current_time
@@ -1308,7 +1665,7 @@ abs
 
 ## `RobosuiteExecutionBackend.abort_hold.retain_position_faults`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L493)。
+[定义位置](../../../manipulation/robosuite_execution.py#L700)。
 
 输入签名：
 
@@ -1351,7 +1708,7 @@ int
 
 ## `RobosuiteExecutionBackend.proprioception`
 
-[定义位置](../../../manipulation/robosuite_execution.py#L606)。
+[定义位置](../../../manipulation/robosuite_execution.py#L813)。
 
 输入签名：
 

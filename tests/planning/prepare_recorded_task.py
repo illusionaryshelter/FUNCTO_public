@@ -280,6 +280,9 @@ def _extract_named_feedback(manifest, fixture, fixture_path):
                 "feedback_id": str(uuid4()), "timestamp_s": timestamp,
                 # END moving the saved file cannot replace its evidence identity.
                 "joint_names": names, "start_q": q.tolist(), "start_dq": dq.tolist(),
+                # BEGIN source adapter supplies its separately recorded active command.
+                "incoming_finger_command": deepcopy(frozen["incoming_finger_command"]),
+                # END encoder q/dq cannot reconstruct a commanded remaining ramp.
                 "arm_joint_names": arms, "finger_joint_names": fingers,
                 "finger_link_names": [link for links in finger_links.values() for link in links],
                 "finger_sphere_links_by_joint": deepcopy(finger_links),

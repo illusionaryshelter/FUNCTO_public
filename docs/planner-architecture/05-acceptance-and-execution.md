@@ -82,13 +82,15 @@
 
 ## 4. 控制时钟与每步操作
 
-执行器保留轨迹原时间轴。每个设备步从保存多项式取得 `q,dq,ddq`，从 `FingerTrajectory` 取得手指指令，并交给 `backend.apply_control`。设备 `step` 推进一步后，`proprioception` 返回新的机器人反馈；执行器据此记录实际时间、跟踪误差、事件应用和物理步数。
+执行器保留轨迹原时间轴。每个设备步在起始时刻从保存多项式取得 `q,dq,ddq`；手指沿原事件及步末协议取指令，再交给 `backend.apply_control`。设备 `step` 推进一步后，`proprioception` 返回新的机器人反馈；执行器据此记录实际时间、跟踪误差、事件应用和物理步数。
 
-`RobosuiteExecutionBackend` 实现仿真中的该设备接口。`describe` 给出关节、执行器、控制范围及标定；`apply_control` 实现已声明的关节轨迹控制；`reference_tool_pose` 用机器人 FK 计算指令工具位姿；`last_step_accounting` 记录实际推进的步数；`abort_hold` 在明确停止条件与有限步数内执行停止动作。
+`RobosuiteExecutionBackend` 实现仿真中的该设备接口。`describe` 给出关节、执行器、控制范围及标定；`apply_control` 实现具名 q/dq/ddq 与积分控制、统一总力矩限幅和固定机器人手指重力；`reference_tool_pose` 用机器人 FK 计算指令工具位姿；`last_step_accounting` 记录实际推进的步数；`abort_hold` 在明确停止条件与有限步数内执行停止动作。
 
 `TrajectoryExecutor._execution_violations` 对照实际机器人反馈与指令关节/工具状态，检查原设备约束及跟踪范围。工具跟踪项的目标是机器人应执行的指令位姿。名义功能目标的末端相对位置/姿态误差由事后评价计算；其数据来源和控制职责在[总架构](../../PLANNER_ARCHITECTURE.md)中定义。
 
 当前 `execute` 中的碰撞检查覆盖机器人模型实体及其自碰撞。执行报告以 `world_collision_checked=False` 表达本次实际反馈检查的范围。规划场景快照继续保存在绑定中，用于解释原候选的模型验收。
+
+完整控制公式、接管/停止语义、状态恢复与独立评价角色见[设备控制组件](11-device-control-and-evaluation.md)。
 
 ## 5. 事件、独立效果与事后记录
 
