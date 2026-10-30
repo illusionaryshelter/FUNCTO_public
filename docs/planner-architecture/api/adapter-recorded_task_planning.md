@@ -317,7 +317,7 @@ result
 output.mkdir
 time.monotonic
 problem.phase_count
-planning.plan_trajectory
+backend.plan
 result.diagnostics.pop
 result.diagnostics
 report.update
@@ -366,7 +366,7 @@ output.mkdir
 time.monotonic
 asdict
 deepcopy
-planning.plan_trajectory
+backend.plan
 result.diagnostics.pop
 report.update
 _write_diagnostic_json
@@ -383,3 +383,5 @@ torch.cuda.is_initialized
 torch.cuda.max_memory_allocated
 torch.cuda.max_memory_reserved
 ```
+
+当前后端调度及 preference 完成证据序列化随本提交更新；输入输出与调用关系见[通用运行适配](../12-shared-runtime-adapters.md)。

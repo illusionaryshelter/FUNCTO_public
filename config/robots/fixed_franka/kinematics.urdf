@@ -1,0 +1,148 @@
+<?xml version='1.0' encoding='utf-8'?>
+<robot name="native_recorded_robot">
+  <link name="robot0_base" />
+  <link name="robot0_link0" />
+  <link name="robot0_link1" />
+  <link name="robot0_link2" />
+  <link name="robot0_link3" />
+  <link name="robot0_link4" />
+  <link name="robot0_link5" />
+  <link name="robot0_link6" />
+  <link name="robot0_link7" />
+  <link name="robot0_right_hand" />
+  <link name="gripper0_right_right_gripper" />
+  <link name="gripper0_right_eef" />
+  <link name="gripper0_right_leftfinger" />
+  <link name="gripper0_right_finger_joint1_tip" />
+  <link name="gripper0_right_rightfinger" />
+  <link name="gripper0_right_finger_joint2_tip" />
+  <link name="fixed_mount0_base" />
+  <link name="fixed_mount0_controller_box" />
+  <link name="fixed_mount0_pedestal_feet" />
+  <link name="fixed_mount0_torso" />
+  <link name="fixed_mount0_pedestal" />
+  <link name="gripper0_right_grip_site" />
+  <joint name="robot0_link0_fixed" type="fixed">
+    <parent link="robot0_base" />
+    <child link="robot0_link0" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="robot0_joint1" type="revolute">
+    <parent link="robot0_link0" />
+    <child link="robot0_link1" />
+    <origin xyz="0.0 0.0 0.333" rpy="0.0 -0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="80.0" velocity="2.175" lower="-2.8973" upper="2.8973" />
+  </joint>
+  <joint name="robot0_joint2" type="revolute">
+    <parent link="robot0_link1" />
+    <child link="robot0_link2" />
+    <origin xyz="0.0 0.0 0.0" rpy="-1.5707963267948966 0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="80.0" velocity="2.175" lower="-1.7628" upper="1.7628" />
+  </joint>
+  <joint name="robot0_joint3" type="revolute">
+    <parent link="robot0_link2" />
+    <child link="robot0_link3" />
+    <origin xyz="0.0 -0.316 0.0" rpy="1.5707963267948966 -0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="80.0" velocity="2.175" lower="-2.8973" upper="2.8973" />
+  </joint>
+  <joint name="robot0_joint4" type="revolute">
+    <parent link="robot0_link3" />
+    <child link="robot0_link4" />
+    <origin xyz="0.0825 0.0 0.0" rpy="1.5707963267948966 -0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="80.0" velocity="2.175" lower="-3.0718" upper="-0.0698" />
+  </joint>
+  <joint name="robot0_joint5" type="revolute">
+    <parent link="robot0_link4" />
+    <child link="robot0_link5" />
+    <origin xyz="-0.0825 0.384 0.0" rpy="-1.5707963267948966 0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="80.0" velocity="2.61" lower="-2.8973" upper="2.8973" />
+  </joint>
+  <joint name="robot0_joint6" type="revolute">
+    <parent link="robot0_link5" />
+    <child link="robot0_link6" />
+    <origin xyz="0.0 0.0 0.0" rpy="1.5707963267948966 -0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="12.0" velocity="2.61" lower="-0.0175" upper="3.7525" />
+  </joint>
+  <joint name="robot0_joint7" type="revolute">
+    <parent link="robot0_link6" />
+    <child link="robot0_link7" />
+    <origin xyz="0.088 0.0 0.0" rpy="1.5707963267948966 -0.0 0.0" />
+    <axis xyz="0.0 0.0 1.0" />
+    <limit effort="12.0" velocity="2.61" lower="-2.8973" upper="2.8973" />
+  </joint>
+  <joint name="robot0_right_hand_fixed" type="fixed">
+    <parent link="robot0_link7" />
+    <child link="robot0_right_hand" />
+    <origin xyz="0.0 0.0 0.1065" rpy="0.0 0.0 -0.7858910057229153" />
+  </joint>
+  <joint name="gripper0_right_right_gripper_fixed" type="fixed">
+    <parent link="robot0_right_hand" />
+    <child link="gripper0_right_right_gripper" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 -1.5707963267948966" />
+  </joint>
+  <joint name="gripper0_right_eef_fixed" type="fixed">
+    <parent link="gripper0_right_right_gripper" />
+    <child link="gripper0_right_eef" />
+    <origin xyz="0.0 0.0 0.097" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="gripper0_right_finger_joint1" type="prismatic">
+    <parent link="gripper0_right_right_gripper" />
+    <child link="gripper0_right_leftfinger" />
+    <origin xyz="0.0 0.0 0.0524" rpy="0.0 -0.0 1.5707963267948966" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit effort="20.0" velocity="0.2" lower="0.0" upper="0.04" />
+  </joint>
+  <joint name="gripper0_right_finger_joint1_tip_fixed" type="fixed">
+    <parent link="gripper0_right_leftfinger" />
+    <child link="gripper0_right_finger_joint1_tip" />
+    <origin xyz="0.0 0.0085 0.056" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="gripper0_right_finger_joint2" type="prismatic">
+    <parent link="gripper0_right_right_gripper" />
+    <child link="gripper0_right_rightfinger" />
+    <origin xyz="0.0 0.0 0.0524" rpy="0.0 -0.0 1.5707963267948966" />
+    <axis xyz="0.0 1.0 0.0" />
+    <limit effort="20.0" velocity="0.2" lower="-0.04" upper="0.0" />
+  </joint>
+  <joint name="gripper0_right_finger_joint2_tip_fixed" type="fixed">
+    <parent link="gripper0_right_rightfinger" />
+    <child link="gripper0_right_finger_joint2_tip" />
+    <origin xyz="0.0 -0.0085 0.056" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="fixed_mount0_base_fixed" type="fixed">
+    <parent link="robot0_base" />
+    <child link="fixed_mount0_base" />
+    <origin xyz="0.0 0.0 0.01" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="fixed_mount0_controller_box_fixed" type="fixed">
+    <parent link="fixed_mount0_base" />
+    <child link="fixed_mount0_controller_box" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="fixed_mount0_pedestal_feet_fixed" type="fixed">
+    <parent link="fixed_mount0_base" />
+    <child link="fixed_mount0_pedestal_feet" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="fixed_mount0_torso_fixed" type="fixed">
+    <parent link="fixed_mount0_base" />
+    <child link="fixed_mount0_torso" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="fixed_mount0_pedestal_fixed" type="fixed">
+    <parent link="fixed_mount0_base" />
+    <child link="fixed_mount0_pedestal" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 -0.0 0.0" />
+  </joint>
+  <joint name="gripper0_right_grip_site_fixed" type="fixed">
+    <parent link="gripper0_right_eef" />
+    <child link="gripper0_right_grip_site" />
+    <origin xyz="0.0 0.0 0.0" rpy="0.0 -0.0 0.0" />
+  </joint>
+</robot>

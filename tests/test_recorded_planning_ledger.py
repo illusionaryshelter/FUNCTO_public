@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -24,7 +24,7 @@ def test_failed_result_archives_ledger_and_passes_previous_work_to_next_attempt(
     # Object identity proves the supplied source binding survives both attempts.
     robot_validator = object()
     # BEGIN the recorder forwards one caller-owned resident backend unchanged.
-    backend = object()
+    backend = SimpleNamespace(robot_validator=robot_validator)
     # END this handoff test never constructs native models.
     # END no test geometry is claimed by this handoff-only sentinel.
     first = {"request_id": "same-explicit-request", "consumed_planning": {"initializations": 1},
@@ -32,8 +32,9 @@ def test_failed_result_archives_ledger_and_passes_previous_work_to_next_attempt(
     second = {**deepcopy(first), "consumed_planning": {"initializations": 2}}
     outputs = [PlanningResult(False, None, {"reason": "synthetic failed initialization"}, request_ledger=first),
                PlanningResult(False, None, {"reason": "synthetic second failed initialization"}, request_ledger=second)]
-    with patch("manipulation.planning.plan_trajectory", side_effect=outputs) as plan, \
-            patch("torch.cuda.max_memory_allocated", return_value=0), \
+    # BEGIN the recorder invokes the already bound backend, including on retry.
+    backend.plan = plan = Mock(side_effect=outputs)
+    with patch("torch.cuda.max_memory_allocated", return_value=0), \
             patch("torch.cuda.max_memory_reserved", return_value=0):
         result = plan_and_record(problem, None, {}, tmp_path/"first", robot_validator=robot_validator, budget=budget,
                                 provenance={"scope": "CPU handoff regression; no native solve"}, execution_limits={}, backend=backend)
@@ -42,10 +43,9 @@ def test_failed_result_archives_ledger_and_passes_previous_work_to_next_attempt(
         plan_and_record(problem, None, {}, tmp_path/"second", robot_validator=robot_validator, budget=budget,
                         provenance={"scope": "same CPU request"}, execution_limits={}, backend=backend, request_ledger=saved)
     assert plan.call_args_list[1].kwargs["request_ledger"] == first
-    # BEGIN recording forwards the explicit physical source model unchanged.
-    assert all(call.kwargs["robot_validator"] is robot_validator for call in plan.call_args_list)
-    assert all(call.kwargs["backend"] is backend for call in plan.call_args_list)
-    # END retries never reconstruct a substitute collision policy.
+    assert backend.robot_validator is robot_validator
+    assert plan.call_count == 2
+    # END retries retain the caller's model and pass the spent-work ledger.
     assert json.loads((tmp_path/"second"/"request-ledger.json").read_text()) == second
     report = json.loads((tmp_path/"second"/"planning-report.json").read_text())
     assert not report["success"] and Path(report["request_ledger_path"]).name == "request-ledger.json"

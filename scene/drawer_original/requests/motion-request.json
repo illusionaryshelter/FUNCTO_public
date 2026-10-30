@@ -1,0 +1,110 @@
+{
+  "problem": {
+    "skill_id": "segment_004",
+    "carrier_id": "manipulated_part",
+    "reference_id": "visual_reference",
+    "source_program": "/home/shelter/recovery/sim-version-plans/2026-10-28-open-drawer-grounding/source-data/approved-source-001/source-program.json",
+    "physical_representation": "/home/shelter/recovery/sim-version-plans/2026-10-28-open-drawer-grounding/source-data/approved-source-001/physical-representation.json",
+    "release_event_id": "segment_004:release",
+    "joint_names": [
+      "robot0_joint1",
+      "robot0_joint2",
+      "robot0_joint3",
+      "robot0_joint4",
+      "robot0_joint5",
+      "robot0_joint6",
+      "robot0_joint7"
+    ],
+    "J_physical": [
+      [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        1.0,
+        0.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0,
+        0.0
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "pose_objectives": [
+    {
+      "goal_id": [
+        "pose_events",
+        0
+      ],
+      "role": "prior",
+      "scales": {
+        "position": 0.002,
+        "rotation": 0.017453292519943295
+      },
+      "scale_source": "Controlled comparison: numerical scales of the original pose quality objective; independent preference data, not hard bounds or success probability"
+    }
+  ],
+  "robot_fixture": "/home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka/robot-fixture.json",
+  "finger_targets": "/home/shelter/recovery/sim-version-plans/2026-10-28-open-drawer-grounding/runs/aligned-planning-inputs-001/finger-targets.json",
+  "execution_limits": "/home/shelter/recovery/sim-version-plans/2026-10-28-open-drawer-grounding/runs/aligned-planning-inputs-001/execution-limits.json",
+  "contact_intervals": {
+    "segment_003:gripper:641:finger1_pad": [
+      0.0,
+      1.0
+    ],
+    "segment_003:gripper:641:finger2_pad": [
+      0.0,
+      1.0
+    ]
+  },
+  "task_geometry_role": {
+    "observed_owner": "Previously observed complete task assembly; same TSDF and fixed observed frame",
+    "manipulated_part": "Declared task motion coordinates and tool relation; no additional geometry",
+    "visual_reference": "Grounded functional reference of the source task",
+    "contacts": "Previously activated source contact features retained through the declared interaction interval; same feature and patch geometry and metric parameters"
+  },
+  "torch_memory_mib": 2048,
+  "budget": {
+    "ik_seeds": 2,
+    "trajectory_seeds": 1,
+    "knots": 16,
+    "interpolation_steps": 4,
+    "ik_iterations": 80,
+    "trajectory_iterations": 100,
+    "interpolation_dt": 0.025,
+    "maximum_trajectory_dt": 0.2,
+    "interpolation_buffer_size": 768,
+    "constraint_weight": 100000.0,
+    "max_task_anchors": 64,
+    "max_robot_spheres": 640,
+    "max_robot_dof": 16,
+    "max_robot_links": 64,
+    "max_scene_gpu_workspace_bytes": 2147483648,
+    "max_host_rss_bytes": 10737418240,
+    "max_device_used_bytes": 8589934592,
+    "max_validation_points": 1536,
+    "validation_joint_step": 0.025,
+    "validation_spatial_step_m": 0.001,
+    "search_seconds": 12.0,
+    "maximum_trajectory_solves": 2,
+    "planning_seconds": 60.0,
+    "random_seed": 123
+  },
+  "configuration_source": {
+    "predecessor_planning_report": "/home/shelter/recovery/sim-version-plans/2026-10-26-twenty-second-planning/joint-planner-003/runs/native-ik-runtime-002/planning-run/planning/planning-report.json",
+    "predecessor_pose_objectives": "/home/shelter/recovery/sim-version-plans/2026-10-26-twenty-second-planning/joint-planner-003/planner-request-004.json",
+    "scope": "Same full PlanningBudget, native reference IK options and pose-prior scales; task geometry and events remain current source data"
+  }
+}

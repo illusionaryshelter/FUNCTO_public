@@ -1,0 +1,58 @@
+robot_cfg:
+  load_dynamics: false
+  kinematics:
+    format_version: 2.0
+    base_link: robot0_base
+    tool_frames:
+    - gripper0_right_grip_site
+    use_global_cumul: true
+    lock_joints:
+      gripper0_right_finger_joint1: 0.039229948107737646
+      gripper0_right_finger_joint2: -0.03923001169079247
+    cspace:
+      joint_names:
+      - robot0_joint1
+      - robot0_joint2
+      - robot0_joint3
+      - robot0_joint4
+      - robot0_joint5
+      - robot0_joint6
+      - robot0_joint7
+      - gripper0_right_finger_joint1
+      - gripper0_right_finger_joint2
+      default_joint_position:
+      - -0.021132560062632418
+      - -0.16105143326781862
+      - 0.020916729056392257
+      - -2.444592209444811
+      - 0.004115624511780582
+      - 2.2267522245222815
+      - 0.7823010517437409
+      - 0.039229948107737646
+      - -0.03923001169079247
+      cspace_distance_weight:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      null_space_weight:
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      - 1.0
+      max_acceleration: 15.0
+      max_jerk: 500.0
+    urdf_path: /home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka/kinematics.urdf
+    asset_root_path: /home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka
+    load_meshes: false
+    load_collision_spheres: false

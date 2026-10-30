@@ -1,0 +1,29 @@
+{
+  "source": "/home/shelter/recovery/collect/preprocessed/20260927T135735_590b9b7c/evidence.json",
+  "scope": "Current native target motion and contacts are independent posthoc evaluation only",
+  "actor": {
+    "entity_name": "PandaGripper0_right",
+    "eef_site_name": "gripper0_right_grip_site",
+    "contact_geom_groups": [
+      [
+        "gripper0_right_finger1_pad_collision"
+      ],
+      [
+        "gripper0_right_finger2_pad_collision"
+      ]
+    ]
+  },
+  "segments": [
+    {
+      "segment_id": "segment_003",
+      "interaction": "grasp",
+      "carrier_body_name": "white_cabinet_1_cabinet_top"
+    }
+  ],
+  "evaluation_owner_bindings": [
+    {
+      "owner_id": "observed_owner",
+      "native_body_name": "white_cabinet_1_cabinet_top"
+    }
+  ]
+}

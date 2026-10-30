@@ -65,16 +65,17 @@ def test_passive_failure_recorder_calls_planner_once_and_keeps_first_cause(tmp_p
          "diagnostic_candidate_source": source, "diagnostic_validation_status": status},
         request_ledger={"spent_solves": 2})
     calls = []
-    backend = object()
     def plan(*args, **kwargs):
         calls.append(kwargs)
         return result
-    monkeypatch.setattr(planning, "plan_trajectory", plan)
+    # BEGIN dispatch and diagnostic persistence share the caller's one backend.
+    backend = SimpleNamespace(plan=plan)
     output = tmp_path / "run"
     returned = plan_and_record(SimpleNamespace(phase_count=1), object(), {}, output,
         robot_validator=object(), budget=Budget(), backend=backend, provenance={}, execution_limits={})
     assert returned is result
-    assert len(calls) == 1 and calls[0]["backend"] is backend
+    assert len(calls) == 1
+    # END the recorder cannot initiate a second solve during archive creation.
     assert not (output / "trajectory.npz").exists()
     report = json.loads((output / "planning-report.json").read_text())
     assert report["diagnostics"]["failure"] == "no_solution_within_budget"

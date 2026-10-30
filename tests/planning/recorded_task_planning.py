@@ -169,8 +169,6 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
     geometry query, or candidate-sized tensor history is installed here.
     """
     import torch
-    from manipulation import planning
-
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
@@ -179,12 +177,21 @@ def plan_and_record(problem, scene, robot, output, *, robot_validator, budget, p
               "provenance": deepcopy(provenance), "execution_limits": deepcopy(execution_limits),
               "phase_count": problem.phase_count, "candidates": [], "observer_errors": []}
     try:
-        result = planning.plan_trajectory(problem, scene, robot, robot_validator=robot_validator,
-            budget=budget, backend=backend, joint_reference=joint_reference, continuation=continuation, rebind=rebind,
-            request_ledger=request_ledger)
+        # BEGIN persistence calls the caller-owned backend exactly once.
+        result = backend.plan(problem, scene, joint_reference=joint_reference,
+            continuation=continuation, rebind=rebind, request_ledger=request_ledger)
+        # END the backend owns its solver, original models and work accounting.
         # The backend hands off at most one owned CPU diagnostic curve. Remove
         # this non-JSON object before binding/report serialization; do not
         # modify its residuals or reevaluate it to populate an archive.
+        # BEGIN serialize the planner's completed diagnostic snapshot.
+        evidence = result.diagnostics.pop("preference_planner", None)
+        if evidence is not None:
+            internals = output.parent / "planner-internals"
+            internals.mkdir(parents=True, exist_ok=True)
+            _write_diagnostic_json(internals / "joint-problem.json", evidence["joint_problem"])
+            _write_diagnostic_json(internals / "objective-trials.json", evidence["objective_trials"])
+        # END archive ownership does not initiate a solve or model query.
         diagnostic = result.diagnostics.pop("diagnostic_trajectory", None)
         report.update(status="completed", success=result.success, diagnostics=result.diagnostics)
         if result.request_ledger is not None:

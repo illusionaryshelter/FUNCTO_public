@@ -82,3 +82,5 @@
 | [tests/planning/continuous_simulation.py](api/adapter-continuous_simulation.md) | 7 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/simulation_snapshot.py](api/adapter-simulation_snapshot.md) | 2 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/prepare_recorded_task.py](api/adapter-prepare_recorded_task.md) | 14 | [11](11-device-control-and-evaluation.md) |
+
+共享请求入口 `run_preference_request`、物理模型构造 `simulation_model`、当前模型目录 `current_catalog`、参考入口转换 `recorded_entrance` 与结果显示 `visualize_preference_result` 的逐项接口说明见[通用运行适配](12-shared-runtime-adapters.md)。

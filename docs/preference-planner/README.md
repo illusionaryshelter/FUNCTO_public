@@ -11,7 +11,7 @@
 | `manipulation.planning.plan_trajectory` | `MotionBackend` → `_ConstrainedPlanner` | 原完整条件验收及执行绑定后交付 |
 | `manipulation.preference_planner.plan_trajectory` | `PreferenceMotionBackend` → `PreferencePlanner` | 显式角色下的完整条件、末段静止及执行绑定完成后交付 |
 
-新类通过正常继承复用原构造器、普通参考 IK、搜索、运动学与验收方法。`NativeSetup` 定义事件 IK 的偏好成本和静态排序；`PreferencePlanner` 定义终止消元、共同轨迹成本及几何必要条件。两路候选生成和默认入口保持独立，保存曲线验收通过共同父方法和数值证据接口复用；该共享组件代码基线为 `8b0e326`，见[共享验收架构](../planner-architecture/10-shared-candidate-validation.md)。当前每次调用只运行选定的一路规划器；多个规划器的时间截止与比较调度属于另行讨论的方案。
+新类通过正常继承复用原构造器、普通参考 IK、搜索、运动学与验收方法。`NativeSetup` 直接拥有普通参考 IK 的数值运行配置，并定义事件 IK 的偏好成本和静态排序；`PreferencePlanner` 定义终止消元、共同轨迹成本及几何必要条件。两路候选生成和默认入口保持独立，保存曲线验收通过共同父方法和数值证据接口复用；该共享组件代码基线为 `8b0e326`，见[共享验收架构](../planner-architecture/10-shared-candidate-validation.md)。当前每次调用只运行选定的一路规划器；多个规划器的时间截止与比较调度属于另行讨论的方案。
 
 ```python
 from manipulation.preference_planner import bind_pose_objectives, plan_trajectory
@@ -51,3 +51,5 @@ result = plan_trajectory(bound, scene, robot, robot_validator=validator, budget=
 - [API 索引](api-index.md)：实际源文件定义、签名、说明及调用关系。
 
 维护组件测试位于 `tests/preference_planner`，保存场景重算与仿真结果位于项目外 `sim-version-plans`。当前依赖为既有 NumPy、SciPy、Torch、cuRobo、Pinocchio、Coal 与 FUNCTO 观测/运动学组件。
+
+记录型请求通过 [通用运行适配](../planner-architecture/12-shared-runtime-adapters.md) 调用同一后端。固定机器人资源由 `config/robots/fixed_franka` 提供；任务、观测、源录制和独立评价记录分别作为显式输入。

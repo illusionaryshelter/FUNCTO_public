@@ -1,0 +1,123 @@
+{
+  "workspace": "/home/shelter/recovery",
+  "skill": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/skills/grasp_drawer_handle_whole_entity",
+  "grounding": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grasp-grounding-entry-bound-001",
+  "observation": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound",
+  "inputs": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/planning-inputs-002",
+  "planning_output": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grasp-planning-002",
+  "segment": "segment_003",
+  "owner_id": "observed_owner",
+  "feedback_id": "drawer-original-1s-independent-grasp",
+  "views": [
+    "view_a",
+    "view_b"
+  ],
+  "program": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/source-evidence/grasp_drawer_handle/compiled-skill/program.json",
+  "source_motion": "/home/shelter/recovery/collect/preprocessed/20260927T135735_590b9b7c/trajectories.h5",
+  "robot_fixture": "/home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka/robot-fixture.json",
+  "robot_calibration": "/home/shelter/recovery/sim-version-plans/2026-10-24-continuous-skills-resource-test/grasp-inputs/feedback.json",
+  "finger_targets": "/home/shelter/recovery/sim-version-plans/2026-10-24-continuous-skills-resource-test/grasp-inputs/finger-targets.json",
+  "execution_limits": "/home/shelter/recovery/sim-version-plans/2026-10-24-continuous-skills-resource-test/grasp-inputs/execution-limits.json",
+  "unknown_policy": "/home/shelter/recovery/sim-version-plans/2026-10-24-continuous-skills-resource-test/grasp-inputs/unknown-policy.json",
+  "robot_materials": "/home/shelter/recovery/sim-version-plans/2026-10-02-grasp-mug-integration/robot-material-calibration.json",
+  "target_region": "top_drawer_handle_patch",
+  "contact_features": [
+    {
+      "source_region": "actor_left_finger_pad",
+      "material_id": "finger1_pad"
+    },
+    {
+      "source_region": "actor_right_finger_pad",
+      "material_id": "finger2_pad"
+    }
+  ],
+  "goal_precision": {
+    "position_m": 0.002,
+    "rotation_rad": 0.017453292519943295,
+    "source": "Unchanged explicit precision of the existing independent-grasp planning request; engineering requirement, not inferred from a candidate"
+  },
+  "contact_policy": {
+    "gap_bounds": [
+      -0.003,
+      0.003
+    ],
+    "normal_tolerance_rad": 0.17453292519943295,
+    "modeling_allowance_m": 0.003,
+    "geometry_error_m": 0.003,
+    "source": "Unchanged finite-contact numerical policy from /home/shelter/recovery/sim-version-plans/2026-10-24-continuous-skills-resource-test/grasp-inputs/current-contact-bindings.json"
+  },
+  "planner_options": [
+    "--center",
+    "0",
+    "-.315",
+    "1.274999976158142",
+    "--extent",
+    ".92",
+    "1.31",
+    ".82",
+    "--voxel-size",
+    ".01",
+    "--depth-error",
+    ".0001",
+    "--self-padding-offset-m",
+    ".01",
+    "--self-padding-scale",
+    "1",
+    "--self-filter-source",
+    "Existing fixed-robot model uncertainty shell of 10 mm; shadow remains unknown",
+    "--knots",
+    "16",
+    "--ik-seeds",
+    "2",
+    "--trajectory-seeds",
+    "1",
+    "--max-validation-points",
+    "1536",
+    "--max-task-anchors",
+    "64",
+    "--maximum-trajectory-solves",
+    "2",
+    "--planning-seconds",
+    "120",
+    "--search-seconds",
+    "12",
+    "--scene-gpu-workspace-mib",
+    "2048",
+    "--max-host-rss-mib",
+    "10240",
+    "--max-device-used-mib",
+    "8192",
+    "--mapping-memory-mib",
+    "4096",
+    "--torch-memory-mib",
+    "2048",
+    "--interpolation-buffer-size",
+    "768"
+  ],
+  "pose_objectives": [
+    {
+      "goal_id": [
+        "pose_events",
+        0
+      ],
+      "role": "prior",
+      "scales": {
+        "position": 0.002,
+        "rotation": 0.017453292519943295
+      },
+      "scale_source": "Controlled comparison: numerical scales of the original pose quality objective; independent preference data, not hard bounds or success probability"
+    },
+    {
+      "goal_id": [
+        "pose_events",
+        1
+      ],
+      "role": "prior",
+      "scales": {
+        "position": 0.002,
+        "rotation": 0.017453292519943295
+      },
+      "scale_source": "Controlled comparison: numerical scales of the original pose quality objective; independent preference data, not hard bounds or success probability"
+    }
+  ]
+}

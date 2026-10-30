@@ -24,6 +24,8 @@ import yaml
 PROJECT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT))
 
+from manipulation.planning import MotionBackend
+
 
 # BEGIN persist reusable semantic masks separately from fusion decisions.
 def save_observation_partitions(scene, output):
@@ -305,12 +307,14 @@ def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *,
 
 
 # BEGIN execution consumes an explicitly prepared current problem.
-def run_prepared(args, *, problem, provenance):
+def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
     """Run the existing scene/solver pipeline on the supplied continuous path.
 
     Problem construction belongs to the caller. The actual feedback is checked
     again here, so an offline reference cannot replace current robot state.
     This function never reconstructs or resamples the supplied reference.
+    backend_factory consumes robot, robot_validator and budget, and returns
+    the resident backend whose plan method owns the chosen solver lifecycle.
     """
     from manipulation.robot_self_filter import classify_depth
     from manipulation.robot_self_filter import SELF, ENVIRONMENT, AMBIGUOUS_SHADOW
@@ -661,7 +665,9 @@ def run_prepared(args, *, problem, provenance):
         mark_wallclock("planning_call_started")
         # END constructing MotionBackend alone is not native initialization.
         # BEGIN the caller owns resident native models across motion requests.
-        backend = MotionBackend(robot, robot_validator=robot_validator, budget=budget)
+        # BEGIN the caller selects a backend through the shared construction API.
+        backend = backend_factory(robot, robot_validator=robot_validator, budget=budget)
+        # END observations, devices and recording retain one implementation.
         try:
             result = plan_and_record(problem, scene, robot, args.output/"planning",
                 robot_validator=robot_validator, budget=budget, backend=backend,
@@ -680,6 +686,8 @@ def run_prepared(args, *, problem, provenance):
         report.update(status="completed", planning_success=result.success,
                       initial_state=result.diagnostics.get("initial_state"),
                       failure=result.diagnostics.get("failure"))
+        # BEGIN return the same completed result after owned resources close.
+        return result
         # END persistence cannot recreate a planner or initiate validation.
     except KeyboardInterrupt:
         report.update(status="interrupted", interruption_reason="Explicit operator interrupt")

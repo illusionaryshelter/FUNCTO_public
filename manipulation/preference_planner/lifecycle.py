@@ -543,7 +543,7 @@ def plan_trajectory(problem, scene, robot, *, robot_validator, budget=None, devi
     finally:
         # BEGIN interrupted initialization retains its completed actual coefficients.
         if planner is not None:
-            for name in ("reference_initialization", "reference_ik_queries",
+            for name in ("reference_initialization", "reference_ik_queries", "reference_ik_runtime",
                          "initial_seed_strategies", "last_optimizer_runtime"):
                 if hasattr(planner, name):
                     diagnostics[name] = deepcopy(getattr(planner, name))

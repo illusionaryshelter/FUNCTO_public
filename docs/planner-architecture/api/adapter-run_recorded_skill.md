@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`3266476`。
+原设备接口代码基线：`3266476`；后端构造参数与返回值随本提交更新，实际编号由同内容文档提交登记。
 职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -583,7 +583,7 @@ Path
 输入签名：
 
 ```python
-def run_prepared(args, *, problem, provenance):
+def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
 ```
 
 实现说明：
@@ -596,7 +596,7 @@ def run_prepared(args, *, problem, provenance):
 
 显式输出分支：
 
-无显式条目。
+`result`：已经由选定后端完成规划与保存的同一 PlanningResult。
 
 读取的对象属性：
 
@@ -1145,3 +1145,5 @@ argparse.ArgumentParser
 parser.add_argument
 parser.parse_args
 ```
+
+`backend_factory` 的输入、资源所有权与当前调用关系见[通用运行适配](../12-shared-runtime-adapters.md)。

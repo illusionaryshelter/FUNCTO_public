@@ -1,0 +1,181 @@
+{
+  "robot_mjcf_path": "/home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka/robot_only.xml",
+  "base_link": "robot0_base",
+  "tool_link": "gripper0_right_grip_site",
+  "tcp_site": "gripper0_right_grip_site",
+  "tool_transform": {
+    "position": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "quaternion_wxyz": [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "joint_names": [
+    "robot0_joint1",
+    "robot0_joint2",
+    "robot0_joint3",
+    "robot0_joint4",
+    "robot0_joint5",
+    "robot0_joint6",
+    "robot0_joint7",
+    "gripper0_right_finger_joint1",
+    "gripper0_right_finger_joint2"
+  ],
+  "arm_joint_names": [
+    "robot0_joint1",
+    "robot0_joint2",
+    "robot0_joint3",
+    "robot0_joint4",
+    "robot0_joint5",
+    "robot0_joint6",
+    "robot0_joint7"
+  ],
+  "finger_joint_names": [
+    "gripper0_right_finger_joint1",
+    "gripper0_right_finger_joint2"
+  ],
+  "position_limits": {
+    "robot0_joint1": [
+      -2.8973,
+      2.8973
+    ],
+    "robot0_joint2": [
+      -1.7628,
+      1.7628
+    ],
+    "robot0_joint3": [
+      -2.8973,
+      2.8973
+    ],
+    "robot0_joint4": [
+      -3.0718,
+      -0.0698
+    ],
+    "robot0_joint5": [
+      -2.8973,
+      2.8973
+    ],
+    "robot0_joint6": [
+      -0.0175,
+      3.7525
+    ],
+    "robot0_joint7": [
+      -2.8973,
+      2.8973
+    ],
+    "gripper0_right_finger_joint1": [
+      0.0,
+      0.04
+    ],
+    "gripper0_right_finger_joint2": [
+      -0.04,
+      0.0
+    ]
+  },
+  "velocity_limits": {
+    "robot0_joint1": 2.175,
+    "robot0_joint2": 2.175,
+    "robot0_joint3": 2.175,
+    "robot0_joint4": 2.175,
+    "robot0_joint5": 2.61,
+    "robot0_joint6": 2.61,
+    "robot0_joint7": 2.61,
+    "gripper0_right_finger_joint1": 0.2,
+    "gripper0_right_finger_joint2": 0.2
+  },
+  "mechanical_contact_pairs": [
+    {
+      "first": "gripper0_right_finger1_pad_collision",
+      "second": "gripper0_right_finger2_pad_collision",
+      "source": "Explicit robot-model mechanical permission approved by the user: the opposing native pads may contact during closure. Identities come from the installed robosuite PandaGripperBase._important_geoms left_fingerpad/right_fingerpad binding and the expanded source scene. Native slide ranges constrain their facing surface gap to [-0.001, 0.079] m; physical contacts remain enabled. This permits only this exact robot-local geom pair, independently of any task or command."
+    }
+  ],
+  "robot_config_path": "/home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka/kinematics.yml",
+  "control_timestep_s": 0.002,
+  "finger_control_ranges": [
+    [
+      0.0,
+      0.04
+    ],
+    [
+      -0.04,
+      0.0
+    ]
+  ],
+  "urdf_path": "/home/shelter/recovery/FUNCTO_public/config/robots/fixed_franka/kinematics.urdf",
+  "collision_geometries": [
+    {
+      "geom": "robot0_link0_collision",
+      "link": "robot0_link0"
+    },
+    {
+      "geom": "robot0_link1_collision",
+      "link": "robot0_link1"
+    },
+    {
+      "geom": "robot0_link2_collision",
+      "link": "robot0_link2"
+    },
+    {
+      "geom": "robot0_link3_collision",
+      "link": "robot0_link3"
+    },
+    {
+      "geom": "robot0_link4_collision",
+      "link": "robot0_link4"
+    },
+    {
+      "geom": "robot0_link5_collision",
+      "link": "robot0_link5"
+    },
+    {
+      "geom": "robot0_link6_collision",
+      "link": "robot0_link6"
+    },
+    {
+      "geom": "robot0_link7_collision",
+      "link": "robot0_link7"
+    },
+    {
+      "geom": "gripper0_right_hand_collision",
+      "link": "gripper0_right_right_gripper"
+    },
+    {
+      "geom": "gripper0_right_finger1_collision",
+      "link": "gripper0_right_leftfinger"
+    },
+    {
+      "geom": "gripper0_right_finger1_pad_collision",
+      "link": "gripper0_right_finger_joint1_tip"
+    },
+    {
+      "geom": "gripper0_right_finger2_collision",
+      "link": "gripper0_right_rightfinger"
+    },
+    {
+      "geom": "gripper0_right_finger2_pad_collision",
+      "link": "gripper0_right_finger_joint2_tip"
+    }
+  ],
+  "fixed_collision_geometries": [
+    {
+      "geom": "fixed_mount0_controller_box_col",
+      "link": "fixed_mount0_controller_box"
+    },
+    {
+      "geom": "fixed_mount0_pedestal_feet_col",
+      "link": "fixed_mount0_pedestal_feet"
+    },
+    {
+      "geom": "fixed_mount0_pedestal_col",
+      "link": "fixed_mount0_pedestal"
+    }
+  ],
+  "source": "Fixed official robot and end-effector configuration, reusable across skills; current poses come from calibration and joint feedback. Simulation episode and evaluator catalog are separate run inputs."
+}

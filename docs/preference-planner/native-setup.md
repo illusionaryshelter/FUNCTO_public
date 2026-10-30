@@ -1,10 +1,10 @@
-# 事件 IK 的位姿偏好与静态候选排序
+# 原生参考 IK、事件位姿偏好与静态候选排序
 
 本文对应 `native_setup.py`。共享基础代码来自 FUNCTO `d3100d0` 的 `_ik_manager_type`、`_ConstrainedPlanner._initialize` 和 `_ConstrainedPlanner._rank_ik_candidates`，其余运动学、时钟、资源管理与场景查询函数通过原接口调用。
 
-代码基线：`1323d81`。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+原事件成本代码基线：`1323d81`；本次普通参考运行配置随本提交实现，提交后的实际实现编号由同内容文档提交登记。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
-本组件处理一个已绑定运动块的事件 IK。IK 在指定事件时刻提出机器人关节构型，作为连接搜索和整条轨迹求解的数值输入。输入包括 `PlanningProblem`、现场观测建立的场景、测得的入口关节状态、机器人标定和固定官方本体模型、原 `PlanningBudget`，以及已有事件时钟。输出包括驻留的原生 IK 对象、事件候选构型、每个候选的原静态判定证据及位姿偏好成本。
+本组件为一个已绑定运动块构造普通参考 IK 和事件 IK。普通参考 IK 沿源运动建立关节初始化样本；事件 IK 在声明事件处产生任务候选。IK 在指定事件时刻提出机器人关节构型，作为连接搜索和整条轨迹求解的数值输入。输入包括 `PlanningProblem`、现场观测建立的场景、测得的入口关节状态、机器人标定和固定官方本体模型、原 `PlanningBudget`，以及已有事件时钟。输出包括驻留的原生 IK 对象、事件候选构型、每个候选的原静态判定证据及位姿偏好成本。
 
 事件 `goal_ids` 使用当前运动块中各类型集合的局部索引。`bound_motion_block` 产生的正式原身份继续保存在原绑定 `goal_identities`，角色和尺度保存在事件 `source['pose_objective']`。选择局部事件时不重新解释 source 的来源字段。工具位置使用问题参考坐标系，四元数采用 `wxyz` 顺序；误差组件及目标局部自由轴由 `pose_roles.py` 复用原几何定义。
 
@@ -24,6 +24,14 @@ class PreferencePlanner(NativeSetup, _ConstrainedPlanner):
 局部初始化使用本模块的 `_ik_manager_type` 创建事件管理器。事件 IK 保持原 `ik_seeds`、迭代数和原生配置；普通参考 IK 继续使用原库成本管理器和一个数值种子。普通参考是初始化提案，其近似位姿误差不构成新的任务要求。
 
 原 `rebind` 继续通过管理器配置类型上的 `bind_request` 更新问题和预算，并清空先前选择的事件索引。时钟字典与种子时间张量按原接口更新，已有原生实例继续复用。当前模块不需要额外的常驻重绑定分支。
+
+## 普通参考 IK 的运行配置
+
+`configure_reference_ik(config)` 接收 cuRobo 的 `IKSolverCfg`。总迭代数 N 来自同一 `PlanningBudget.ik_iterations`；L-BFGS 的内层分组取 gcd(20,N)，外层组数为 N/gcd(20,N)。这是整数调度规则，既覆盖默认预算，也保持调用方显式预算的总工作量。配置启用原生 CUDA Graph、设 `fixed_iters=False`、`exit_early=False`，并保留既有成本收敛值、模型、成本管理器、目标精度与一个参考种子。事件 IK 的配置独立构造。
+
+函数复制原生配置容器，对 L-BFGS 调用现成 `update_niters`；其他优化阶段及模型、成本对象继续使用原输入。`NativeSetup._initialize` 在创建普通参考求解器前设置 cuRobo 的 `runtime.cuda_graph_reset=True`，直接构造一个配置完成的实例。后端重绑定复用该实例；生命周期结束时由原 `close` 释放。
+
+`reference_ik_configuration(config)` 返回实际配置的 JSON 字段，包括内外层次数、停止条件、图配置、参考种子和原位姿精度。初始化记录 `reference_ik_runtime`，`lifecycle` 将其附入本次 `PlanningResult.diagnostics`，记录器只序列化完成后的值。配置属于 `preference_planner`，请求文件不再选择实验包装类或覆盖 IK 运行选项。
 
 ## 事件成本与原生指标
 
@@ -59,3 +67,5 @@ class PreferencePlanner(NativeSetup, _ConstrainedPlanner):
 `tests/preference_planner/test_native_setup.py` 使用实际安装的 cuRobo 配置类、管理器、成本容器及原几何雅可比到四元数梯度的映射；CPU 直接进入实际 `_add_event_costs`。它们覆盖 prior 的非零位置和姿态梯度、硬指标与偏好的分离、required 原归一化值、同一时刻混合角色、自由 yaw、运动块局部索引与重新绑定、已有成本容器保留，以及原构造函数的异常清理和精度恢复。
 
 静态排序检查通过原 `_scene_boundary_evaluate` 处理解析场景分量，确认每个有限候选各一次 FK、场景与原生查询；并检查原资格优先、重复合并、数量限制、数值成功标志的记录职责和同成本下的原连续性排序。完整场景结果由阶段运行记录说明。
+
+`tests/preference_planner/test_reference_runtime.py` 使用原生配置类检查不同整数预算下的工作量、成本与模型对象保留；共享仿真资源和记录接口的核对见[通用运行适配](../planner-architecture/12-shared-runtime-adapters.md)。

@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>联合规划与实际物理结果</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101724;color:#e7eff7;font:16px/1.6 system-ui,sans-serif;padding:22px}main{max-width:1450px;margin:auto}h1{font-size:26px}h2{font-size:20px}.box{background:#192436;border:1px solid #35475e;border-radius:8px;padding:15px;margin:14px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid>div{min-width:0}.viewport{overflow:auto;max-height:75vh;background:#080d15}canvas{display:block;width:100%;height:auto;cursor:zoom-in}.zoomed{width:1280px;max-width:none;cursor:zoom-out}.sticky{position:sticky;top:0;z-index:2}button{background:#293f5b;color:#eff7ff;border:1px solid #536c8b;border-radius:5px;padding:7px;margin:3px}input[type=range]{width:100%}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;margin:7px 0}a{color:#8dceff}.bad{color:#ff9d9d}.good{color:#82e0b1}.warn{color:#ffdc7d}.muted{color:#beccdc}.source{max-width:760px}table{border-collapse:collapse;width:100%}td,th{padding:8px;border-bottom:1px solid #35475e;text-align:left}small{color:#beccdc}@media(max-width:900px){.grid{grid-template-columns:1fr}body{padding:10px}.sticky{position:static}}
+</style>
+<main>
+<h1>联合规划与实际物理结果</h1><p id="task"></p>
+<div class="box"><p id="outcome"></p><table><tbody id="status"></tbody></table><p id="scope" class="muted"></p><div id="links"></div></div>
+<div class="box sticky"><strong>保存曲线的完整位姿</strong><input id="time" type="range" min="0" step="1"><div id="clock"></div><div id="physical"><label>实际物理记录：每一个反馈样本<input id="actualTime" type="range" min="0" step="1"></label><div id="actualClock"></div></div><div id="events"></div><small>黄色：迁移参考；蓝色：初始化；紫红色：当前保存曲线；绿色：实际物理反馈。x/y/z 轴为红/绿/蓝，长度 35 mm；每条轨迹只显示当前时刻一个位姿。点击图像放大，原区域与黄色采样点保留。</small><p id="missing" class="warn"></p></div>
+<div class="grid" id="views"></div>
+<div class="box"><h2>当前判定证据与位置</h2><div id="witnessSummary"></div><div id="witnessDetail"></div></div>
+<div class="box"><h2>源示教区域与完整运动</h2><div class="source" id="sourceView"></div><p>源坐标系 W_D 与当前标定世界坐标 W 分别保留。技能进度映射到源示教保存时间，下面列出当前选中的原始时间。</p></div>
+<div class="box"><h2>当前位姿与旋转数值</h2><p>位置单位 m，RPY 单位度，R=Rz(yaw)Ry(pitch)Rx(roll)。位姿矩阵将工具坐标 E 映到 W；源示教采用 W_D。实际物理记录的位姿来源与独立观测标志单列。</p><div class="grid" id="poses"></div><p><a href="display-poses.npz">完整显示位姿与时钟</a> · <a href="display-data.json">显示数据和原证据</a> · <a href="display-checks.json">显示一致性核对</a> · <a href="javascript-checks.json">页面脚本核对</a></p></div>
+<div class="box"><h2>本次物理视频</h2><p id="videoStatus"></p><div class="grid" id="videos"></div></div>
+</main>
+<script>
+const D=__DISPLAY_DATA__,el=id=>document.getElementById(id),slider=el('time'),actualSlider=el('actualTime'),images={};
+let actualIndex=null;
+slider.max=D.times.length-1;slider.value=D.initial_index;el('task').textContent=D.task;el('outcome').textContent=D.outcome;el('outcome').className=D.planning_success===true?'good':D.planning_success===false?'bad':'warn';el('scope').textContent=D.scope;
+el('missing').textContent=D.missing_tracks.length?'缺失记录：'+D.missing_tracks.join(' / '):'';
+for(const row of D.status){const tr=document.createElement('tr');tr.innerHTML='<th></th><td></td>';tr.children[0].textContent=row[0];tr.children[1].textContent=row[1];el('status').appendChild(tr);}
+for(const row of D.links){const a=document.createElement('a');a.href=row.path;a.textContent=row.label+' · ';el('links').appendChild(a);}
+function panel(parent,p){const box=document.createElement('div');box.className='box';box.innerHTML='<strong>'+p.title+'</strong><div class="viewport"><canvas id="canvas-'+p.id+'" width="'+p.width+'" height="'+p.height+'"></canvas></div><small id="note-'+p.id+'"></small>';el(parent).appendChild(box);el('canvas-'+p.id).onclick=()=>el('canvas-'+p.id).classList.toggle('zoomed');const image=new Image();image.onload=draw;image.src=p.image;images[p.id]=image;}
+for(const p of D.panels)panel('views',p);panel('sourceView',D.source);
+el('videoStatus').textContent=D.videos.length?'原仿真录像；每段录像的精确采集时刻单独保存。':'本次物理视频缺失。';for(const row of D.videos){const block=document.createElement('div'),title=document.createElement('p'),video=document.createElement('video'),a=document.createElement('a');title.textContent=row.view+' · '+row.timing;video.src=row.path;video.controls=true;video.preload='metadata';video.style.width='100%';a.href=row.capture_times;a.textContent='原始帧采集时刻';block.appendChild(title);block.appendChild(video);block.appendChild(a);el('videos').appendChild(block);}
+for(const event of D.events){const b=document.createElement('button');b.textContent=event.label+' '+D.times[event.index].toFixed(3)+'s';b.onclick=()=>{slider.value=event.index;syncActual();draw();};el('events').appendChild(b);}
+function line(ctx,points,color,width){ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(...p):ctx.moveTo(...p));ctx.strokeStyle=color;ctx.lineWidth=width;ctx.stroke();}
+function background(p){const ctx=el('canvas-'+p.id).getContext('2d');ctx.clearRect(0,0,p.width,p.height);if(images[p.id]?.complete)ctx.drawImage(images[p.id],0,0);return ctx;}
+function track(ctx,t,index){line(ctx,t.pixels,t.color,1.8);if(index===null)return;const axes=t.axes[index];for(let j=1;j<4;j++)line(ctx,[axes[0],axes[j]],['','#ff665f','#74e98a','#75adff'][j],2.8);ctx.beginPath();ctx.arc(...axes[0],4,0,Math.PI*2);ctx.fillStyle=t.color;ctx.fill();}
+function witness(ctx,mark){const[x,y]=mark.pixel;line(ctx,[[x-7,y-7],[x+7,y+7]],'#ff6262',3);line(ctx,[[x-7,y+7],[x+7,y-7]],'#ff6262',3);if(mark.target_pixel){line(ctx,[mark.pixel,mark.target_pixel],'#ff9b73',1.5);ctx.beginPath();ctx.arc(...mark.target_pixel,5,0,Math.PI*2);ctx.strokeStyle='#ffdc7d';ctx.stroke();}}
+function formatted(t,index){return t.label+'\n位置 [m] '+t.poses[index].slice(0,3).map(r=>r[3].toFixed(7)).join(', ')+'\nRPY [°] '+t.rpy_deg[index].map(v=>v.toFixed(5)).join(', ')+'\n'+t.poses[index].map(r=>r.map(v=>v.toFixed(7).padStart(11)).join(' ')).join('\n');}
+function poseBlock(text){const p=document.createElement('pre');p.textContent=text;el('poses').appendChild(p);}
+// Curve time and physical elapsed time are separate recorded clocks. The
+// physical slider reaches every sample, including repeated command times.
+function syncActual(){if(!D.actual)return;const t=D.times[Number(slider.value)],ts=D.actual.curve_times;if(t<ts[0]||t>ts[ts.length-1]){actualIndex=null;return;}let best=0;for(let i=1;i<ts.length;i++)if(Math.abs(ts[i]-t)<Math.abs(ts[best]-t))best=i;actualIndex=best;actualSlider.value=best;}
+function draw(){
+ const index=Number(slider.value),sourceIndex=D.source.indices[index];
+ el('clock').textContent='名义曲线时间 '+D.times[index].toFixed(9)+' s · 入口加名义时间 '+(D.native_start_s+D.times[index]).toFixed(9)+' s · 技能进度 '+D.progress[index].toFixed(6)+' · 源保存时间 '+D.source.paths.eef.times[sourceIndex].toFixed(9)+' s';
+ el('actualClock').textContent=actualIndex===null?D.actual_missing_text:'实际经过时间 '+D.actual.times[actualIndex].toFixed(9)+' s · 记录命令曲线时间 '+D.actual.curve_times[actualIndex].toFixed(9)+' s · 物理样本 '+actualIndex;
+ for(const p of D.panels){const ctx=background(p);for(const key of D.track_keys)track(ctx,p.paths[key],index);if(D.actual)track(ctx,p.paths.actual,actualIndex);const marks=p.marks.filter(m=>m.index===index);marks.forEach(m=>witness(ctx,m));el('note-'+p.id).textContent=marks.map(m=>m.text).join('\n')||'W · 原始场景、功能区域与采样点；当前保存轨迹。';}
+ const source=D.source,ctx=background(source);for(const t of Object.values(source.paths))track(ctx,t,sourceIndex);el('note-'+source.id).textContent='W_D · 源保存时间 '+source.paths.eef.times[sourceIndex].toFixed(9)+' s';
+ const current=D.markers.filter(m=>m.index===index);el('witnessSummary').textContent=current.length?current.map(m=>m.text).join('\n'):D.failure_summary;el('witnessDetail').replaceChildren();for(const m of current){const pre=document.createElement('pre');pre.textContent=JSON.stringify(m.evidence,null,2);el('witnessDetail').appendChild(pre);}
+ el('poses').replaceChildren();for(const key of D.track_keys)poseBlock(formatted(D.panels[0].paths[key],index));for(const t of Object.values(source.paths))poseBlock(formatted(t,sourceIndex));
+ poseBlock(actualIndex===null?(D.actual?'当前名义时间没有对应的实际物理样本。':D.actual_missing_text):formatted(D.panels[0].paths.actual,actualIndex)+'\n实际经过时间 '+D.actual.times[actualIndex].toFixed(9)+' s\n位姿来源 '+JSON.stringify(D.actual.source)+'\n独立观测标志 '+JSON.stringify(D.actual.independent_observation));
+}
+if(D.actual){actualSlider.max=D.actual.times.length-1;actualSlider.oninput=()=>{actualIndex=Number(actualSlider.value);slider.value=D.actual.nominal_indices[actualIndex];draw();};syncActual();}else el('physical').style.display='none';
+slider.oninput=()=>{syncActual();draw();};draw();
+</script></html>

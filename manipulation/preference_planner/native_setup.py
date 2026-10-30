@@ -17,7 +17,8 @@ constructor dispatches to this initialization method and retains its cleanup.
 
 # BEGIN experiment-local native setup with one explicit pose-prior consumer.
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
+from math import gcd
 
 import numpy as np
 
@@ -32,6 +33,58 @@ from manipulation.planning import (
 from manipulation.planning_ik import _static_qualification, _validate_reports
 from manipulation.resource_admission import require_device_memory
 from .objective import pose_prior_cost
+
+
+# BEGIN ordinary reference IK uses one planner-owned numerical policy.
+def configure_reference_ik(config):
+    """Set native scheduling before the reference solver is constructed.
+
+    The existing request budget owns the total iteration count. Twenty is the
+    configured maximum group size; its greatest common divisor with that count
+    preserves every admitted integer budget without rounding work up or down.
+    Robot, costs and convergence thresholds retain their original objects and
+    values. Event IK has its own configuration and is not passed here.
+    """
+    optimizers = [replace(item) for item in config.optimizer_configs]
+    index = [item.solver_name for item in optimizers].index('lbfgs')
+    original = optimizers[index]
+    optimized = replace(original, inner_iters=gcd(20, original.num_iters),
+        fixed_iters=False, cost_convergence=original.cost_convergence,
+        cost_delta_threshold=original.cost_delta_threshold,
+        cost_relative_threshold=original.cost_relative_threshold)
+    optimized.update_niters(original.num_iters)
+    optimizers[index] = optimized
+    core = replace(config.core_cfg, optimizer_configs=optimizers, use_cuda_graph=True)
+    return replace(config, core_cfg=core, exit_early=False)
+
+
+def reference_ik_configuration(config) -> dict:
+    """Describe effective scheduling and stopping values as ordinary JSON.
+
+    These fields describe the native L-BFGS stage used by the ordinary
+    reference solver. Full robot and cost declarations remain available in
+    the native config for the planner's complete input archive.
+    """
+    optimizer = config.optimizer_configs[
+        [value.solver_name for value in config.optimizer_configs].index("lbfgs")]
+    fields = (
+        "solver_name", "num_iters", "inner_iters", "outer_iters", "fixed_iters",
+        "cost_convergence", "cost_delta_threshold", "cost_relative_threshold",
+        "converged_ratio", "convergence_iteration", "minimum_iters",
+        "return_best_action",
+    )
+    return dict(
+        use_cuda_graph=config.use_cuda_graph, exit_early=config.exit_early,
+        store_debug=config.store_debug, use_lm_seed=config.use_lm_seed,
+        num_seeds=config.num_seeds,
+        position_tolerance=config.position_tolerance,
+        orientation_tolerance=config.orientation_tolerance,
+        success_requires_convergence=config.success_requires_convergence,
+        optimizer={name: getattr(optimizer, name) for name in fields},
+        other_optimizer_names=[value.solver_name for value in config.optimizer_configs
+                               if value.solver_name != "lbfgs"],
+    )
+# END configuration ownership is independent of task and skill identities.
 
 
 def rank_pose_ik_candidates(candidates, reports, previous, *, count, joint_tolerance):
@@ -337,7 +390,23 @@ class NativeSetup:
             optimization_dt=None, velocity_regularization_weight=.01, acceleration_regularization_weight=.01,
             override_optimizer_num_iters={'lbfgs': budget.ik_iterations}, random_seed=budget.random_seed)
         reference_cfg.use_lm_seed = reference_cfg.exit_early = False
+        # BEGIN construct the configured reference solver once in its owner.
+        # cuRobo owns reset/capture on request rebinding. This process setting
+        # is established before allocating its graph-enabled reference solver.
+        import curobo.runtime as runtime
+        runtime.cuda_graph_reset = True
+        reference_cfg = configure_reference_ik(reference_cfg)
         self.reference_ik = InverseKinematics(reference_cfg)
+        self.reference_ik_runtime = dict(
+            effective=reference_ik_configuration(self.reference_ik.config),
+            runtime=dict(cuda_graphs=runtime.cuda_graphs,
+                         cuda_graph_reset=runtime.cuda_graph_reset,
+                         torch_cuda_build=torch.version.cuda),
+            configured_iteration_limit=budget.ik_iterations,
+            event_ik_iteration_limits={value.solver_name:value.num_iters
+                for value in self.ik.config.optimizer_configs},
+            scope='PreferencePlanner-owned reference configuration; one native construction')
+        # END the original backend owns reuse, request rebinding and cleanup.
         # Native allocation is now resident; enforce the original physical caps
         # against measured usage, without charging the admission allowance twice.
         require_device_memory(torch, self.device_cfg.device, native_bytes=0,

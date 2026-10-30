@@ -92,3 +92,5 @@ manipulation 功能位姿参考中的 `is_initial_relative_rotation_rpy` 选择�
 
 
 接受区域到功能坐标的接口在 [输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md) 中定义。正式入口传入技能表示已有的 `kind`；`manipulation` 的交互区域 F 使用接受区域的观测中心与声明几何方向，`grasp` 保持源功能坐标的 Sim(3) 传播。区域数值推断、源技能运动及后续参考/规划使用各自明确的数据契约。
+
+通用请求装配、规划器运行设置的归属、固定机器人资源及物理环境/评价输入的调用关系见[通用运行适配](docs/planner-architecture/12-shared-runtime-adapters.md)。

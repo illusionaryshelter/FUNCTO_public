@@ -1,0 +1,38 @@
+{
+  "workspace_root": "/home/shelter/recovery",
+  "segments": [
+    {
+      "id": "segment_003",
+      "program_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/planning-inputs-002/program.json",
+      "snapshot": {
+        "views": [
+          {
+            "id": "view_a",
+            "rgb_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound/view_a/rgb.png",
+            "depth_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound/view_a/depth_m.npy",
+            "calibration_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound/view_a/calibration.json"
+          },
+          {
+            "id": "view_b",
+            "rgb_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound/view_b/rgb.png",
+            "depth_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound/view_b/depth_m.npy",
+            "calibration_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/grounding-scene-entry-bound/view_b/calibration.json"
+          }
+        ],
+        "feedback_path": "/home/shelter/recovery/FUNCTO_public/scene/drawer_original/requests/initial-feedback.json",
+        "reference_frame": "world"
+      },
+      "grounding": {
+        "status": "accepted_observed_region",
+        "candidates": [
+          {
+            "id": "current_prediction",
+            "scene_path": "/home/shelter/recovery/sim-version-plans/2026-10-24-upper-drawer-block-visibility/planning-inputs-002/scene.json"
+          }
+        ]
+      },
+      "source_library_segment": "segment_003"
+    }
+  ],
+  "source_recording": "/home/shelter/recovery/collect/scripted_recordings/20260927T135735_590b9b7c"
+}
