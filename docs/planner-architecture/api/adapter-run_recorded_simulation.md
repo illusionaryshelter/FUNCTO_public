@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_simulation.py` 实现契约
 
-代码基线：`9cdb433`。
+代码基线：`3266476`。
 职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_read`
