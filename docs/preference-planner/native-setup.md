@@ -2,7 +2,7 @@
 
 本文对应 `native_setup.py`。共享基础代码来自 FUNCTO `d3100d0` 的 `_ik_manager_type`、`_ConstrainedPlanner._initialize` 和 `_ConstrainedPlanner._rank_ik_candidates`，其余运动学、时钟、资源管理与场景查询函数通过原接口调用。
 
-原事件成本代码基线：`1323d81`；本次普通参考运行配置随本提交实现，提交后的实际实现编号由同内容文档提交登记。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
+代码基线：`1e21ae6`；本次为同代码内容的文档登记。本文描述 `manipulation/preference_planner/` 的当前实现；原规划组件基线为 `d3100d0`。
 
 本组件为一个已绑定运动块构造普通参考 IK 和事件 IK。普通参考 IK 沿源运动建立关节初始化样本；事件 IK 在声明事件处产生任务候选。IK 在指定事件时刻提出机器人关节构型，作为连接搜索和整条轨迹求解的数值输入。输入包括 `PlanningProblem`、现场观测建立的场景、测得的入口关节状态、机器人标定和固定官方本体模型、原 `PlanningBudget`，以及已有事件时钟。输出包括驻留的原生 IK 对象、事件候选构型、每个候选的原静态判定证据及位姿偏好成本。
 

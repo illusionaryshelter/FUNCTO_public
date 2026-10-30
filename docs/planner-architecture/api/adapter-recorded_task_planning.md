@@ -384,4 +384,4 @@ torch.cuda.max_memory_allocated
 torch.cuda.max_memory_reserved
 ```
 
-当前后端调度及 preference 完成证据序列化随本提交更新；输入输出与调用关系见[通用运行适配](../12-shared-runtime-adapters.md)。
+当前后端调度及 preference 完成证据序列化代码基线为 `1e21ae6`；输入输出与调用关系见[通用运行适配](../12-shared-runtime-adapters.md)。

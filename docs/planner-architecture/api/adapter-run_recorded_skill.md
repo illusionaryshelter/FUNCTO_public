@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-原设备接口代码基线：`3266476`；后端构造参数与返回值随本提交更新，实际编号由同内容文档提交登记。
+代码基线：`1e21ae6`；本次为同代码内容的文档登记。
 职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
