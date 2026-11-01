@@ -2,7 +2,7 @@
 
 `manipulation.direct_planner` 将完整工具参考、具名机器人入口、任务关系和现场观测模型组成一次整段 C² 关节轨迹优化。其公开输出为原 `PlanningResult`：接受的关节/手指曲线、原执行绑定、请求账本，以及能够定位数值失败与几何条件的诊断记录。
 
-数值来源是独立实验代码基线 `e0245c1`，本组件把其中 25 个计算模块组织为库内包。初始化、目标与约束、数值坐标、IPOPT 配置和候选结果保留原计算。模块迁移的独立语法核对记录在 `sim-version-plans/2026-11-01-functo-direct-planner-integration/migration-checks.json`，日期实验记录与原输入对照保存在该独立实验目录。
+库内实现基线为 `e254f61`，本次文档登记保持该实现的代码内容。数值来源是独立实验代码基线 `e0245c1`，本组件把其中 25 个计算模块组织为库内包。初始化、目标与约束、数值坐标、IPOPT 配置和候选结果保留原计算。模块迁移的独立语法核对记录在 `sim-version-plans/2026-11-01-functo-direct-planner-integration/migration-checks.json`，日期实验记录与原输入对照保存在该独立实验目录。
 
 本组件使用 CasADi/IPOPT/MUMPS 完成数值优化；SciPy 提供有界最小二乘、区间求根及稀疏计算；Pinocchio 提供机器人运动学，Coal 提供官方机器人实体距离，Warp/Torch 提供场批量查询，Numba 编译最近点到关节的一阶导数。FUNCTO 原任务、参考、曲线、连续关节域、声明关系、机器人模型、预算和执行绑定承担各自数据职责。
 
