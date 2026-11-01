@@ -14,7 +14,7 @@
 
 新增组件及完成证据、纯前向运动学代码基线为 `c289890`，详细输入、坐标、API 和调用关系见 [声明位姿偏好规划器](docs/preference-planner/README.md)。以下原组件章节继续描述原入口；新增组件的覆盖方法与独立生命周期由其文档列明。
 
-`manipulation.direct_planner` 提供独立的 `DirectPreferenceBackend` 与 `DirectPreferencePlanner`，实际代码基线为 `e254f61`。该分支对完整参考拟合数值初值，以同点共享的任务、注册模型几何和连续关节条件组成稀疏 IPOPT 问题；交付本次计算中目标最低的原条件可行点。输入继续使用原 `PlanningProblem`、`OnlinePlanningScene`、具名机器人反馈及官方机器人模型，输出使用原 `PlanningResult` 和执行绑定。算法、数据语义、公开调用和逐模块 API 见[直接关节轨迹规划器](docs/direct-planner/README.md)。
+`manipulation.direct_planner` 提供独立的 `DirectPreferenceBackend` 与 `DirectPreferencePlanner`，迁移代码基线为 `e254f61`，当前候选出口的位姿精度语义见组件架构。该分支对完整参考拟合数值初值，以同点共享的任务、注册模型几何和连续关节条件组成稀疏 IPOPT 问题；优先选取本次计算中目标最低的原条件可行点。最终候选的位姿事件超限保存为独立事后警告，其余任务、关节及现场条件形成交付判定；优化中的名义位姿约束保留。输入继续使用原 `PlanningProblem`、`OnlinePlanningScene`、具名机器人反馈及官方机器人模型，输出使用原 `PlanningResult` 和执行绑定。算法、数据语义、公开调用和逐模块 API 见[直接关节轨迹规划器](docs/direct-planner/README.md)。
 
 ## 组件与调用关系
 

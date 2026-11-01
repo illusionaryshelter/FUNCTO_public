@@ -97,7 +97,28 @@ def evaluate_candidate(planner, trajectory, *, record_work, objective):
     with torch.no_grad():
         terms = planner.problem.residuals(*tool, computation.progress, q, names, dq,
             trajectory_time=computation.times, tool_linear_velocity=twist[0], tool_angular_velocity=twist[1])
-    residuals = {name: _maximum(value) for name, value in terms.items()}
+    # BEGIN final pose accuracy is posthoc evidence, independent of delivery.
+    # The optimizer still consumes the original required pose-event constraints.
+    # Here their metric excess is retained separately so neither the candidate
+    # verdict nor execution_binding's validation violations recreates a pose gate.
+    pose_residuals = {name: _maximum(value) for name, value in terms.items()
+                      if name.startswith('function_pose:')}
+    residuals = {name: _maximum(value) for name, value in terms.items()
+                 if not name.startswith('function_pose:')}
+    with torch.no_grad():
+        measurements = planner.problem.measurements(*tool, computation.progress,
+            trajectory_time=computation.times)
+    pose_accuracy = dict(
+        status='warning' if any(not np.isfinite(value) or value > 0.
+            for value in pose_residuals.values()) else 'within_tolerance',
+        scope='Posthoc candidate pose-event accuracy; original nominal solver constraints retained',
+        residuals=pose_residuals,
+        maximum_absolute_measurements={name: _maximum(value.abs())
+            for name, value in measurements.items() if name.startswith('function:')},
+        goals=[dict(goal_id=['pose_events', index], progress=goal.progress,
+            component_tolerances=goal.component_tolerances)
+            for index, goal in enumerate(planner.problem.pose_events)])
+    # END all remaining task, joint and scene conditions keep their own verdict.
     issues = planner.problem.verification_issues(computation.progress)
     residuals['query_completeness'] = float(bool(issues))
     validation = planner._candidate_domain_validation(trajectory)
@@ -114,7 +135,7 @@ def evaluate_candidate(planner, trajectory, *, record_work, objective):
     for index, row in enumerate(geometry.bound.records):
         collision[row['component']] = max(collision.get(row['component'], 0.), float(geometry.spatial_values[index]))
     residuals['process_scene'] = max(collision.values(), default=0.)
-    report = dict(**objective, residuals=residuals, scene_components=scene,
+    report = dict(**objective, residuals=residuals, pose_accuracy=pose_accuracy, scene_components=scene,
         collision_residuals=collision, scene_update_residuals={},
         coverage_residuals={k: v for k, v in scene.items() if k.startswith('unknown/')},
         conditional_unknown_residuals=conditional, owner_coverage=coverage,
@@ -134,6 +155,7 @@ def evaluate_candidate(planner, trajectory, *, record_work, objective):
     planner.last_validation = validation if report['accepted'] else None
     planner.last_candidate_report = report
     planner.candidate_history.append(dict(accepted=report['accepted'], residuals=deepcopy(residuals),
+        pose_accuracy=deepcopy(pose_accuracy),
         objective_components=deepcopy(report['objective_components']), controls=full.tolist()))
     planner.candidate_evaluations.append(dict(completed=True, accepted=report['accepted'],
         elapsed_seconds=perf_counter()-started, scope=validation['scope']))

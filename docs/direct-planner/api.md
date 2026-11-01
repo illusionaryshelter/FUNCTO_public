@@ -393,7 +393,7 @@
 
 [源码](../../manipulation/direct_planner/candidate_result.py)。输入：求解器保留的 ComputationPoint、其原曲线、任务/场景声明、连续关节域和统一目标。
 
-计算和输出：消费同点原任务与几何值，补齐原连续域、末段及声明关系信息，形成原绑定接口消费的接受/拒绝结果及具体证据。
+计算和输出：消费同点原任务与几何值，补齐连续域、末段及声明关系信息。位姿事件的原超限、实际误差和容差进入独立 `pose_accuracy` 事后警告；其余条件组成接受/拒绝结果和执行绑定的违反量。
 
 直接包内依赖：原 FUNCTO / 数值库接口。包内调用组件：`direct_preference`。
 
@@ -401,7 +401,7 @@
 |---|---|
 | `_maximum(value)` | 消费同点原任务与几何值，补齐原连续域、末段及声明关系信息，形成原绑定接口消费的接受/拒绝结果及具体证据。 |
 | `scene_conditions(point)` | Evaluate declared relationship and unknown policy on retained states. |
-| `evaluate_candidate(planner, trajectory, *, record_work, objective)` | Form one finite-query verdict and the exact curve's binding metadata. |
+| `evaluate_candidate(planner, trajectory, *, record_work, objective)` | 输出本次曲线的物理/任务条件判定、独立位姿精度警告和执行绑定元数据；名义优化约束仍由 PlanningProblem 原接口提供。 |
 
 ## shared_solver：CasADi/IPOPT 与稀疏回调
 
