@@ -2,15 +2,15 @@
 
 `manipulation.direct_planner` 将完整工具参考、具名机器人入口、任务关系和现场观测模型组成一次整段 C² 关节轨迹优化。其公开输出为原 `PlanningResult`：接受的关节/手指曲线、原执行绑定、请求账本，以及能够定位数值失败与几何条件的诊断记录。
 
-当前实现代码基线为 `dc0b0ea`，本次文档登记保持该实现的代码内容；原迁移基线为 `e254f61`。候选出口将位姿事件精度保存为事后警告。数值来源是独立实验代码基线 `e0245c1`，本组件把其中 25 个计算模块组织为库内包。初始化、目标与约束、数值坐标及 IPOPT 配置保留原计算。模块迁移的独立语法核对记录在 `sim-version-plans/2026-11-01-functo-direct-planner-integration/migration-checks.json`，日期实验记录与原输入对照保存在该独立实验目录。
+当前实现由本次合并代码提交提供（提交完成后登记实际编号）。性能实现来源为独立实验 `50e4954`，其支撑半空间预消元、解析 Jacobian 批量填槽及一阶运动学计算现由本库维护。公开配置与通用输入共同确定求解；日期验收记录位于 `sim-version-plans/2026-11-02-functo-presolve-integration`。
 
-本组件使用 CasADi/IPOPT/MUMPS 完成数值优化；SciPy 提供有界最小二乘、区间求根及稀疏计算；Pinocchio 提供机器人运动学，Coal 提供官方机器人实体距离，Warp/Torch 提供场批量查询，Numba 编译最近点到关节的一阶导数。FUNCTO 原任务、参考、曲线、连续关节域、声明关系、机器人模型、预算和执行绑定承担各自数据职责。
+本组件使用 CasADi/IPOPT/MUMPS 完成数值优化；SciPy 提供有界最小二乘、区间求根及稀疏计算；Pinocchio 提供机器人运动学，Coal 提供官方机器人实体距离，Warp/Torch 提供场批量查询，Numba 编译最近点到关节的一阶导数；mpmath.iv 对支撑半空间的静态蕴含上界进行区间计算。FUNCTO 原任务、参考、曲线、连续关节域、声明关系、机器人模型、预算和执行绑定承担各自数据职责。
 
 编译缓存由各数值库及调用方的标准设置管理。`BatchDistance` 调用 `warp.init()`，沿用调用方已有的 `warp.config.kernel_cache_dir` 或 Warp 读取的 `WARP_CACHE_PATH`；库内数值模块不绑定实验目录。Numba 的编译缓存随该模块及运行环境设置保存。
 
 ## 计算主线
 
-输入任务和现场模型经后端绑定形成固定物理时钟、曲线基和事件侧。初始化把末端提案拟合到完整参考，按同一原问题的总违反量与目标排序。一个数值点先共享关节状态、连杆位姿和关节导数，再计算完整目标、任务、几何及连续关节条件；稀疏导数交给 IPOPT。求解保留已计算点中目标最低的原条件可行点，候选出口使用其原数值与同一导出曲线形成执行绑定。
+输入任务和现场模型经后端绑定形成固定物理时钟、曲线基和事件侧。初始化把末端提案拟合到完整参考，按同一原问题的总违反量与目标排序。一个数值点先共享关节状态、连杆位姿和关节导数，再计算完整目标、任务、几何及连续关节条件；稀疏导数交给 IPOPT。求解保留已计算点中目标最低的保留求解约束行可行点，候选出口使用其原数值与同一导出曲线形成执行绑定。
 
 ```mermaid
 flowchart TD
@@ -46,7 +46,7 @@ flowchart TD
 
 ## 请求与初始化
 
-公开入口位于 `manipulation.direct_planner`。`bind_pose_objectives(problem, declarations)` 使用原事件声明接口，将 required/prior 角色和尺度绑定到 `PlanningProblem`。`ReferenceObjective` 显式声明完整参考的位置/旋转尺度、相对权重、工具角运动权重和关节运动权重。`DirectPreferenceBackend(robot, robot_validator=..., budget=..., reference_objective=..., initialization=...)` 持有这些声明及原后端资源，调用 `backend.plan(problem, scene)` 返回原 `PlanningResult`。调用方在请求结束后调用 `backend.close()`。
+公开入口位于 `manipulation.direct_planner`。`bind_pose_objectives(problem, declarations)` 使用原事件声明接口，将 required/prior 角色和尺度绑定到 `PlanningProblem`。`ReferenceObjective` 显式声明完整参考的位置/旋转尺度、相对权重、工具角运动权重和关节运动权重。`DirectPreferenceBackend(robot, robot_validator=..., budget=..., reference_objective=..., initialization=..., support_presolve=True)` 持有这些声明及原后端资源，调用 `backend.plan(problem, scene)` 返回原 `PlanningResult`。调用方在请求结束后调用 `backend.close()`。
 
 `initialization` 是原初始化声明字典：`proposal_count` 指定末端提案数，`maximum_evaluations` 指定每个完整参考拟合的函数评估上限，`pose_fit_position_scale_m/pose_fit_rotation_scale_rad` 为提案位姿拟合的数值尺度。任务事件的允许误差由 `PlanningProblem` 自己提供。`plan_trajectory(problem, scene, backend=..., budget=...)` 是同一请求生命周期的显式函数入口；请求账本、取消回调、截止时刻、测量续接和已给定关节参考通过具名参数传入。
 
@@ -66,7 +66,7 @@ flowchart TD
 
 `coefficient_position_box` 利用原局部末段映射中每个完整 B 样条系数仅依赖一个自由行的结构，求出完整系数位于原关节区间的参数盒。其凸包性质为初始化曲线提供位置范围充分条件。`fit` 使用已安装 SciPy 的有界稀疏最小二乘，在这个盒内拟合每个首末连接，记录投影量、残差分项、计算次数和停止状态。主问题继续使用原连续多项式极值域。每次残差和 Jacobian 调用服从原累计请求检查。
 
-`DirectPreferencePlanner.reference_seeds` 随后建立一次 `BoundComputation`，对全部完整参考拟合提案计算原完整目标和原有符号条件。排序键依次为 `sum(max(lower−g,g−upper,0))` 和完整目标值。`fitted_connection_controls` 保留原首末连接；`reference_fits`、`problem_scores` 与 `fitted_proposal_controls` 保存整段拟合及原问题证据；`selected_proposal` 指定本次初值。该排序只选择数值初值；候选资格由主求解出口决定。同一个 `numerical_problem` 继续传入 `solve_trajectory`，其目标、任务、几何、物理域、稀疏结构在初始化与主求解之间相同。初始化计算进入累计请求墙钟和各生产函数计时，实际主求解调用处计入 `trajectory_solves`。
+`DirectPreferencePlanner.reference_seeds` 随后建立一次 `BoundComputation`，对全部完整参考拟合提案计算原完整目标和原有符号条件。排序键依次为 `sum(max(lower−g,g−upper,0))` 和完整目标值。`fitted_connection_controls` 保留原首末连接；`reference_fits`、`problem_scores` 与 `fitted_proposal_controls` 保存整段拟合及原问题证据；`selected_proposal` 指定本次初值。该排序只选择数值初值；候选资格由主求解出口决定。同一个 `numerical_problem` 继续传入 `solve_trajectory`。目标、任务值、几何和物理域共享同一生产函数；初始化使用完整评分行，主求解使用下文定义的保留行。`PlanningBudget.trajectory_iterations` 是用户定义的单次主求解迭代上限，默认 60，原准入范围为 1..300。记录运行器 `--trajectory-iterations` 的默认值直接读取该字段。`DirectPreferencePlanner.optimize` 将预算传给 `solve_trajectory`，最终设置 `ipopt.max_iter`；原收敛条件可在上限前终止。初始化的函数评估预算与累计请求秒数分别保留自己的职责。初始化计算进入累计请求墙钟和各生产函数计时，实际主求解调用处计入 `trajectory_solves`。
 
 ## 曲线、手指与共同状态
 
@@ -74,7 +74,7 @@ flowchart TD
 
 `nominal_hand_geometry.bind_position_controlled_finger_geometry` 接收原手指指令、条件和事件时钟，构造声明的位置控制模型。已建立的接触/持有区间与释放后的自由手指段分别使用原模型语义；手指编码器、控制目标和持物声明具有各自来源。
 
-`DifferentiablePinKinematics` 封装同一注册模型的批量 FK 与关节导数。`support_linearization.linearized_robot_state` 将 q/dq、名义手指状态、基座标定和 TCP 偏移组合为一个共同机器人状态，同时返回参考连杆 Jacobian。一个数值点的目标、任务和几何共享这批状态。
+`DifferentiablePinKinematics` 封装同一注册模型的批量 FK 与关节导数。`support_linearization.linearized_robot_state` 将 q/dq、名义手指状态、基座标定和 TCP 偏移组合为一个共同机器人状态，同时返回参考连杆 Jacobian。一个数值点的目标、任务和几何共享这批状态。其基类为库内 `manipulation.pin_kinematics.PinKinematics`；需要速度导数时调用四参数 `pin.computeForwardKinematicsDerivatives(model,data,q,dq)`，提供位姿、线/角速度及 q/dq 的一阶导数。
 
 ## 共同目标与任务导数
 
@@ -84,9 +84,21 @@ flowchart TD
 
 `DirectComputation.shared_context` 建立共同状态，`task_linearization` 调用通用任务 API；`objective_components` 在同一状态上求上述目标。`BoundComputation` 一次绑定固定的任务、几何和物理行结构。`ConstraintEnvelope` 按原注册实体对与声明条件合并几何时刻行：原 gₖ 全部不大于零与组内最大值不大于零等价。每组保留原行身份、全部可能系数列的并集和当前胜出行，`select` 返回最大值，`jacobian_values` 将胜出原行的导数写入该并集。相等时选择原顺序第一行；切换处使用该活动分支的一阶值。原 `GeometryPoint` 仍保存所有时刻、事件侧及区间见证，候选报告直接读取这些未合并数值。`evaluate` 返回 `ComputationPoint`，后者保留目标值、任务行、几何行、关节行以及用于候选结果的独立数值状态。`objective_gradient/jacobian_values` 按需计算一次并缓存；导数消费后释放 Torch 计算图，候选诊断只保留已分离的数值。
 
-`support_linearization.task_linearization` 对现有支撑计算建立解析因子；`SupportLinearization.row_values` 只产生请求的系数列。`normalized_pose_event` 将已声明位置事件写为平方误差除以原容差平方再减一，将全旋转与摆动/有限转动写为等价的四元数弦距条件。零宽转动等式保持原 signed-yaw 值。它只替换任务生产者实际输出的对应不等式，原掩码、行身份和事件容差不变；原任务残差仍用于米制/弧度报告。其他任务项保持原自动微分关系。`SparseTaskRows` 根据原行名称及声明确定实际依赖列；`select_values` 读取同一任务值，`jacobian_values` 将各因子写入固定稀疏槽。`material_hull_indices` 对技能材料点的线性支撑条件取原点集合的凸包索引，保留同一线性极值和未解析仿射厚度。
+`support_linearization.task_linearization` 对现有支撑计算建立解析因子 `SupportLinearization`，其中 `joint_jacobian[row,joint]` 是材料半空间对事件处具名关节的导数，`coefficient_row[control]` 是原曲线基与末段仿射映射的乘积。`normalized_pose_event` 将已声明位置事件写为平方误差除以原容差平方再减一，将全旋转与摆动/有限转动写为等价的四元数弦距条件。零宽转动等式保持原 signed-yaw 值。它只替换任务生产者实际输出的对应不等式，原掩码、行身份和事件容差不变；原任务残差仍用于米制/弧度报告。其他任务项保持原自动微分关系。`SparseTaskRows` 根据原行名称及声明确定实际依赖列；`select_values` 读取同一任务值，`jacobian_values` 按每组固定的槽、局部行、关节列和系数列索引，一次写入 `H[rows,joints] * B[coefficients]`。解析组之间的其他任务行继续采用原自动微分。组索引在绑定时构造，查询时直接批量填写。`material_hull_indices` 对技能材料点的线性支撑条件取原点集合的凸包索引，保留同一线性极值和未解析仿射厚度。
 
 `SparsePhysicalRows.evaluate` 继续求原三次多项式的连续位置、速度、加速度和 jerk 极值。`PhysicalPoint.jacobian_values` 将实际极值处的导数写入稀疏槽。`SparseRows` 统一行、列和 CasADi CCS 存储；`coefficient_columns` 根据原样条基与具名关节依赖产生列集合。
+
+## 可选支撑半空间预消元
+
+`DirectPreferenceBackend.support_presolve` 是后端构造时的布尔参数，默认 `True`。`bind_request` 将它传入 `DirectPreferencePlanner`，后者在 `_bind_computation` 中传入 `DirectComputation`；`BoundComputation` 将该值交给 `SparseTaskRows`。后端重绑定新请求时沿用此配置。`False` 选择全部原变量任务行，`True` 根据保留的位置条件计算可删除的支撑半空间行。两种设置共用同一个求解器、初始化评分和完整候选评价。
+
+`support_presolve.implied_support_rows` 的输入是完成原固定行检查之后的变量任务行、解析支撑因子、原材料点索引和物理查询时钟。它只使用行集合中实际保留的 required 位置球。`_first_event_query` 确定事件首次物理查询；前提位置球和支撑条件必须在同一查询列成立。输出为删除掩码与证明记录：条件身份、材料源行、位置前提、物理查询列及半空间上界。
+
+以 W 表示标定世界系，E 表示 TCP，C 表示材料系，F 表示功能系，材料点满足 `x = p_F + R_E(R_EC c + t_EC − t_EF)`。固定半径 `r = ‖R_EC c + t_EC − t_EF‖` 在旋转下不变。保留的位置球 `‖p_F−p_target‖≤ε` 蕴含半空间上界 `aᵀx+b ≤ aᵀp_target+b+‖a‖(ε+r)`。`support_halfspace_bounds` 将原 body 与 footprint 条件转为这一表达，保留原 surface.origin、法向长度、margin 和 numerical.position_m。功能姿态在半径范数中消去。
+
+固定变换、点积与范数用现有 mpmath.iv 外包区间计算；最终正数乘积和加法以 `numpy.nextafter(...,+∞)` 外舍入。上界严格小于零时删除相应求解行；其他行保留。材料索引来自 `material_hull_indices`，完整技能材料点、支撑与功能声明继续由原任务接口持有。最终任务评价直接计算完整原条件。
+
+`SparseTaskRows.scoring_source_indices/scoring_row_keys` 保存消元前的完整变量任务行，`solver_selection` 表示送入 NLP 的行选择。`ComputationPoint` 用同一次任务生产同时建立 `scoring_constraint_values` 与 `constraint_values`；几何最大值和连续关节条件在两者中相同。`initialization_score` 在完整评分行上计算违反量及目标，`shared_solver` 消费保留行及其稀疏导数。`support_presolve` 报告保存 `enabled`、删除行数、证明和耗时；`maximum_solver_violation/solver_conditions_feasible/solver_constraint_scope` 标注数值可行性对应的求解行范围。删除蕴含行保留声明模型的可行集合，并可改变不可行区域中的优化路径。
 
 ## 固定批量几何
 
@@ -118,9 +130,9 @@ flowchart TD
 
 `shared_solver._Oracle` 以精确相等的原系数共享同点值和导数，`_Jacobian` 把固定稀疏数值交给 CasADi。`solve_trajectory` 接收初始化已建立的 `BoundComputation`，以 `C = C_initial + S z` 将 IPOPT 的 z 映射为原系数 C；初始 z 为零。目标、任务、几何和连续关节域都在 C 上调用原生产函数，CasADi 对固定线性变换应用导数链。迭代记录、返回系数和候选点均经同一个坐标函数恢复，报告保存实际块条件数与准备时间。
 
-唯一数值求解器为 IPOPT，线性子问题由 recovery 中已安装的 MUMPS 分解。外部几何提供一阶导数，完整拉格朗日曲率采用 IPOPT 的六对有限记忆更新；目标直接使用显式物理尺度。变量变换只定义数值坐标。原约束界限保持不变，数值约束容差为 1e−9，常规停止精度为 1e−6。库内可接受停止要求整体最优性误差与对偶误差不高于 1、原约束违反不高于 1e−9、互补误差不高于 1e−3、目标相对变化连续三次不高于 1e−3。求解中的任务和场景可行性按原零界限计算。`iteration_records` 为每次迭代保存原不等式违反、完整目标和累计求解秒数，首次原数值可行迭代单独标注；IPOPT 含松弛变量的内部残差属于原生统计。原累计时间、取消和资源检查覆盖回调与生产函数边界。原生 IPOPT 返回后先保存统计，再处理请求中断；失败保存最后完整点和原异常。
+唯一数值求解器为 IPOPT，线性子问题由 recovery 中已安装的 MUMPS 分解。外部几何提供一阶导数，完整拉格朗日曲率采用 IPOPT 的六对有限记忆更新；目标直接使用显式物理尺度。变量变换只定义数值坐标。原约束界限保持不变，数值约束容差为 1e−9，常规停止精度为 1e−6。库内可接受停止要求整体最优性误差与对偶误差不高于 1、原约束违反不高于 1e−9、互补误差不高于 1e−3、目标相对变化连续三次不高于 1e−3。求解中的保留任务行、场景与关节条件按原零界限计算。`iteration_records` 为每次迭代保存保留行不等式违反、完整目标和累计求解秒数，首次保留行数值可行迭代单独标注；IPOPT 含松弛变量的内部残差属于原生统计。原累计时间、取消和资源检查覆盖回调与生产函数边界。原生 IPOPT 返回后先保存统计，再处理请求中断；失败保存最后完整点和原异常。
 
-`_Oracle.point` 对每个完整点检查原零界限并保存本次调用中目标最低的可行点；`feasible_improvements` 记录实际目标、时间、试点身份和约化系数。求解继续使用声明迭代预算与原 IPOPT 停止条件。`solve_trajectory` 优先交付最低目标可行点；若全部点不可行，则交付末点及其数值失败记录，由候选出口按各条件的职责形成结果。数值收敛状态、库停止原因和选择可行状态分别记录。当前点的状态、原几何结果和全控制系数共同交给候选出口。
+`_Oracle.point` 对每个完整点按保留行检查原零界限并保存本次调用中目标最低的可行点；`feasible_improvements` 记录实际目标、时间、试点身份和约化系数。求解继续使用声明迭代预算与原 IPOPT 停止条件。`solve_trajectory` 优先交付最低目标可行点；若全部点不可行，则交付末点及其数值失败记录，由候选出口按各条件的职责形成结果。数值收敛状态、库停止原因和选择可行状态分别记录。当前点的状态、原几何结果和全控制系数共同交给候选出口。
 
 `DirectPreferencePlanner.evaluate_candidate` 显式调用 `candidate_result.evaluate_candidate`，读取本次求解保留的同一系数、机器人状态和几何结果。原任务残差给出米制/弧度错误，原 `_candidate_domain_validation` 给出连续关节极值，`_hold_polynomial_report` 检查原终端后缀。`scene_conditions` 计算声明接触、初始支撑、名义手指及运动实体的观测/条件未知区域。该候选出口形成一次原执行绑定所需的验证元数据，并将选中点自己的完整几何报告设为本次导出记录，使网页空间见证与交付曲线相同。几何结论覆盖原有限物理查询与固定局部坐标，关节范围覆盖连续多项式。候选结果直接使用这一计算范围及相应空间见证。
 
@@ -136,11 +148,15 @@ from manipulation.direct_planner import (
     DirectPreferenceBackend, ReferenceObjective, bind_pose_objectives,
 )
 
+from manipulation.planning import PlanningBudget
+
+budget = PlanningBudget(trajectory_iterations=60)
 problem = bind_pose_objectives(problem, pose_declarations)
 objective = ReferenceObjective(**reference_objective_declaration)
 backend = DirectPreferenceBackend(
     robot, robot_validator=robot_validator, budget=budget,
     reference_objective=objective, initialization=initialization_declaration,
+    support_presolve=True,  # False 使用完整原变量任务行
 )
 try:
     result = backend.plan(problem, scene)
@@ -154,6 +170,6 @@ finally:
 
 `tests/direct_planner` 保存独立目标表达式、任务值与导数、连续关节极值、符号/原生运动学、CPU/CUDA 场值与支持域、官方实体距离、空间见证、区间驻点、初始化、累计请求账本及候选出口的检查。测试直接导入本包；测试数据使用库内小型机器人和观测场夹具。
 
-`BoundComputation.produce` 的计数覆盖同一数值问题的初始化评分与主求解。IPOPT 入口计时记录实际值/导数回调；同点共享会把计算计入首先请求它的入口。目标子项包含于目标父项，几何子阶段包含于几何父项。生命周期墙钟分别记录绑定、入口核验、初始化、主求解及候选交付；调用方另行记录输入准备与写盘。
+`BoundComputation.produce` 的计数覆盖同一数值问题的初始化评分与主求解。`snapshot_producers` 在 solver_binding、initialization_scored 和 main_started/main_finished 保存计数与时间快照，其差值对应实际阶段开销。IPOPT 入口计时记录实际值/导数回调；同点共享会把计算计入首先请求它的入口。目标子项包含于目标父项，几何子阶段包含于几何父项。生命周期墙钟分别记录绑定、入口核验、初始化、主求解及候选交付；调用方另行记录输入准备与写盘。
 
 求解器的最优性停止状态、原约束可行性和实际候选交付为不同字段。几何条件对应原查询时刻、有限材料点与被括住的机器人距离驻点；关节条件对应连续三次多项式。完整曲线与参考的全程形态由已归档位姿和中间记录分析。实际物理执行及其事后结果由设备/评价组件产生，规划结果保持自身来源和范围。

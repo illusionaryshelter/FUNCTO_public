@@ -7,17 +7,22 @@ process rows use their actual event/query rows. No trial Jacobian determines
 which columns exist.
 """
 
+from time import perf_counter
+
 import numpy as np
 import torch
 
 from manipulation.planning_problem import _first_event_query
 from .sparse_rows import SparseRows, coefficient_columns
+# BEGIN retained-row selection uses the ordinary task's geometric implication.
+from .support_presolve import implied_support_rows
+# END the task producer remains the complete original declaration.
 
 
 class SparseTaskRows:
     """Select declared variable rows and bind their sparse derivative slots."""
 
-    def __init__(self, computation, values, blocks, declarations, context):
+    def __init__(self, computation, values, blocks, declarations, context, *, support_presolve=True):
         self.computation = computation
         self.joints = len(computation.joint_names)
         self.variables = computation.terminal.matrix.shape[1]*self.joints
@@ -63,11 +68,52 @@ class SparseTaskRows:
                                   'finite': np.isfinite(numbers).tolist(), 'feasible': bool(feasible.all())})
                 group_offset += size
             full_offset += vector.numel()
+        # BEGIN original scoring rows and solver rows have distinct selections.
+        # Constant rows were handled above. Only variable support halfspaces
+        # implied by a retained required position row leave the NLP layout.
+        self.scoring_source_indices = np.asarray(source_indices, dtype=np.int64)
+        self.scoring_row_keys = tuple(keys)
+        # BEGIN explicit selection retains either the reduced or complete rows.
+        if support_presolve:
+            removed, presolve = implied_support_rows(computation, keys, analytic, blocks)
+        else:
+            removed = np.zeros(len(keys), dtype=bool)
+            presolve = dict(removed_task_rows=0, certificates=[], elapsed_seconds=0.,
+                scope="Complete variable task rows; support presolve disabled")
+        presolve["enabled"] = support_presolve
+        # END no automatic retry or second solver is attached to this option.
+        self.solver_selection = np.flatnonzero(~removed)
+        columns = [columns[row] for row in self.solver_selection]
+        source_indices = self.scoring_source_indices[self.solver_selection]
+        keys = [keys[row] for row in self.solver_selection]
+        analytic = {target: analytic[int(original)]
+                    for target, original in enumerate(self.solver_selection) if int(original) in analytic}
+        # END initialization retains the same original complete violation score.
         self.pattern = SparseRows(columns, self.variables)
         self.columns_by_row = self.pattern.columns_by_row
         self.source_indices = np.asarray(source_indices, dtype=np.int64)
         self.row_keys = tuple(keys)
-        self.analytic = analytic
+        # BEGIN bind each analytic product to its final sparse output slot.
+        # Factor H differentiates one task block with respect to named joints;
+        # B maps reduced spline coefficients to that event. The existing CSR
+        # pattern supplies output slots even when AD rows split the block.
+        started = perf_counter()
+        grouped = {}
+        for row, (kind, name, local) in analytic.items():
+            block = grouped.setdefault((kind, name), ([], []))
+            block[0].append(row)
+            block[1].append(local)
+        self.analytic_slots = {}
+        for key, (rows, locals_) in grouped.items():
+            slots = np.concatenate([np.arange(self.pattern.indptr[row],
+                                               self.pattern.indptr[row+1]) for row in rows])
+            counts = np.diff(self.pattern.indptr)[rows]
+            local_rows = np.repeat(locals_, counts)
+            columns_ = self.pattern.columns[slots]
+            self.analytic_slots[key] = (slots, local_rows,
+                                        columns_ % self.joints, columns_ // self.joints)
+        slot_binding_seconds = perf_counter()-started
+        # END callback work consists only of H/B gathers and one product.
         self.ad_rows = np.asarray([row for row in range(len(columns)) if row not in analytic], dtype=np.int64)
         column_slots = {}
         for local, row in enumerate(self.ad_rows):
@@ -88,6 +134,8 @@ class SparseTaskRows:
                        'fixed_task_constraints': fixed,
                        'analytic_task_rows': len(analytic),
                        'automatic_task_rows': len(columns)-len(analytic),
+                       'support_presolve': presolve,
+                       'analytic_slot_binding_seconds': slot_binding_seconds,
                        'task_jacobian_method': ('producer_local_slots_and_scalar_rows'
                            if len(self.ad_rows) < len(self.ad_column_slots)
                            else 'producer_local_slots_and_covector_columns')}
@@ -143,6 +191,12 @@ class SparseTaskRows:
         """Take the same fixed scalar selection from this point's task vector."""
         return torch.cat(values)[self.source_indices]
 
+    # BEGIN full initialization scores reuse the already produced task values.
+    def scoring_values(self, values):
+        """Return the original variable task rows before implied-row elimination."""
+        return torch.cat(values)[self.scoring_source_indices]
+    # END the final task evaluator independently retains the original declarations.
+
     def jacobian_values(self, values, controls, blocks, *, check_request):
         """Write local analytic slots or one scalar VJP directly per row.
 
@@ -153,10 +207,14 @@ class SparseTaskRows:
         """
         selected = self.select_values(values)
         result = np.empty(self.pattern.nnz)
-        for row, (kind, name, local) in self.analytic.items():
+        # BEGIN fill the same H[row,joint]*B[coefficient] products by factor.
+        for (kind, name), (slots, rows, joints, coefficients) in self.analytic_slots.items():
             check_request()
-            result[self.pattern.slices[row]] = blocks[kind][name][1].row_values(
-                local, self.columns_by_row[row])
+            factor = blocks[kind][name][1]
+            result[slots] = (factor.joint_jacobian[rows, joints]
+                             * factor.coefficient_row[coefficients])
+            check_request()
+        # END explicit indexed assignment writes into the shared result array.
         if len(self.ad_rows) < len(self.ad_column_slots):
             for row in self.ad_rows:
                 check_request()

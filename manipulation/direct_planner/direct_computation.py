@@ -26,8 +26,11 @@ from .constraint_envelope import ConstraintEnvelope
 class DirectComputation(JointComputation):
     """Bind full task rows, analytic support factors and one reference clock."""
 
-    def __init__(self, *, base, terminal, geometry, reference_objective):
+    def __init__(self, *, base, terminal, geometry, reference_objective, support_presolve=True):
         super().__init__(base=base, terminal=terminal, geometry=geometry)
+        # BEGIN propagate the public solver-row selection into fixed binding.
+        self.support_presolve = support_presolve
+        # END complete task values remain independent of this option.
         self.reference_objective = reference_objective
         # BEGIN each objective query reports its declared relationship terms.
         self.scene_relation_report = {}
@@ -125,7 +128,8 @@ class BoundComputation:
         declarations = ({}, {})
         values, blocks = self.produce('task', lambda: computation.task_linearization(
             controls, solver_rows_out=declarations, context=context))
-        self.task = SparseTaskRows(computation, values, blocks, declarations, context)
+        self.task = SparseTaskRows(computation, values, blocks, declarations, context,
+            support_presolve=computation.support_presolve)
         self.geometry = computation.geometry.bind_solver(computation.terminal)
         # BEGIN each declared entity pair supplies one equivalent inequality.
         # Original physical clocks, event sides and stationary witnesses stay
@@ -138,19 +142,31 @@ class BoundComputation:
         # END no material-exchange revision participates in solver state.
         self.physical = SparsePhysicalRows(computation.full_domain, computation.terminal)
         self.row_keys = self.task.row_keys + self.geometry_envelope.row_keys + self.physical.row_keys
+        # BEGIN initialization row identity includes the original support rows.
+        self.scoring_row_keys = self.task.scoring_row_keys + self.geometry_envelope.row_keys + self.physical.row_keys
+        # END geometric maxima and physical conditions retain the same ordering.
         self.pattern = SparseRows((*self.task.columns_by_row, *self.geometry_envelope.pattern.columns_by_row,
                                    *self.physical.columns_by_row), self.variables)
         self.lower = np.full(len(self.row_keys), -np.inf)
         self.lower[:self.task.equalities] = 0.
         self.upper = np.zeros(len(self.row_keys))
         self.fixed_feasible = self.task.fixed_feasible
+        # BEGIN phase snapshots separate initializer work from main callbacks.
+        self.producer_snapshots = {}
         self.report = {**self.task.report, 'solver_geometry_inequalities': len(self.geometry_envelope.row_keys),
                        'original_geometry_inequalities': len(self.geometry.row_keys),
                        'solver_physical_inequalities': len(self.physical.row_keys),
                        'solver_jacobian_nonzeros': self.pattern.nnz,
                        'solver_jacobian_shape': list(self.pattern.shape),
-                       'producer_evaluations': self.counts, 'producer_seconds': self.seconds}
+                       'producer_evaluations': self.counts, 'producer_seconds': self.seconds,
+                       'producer_snapshots': self.producer_snapshots}
         self._initial = (np.asarray(initial).copy(), controls, context, values, blocks)
+        self.snapshot_producers('solver_binding')
+
+    def snapshot_producers(self, label):
+        """Copy completed counts/times at an actual caller stage boundary."""
+        self.producer_snapshots[label] = dict(counts=self.counts.copy(), seconds=self.seconds.copy())
+        # END snapshots are passive records, never inputs to a planning decision.
 
     def produce(self, name, function):
         """Charge actual completed/failed producer work to this fixed problem."""
@@ -211,12 +227,37 @@ class ComputationPoint:
             full_controls, shared_context=context))
         self.physical = bound.produce('physical', lambda: bound.physical.evaluate(
             full_controls, check_request=bound.check_request))
-        task = bound.task.select_values(task_values).detach().numpy()
+        # BEGIN retain complete task values for initialization scoring.
+        task = bound.task.scoring_values(task_values).detach().numpy()
+        # END the same production supplies the solver selection below.
         # BEGIN the optimizer consumes grouped maxima; candidate evidence is original.
         geometry, self.geometry_winners = bound.geometry_envelope.select(self.geometry.values)
-        self.constraint_values = np.concatenate((task, geometry, self.physical.values))
+        # BEGIN one value production serves full scoring and the reduced NLP.
+        self.scoring_constraint_values = np.concatenate((task, geometry, self.physical.values))
+        self.constraint_values = np.concatenate((task[bound.task.solver_selection], geometry, self.physical.values))
+        # END discarded support rows never change initialization branch ranking.
         # END no physical or task condition is dropped by the max identity.
         self._gradient = self._jacobian = None
+
+    # BEGIN initial proposals are ranked by the original full condition set.
+    def initialization_score(self):
+        """Original sum of positive violations, then the original objective.
+
+        Task equalities occupy the leading rows and have zero lower/upper
+        bounds; all other original task, geometry and physical rows are <= 0.
+        This consumes completed arrays, without additional FK or geometry.
+        """
+        values = self.scoring_constraint_values
+        violation = np.maximum(values, 0.)
+        equalities = self.bound.task.equalities
+        violation[:equalities] = np.abs(values[:equalities])
+        worst = int(np.argmax(violation))
+        return dict(total_positive_violation=float(violation.sum()),
+            maximum_positive_violation=float(violation[worst]),
+            positive_condition_count=int(np.count_nonzero(violation)),
+            worst_condition=self.bound.scoring_row_keys[worst],
+            objective=self.objective_value, objective_components=self.objective_components)
+    # END IPOPT callbacks and derivatives use the separate retained-row vector.
 
     def objective_gradient(self):
         """Use the shared native first-order graph once for the complete cost."""

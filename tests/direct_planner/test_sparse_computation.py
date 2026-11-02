@@ -175,8 +175,10 @@ def test_support_hull_keeps_source_points_and_matches_selected_original_rows():
         selected = original_groups[1][name].reshape(-1)[factor.source_rows]
         torch.testing.assert_close(values[1][span], selected.detach(), rtol=0., atol=0.)
         expected_blocks.append(selected)
-        actual_blocks.append(np.stack([factor.row_values(row, np.arange(initial.size))
-                                       for row in range(len(factor.source_rows))]))
+        # BEGIN expand the current factor protocol for this independent AD check.
+        actual_blocks.append((factor.coefficient_row[None, :, None]
+            * factor.joint_jacobian[:, None, :]).reshape(-1, initial.size))
+        # END production stores the factored arrays and fills sparse slots.
     expected = task_jacobian(torch.cat(expected_blocks), controls,
                             check_request=lambda: None, admit_work=lambda: None)
     np.testing.assert_allclose(np.vstack(actual_blocks), expected, rtol=2e-12, atol=2e-12)

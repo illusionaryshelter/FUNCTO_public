@@ -32,7 +32,7 @@ from manipulation.direct_planner.material_hull import material_hull_indices
 from manipulation.direct_planner.sparse_physical import SparsePhysicalRows
 from manipulation.direct_planner.sparse_task import SparseTaskRows
 from manipulation.direct_planner.terminal_binding import bind_terminal_hold
-from manipulation.direct_planner.support_linearization import SupportLinearization, linearized_robot_state, task_linearization
+from manipulation.direct_planner.support_linearization import linearized_robot_state, task_linearization
 from manipulation.goals import SupportSurface
 from manipulation.gripper_trajectory import NominalFingerGeometry
 from manipulation.physical_joint_domain import CubicJointDomain
@@ -119,8 +119,10 @@ def assemble(values, blocks, controls):
     for size, group in zip(sizes, blocks):
         for row_slice, factor in group.values():
             target = slice(offset + row_slice.start, offset + row_slice.stop)
-            result[target] = np.stack([factor.row_values(row, np.arange(controls.numel()))
-                                       for row in range(len(factor.joint_jacobian))])
+            # BEGIN independent dense reference expands the two factor arrays.
+            result[target] = (factor.coefficient_row[None, :, None]
+                             * factor.joint_jacobian[:, None, :]).reshape(-1, controls.numel())
+            # END the library writes only its fixed sparse output slots.
             remaining[target] = False
         offset += size
     vector = torch.cat(values)
@@ -159,7 +161,7 @@ def original_values_in_solver_units(bound, controls, *, masks):
 
 
 @pytest.mark.parametrize('analytic', [True, False])
-def test_original_named_rows_mixed_components_and_reduced_columns(analytic, monkeypatch):
+def test_original_named_rows_mixed_components_and_reduced_columns(analytic):
     """Mixed body/footprint and gap/normal retain all original values and derivatives."""
     bound, initial = support_case(analytic=analytic)
     original_controls = torch.tensor(initial, dtype=torch.float64, requires_grad=True)
@@ -172,12 +174,10 @@ def test_original_named_rows_mixed_components_and_reduced_columns(analytic, monk
     controls = torch.tensor(initial, dtype=torch.float64, requires_grad=True)
     masks = ({}, {})
     before = bound.kinematics.native_calls
-    with monkeypatch.context() as patch:
-        def derivative_not_requested(*args):
-            raise AssertionError('The value producer assembled a dense support Jacobian')
-        patch.setattr(SupportLinearization, 'row_values', derivative_not_requested)
-        values, blocks = task_linearization(bound, controls, solver_rows_out=masks,
-            support_material_indices=bound.support_material_indices)
+    # BEGIN the value producer returns joint and coefficient factors directly.
+    values, blocks = task_linearization(bound, controls, solver_rows_out=masks,
+        support_material_indices=bound.support_material_indices)
+    # END the independent dense expansion below checks the factored derivative.
     assert bound.kinematics.native_calls == before + 1
     for actual, wanted in zip(values, original):
         # BEGIN independent trigonometric formulations have round-off error.
@@ -231,8 +231,12 @@ def test_analytic_values_have_no_reverse_graph_and_discarded_graphs_release():
         reference, factors = forward(consume)
         gc.collect()
         assert reference() is None
-        assert all(factor.row_values(0, np.arange(initial.size)).shape == (initial.size,)
+        # BEGIN retained factors contain only owned NumPy derivative arrays.
+        assert all(isinstance(factor.joint_jacobian, np.ndarray)
+                   and isinstance(factor.coefficient_row, np.ndarray)
+                   and factor.joint_jacobian.shape[1] * len(factor.coefficient_row) == initial.size
                    for _, factor in factors[1].values())
+        # END no removed per-row method is needed to inspect the factor lifetime.
 
 
 def finger_case():

@@ -6,7 +6,7 @@
 
 ## direct_preference：公开后端与数值规划对象
 
-[源码](../../manipulation/direct_planner/direct_preference.py)。输入：PlanningProblem、OnlinePlanningScene、官方机器人配置、验证器、预算、ReferenceObjective 与初始化声明。
+[源码](../../manipulation/direct_planner/direct_preference.py)。输入：PlanningProblem、OnlinePlanningScene、官方机器人配置、验证器、预算、ReferenceObjective、初始化声明和 support_presolve 布尔配置。
 
 计算和输出：DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。
 
@@ -14,7 +14,7 @@
 
 | API 签名 | 调用作用 |
 |---|---|
-| `DirectPreferencePlanner.__init__(self, *args, reference_objective, initialization, incoming_terminal_contract=None, **kwargs)` | DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。 |
+| `DirectPreferencePlanner.__init__(self, *args, reference_objective, initialization, incoming_terminal_contract=None, support_presolve=True, **kwargs)` | DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。 |
 | `DirectPreferencePlanner.rebind(self, problem, scene, budget, *, continuation=None, goal_identities=None)` | DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。 |
 | `DirectPreferencePlanner._controls_curve(self, controls)` | Associate the original Hermite export with its exact coefficient array. |
 | `DirectPreferencePlanner._candidate_domain_validation(self, trajectory)` | Read original continuous joint bounds and the bound terminal suffix. |
@@ -26,7 +26,7 @@
 | `DirectPreferencePlanner.optimize(self, seed, *, iterations=None)` | Solve each explicitly supplied initial coefficient array once. |
 | `DirectPreferencePlanner._expand_snapshots(self, runtime)` | DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。 |
 | `DirectPreferencePlanner._retain_diagnostic_trial(self, runtime, solve_index)` | Keep an already evaluated curve when further work is interrupted. |
-| `DirectPreferenceBackend.__init__(self, *args, reference_objective, initialization, **kwargs)` | DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。 |
+| `DirectPreferenceBackend.__init__(self, *args, reference_objective, initialization, support_presolve=True, **kwargs)` | DirectPreferenceBackend 持有请求资源；DirectPreferencePlanner 绑定参考和计算，生成初值、调用 IPOPT、提供候选与诊断；backend.plan 返回 PlanningResult。 |
 | `DirectPreferenceBackend.bind_request(self, problem, scene, *, budget, continuation=None, goal_identities=None)` | Bind the local computation while retaining resident resource checks. |
 | `DirectPreferenceBackend.plan(self, problem, scene, *, continuation=None, request_ledger=None, rebind=None, cancelled=None, deadline=None, joint_reference=None)` | Use the local initialization/optimization lifecycle with original inputs. |
 
@@ -62,7 +62,7 @@
 
 ## direct_computation：固定数值问题与同点共享
 
-[源码](../../manipulation/direct_planner/direct_computation.py)。输入：原 TrajectoryComputation、末段仿射映射、几何提供器、完整参考目标及自由曲线系数。
+[源码](../../manipulation/direct_planner/direct_computation.py)。输入：原 TrajectoryComputation、末段仿射映射、几何提供器、完整参考目标、support_presolve 配置及自由曲线系数。
 
 计算和输出：DirectComputation/BoundComputation 建立固定行列结构；ComputationPoint 保存目标、条件、稀疏导数、空间见证和导出候选所需的同点状态。
 
@@ -70,17 +70,19 @@
 
 | API 签名 | 调用作用 |
 |---|---|
-| `DirectComputation.__init__(self, *, base, terminal, geometry, reference_objective)` | DirectComputation/BoundComputation 建立固定行列结构；ComputationPoint 保存目标、条件、稀疏导数、空间见证和导出候选所需的同点状态。 |
+| `DirectComputation.__init__(self, *, base, terminal, geometry, reference_objective, support_presolve=True)` | DirectComputation/BoundComputation 建立固定行列结构；ComputationPoint 保存目标、条件、稀疏导数、空间见证和导出候选所需的同点状态。 |
 | `DirectComputation.shared_context(self, controls)` | Evaluate original states and named frame Jacobians once at this x. |
 | `DirectComputation.task(self, controls, *, solver_rows_out=None)` | Return the original complete declared task rows for inspection. |
 | `DirectComputation.task_linearization(self, controls, *, solver_rows_out=None, context=None)` | Return values and factored analytic blocks in the original row order. |
 | `DirectComputation.objective_components(self, controls, *, context=None, producer=None)` | Use one FK result for original costs and the complete TCP reference. |
 | `DirectComputation.bind_solver(self, initial, *, check_request)` | Create one fixed task/geometry/physical sparse numerical problem. |
 | `BoundComputation.__init__(self, computation, initial, *, check_request)` | DirectComputation/BoundComputation 建立固定行列结构；ComputationPoint 保存目标、条件、稀疏导数、空间见证和导出候选所需的同点状态。 |
+| `BoundComputation.snapshot_producers(self, label)` | Copy completed counts/times at an actual caller stage boundary. |
 | `BoundComputation.produce(self, name, function)` | Charge actual completed/failed producer work to this fixed problem. |
 | `BoundComputation.solver_coordinates(self, point)` | Keep coefficient conditioning separate from physical value producers. |
 | `BoundComputation.evaluate(self, controls)` | Build an exact-x point; same-point caching belongs to the solver. |
 | `ComputationPoint.__init__(self, bound, controls, context, task_values, task_blocks)` | DirectComputation/BoundComputation 建立固定行列结构；ComputationPoint 保存目标、条件、稀疏导数、空间见证和导出候选所需的同点状态。 |
+| `ComputationPoint.initialization_score(self)` | Original sum of positive violations, then the original objective. |
 | `ComputationPoint.objective_gradient(self)` | Use the shared native first-order graph once for the complete cost. |
 | `ComputationPoint.jacobian_values(self)` | Concatenate producer-owned sparse values, retaining no dense matrix. |
 
@@ -191,25 +193,42 @@
 | API 签名 | 调用作用 |
 |---|---|
 | `normalized_pose_event(requirement, position, quaternion)` | Return dimensionless inequalities for the original pose-event set. |
-| `SupportLinearization.row_values(self, row, columns)` | Fill one declared sparse row in [reduced control,named joint] order. |
 | `linearized_robot_state(computation, q, dq)` | Return original robot_tool_states products plus same-call frame J. |
 | `_support_factors(computation, requirement, robot_state, jacobians, components, material_indices)` | Pull one original event's rigid material points through frame J and W E. |
 | `task_linearization(computation, controls, *, support_material_indices, solver_rows_out=None, robot_state=None, jacobians=None)` | Return task rows, normalized event sets and factored analytic support blocks. |
+
+## support_presolve：支撑半空间的静态预消元
+
+[源码](../../manipulation/direct_planner/support_presolve.py)。输入：原变量任务行、required 位置球、同物理查询处的固定功能/材料坐标及支撑半空间。
+
+计算和输出：用区间算术计算刚性旋转不变的材料半径与半空间上界；返回被保留位置球蕴含的删行掩码与原行证明记录。
+
+直接包内依赖：原 FUNCTO / 数值库接口。包内调用组件：`sparse_task`。
+
+| API 签名 | 调用作用 |
+|---|---|
+| `_vector(values)` | Regard supplied binary floats as exact endpoints, not decimal strings. |
+| `_dot(first, second)` | Evaluate a short scalar product with outward interval rounding. |
+| `_norm(vector)` | The interval square, unlike x*x, handles intervals crossing zero. |
+| `_upper(value)` | Enclose an interval endpoint even if its precision exceeds float64. |
+| `support_halfspace_bounds(requirement, event, material_indices, numerical)` | Return body/footprint upper bounds in their original material order. |
+| `implied_support_rows(computation, row_keys, analytic, blocks)` | Select redundant rows using only actual retained required position rows. |
 
 ## sparse_task：任务稀疏系数导数
 
 [源码](../../manipulation/direct_planner/sparse_task.py)。输入：原条件掩码、支撑因子、事件时刻与曲线局部支撑结构。
 
-计算和输出：选择实际求解行并建立每行结构列；解析支撑与剩余自动微分共同填写同一稀疏数值槽。
+计算和输出：保留完整评分行，按 support_presolve 选择位置球蕴含的压缩行或全部原变量行；绑定解析索引并批量填槽，剩余行自动微分。
 
-直接包内依赖：`sparse_rows`。包内调用组件：`direct_computation`。
+直接包内依赖：`sparse_rows`, `support_presolve`。包内调用组件：`direct_computation`。
 
 | API 签名 | 调用作用 |
 |---|---|
-| `SparseTaskRows.__init__(self, computation, values, blocks, declarations, context)` | 选择实际求解行并建立每行结构列；解析支撑与剩余自动微分共同填写同一稀疏数值槽。 |
-| `SparseTaskRows._event_column(self, progress)` | 选择实际求解行并建立每行结构列；解析支撑与剩余自动微分共同填写同一稀疏数值槽。 |
+| `SparseTaskRows.__init__(self, computation, values, blocks, declarations, context, *, support_presolve=True)` | 保留完整评分行，按 support_presolve 选择位置球蕴含的压缩行或全部原变量行；绑定解析索引并批量填槽，剩余行自动微分。 |
+| `SparseTaskRows._event_column(self, progress)` | 保留完整评分行，按 support_presolve 选择位置球蕴含的压缩行或全部原变量行；绑定解析索引并批量填槽，剩余行自动微分。 |
 | `SparseTaskRows._columns(self, name, shape)` | Resolve all current generic PlanningProblem scalar row producers. |
 | `SparseTaskRows.select_values(self, values)` | Take the same fixed scalar selection from this point's task vector. |
+| `SparseTaskRows.scoring_values(self, values)` | Return the original variable task rows before implied-row elimination. |
 | `SparseTaskRows.jacobian_values(self, values, controls, blocks, *, check_request)` | Write local analytic slots or one scalar VJP directly per row. |
 
 ## sparse_physical：连续关节条件与导数
@@ -393,7 +412,7 @@
 
 [源码](../../manipulation/direct_planner/candidate_result.py)。输入：求解器保留的 ComputationPoint、其原曲线、任务/场景声明、连续关节域和统一目标。
 
-计算和输出：消费同点原任务与几何值，补齐连续域、末段及声明关系信息。位姿事件的原超限、实际误差和容差进入独立 `pose_accuracy` 事后警告；其余条件组成接受/拒绝结果和执行绑定的违反量。
+计算和输出：消费同点原任务与几何值，补齐原连续域、末段及声明关系信息，形成原绑定接口消费的接受/拒绝结果及具体证据。
 
 直接包内依赖：原 FUNCTO / 数值库接口。包内调用组件：`direct_preference`。
 
@@ -401,7 +420,7 @@
 |---|---|
 | `_maximum(value)` | 消费同点原任务与几何值，补齐原连续域、末段及声明关系信息，形成原绑定接口消费的接受/拒绝结果及具体证据。 |
 | `scene_conditions(point)` | Evaluate declared relationship and unknown policy on retained states. |
-| `evaluate_candidate(planner, trajectory, *, record_work, objective)` | 输出本次曲线的物理/任务条件判定、独立位姿精度警告和执行绑定元数据；名义优化约束仍由 PlanningProblem 原接口提供。 |
+| `evaluate_candidate(planner, trajectory, *, record_work, objective)` | Form one finite-query verdict and the exact curve's binding metadata. |
 
 ## shared_solver：CasADi/IPOPT 与稀疏回调
 

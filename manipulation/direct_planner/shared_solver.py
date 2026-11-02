@@ -157,7 +157,7 @@ class _Oracle(ca.Callback):
                                for index in largest])
         self.last_complete = self.latest
         self.cache_x, self.cache = flat.copy(), point
-        # BEGIN compare only fully computed original conditions and objective.
+        # BEGIN compare complete retained solver conditions and original objective.
         feasible = (np.isfinite(point.objective_value) and np.isfinite(point.constraint_values).all()
             and np.all(point.constraint_values >= self.bound.lower)
             and np.all(point.constraint_values <= self.bound.upper))
@@ -167,7 +167,9 @@ class _Oracle(ca.Callback):
             self.feasible_improvements.append(dict(trial_index=self.latest['trial_index'],
                 elapsed_seconds=perf_counter()-self.started,
                 objective=point.objective_value,
-                maximum_original_violation=float(violation.max()),
+                # BEGIN this extremum describes retained NLP rows after presolve.
+                maximum_solver_violation=float(violation.max()),
+                # END original row identities remain attached to each statistic.
                 reduced_controls=flat.reshape(self.bound.shape).tolist()))
         # END the optimizer continues its declared work after each improvement.
         return point
@@ -241,8 +243,10 @@ class _Iteration(ca.Callback):
         self.owner.iteration_records.append(dict(
             callback_index=self.owner.counts['callback_iterations'],
             elapsed_seconds=perf_counter()-self.owner.started,
-            objective=float(arguments[1]), maximum_original_violation=float(violation.max()),
-            original_conditions_feasible=bool(feasible)))
+            # BEGIN the callback receives compressed g, not a full-task vector.
+            objective=float(arguments[1]), maximum_solver_violation=float(violation.max()),
+            solver_conditions_feasible=bool(feasible)))
+        # END full original task evaluation belongs to the candidate outlet.
         # END IPOPT's internal slack residual remains in its own statistics.
         if feasible and self.owner.first_feasible_iterate is None:
             self.owner.first_feasible_iterate = self.owner.last_iterate.copy()
@@ -289,6 +293,9 @@ def solve_trajectory(bound, initial, *, iterations, check_request, remaining_sec
         require_host_memory(int(pending_geometry_bytes), pending_existing_bytes=0,
                             max_rss_bytes=computation.max_host_rss_bytes)
         report.update(bound.report)
+        # BEGIN declare the row domain used by callback extrema and feasibility.
+        report['solver_constraint_scope'] = 'Retained task rows, geometric pair maxima and original joint-domain rows'
+        # END presolve certificates retain the identities of eliminated support rows.
         if not bound.fixed_feasible:
             report.update(state='completed', status='Fixed_Constraint_Infeasible',
                           message='A declared constant task row is infeasible', iterations=0,

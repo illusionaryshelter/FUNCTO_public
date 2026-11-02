@@ -184,6 +184,11 @@ def test_each_declared_source_uses_one_call_and_stale_acceptance_cannot_stop_it(
     results = list(planner.optimize(torch.zeros((1, 2, 1, 2), dtype=torch.float64)))
     assert len(results) == planner.request_work['trajectory_solves'] == 2
     assert [row['seed_index'] for row in planner.solve_history] == [0, 1]
+    # BEGIN producer snapshots bracket both real solver invocations.
+    snapshots = planner.numerical_problem.producer_snapshots
+    for index in range(2):
+        assert snapshots[f'main_{index}_finished']['evaluations'] > snapshots[f'main_{index}_started']['evaluations']
+    # END passive records belong to the original numerical problem.
 
 
 def test_complete_rejection_at_cap_does_not_submit_another_problem(monkeypatch):
@@ -222,7 +227,11 @@ def test_terminal_singleton_constructs_exact_curve_without_reference_ik():
     planner.terminal = SimpleNamespace(matrix=np.empty((2, 0)), offset=controls, report={},
         reduce=lambda value: np.empty((0, 2)))
     planner.check_request = lambda: None
-    planner.computation = SimpleNamespace(bind_solver=lambda value, check_request: SimpleNamespace(shape=value.shape))
+    # BEGIN the exact singleton still records the initialization boundary.
+    snapshots = []
+    planner.computation = SimpleNamespace(bind_solver=lambda value, check_request:
+        SimpleNamespace(shape=value.shape, snapshot_producers=snapshots.append))
+    # END its explicit fixture implements the current bound-problem protocol.
     planner.torch = torch
     planner._controls_curve = lambda value: np.asarray(value).copy()
     seeds, counts = planner.reference_seeds()
@@ -231,6 +240,7 @@ def test_terminal_singleton_constructs_exact_curve_without_reference_ik():
     assert counts == planner.reference_ik_queries == []
     assert planner.initial_seed_strategies == ['terminal_unique_curve']
     assert planner.reference_initialization['status'] == 'terminal_unique_curve'
+    assert snapshots == ['initialization_scored']
 # END exact controls retain their own complete-candidate qualification path.
 
 

@@ -70,14 +70,6 @@ class SupportLinearization:
     coefficient_row: np.ndarray
     source_rows: np.ndarray
 
-    # BEGIN producer-owned local slots replace full control Jacobian expansion.
-    def row_values(self, row, columns):
-        """Fill one declared sparse row in [reduced control,named joint] order."""
-        joints = self.joint_jacobian.shape[1]
-        return (self.joint_jacobian[int(row), columns % joints]
-                * self.coefficient_row[columns // joints])
-    # END no body-by-all-controls matrix is created by this producer.
-
 
 def linearized_robot_state(computation, q, dq):
     """Return original robot_tool_states products plus same-call frame J.
@@ -166,8 +158,11 @@ def task_linearization(computation, controls, *, support_material_indices,
     Returns ``((equalities,inequalities),(equality_blocks,inequality_blocks))``.
     Each block dictionary maps the original condition name to ``(slice,factor)``;
     slices address the solver-local rows in their equality/inequality vector.
-    A factor's row_values() fills only requested structural columns. The
-    explicit support_material_indices were bound once from immutable points.
+    # BEGIN the sparse consumer binds and fills each factor's analytic slots.
+    Factors expose joint_jacobian/coefficient_row without expanding a dense
+    control Jacobian. The explicit support_material_indices were bound once
+    from immutable points.
+    # END values and source-row identities keep the original producer order.
 
     The unchanged condition producer creates values and declaration masks.
     Analytic body/footprint values are detached before concatenation, so the

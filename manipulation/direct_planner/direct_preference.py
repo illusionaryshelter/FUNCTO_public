@@ -39,10 +39,13 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
 
     # BEGIN explicit request data is available before native binding/rebinding.
     def __init__(self, *args, reference_objective, initialization,
-                 incoming_terminal_contract=None, **kwargs):
+                 incoming_terminal_contract=None, support_presolve=True, **kwargs):
         self.initialization_declaration = initialization
         self.reference_objective_declaration = reference_objective
         self.incoming_terminal_contract = incoming_terminal_contract
+        # BEGIN caller selects solver-row elimination for this backend lifetime.
+        self.support_presolve = support_presolve
+        # END task production and complete candidate evaluation are shared.
         self.binding_continuation = kwargs.get('continuation')
         super().__init__(*args, **kwargs)
     # END the declaration has no implicit scale or weight.
@@ -100,7 +103,8 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
         reference = self.reference_objective_declaration.bind(self.bound_reference,
             base.times[0, base.ordinary_indices])
         self.computation = DirectComputation(base=base, terminal=self.terminal,
-            geometry=self.geometry_constraints, reference_objective=reference)
+            geometry=self.geometry_constraints, reference_objective=reference,
+            support_presolve=self.support_presolve)
         self.solve_history, self.candidate_history = [], []
         self._current_control_curve = self._current_full_controls = None
         self.last_candidate_report = None
@@ -195,6 +199,9 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
             self.numerical_problem = self.computation.bind_solver(
                 self.terminal.reduce(seeds[0, 0].detach().numpy()), check_request=self.check_request)
             self.initialization_candidate = self._controls_curve(projected[0, 0])
+            # BEGIN record the supplied-reference initialization boundary too.
+            self.numerical_problem.snapshot_producers('initialization_scored')
+            # END this passive timestamp does not change reference selection.
             return seeds, successes
         if self.terminal.matrix.shape[1]:
             curve = self.physical_domain._curve_map
@@ -241,15 +248,9 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
             scores = []
             for candidate in candidates:
                 point = self.numerical_problem.evaluate(candidate)
-                violation = np.maximum(np.maximum(
-                    self.numerical_problem.lower-point.constraint_values,
-                    point.constraint_values-self.numerical_problem.upper), 0.)
-                worst = int(np.argmax(violation))
-                scores.append(dict(total_positive_violation=float(violation.sum()),
-                    maximum_positive_violation=float(violation[worst]),
-                    positive_condition_count=int(np.count_nonzero(violation)),
-                    worst_condition=self.numerical_problem.row_keys[worst],
-                    objective=point.objective_value, objective_components=point.objective_components))
+                # BEGIN implied-row removal only changes the solver's layout.
+                scores.append(point.initialization_score())
+                # END the original (full violation, full objective) ranking remains.
             selected = min(range(len(candidates)), key=lambda i: (
                 scores[i]['total_positive_violation'], scores[i]['objective']))
             controls = self.terminal.expand(candidates[selected])
@@ -274,6 +275,9 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
             scope='Registered-model terminal proposals, complete-reference fits and original fixed problem ranking')
         seeds = self.torch.as_tensor(controls, dtype=self.torch.float64)[None, None]
         self.initialization_candidate = self._controls_curve(controls)
+        # BEGIN the shared counters already contain both initialization scores.
+        self.numerical_problem.snapshot_producers('initialization_scored')
+        # END main-solver timing uses a later snapshot of these same counters.
         return seeds, []
     # END the chosen curve and all subsequent trials share one bound problem.
 
@@ -298,6 +302,9 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
                 self.check_request('trajectory_solves')
                 self.request_work['trajectory_solves'] += 1
 
+            # BEGIN count only this solve's increments in the shared producers.
+            self.numerical_problem.snapshot_producers(f'main_{index}_started')
+            # END initialization counts remain available at their own boundary.
             try:
                 if reduced.size:
                     result = solve_trajectory(self.numerical_problem, reduced,
@@ -319,6 +326,9 @@ class DirectPreferencePlanner(DirectSetup, _ConstrainedPlanner):
             else:
                 self._expand_snapshots(runtime)
             finally:
+                # BEGIN preserve completed work even when the solver is interrupted.
+                self.numerical_problem.snapshot_producers(f'main_{index}_finished')
+                # END the outer planning-call clock includes all these stages.
                 runtime['objective_query_range'] = [history_start, len(self.computation.trial_history)]
                 self.solve_history.append(runtime)
             self.last_optimizer_diagnostics.append(result.report)
@@ -366,9 +376,12 @@ class DirectPreferenceBackend(PreferenceMotionBackend):
     """Own native resources and one explicit reference preference declaration."""
 
     # BEGIN reuse the maintained backend ownership and capacity contract.
-    def __init__(self, *args, reference_objective, initialization, **kwargs):
+    def __init__(self, *args, reference_objective, initialization, support_presolve=True, **kwargs):
         self.initialization_declaration = initialization
         self.reference_objective = reference_objective
+        # BEGIN one explicit option selects the retained NLP row set.
+        self.support_presolve = support_presolve
+        # END rebinding retains this backend configuration.
         super().__init__(*args, **kwargs)
 
     def bind_request(self, problem, scene, *, budget, continuation=None, goal_identities=None):
@@ -404,7 +417,8 @@ class DirectPreferenceBackend(PreferenceMotionBackend):
                 self.device, robot_validator=self.robot_validator,
                 continuation=continuation, goal_identities=goal_identities,
                 incoming_terminal_contract=self.incoming_terminal_contract,
-                reference_objective=self.reference_objective, initialization=self.initialization_declaration)
+                reference_objective=self.reference_objective, initialization=self.initialization_declaration,
+                support_presolve=self.support_presolve)
         else:
             self._planner.rebind(problem, scene, budget, continuation=continuation,
                 goal_identities=goal_identities)

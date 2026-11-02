@@ -185,7 +185,9 @@ class PinKinematics:
                 dq[self._v_columns] = rates[sample]
                 # BEGIN velocity FK and velocity derivatives have distinct consumers.
                 if with_derivatives:
-                    pin.computeForwardKinematicsDerivatives(self.model, data, q, dq, np.zeros(self.model.nv))
+                    # BEGIN pose, twist and their first derivatives require q and dq.
+                    pin.computeForwardKinematicsDerivatives(self.model, data, q, dq)
+                    # END acceleration derivatives are outside this state interface.
                 else:
                     pin.forwardKinematics(self.model, data, q, dq)
                 # END no_grad does not implicitly skip a manually requested Pin derivative.

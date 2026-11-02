@@ -131,7 +131,9 @@ class PlanningBudget:
     # END this is a representation dimension change, not skill-specific tuning.
     interpolation_steps: int = 4
     ik_iterations: int = 40
-    trajectory_iterations: int = 100
+    # BEGIN user-configurable main-solve iteration cap.
+    trajectory_iterations: int = 60
+    # END native convergence may terminate before this cap.
     interpolation_dt: float = 0.025
     maximum_trajectory_dt: float = 0.2
     interpolation_buffer_size: int = 512

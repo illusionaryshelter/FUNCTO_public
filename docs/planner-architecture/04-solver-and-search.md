@@ -1,5 +1,6 @@
 # 固定时钟的统一约束求解与有限搜索
 
+共享迭代预算与一阶运动学的代码基线：本次合并代码提交，完成后登记。
 求解算法基线为 `be44b54`；同一请求中候选交付的当前实现见 [planning API](api/planning.md) 所列代码提交。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
 时间预算配置对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容；当前默认值为 `PlanningBudget.planning_seconds=60.0`。
@@ -32,7 +33,7 @@
 
 `robot_tool_states` 从仿射样条取得 `q,dq`，加入场景声明的名义手指坐标与速度，调用 `PinKinematics.states`。Pin 模型复用验证器的完整机器人。位姿导数使用帧 Jacobian；速度导数使用 Pin 的 LOCAL 帧原生导数，再经可微旋转表达在参考系中。工具固定平移贡献线速度杆臂项，固定旋转组成 TCP 姿态。`_candidate_robot_state` 对任意保存曲线调用同一接口。
 
-`PinKinematics.poses/states` 按实际 Torch 梯度需求选择原生计算。启用 autograd 且输入需要梯度时，`_evaluate(..., with_derivatives=True)` 计算原帧 Jacobian 和速度导数。纯前向评分、验收及不需要梯度的调用使用 `forwardKinematics`、`updateFramePlacements` 和相同的 LOCAL 速度读取；位姿、标定、四元数和参考系旋转公式保持一致，导数缓冲为空。坐标、接口和验证见[运动学 API](api/pin_kinematics.md)。
+`PinKinematics.poses/states` 按实际 Torch 梯度需求选择原生计算。启用 autograd 且输入需要梯度时，`_evaluate(..., with_derivatives=True)` 调用四参数 `pin.computeForwardKinematicsDerivatives(model,data,q,dq)` 计算原帧 Jacobian 和速度导数。纯前向评分、验收及不需要梯度的调用使用 `forwardKinematics`、`updateFramePlacements` 和相同的 LOCAL 速度读取；位姿、标定、四元数和参考系旋转公式保持一致，导数缓冲为空。坐标、接口和验证见[运动学 API](api/pin_kinematics.md)。
 
 `PlanningProblem.constraint_components` 返回等式字典和逐项有符号不等式字典。约定不等式 `g(a)<=0`，各行保留原物理单位、原任务点、半空间和事件身份。过程关系、位姿及机构坐标事件、方向历史、关节耦合和声明停止均从同一曲线状态计算。条件生产函数可同时写入 `solver_rows_out=(equality_masks, inequality_masks)`：与完整条件具有同一键、顺序和形状的布尔布局。固定进度界、声明区间外零行、方向历史中的固定首项及零宽固定入口偏航均由声明和曲线结构识别。布局只在初始任务求值中绑定，先核对被省去行的原值有限且满足等式为零或不等式非正，再按同一布局向 SLSQP 提交剩余行。`fixed_task_constraints` 保存原键、组内行索引、值和判定。固定行违反条件时直接返回原初值及不可变条件失败记录。完整 `task` 与最终验收保留所有原值；某次数值导数为零的变量行仍参与求解。
 
@@ -64,7 +65,7 @@ Pinocchio 临时增量为 `8[S(6FNᵣ+12F+Nᵣ)+2]` 字节，其中 `S` 是任�
 
 ## 6. 搜索、验收与预算
 
-`PlanningBudget.planning_seconds` 给出一次规划请求的累计墙钟上限，默认 60 s。`plan_trajectory` 的原计时器覆盖后端绑定、参考初始化、搜索、优化、候选验收和执行绑定；原请求重试继续累计已有消耗。`check_request` 消费同一账本，因此阶段切换与后续候选不重置时间。记录式 CLI 的省略值直接读取该字段；显式预算仍按原 API 传入和校验。输入场景准备及物理执行保留各自计时边界。`trajectory_iterations=100`、最多两个求解批次及其余原预算字段保持独立语义。
+`PlanningBudget.planning_seconds` 给出一次规划请求的累计墙钟上限，默认 60 s。`plan_trajectory` 的原计时器覆盖后端绑定、参考初始化、搜索、优化、候选验收和执行绑定；原请求重试继续累计已有消耗。`check_request` 消费同一账本，因此阶段切换与后续候选不重置时间。记录式 CLI 的省略值直接读取该字段；显式预算仍按原 API 传入和校验。输入场景准备及物理执行保留各自计时边界。`trajectory_iterations=60`、最多两个求解批次及其余原预算字段保持独立语义。
 
 初值首先通过完整候选评价；合格并完成执行绑定时立即交付。若 require_observation 策略的完整分项证据将失败隔离为仅覆盖不足，返回 `needs_observation`；否则已有正碰撞或覆盖残差触发一次 `ompl_seed`，再进入主求解。forbid 的覆盖违例可由搜索处理，require_observation 与其他失败混合的证据沿同一几何调度；allow_attempt 的条件未知保持原含义。功能事件 IK 给出允许集合中的边界提议；搜索将每个提议放到当前前缀私有场景中，按该分支已建立的释放锚点和关系计算任务及几何资格。预计算时缺少释放锚点的静态判定只作为记录。
 

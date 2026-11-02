@@ -1,8 +1,6 @@
 # `manipulation/pin_kinematics.py` 实现契约
 
-代码基线：`8b0e326`。
-共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
-
+代码基线：`本次合并代码提交，完成后登记`。
 职责和数据语义见[组件说明](../04-solver-and-search.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_pose_vjp`
@@ -580,7 +578,6 @@ pin.computeJointJacobians
 pin.forwardKinematics
 self._v_columns
 pin.computeForwardKinematicsDerivatives
-np.zeros
 pin.updateFramePlacements
 self._frame_ids
 data.oMf
@@ -659,7 +656,6 @@ range
 pin.computeJointJacobians
 pin.forwardKinematics
 pin.computeForwardKinematicsDerivatives
-np.zeros
 pin.updateFramePlacements
 enumerate
 pin.Quaternion(rotation).coeffs

@@ -1,11 +1,11 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`1e21ae6`；本次为同代码内容的文档登记。
-职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
+代码基线：`本次合并代码提交，完成后登记`。
+职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L29)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L31)。
 
 输入签名：
 
@@ -81,7 +81,7 @@ json.dumps
 
 ## `load_contact_bindings`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L68)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L70)。
 
 输入签名：
 
@@ -140,7 +140,7 @@ InitialSupportRelation
 
 ## `load_joint_reference`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L94)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L96)。
 
 输入签名：
 
@@ -224,7 +224,7 @@ JointTrajectory
 
 ## `finger_trajectory_factory`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L125)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L127)。
 
 输入签名：
 
@@ -273,7 +273,7 @@ float
 
 ## `finger_trajectory_factory.build`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L142)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L144)。
 
 输入签名：
 
@@ -339,7 +339,7 @@ np.stack
 
 ## `position_controlled_hand`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L179)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L181)。
 
 输入签名：
 
@@ -420,7 +420,7 @@ execution_limits.describe
 
 ## `position_controlled_hand.nominal_geometry`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L206)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L208)。
 
 输入签名：
 
@@ -456,7 +456,7 @@ bind_nominal_finger_geometry
 
 ## `require_feedback_identity`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L233)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L235)。
 
 输入签名：
 
@@ -501,7 +501,7 @@ ValueError
 
 ## `recorded_owner_observation_inputs`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L245)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L247)。
 
 输入签名：
 
@@ -578,7 +578,7 @@ Path
 
 ## `run_prepared`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L308)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L310)。
 
 输入签名：
 
@@ -593,10 +593,14 @@ def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
 > Problem construction belongs to the caller. The actual feedback is checked
 > again here, so an offline reference cannot replace current robot state.
 > This function never reconstructs or resamples the supplied reference.
+> backend_factory consumes robot, robot_validator and budget, and returns
+> the resident backend whose plan method owns the chosen solver lifecycle.
 
 显式输出分支：
 
-`result`：已经由选定后端完成规划与保存的同一 PlanningResult。
+```python
+result
+```
 
 读取的对象属性：
 
@@ -976,7 +980,7 @@ np.savez_compressed
 scene.validate_problem
 entrance_fk['geometry_poses'].values
 PlanningBudget
-MotionBackend
+backend_factory
 plan_and_record
 execution_limits.describe
 load_joint_reference
@@ -991,7 +995,7 @@ _write_diagnostic_json
 
 ## `run_prepared.mark_wallclock`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L342)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L346)。
 
 输入签名：
 
@@ -1026,7 +1030,7 @@ print
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L697)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L705)。
 
 输入签名：
 
@@ -1104,7 +1108,7 @@ run_prepared
 
 ## `parse_args`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L726)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L734)。
 
 输入签名：
 
@@ -1127,6 +1131,7 @@ parser.parse_args(argv)
 ```python
 argparse.ArgumentParser
 parser.add_argument
+PlanningBudget.trajectory_iterations
 PlanningBudget.planning_seconds
 parser.parse_args
 ```
@@ -1145,5 +1150,3 @@ argparse.ArgumentParser
 parser.add_argument
 parser.parse_args
 ```
-
-`backend_factory` 的输入、资源所有权与当前调用关系见[通用运行适配](../12-shared-runtime-adapters.md)。

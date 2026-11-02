@@ -791,9 +791,9 @@ def parse_args(argv=None):
     parser.add_argument("--ik-seeds", type=int, default=4)
     parser.add_argument("--trajectory-seeds", type=int, default=2)
     # BEGIN a caller can vary work without changing constraints or native internals.
-    parser.add_argument("--trajectory-iterations", type=int, default=100,
+    parser.add_argument("--trajectory-iterations", type=int, default=PlanningBudget.trajectory_iterations,
                         help="Trajectory iteration budget; existing PlanningBudget limit is 1..300")
-    # END the default and PlanningBudget admission remain unchanged.
+    # END explicit CLI values override the shared library default.
     parser.add_argument("--max-validation-points", type=int, default=2048)
     parser.add_argument("--max-task-anchors", type=int, default=256)
     # BEGIN make the existing request work limits reviewable in run commands.

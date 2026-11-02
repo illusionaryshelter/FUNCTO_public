@@ -82,6 +82,12 @@ class QuadraticComputation:
                 self.fixed_feasible = owner.fixed_feasible
                 self.report = {'solver_task_equalities': 1, 'solver_task_inequalities': 2,
                                'solver_jacobian_nonzeros': pattern.nnz}
+                # BEGIN the fixed-problem protocol records lifecycle snapshots.
+                self.producer_snapshots = {}
+
+            def snapshot_producers(self, label):
+                self.producer_snapshots[label] = {'evaluations': len(owner.evaluated)}
+            # END this analytical producer records its actual evaluation count.
 
             def evaluate(self, controls):
                 check_request()
