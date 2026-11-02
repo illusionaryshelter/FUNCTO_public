@@ -14,7 +14,7 @@
 
 新增组件及完成证据、纯前向运动学代码基线为 `c289890`，详细输入、坐标、API 和调用关系见 [声明位姿偏好规划器](docs/preference-planner/README.md)。以下原组件章节继续描述原入口；新增组件的覆盖方法与独立生命周期由其文档列明。
 
-`manipulation.direct_planner` 提供独立的 `DirectPreferenceBackend` 与 `DirectPreferencePlanner`，当前代码由本次合并提交提供（提交完成后登记实际编号）。该分支对完整参考拟合数值初值，以同点共享的任务、注册模型几何和连续关节条件组成稀疏 IPOPT 问题；默认开启 `support_presolve`，以保留位置球蕴含关系消去支撑半空间行；关闭时使用完整原变量行。初始化评分及最终任务评价保留完整原条件，主求解优先选取保留行可行且目标最低的计算点。`PlanningBudget.trajectory_iterations` 为用户定义的迭代上限，默认 60。最终候选的位姿事件超限保存为独立事后警告，其余任务、关节及现场条件形成交付判定；优化中的名义位姿约束保留。输入继续使用原 `PlanningProblem`、`OnlinePlanningScene`、具名机器人反馈及官方机器人模型，输出使用原 `PlanningResult` 和执行绑定。算法、数据语义、公开调用和逐模块 API 见[直接关节轨迹规划器](docs/direct-planner/README.md)。
+`manipulation.direct_planner` 提供独立的 `DirectPreferenceBackend` 与 `DirectPreferencePlanner`，当前代码基线为 `d4f0f33`；本次文档提交仅登记基线，代码内容保持相同。该分支对完整参考拟合数值初值，以同点共享的任务、注册模型几何和连续关节条件组成稀疏 IPOPT 问题；默认开启 `support_presolve`，以保留位置球蕴含关系消去支撑半空间行；关闭时使用完整原变量行。初始化评分及最终任务评价保留完整原条件，主求解优先选取保留行可行且目标最低的计算点。`PlanningBudget.trajectory_iterations` 为用户定义的迭代上限，默认 60。最终候选的位姿事件超限保存为独立事后警告，其余任务、关节及现场条件形成交付判定；优化中的名义位姿约束保留。输入继续使用原 `PlanningProblem`、`OnlinePlanningScene`、具名机器人反馈及官方机器人模型，输出使用原 `PlanningResult` 和执行绑定。算法、数据语义、公开调用和逐模块 API 见[直接关节轨迹规划器](docs/direct-planner/README.md)。
 
 ## 组件与调用关系
 
