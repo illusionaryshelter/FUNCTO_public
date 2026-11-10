@@ -450,7 +450,7 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
                          max_mapping_bytes, max_host_rss_bytes=DEFAULT_MAX_HOST_RSS_BYTES,
                          max_device_used_bytes=DEFAULT_MAX_DEVICE_USED_BYTES,
                          fine_regions=None, observed_owners=(), background=None, coverage=None,
-                         initial_support_relations=()):
+                         inherited_initial_state=None):
     """Combine newly observed entities with existing fixed entity fields.
 
     owner_frames names only entities to integrate from the supplied masks and
@@ -550,7 +550,9 @@ def build_scene_from_rgbd(views, owner_frames, *, mapper_cfg, depth_error_m, tas
         fixed_geometry_names=fixed_geometry_names, tool_geometry_names=tool_geometry_names,
         contacts=contacts, gripper=gripper,
         has_gripper=has_gripper, unknown_policy=unknown_policy,
-        initial_support_relations=initial_support_relations)
+        # BEGIN scene construction retains the accepted predecessor boundary.
+        inherited_initial_state=inherited_initial_state)
+        # END observed fields keep their original values and ownership.
     # BEGIN persist semantic inputs separately from one-time fusion admission.
     scene.observation_partition_masks = {}
     for name, view in normalized.items():

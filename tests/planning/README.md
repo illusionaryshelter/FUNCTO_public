@@ -18,7 +18,7 @@
 
 `save_observation_partitions` 在 `observations/<view>/` 中独立保存本次新建实体的 `owner-*-semantic-mask.npy`、原始 `background-candidate-mask.npy` 和实际积分 `background-mask.npy`。`partition-report.json` 按实体 ID 指向文件并说明职责。后续 `--owner-mask` 读取原实体文件，`--background-mask` 读取原始候选文件；实际积分背景用于检查本次过滤结果。这样重复复用只排除同一圈边缘，也无需再次调用分割。复用背景模型时不会生成新的积分背景 mask。
 
-`--contact-bindings` 的必填字段为 `contacts/source`，可选字段为 `grasp_activations/initial_support_relations`。`ContactRule` 保留原任务特征、有限目标区域、材料身份及活动区间；原抓取激活和初始支撑分别绑定。源任务点、轨迹、区域与事件完整保留。
+`--contact-bindings` 的必填字段为 `contacts/source`，可选字段为 `grasp_activations`。`ContactRule` 保留原任务特征、有限目标区域、材料身份及活动区间；原抓取激活按完整声明绑定。源任务点、轨迹、区域与事件完整保留。
 
 `robot_validation_fixture.tool_geometry_names` 根据已声明手指关节的机构公共父子树返回完整工具组件，运行器将其写入报告并传给场景。`CollisionOwner` 的有效 `Attachment` 把已有实体场随同一 TCP 刚性运动，并决定组合体内部配对；当前工具五个实体与附着对象、共同附着对象之间不作内部查询，各成员继续用原几何检查外部。无显式释放时，附着包含规划窗口终点。场景报告用 `internal_assembly_pair_count` 记录排除的配对样本数。
 
@@ -53,3 +53,5 @@
 标准释放效果 `actual_release_from_current_feedback` 在原设备时刻截取接触前缀：同一目标此前有接触，且声明手指组均持续无接触达到已有释放窗口，才得到T。终点接触诊断和原事件时刻的效果证据分别记录。生产条件的 `effect_requirement` 选择这一独立评分计算；在线事件是否等待证据由它自身的 `requires_evidence` 指定。
 
 `--profile-runtime` 启用已有 cProfile 记录，分析器开销计入请求。实验交付使用可直接打开的本地 HTML，优先展示真实仿真图像上的源示教区域、迁移目标区域和采样点，支持比较与放大，同时保存接受、警告、拒绝、失败和缺失状态。阶段数据放在工作区 `sim-version-plans`。
+
+`--inherited-initial-state` 指向已接受前置执行的具名 q/dq、反馈身份、时间及来源。场景将它与本次固定机器人入口绑定，精确 t=0 的现场实体对直接继承无碰撞前提；正时间配对与官方机器人自身约束沿用相同规则。详见[场景初态接口](../../docs/planner-architecture/13-inherited-initial-state.md)。

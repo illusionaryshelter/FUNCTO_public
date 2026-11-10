@@ -74,7 +74,7 @@ def box_distance(a, b):
     """Return outward-rounded separation of two bounds in the same frame.
 
     Each input is (lower[3], upper[3]). Read-only and strided arrays are
-    consumed directly; all field, native and initial-support callers share
+    consumed directly; all observed-field and native-model callers share
     this calculation through their existing imports.
     """
     return _box_distance(a[0], a[1], b[0], b[1])
@@ -355,7 +355,7 @@ class ObservedField:
         """Evaluate supported cells, optionally removing declared cell material.
 
         ``excluded_cells`` contains original occupied-cell identities from a
-        finite initial-support permission. Adjacent supported cells retain
+        finite cell-domain selection. Adjacent supported cells retain
         their own identity. The returned mask describes this query domain;
         unobserved locations retain their original unknown status.
         """

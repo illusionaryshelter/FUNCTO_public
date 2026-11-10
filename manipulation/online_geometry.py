@@ -64,7 +64,7 @@ class OnlinePlanningScene:
     def __init__(self, *, background, owners, coverage, reference_frame,
                  robot_model, fixed_geometry_names, tool_geometry_names, contacts=(), gripper=None,
                  has_gripper=True, unknown_policy,
-                 initial_support_relations=(), numerical_position_tolerance_m=1e-6,
+                 inherited_initial_state=None, numerical_position_tolerance_m=1e-6,
                  numerical_rotation_tolerance_rad=1e-6):
         if (not isinstance(background, FrozenObservedField)
                 or any(not isinstance(owner.query, FrozenObservedField) for owner in owners)):
@@ -116,16 +116,13 @@ class OnlinePlanningScene:
         self.numerical_rotation_tolerance_rad = float(numerical_rotation_tolerance_rad)
         self.required_progress_anchors = tuple(sorted(
             {x for rule in self.contacts for x in rule.interval}
-            | {x for owner in self.owners for relation in owner.attachments for x in relation.interval}
-            | {x for relation in initial_support_relations for x in relation.interval}))
-        self.initial_support_relations = tuple(initial_support_relations)
-        self._initial_support_models = {}
-        if self.initial_support_relations:
-            from .initial_support import PreparedInitialSupport
-            by_owner = {owner.owner_id: owner for owner in self.owners}
-            self._initial_support_models = {row.relation_id: PreparedInitialSupport(
-                row, by_owner[row.actor], by_owner[row.target_owner],
-                self.numerical_position_tolerance_m) for row in self.initial_support_relations}
+            | {x for owner in self.owners for relation in owner.attachments for x in relation.interval}))
+        # BEGIN an accepted predecessor declares a collision-free entrance.
+        # The declaration is bound to the same measured q/dq in validate_problem.
+        # Only the exact initial physical instant inherits this scene premise;
+        # registered robot self pairs and all later field queries stay active.
+        self.inherited_initial_state = deepcopy(inherited_initial_state)
+        # END the declaration introduces neither contact material nor a cost.
         self._fixed_release_poses = {}
         self.observation_report, self.observation_partition_masks = {}, {}
         self.grasp_contact_activations = ()
@@ -321,6 +318,14 @@ class OnlinePlanningScene:
     def validate_problem(self, problem, *, goal_identities=None):
         if problem.reference_frame != self.reference_frame:
             raise ValueError("Scene and robot must use the same calibrated reference frame")
+        # BEGIN inheritance names the robot boundary actually used by the task.
+        if self.inherited_initial_state is not None:
+            state = self.inherited_initial_state
+            columns = [state['joint_names'].index(name) for name in problem.joint_names]
+            if (not np.array_equal(problem.start_q, np.asarray(state['q'])[columns])
+                    or not np.array_equal(problem.start_dq, np.asarray(state['dq'])[columns])):
+                raise ValueError("Inherited scene state and problem must use the same measured q/dq")
+        # END this binds input identity and does not re-evaluate scene collision.
         conditions = {row["condition_id"]: row for row in problem.conditions if "condition_id" in row}
         # Bind finite contact declarations to the same nominal goal and close
         # occurrence. Execution activates by command occurrence, never by an
@@ -674,7 +679,6 @@ class OnlinePlanningScene:
                 costs[f"conditional/contact/{rule.rule_id}"] = uncertain
         # A pair owns only its declared feature regions; no rule can exempt
         # an entire finger because a smaller pad has missing observations.
-        progress_cpu = permission_progress.detach().cpu().numpy()
         uncertain_cpu = (np.zeros(tuple(progress.shape), bool) if hand_state is None
                          else hand_state.uncertain.detach().cpu().numpy())
         unmodelled = (set() if hand_state is None else
@@ -722,13 +726,19 @@ class OnlinePlanningScene:
                      if ((actor == "robot" and rule.actor == "robot" and rule.target_owner == target
                           and rule.robot_body == first_id)
                          or (actor != "robot" and {rule.actor, rule.target_owner} == {first_id, second_id}))]
-            support = [model for model in self._initial_support_models.values()
-                       if model.relation.actor == actor and model.relation.target_owner == target]
             for index in np.ndindex(tuple(progress.shape)):
                 if self.check_request is not None:
                     self.check_request()
                 # BEGIN each pair reuses this state's batch zero, including skips.
                 state_zero = zero[index]
+                # BEGIN the accepted initial scene is an input premise.
+                if self.inherited_initial_state is not None and evidence_time[index] == 0.:
+                    residuals.append(state_zero)
+                    record_pair(index, component, first_id, second_id,
+                        {"status": "inherited_initial_state", "lower_m": None},
+                        geometry_entity_key=entity_key)
+                    continue
+                # END every positive physical time uses the original pair query.
                 if uncertain_cpu[index] and unmodelled_entity_keys.intersection(entity_key.values()):
                     residuals.append(state_zero)
                     record_pair(index, component, first_id, second_id,
@@ -756,9 +766,6 @@ class OnlinePlanningScene:
                         region = (world_normals, world_bounds)
                         regions.append((region, region))
                 permission = PairPermission(regions) if regions else None
-                for model in support:
-                    if model.relation.interval[0] <= progress_cpu[index] < model.relation.interval[1]:
-                        permission = model.permission(sm[index], additional=permission)
                 # BEGIN prepare a world range only for an actual nonempty query.
                 native_bounds = None
                 if actor == "robot" and second.root is not None:
@@ -790,10 +797,6 @@ class OnlinePlanningScene:
             # Only confirmed penetration contributes a collision residual.
         # END a zero-distance unresolved domain is not a clearance violation.
         # END assembly membership only removes internal pairs while Attachment is active.
-        for model in self._initial_support_models.values():
-            support_components = model.components(poses[model.relation.actor], poses[model.relation.target_owner],
-                                                  progress, check_request=self.check_request)
-            costs.update(support_components)
         # BEGIN only moving scene owners consume the declared unknown-space policy.
         from .observed_coverage import query_coverage
         report["owner_coverage"] = {}
@@ -838,8 +841,8 @@ class OnlinePlanningScene:
         every required reference-frame robot link to differentiable position
         and wxyz quaternion tensors from the caller's calibrated FK. Entity
         fixed transforms, owner attachment/release relations, hand certainty,
-        finite contact regions and initial-support cell identities retain
-        their existing scene definitions. Material samples remain fixed for
+        finite contact regions retain their existing scene definitions.
+        Material samples remain fixed for
         the whole solve. Original ``components`` and interval queries retain
         all collision, missing-contact and unknown-space decisions.
 
@@ -943,7 +946,6 @@ class OnlinePlanningScene:
                     first, second = second, first
                 pairs.append(("field", first.owner_id, second.owner_id))
         attachment_progress = progress.detach().cpu().numpy()
-        permission_cpu = permission_progress.detach().cpu().numpy()
         attached = {owner.owner_id: np.logical_or.reduce(
             [relation.active(attachment_progress) for relation in owner.attachments])
             if owner.attachments else np.zeros(tuple(progress.shape), bool) for owner in self.owners}
@@ -954,11 +956,13 @@ class OnlinePlanningScene:
                 kind == "robot" and rule.actor == "robot" and rule.robot_body == first
                 and rule.target_owner == second) or (kind == "field"
                 and {rule.actor, rule.target_owner} == {first, second})]
-            support = [model for model in self._initial_support_models.values()
-                       if model.relation.actor == actor and model.relation.target_owner == second]
             for index in np.ndindex(tuple(progress.shape)):
                 if self.check_request is not None:
                     self.check_request()
+                # BEGIN numerical objectives use the same inherited boundary.
+                if self.inherited_initial_state is not None and trajectory_time[index] == 0.:
+                    continue
+                # END later material samples keep their original objective.
                 if kind == "robot" and uncertain[index] and first in unmodelled:
                     report["unmodelled_pair_count"] += 1
                     continue
@@ -976,18 +980,10 @@ class OnlinePlanningScene:
                         region = world_normals, bounds[index] + world_normals @ target_matrix[:3, 3]
                         regions.append((region, region))
                 permission = PairPermission(regions) if regions else None
-                for model in support:
-                    if model.relation.interval[0] <= permission_cpu[index] < model.relation.interval[1]:
-                        permission = model.permission(matrices[second][index], additional=permission)
                 values.append(pair_objective(samples[kind, first],
                     tuple(row[index] for row in first_pose), samples["field", second],
                     tuple(row[index] for row in poses[second]), permission=permission, report=report))
                 report["pair_state_count"] += 1
-        for model in self._initial_support_models.values():
-            components = model.components(poses[model.relation.actor], poses[model.relation.target_owner],
-                                          progress, check_request=self.check_request)
-            values.extend((components[f"initial_support/{model.relation.relation_id}"]
-                           / model.actor_field.voxel_size).square().reshape(-1).unbind())
         result = zero + (torch.stack(values).sum() / progress.numel() if values else zero)
         report["relationship_components"] = {
             key: value.detach().cpu().numpy().tolist() for key, value in relationship_components.items()}
@@ -1076,6 +1072,9 @@ class OnlinePlanningScene:
             "fixed_geometry_names": list(self.fixed_geometry_names),
             "tool_geometry_names": list(self.tool_geometry_names),
             "unknown_policy": deepcopy(self.unknown_policy), "robot_view_coverage_status": "not_queried",
+            # BEGIN preserve the declared entrance through candidate serialization.
+            "inherited_initial_state": _plain(self.inherited_initial_state),
+            # END runtime checks continue to consume measured robot state.
             "collision_rule": "nonpenetration",
             "required_progress_anchors": self.required_progress_anchors,
             "observation_report": deepcopy(self.observation_report)}
@@ -1112,7 +1111,6 @@ class OnlinePlanningScene:
             "background": self.background.record(), "contacts": _plain([asdict(row) for row in self.contacts]),
             "tool_geometry_names": list(self.tool_geometry_names),
             "grasp_contact_activations": _plain(self.grasp_contact_activations),
-            "initial_support_relations": [row.record() for row in self.initial_support_relations],
             "gripper": hand_record, "has_gripper": self.has_gripper,
             "numerical_position_tolerance_m": self.numerical_position_tolerance_m,
             "numerical_rotation_tolerance_rad": self.numerical_rotation_tolerance_rad,

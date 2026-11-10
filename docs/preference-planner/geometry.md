@@ -38,7 +38,7 @@ g_b(C)=-d_A\bigl(T_{WA}(t)^{-1}T_{WB}(t)b_B\bigr)\leq0,
 
 `workspace_bytes()` 按原基础查询数加当前行数计算新增FK批次的数组规模，包括仿射查询、Pinocchio位姿/速度及三个Jacobian、实体变换、接触特征图、见证标量图、原观测支持排除的串行临时数组，以及一次反向计算相对于原基础批次的差额。`witness_scalar_graphs` 与 `witness_records` 分别记录张量和共享Python证据，便于反向批次只扩展张量。原场景模型和观测值共享，不重复计入。主求解器将这些额外字节与其密集求解缓冲一起准入；`_context` 在实际构造前再次使用原 `require_host_memory` 和同一请求内存上限，读取当前驻留状态而不创建新预算。
 
-内部 `_context` 在原完整查询之后添加见证时刻。原查询中所有释放事件锚点继续存在，`scene._owner_poses` 因而对原释放时刻的机器人位姿求导；释放后的实体不会错误跟随之后的机器人位姿。`_permission` 复用原 `scene._permission` 和初始支撑许可生产接口，每次用当前位姿重建有限区域，区分用于运动关系的progress与用于接触许可的permission_progress。机器人手指运动未知、声明附着内部实体对和许可点对各自保留原状态。
+内部 `_context` 在原完整查询之后添加见证时刻。原查询中所有释放事件锚点继续存在，`scene._owner_poses` 因而对原释放时刻的机器人位姿求导；释放后的实体不会错误跟随之后的机器人位姿。`_permission` 复用原 `scene._permission` 的有限材料许可接口，每次用当前位姿重建有限区域，区分用于运动关系的progress与用于接触许可的permission_progress。机器人手指运动未知、声明附着内部实体对和许可点对各自保留原状态。
 
 ## 批量约束导数与内存
 

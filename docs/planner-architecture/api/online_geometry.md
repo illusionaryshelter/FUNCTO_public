@@ -1,8 +1,6 @@
 # `manipulation/online_geometry.py` 实现契约
 
-代码基线：`8b0e326`。
-共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
-
+代码基线：`本轮继承初态实现，提交后登记实际编号`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_plain`
@@ -143,7 +141,7 @@ binding_record = to_execution_binding
 输入签名：
 
 ```python
-def __init__(self, *, background, owners, coverage, reference_frame, robot_model, fixed_geometry_names, tool_geometry_names, contacts=(), gripper=None, has_gripper=True, unknown_policy, initial_support_relations=(), numerical_position_tolerance_m=1e-06, numerical_rotation_tolerance_rad=1e-06):
+def __init__(self, *, background, owners, coverage, reference_frame, robot_model, fixed_geometry_names, tool_geometry_names, contacts=(), gripper=None, has_gripper=True, unknown_policy, inherited_initial_state=None, numerical_position_tolerance_m=1e-06, numerical_rotation_tolerance_rad=1e-06):
 ```
 
 显式输出分支：
@@ -178,11 +176,6 @@ rule.robot_body
 rule.interval
 owner.attachments
 relation.interval
-self.initial_support_relations
-row.relation_id
-row.actor
-row.target_owner
-self.numerical_position_tolerance_m
 ```
 
 写入目标：
@@ -220,10 +213,7 @@ self.numerical_rotation_tolerance_rad
 self.required_progress_anchors
 x
 relation
-self.initial_support_relations
-self._initial_support_models
-by_owner
-row
+self.inherited_initial_state
 self._fixed_release_poses
 self.observation_report
 self.observation_partition_masks
@@ -257,12 +247,11 @@ np.asarray
 np.any
 float
 sorted
-PreparedInitialSupport
 ```
 
 ## `OnlinePlanningScene.bind_online_robot`
 
-[定义位置](../../../manipulation/online_geometry.py#L142)。
+[定义位置](../../../manipulation/online_geometry.py#L139)。
 
 输入签名：
 
@@ -307,7 +296,7 @@ DifferentiableRobotKinematics
 
 ## `OnlinePlanningScene.clone_for_rollout`
 
-[定义位置](../../../manipulation/online_geometry.py#L154)。
+[定义位置](../../../manipulation/online_geometry.py#L151)。
 
 输入签名：
 
@@ -350,7 +339,7 @@ dict
 
 ## `OnlinePlanningScene._release_pose`
 
-[定义位置](../../../manipulation/online_geometry.py#L163)。
+[定义位置](../../../manipulation/online_geometry.py#L160)。
 
 输入签名：
 
@@ -417,7 +406,7 @@ matches.any
 
 ## `OnlinePlanningScene.with_release_history`
 
-[定义位置](../../../manipulation/online_geometry.py#L184)。
+[定义位置](../../../manipulation/online_geometry.py#L181)。
 
 输入签名：
 
@@ -482,7 +471,7 @@ ValueError
 
 ## `OnlinePlanningScene._permission`
 
-[定义位置](../../../manipulation/online_geometry.py#L206)。
+[定义位置](../../../manipulation/online_geometry.py#L203)。
 
 输入签名：
 
@@ -640,7 +629,7 @@ active.to
 
 ## `OnlinePlanningScene.optimizer_preferences`
 
-[定义位置](../../../manipulation/online_geometry.py#L275)。
+[定义位置](../../../manipulation/online_geometry.py#L272)。
 
 输入签名：
 
@@ -708,7 +697,7 @@ constant_tensor
 
 ## `OnlinePlanningScene.project_residual`
 
-[定义位置](../../../manipulation/online_geometry.py#L299)。
+[定义位置](../../../manipulation/online_geometry.py#L296)。
 
 输入签名：
 
@@ -769,7 +758,7 @@ _tensor
 
 ## `OnlinePlanningScene.validate_problem`
 
-[定义位置](../../../manipulation/online_geometry.py#L321)。
+[定义位置](../../../manipulation/online_geometry.py#L318)。
 
 输入签名：
 
@@ -786,6 +775,13 @@ def validate_problem(self, problem, *, goal_identities=None):
 ```python
 problem.reference_frame
 self.reference_frame
+self.inherited_initial_state
+state['joint_names'].index
+problem.joint_names
+np.array_equal
+problem.start_q
+np.asarray
+problem.start_dq
 problem.conditions
 row.get
 problem.pose_events
@@ -806,7 +802,6 @@ owner.owner_id
 relation.interval
 np.linalg.inv
 np.linalg
-np.asarray
 np.eye
 relation.position_tool_owner
 Rotation.from_quat(relation.quaternion_tool_owner[[1, 2, 3, 0]]).as_matrix
@@ -827,6 +822,9 @@ row.progress
 写入目标：
 
 ```python
+state
+columns
+name
 conditions
 row
 activations
@@ -853,6 +851,9 @@ release
 
 ```python
 ValueError
+state['joint_names'].index
+np.array_equal
+np.asarray
 row.get
 list
 range
@@ -869,7 +870,6 @@ tuple
 deepcopy
 declaration.get
 np.linalg.inv
-np.asarray
 np.eye
 Rotation.from_quat(relation.quaternion_tool_owner[[1, 2, 3, 0]]).as_matrix
 Rotation.from_quat
@@ -879,7 +879,7 @@ release.get
 
 ## `OnlinePlanningScene._owner_poses`
 
-[定义位置](../../../manipulation/online_geometry.py#L378)。
+[定义位置](../../../manipulation/online_geometry.py#L383)。
 
 输入签名：
 
@@ -953,7 +953,7 @@ owner.pose
 
 ## `OnlinePlanningScene._robot_self_components`
 
-[定义位置](../../../manipulation/online_geometry.py#L403)。
+[定义位置](../../../manipulation/online_geometry.py#L408)。
 
 输入签名：
 
@@ -1106,7 +1106,7 @@ torch.stack(self_unresolved).reshape
 
 ## `OnlinePlanningScene._robot_self_components.retained_states`
 
-[定义位置](../../../manipulation/online_geometry.py#L449)。
+[定义位置](../../../manipulation/online_geometry.py#L454)。
 
 输入签名：
 
@@ -1146,7 +1146,7 @@ geometry_evidence_out.retain_native_chunk
 
 ## `OnlinePlanningScene.components`
 
-[定义位置](../../../manipulation/online_geometry.py#L503)。
+[定义位置](../../../manipulation/online_geometry.py#L508)。
 
 输入签名：
 
@@ -1243,9 +1243,6 @@ torch.stack(gaps).reshape
 torch.stack
 progress.new_tensor(undecided).reshape
 progress.new_tensor
-permission_progress.detach().cpu().numpy
-permission_progress.detach().cpu
-permission_progress.detach
 np.zeros
 hand_state.uncertain.detach().cpu().numpy
 hand_state.uncertain.detach().cpu
@@ -1272,24 +1269,17 @@ np.logical_or
 relation.active
 attachment_progress.shape
 rule.robot_body
-self._initial_support_models.values
-self._initial_support_models
-model.relation.actor
-model.relation
-model.relation.target_owner
+self.inherited_initial_state
+residuals.append
 unmodelled_entity_keys.intersection
 entity_key.values
-residuals.append
 self.tool_geometry_names
 regions.append
-model.relation.interval
-model.permission
 second.root
 self._native_local_bounds
 report['status_counts'].get
 torch.stack(residuals).reshape
 costs.get
-model.components
 self.coverage
 self.unknown_policy
 unknown.append
@@ -1371,7 +1361,6 @@ normal_cost
 costs[f'contact/{rule.rule_id}']
 costs[f'unresolved/contact/{rule.rule_id}']
 costs[f'conditional/contact/{rule.rule_id}']
-progress_cpu
 uncertain_cpu
 unmodelled
 unmodelled_entity_keys
@@ -1397,8 +1386,6 @@ actor
 residuals
 entity_key
 rules
-support
-model
 state_zero
 held_internal
 report['internal_assembly_pair_count']
@@ -1414,7 +1401,6 @@ report['pair_queries']
 status
 report['status_counts'][status]
 costs[component]
-support_components
 report['owner_coverage']
 unknown
 unresolved
@@ -1483,9 +1469,6 @@ torch.stack(gaps).reshape
 torch.stack
 progress.new_tensor(undecided).reshape
 progress.new_tensor
-permission_progress.detach().cpu().numpy
-permission_progress.detach().cpu
-permission_progress.detach
 np.zeros
 hand_state.uncertain.detach().cpu().numpy
 hand_state.uncertain.detach().cpu
@@ -1500,15 +1483,13 @@ progress.detach().cpu
 progress.detach
 np.logical_or.reduce
 relation.active
-self._initial_support_models.values
 self.check_request
-unmodelled_entity_keys.intersection
-entity_key.values
 residuals.append
 record_pair
+unmodelled_entity_keys.intersection
+entity_key.values
 regions.append
 PairPermission
-model.permission
 _native_bounds
 _transform
 pair_residual
@@ -1516,7 +1497,6 @@ report['status_counts'].get
 record_nonclear
 torch.stack(residuals).reshape
 costs.get
-model.components
 query_coverage
 unknown.append
 unresolved.append
@@ -1529,7 +1509,7 @@ progress.new_tensor(unresolved).reshape
 
 ## `OnlinePlanningScene.components.record_pair`
 
-[定义位置](../../../manipulation/online_geometry.py#L535)。
+[定义位置](../../../manipulation/online_geometry.py#L540)。
 
 输入签名：
 
@@ -1559,7 +1539,7 @@ geometry_evidence_out.append_observed
 
 ## `OnlinePlanningScene.components.record_nonclear`
 
-[定义位置](../../../manipulation/online_geometry.py#L549)。
+[定义位置](../../../manipulation/online_geometry.py#L554)。
 
 输入签名：
 
@@ -1599,7 +1579,7 @@ order
 
 ## `OnlinePlanningScene.components.nonclear_diagnostics`
 
-[定义位置](../../../manipulation/online_geometry.py#L568)。
+[定义位置](../../../manipulation/online_geometry.py#L573)。
 
 输入签名：
 
@@ -1640,7 +1620,7 @@ rows.extend
 
 ## `OnlinePlanningScene.optimization_objective`
 
-[定义位置](../../../manipulation/online_geometry.py#L829)。
+[定义位置](../../../manipulation/online_geometry.py#L832)。
 
 输入签名：
 
@@ -1659,8 +1639,8 @@ def optimization_objective(self, position, quaternion, progress, joint_position,
 > every required reference-frame robot link to differentiable position
 > and wxyz quaternion tensors from the caller's calibrated FK. Entity
 > fixed transforms, owner attachment/release relations, hand certainty,
-> finite contact regions and initial-support cell identities retain
-> their existing scene definitions. Material samples remain fixed for
+> finite contact regions retain their existing scene definitions.
+> Material samples remain fixed for
 > the whole solve. Original ``components`` and interval queries retain
 > all collision, missing-contact and unknown-space decisions.
 >
@@ -1748,33 +1728,16 @@ second.owner_id
 progress.detach().cpu().numpy
 progress.detach().cpu
 progress.detach
-permission_progress.detach().cpu().numpy
-permission_progress.detach().cpu
-permission_progress.detach
 owner.attachments
 np.logical_or.reduce
 np.logical_or
 relation.active
 rule.robot_body
-self._initial_support_models.values
-self._initial_support_models
-model.relation.actor
-model.relation
-model.relation.target_owner
 self.check_request
+self.inherited_initial_state
 self.tool_geometry_names
 target_matrix[:3, :3].T
 regions.append
-model.relation.interval
-model.permission
-model.components
-values.extend
-(components[f'initial_support/{model.relation.relation_id}'] / model.actor_field.voxel_size).square().reshape(-1).unbind
-(components[f'initial_support/{model.relation.relation_id}'] / model.actor_field.voxel_size).square().reshape
-(components[f'initial_support/{model.relation.relation_id}'] / model.actor_field.voxel_size).square
-model.relation.relation_id
-model.actor_field.voxel_size
-model.actor_field
 torch.stack(values).sum
 torch.stack
 progress.numel
@@ -1846,14 +1809,11 @@ target
 first
 second
 attachment_progress
-permission_cpu
 attached
 relation
 first_pose
 actor
 rules
-support
-model
 report['internal_assembly_pair_count']
 regions
 normals
@@ -1864,7 +1824,6 @@ world_normals
 region
 permission
 report['pair_state_count']
-components
 result
 report['relationship_components']
 value
@@ -1926,22 +1885,12 @@ combinations
 progress.detach().cpu().numpy
 progress.detach().cpu
 progress.detach
-permission_progress.detach().cpu().numpy
-permission_progress.detach().cpu
-permission_progress.detach
 np.logical_or.reduce
 relation.active
-self._initial_support_models.values
 self.check_request
 regions.append
 PairPermission
-model.permission
 pair_objective
-model.components
-values.extend
-(components[f'initial_support/{model.relation.relation_id}'] / model.actor_field.voxel_size).square().reshape(-1).unbind
-(components[f'initial_support/{model.relation.relation_id}'] / model.actor_field.voxel_size).square().reshape
-(components[f'initial_support/{model.relation.relation_id}'] / model.actor_field.voxel_size).square
 torch.stack(values).sum
 torch.stack
 progress.numel
@@ -1955,7 +1904,7 @@ report_out.update
 
 ## `OnlinePlanningScene.evaluate`
 
-[定义位置](../../../manipulation/online_geometry.py#L999)。
+[定义位置](../../../manipulation/online_geometry.py#L995)。
 
 输入签名：
 
@@ -2004,7 +1953,7 @@ name.startswith
 
 ## `OnlinePlanningScene.estimated_workspace_allocation`
 
-[定义位置](../../../manipulation/online_geometry.py#L1009)。
+[定义位置](../../../manipulation/online_geometry.py#L1005)。
 
 输入签名：
 
@@ -2116,7 +2065,7 @@ dict
 
 ## `OnlinePlanningScene.describe`
 
-[定义位置](../../../manipulation/online_geometry.py#L1071)。
+[定义位置](../../../manipulation/online_geometry.py#L1067)。
 
 输入签名：
 
@@ -2127,7 +2076,7 @@ def describe(self):
 显式输出分支：
 
 ```python
-{'model': 'native_robot_observed_scene_v1', 'reference_frame': self.reference_frame, 'robot_geometry_source': 'registered_native_model', 'owners': [owner.owner_id for owner in self.owners], 'robot_entities': list(self.robot_model.geometry_names), 'fixed_geometry_names': list(self.fixed_geometry_names), 'tool_geometry_names': list(self.tool_geometry_names), 'unknown_policy': deepcopy(self.unknown_policy), 'robot_view_coverage_status': 'not_queried', 'collision_rule': 'nonpenetration', 'required_progress_anchors': self.required_progress_anchors, 'observation_report': deepcopy(self.observation_report)}
+{'model': 'native_robot_observed_scene_v1', 'reference_frame': self.reference_frame, 'robot_geometry_source': 'registered_native_model', 'owners': [owner.owner_id for owner in self.owners], 'robot_entities': list(self.robot_model.geometry_names), 'fixed_geometry_names': list(self.fixed_geometry_names), 'tool_geometry_names': list(self.tool_geometry_names), 'unknown_policy': deepcopy(self.unknown_policy), 'robot_view_coverage_status': 'not_queried', 'inherited_initial_state': _plain(self.inherited_initial_state), 'collision_rule': 'nonpenetration', 'required_progress_anchors': self.required_progress_anchors, 'observation_report': deepcopy(self.observation_report)}
 ```
 
 读取的对象属性：
@@ -2141,6 +2090,7 @@ self.robot_model
 self.fixed_geometry_names
 self.tool_geometry_names
 self.unknown_policy
+self.inherited_initial_state
 self.required_progress_anchors
 self.observation_report
 ```
@@ -2156,11 +2106,12 @@ owner
 ```python
 list
 deepcopy
+_plain
 ```
 
 ## `OnlinePlanningScene.to_execution_binding`
 
-[定义位置](../../../manipulation/online_geometry.py#L1083)。
+[定义位置](../../../manipulation/online_geometry.py#L1082)。
 
 输入签名：
 
@@ -2171,7 +2122,7 @@ def to_execution_binding(self):
 显式输出分支：
 
 ```python
-{'schema': 'native_robot_observed_scene_v1', **self.describe(), 'owners': owners, 'robot_model': native, 'background': self.background.record(), 'contacts': _plain([asdict(row) for row in self.contacts]), 'tool_geometry_names': list(self.tool_geometry_names), 'grasp_contact_activations': _plain(self.grasp_contact_activations), 'initial_support_relations': [row.record() for row in self.initial_support_relations], 'gripper': hand_record, 'has_gripper': self.has_gripper, 'numerical_position_tolerance_m': self.numerical_position_tolerance_m, 'numerical_rotation_tolerance_rad': self.numerical_rotation_tolerance_rad, 'coverage': self.coverage.record()}
+{'schema': 'native_robot_observed_scene_v1', **self.describe(), 'owners': owners, 'robot_model': native, 'background': self.background.record(), 'contacts': _plain([asdict(row) for row in self.contacts]), 'tool_geometry_names': list(self.tool_geometry_names), 'grasp_contact_activations': _plain(self.grasp_contact_activations), 'gripper': hand_record, 'has_gripper': self.has_gripper, 'numerical_position_tolerance_m': self.numerical_position_tolerance_m, 'numerical_rotation_tolerance_rad': self.numerical_rotation_tolerance_rad, 'coverage': self.coverage.record()}
 ```
 
 读取的对象属性：
@@ -2203,8 +2154,6 @@ self.background
 self.contacts
 self.tool_geometry_names
 self.grasp_contact_activations
-row.record
-self.initial_support_relations
 self.has_gripper
 self.numerical_position_tolerance_m
 self.numerical_rotation_tolerance_rad
@@ -2242,6 +2191,5 @@ self.robot_model.model_record
 self.robot_validator.T_reference_base.tolist
 self.describe
 self.background.record
-row.record
 self.coverage.record
 ```

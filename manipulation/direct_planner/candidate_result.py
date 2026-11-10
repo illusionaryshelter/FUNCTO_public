@@ -48,12 +48,6 @@ def scene_conditions(point):
         costs['contact/'+rule.rule_id] = _maximum(normal*policy['active']*(1-uncertain))+max(gaps, default=0.)
         costs['unresolved/contact/'+rule.rule_id] = max(unresolved, default=0.)
         conditional['contact/'+rule.rule_id] = _maximum(uncertain)
-    for model in scene._initial_support_models.values():
-        components = model.components(context['owner_poses'][model.relation.actor],
-            context['owner_poses'][model.relation.target_owner], context['progress'],
-            check_request=scene.check_request)
-        costs.update({key: _maximum(value) for key, value in components.items()})
-
     known = scene.coverage._known
     shape = np.asarray(known.shape[::-1])
     origin, h = scene.coverage.origin, scene.coverage.voxel_size

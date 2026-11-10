@@ -1,6 +1,6 @@
 # 直接规划器 API 与实现索引
 
-实际代码基线与完整数学定义见 [组件架构](README.md)。本页的函数签名和包内依赖由当前源码生成；模块契约说明数据输入、计算职责及返回内容。
+实际代码基线与完整数学定义见 [组件架构](README.md)；场景初态与关系接口见[已接受初态组件](../planner-architecture/13-inherited-initial-state.md)。本页的函数签名和包内依赖由当前源码生成；模块契约说明数据输入、计算职责及返回内容。
 
 公开包入口为 `DirectPreferenceBackend`、`DirectPreferencePlanner`、`ReferenceObjective`、`plan_trajectory` 与原 `bind_pose_objectives`。内部模块通过包内相对导入组合，实验文件读取由调用方负责。
 
@@ -386,7 +386,7 @@
 
 ## scene_relationships：显式关系的目标项
 
-[源码](../../manipulation/direct_planner/scene_relationships.py)。输入：原现场接触/初始支撑声明、固定材料点、工具位姿、物理时间和技能进度。
+[源码](../../manipulation/direct_planner/scene_relationships.py)。输入：原现场接触声明、固定材料点、工具位姿、物理时间和技能进度。
 
 计算和输出：调用原关系目标计算，返回同一图中的关系偏好标量及普通证据；实体非穿透由几何条件提供。
 
@@ -394,7 +394,7 @@
 
 | API 签名 | 调用作用 |
 |---|---|
-| `scene_relationship_objective(scene, position, quaternion, progress, joint_position, joint_names, *, trajectory_time, material_samples, report_out=None)` | Return the original required-contact and initial-support scalar sum. |
+| `scene_relationship_objective(scene, position, quaternion, progress, joint_position, joint_names, *, trajectory_time, material_samples, report_out=None)` | Return the declared required-contact scalar sum. |
 
 ## material_hull：技能材料点的线性约束索引
 

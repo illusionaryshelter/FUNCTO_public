@@ -57,7 +57,6 @@ def robot_case():
     original, controls = curve_fixture.computation(extra_parameters=(.43,))
     # BEGIN this isolated objective fixture declares an empty relation inventory.
     original.scene.contacts = ()
-    original.scene._initial_support_models = {}
     # END material/contact integration uses a separate real observed-scene fixture.
     problem = bind_pose_objectives(original.problem, [dict(goal_id=['pose_events', 0],
         role='prior', scales=dict(position=.02, rotation=.1, yaw=.1),

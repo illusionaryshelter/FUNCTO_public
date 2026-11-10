@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`d4f0f33`。
+代码基线：`本轮继承初态实现，提交后登记实际编号`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
@@ -91,16 +91,12 @@ def load_contact_bindings(path):
 
 实现说明：
 
-> Validate recorded contact input and construct independent support facts.
->
-> Ordinary contact features bind through explicit source task declarations.
-> Initial support carries observed plane evidence and an existing interval;
-> its entrance geometry and height baseline belong to scene construction.
+> Read finite contact features and their source task declarations.
 
 显式输出分支：
 
 ```python
-(inputs, tuple((InitialSupportRelation(**row) for row in declarations)))
+inputs
 ```
 
 读取的对象属性：
@@ -109,7 +105,6 @@ def load_contact_bindings(path):
 json.loads
 Path(path).read_text
 inputs['source'].strip
-inputs.get
 ```
 
 写入目标：
@@ -118,8 +113,6 @@ inputs.get
 inputs
 required
 optional
-declarations
-row
 ```
 
 直接调用符号：
@@ -132,15 +125,11 @@ isinstance
 set
 ValueError
 inputs['source'].strip
-inputs.get
-any
-tuple
-InitialSupportRelation
 ```
 
 ## `load_joint_reference`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L96)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L86)。
 
 输入签名：
 
@@ -224,7 +213,7 @@ JointTrajectory
 
 ## `finger_trajectory_factory`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L127)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L117)。
 
 输入签名：
 
@@ -273,7 +262,7 @@ float
 
 ## `finger_trajectory_factory.build`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L144)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L134)。
 
 输入签名：
 
@@ -339,7 +328,7 @@ np.stack
 
 ## `position_controlled_hand`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L181)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L171)。
 
 输入签名：
 
@@ -420,7 +409,7 @@ execution_limits.describe
 
 ## `position_controlled_hand.nominal_geometry`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L208)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L198)。
 
 输入签名：
 
@@ -456,7 +445,7 @@ bind_nominal_finger_geometry
 
 ## `require_feedback_identity`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L235)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L225)。
 
 输入签名：
 
@@ -501,7 +490,7 @@ ValueError
 
 ## `recorded_owner_observation_inputs`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L247)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L237)。
 
 输入签名：
 
@@ -578,7 +567,7 @@ Path
 
 ## `run_prepared`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L310)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L300)。
 
 输入签名：
 
@@ -679,7 +668,6 @@ args.contact_bindings
 row.get
 problem.conditions
 row.rule_id
-row.relation_id
 problem.requirement_consumption
 frame['T_output_owner'].tolist
 supplied_masks[identity, view['id']].resolve
@@ -724,6 +712,8 @@ args.fine_regions
 args.fine_regions.read_text
 row.items
 args.depth_error
+args.inherited_initial_state
+args.inherited_initial_state.read_text
 args.unknown_policy.read_text
 args.unknown_policy
 scene.observation_report
@@ -813,7 +803,6 @@ report['gripper']
 tool_members
 report['tool_geometry_names']
 contacts
-initial_support_relations
 report['contact_binding']
 contact_inputs
 row
@@ -974,6 +963,7 @@ torch.tensor
 args.fine_regions.read_text
 row.items
 build_scene_from_rgbd
+args.inherited_initial_state.read_text
 args.unknown_policy.read_text
 save_observation_partitions
 np.savez_compressed
@@ -995,7 +985,7 @@ _write_diagnostic_json
 
 ## `run_prepared.mark_wallclock`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L346)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L336)。
 
 输入签名：
 
@@ -1030,7 +1020,7 @@ print
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L705)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L697)。
 
 输入签名：
 
@@ -1108,7 +1098,7 @@ run_prepared
 
 ## `parse_args`
 
-[定义位置](../../../tests/planning/run_recorded_skill.py#L734)。
+[定义位置](../../../tests/planning/run_recorded_skill.py#L726)。
 
 输入签名：
 

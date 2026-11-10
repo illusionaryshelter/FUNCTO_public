@@ -48,7 +48,7 @@ def _static_qualification(report):
         any(positive(value) for value in report.get("native_violations", {}).values())
         or any(positive(component["maximum"])
                for name, component in report.get("scene_components", {}).items()
-               if name.startswith(("collision/", "contact/", "initial_support/"))
+               if name.startswith(("collision/", "contact/"))
                or name == "gripper/controller"))
     return (bool(task_failed), bool(model_failed),
             not task_failed and (not evaluated or not report["task_satisfied"]),

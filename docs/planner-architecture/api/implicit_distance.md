@@ -21,7 +21,7 @@
 | `box_distance(a, b)` | 两个 `(lower[3],upper[3])` 的 float64 世界范围，直接调用共同编译内核，输出非负分离下界 |
 | `trilinear(values, coordinates)` | 八角值及单元归一化坐标，输出插值、局部梯度和算术误差 |
 
-`_EPS` 和 `_GAMMA` 来自共同数值模块。`box_distance` 是场—场、机器人—场和初始支撑共同消费的接口。原范围对接口及输入数组所有权保留；Numba 编译的详细算术和首次调用语义见[内核契约](geometry_kernels.md)。
+`_EPS` 和 `_GAMMA` 来自共同数值模块。`box_distance` 是场—场和机器人—场共同消费的接口。原范围对接口及输入数组所有权保留；Numba 编译的详细算术和首次调用语义见[内核契约](geometry_kernels.md)。
 
 ## 3. 有限点对许可
 
@@ -70,4 +70,4 @@
 
 ## 6. 依赖与消费者
 
-`FrozenObservedField` 继承本场表示并负责归档；`observed_collision` 由场景选择场—场查询。`native_field_distance` 复用范围、坐标误差、点对许可和场单元计算，同时保留官方机器人原形状。`initial_support` 消费相同范围距离与原单元身份。`sampled_geometry_objective` 消费原材料点及实际插值/梯度；`interval_geometry` 消费场景交付的完整实体下界。组件之间通过上述表示和返回记录连接。
+`FrozenObservedField` 继承本场表示并负责归档；`observed_collision` 由场景选择场—场查询。`native_field_distance` 复用范围、坐标误差、点对许可和场单元计算，同时保留官方机器人原形状。`sampled_geometry_objective` 消费原材料点及实际插值/梯度；`interval_geometry` 消费场景交付的完整实体下界。组件之间通过上述表示和返回记录连接。

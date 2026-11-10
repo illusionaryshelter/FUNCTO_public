@@ -113,6 +113,27 @@ def test_fixed_original_geometry_values_and_sparse_jacobian_match_difference(tmp
     np.testing.assert_array_equal(point.values, point.spatial_values)
 
 
+# BEGIN an inherited scene premise changes only exact entrance field rows.
+def test_inherited_initial_state_keeps_future_field_and_robot_constraints(tmp_path):
+    base, controls = computation(tmp_path)
+    geometry, terminal, bound = bind(base)
+    ordinary = bound.evaluate(controls)
+    base.scene.inherited_initial_state = dict(source='accepted predecessor feedback')
+    geometry, terminal, bound = bind(base)
+    inherited = bound.evaluate(controls)
+    initial = np.array([row['time_s'] == 0. and not (
+        row['first'].startswith('robot/') and row['second'].startswith('robot/'))
+        for row in bound.records])
+    assert initial.any() and np.max(ordinary.values[initial]) > 0.
+    # Inactive numerical rows keep the provider's finite nonpositive tail.
+    # Their value has no distance meaning and contributes no violation/gradient.
+    assert np.all(inherited.values[initial] <= 0.)
+    np.testing.assert_array_equal(inherited.values[~initial], ordinary.values[~initial])
+    np.testing.assert_array_equal(dense(inherited)[initial], 0.)
+    assert inherited.report['inactive_count'] == int(initial.sum())
+# END positive physical time and native interval minima retain the same values.
+
+
 # BEGIN an interior collision must contribute to the actual optimizer rows.
 def test_native_interval_finds_collision_between_clear_endpoints_and_differentiates(tmp_path):
     from manipulation.cubic_constraints import CubicAffineMap

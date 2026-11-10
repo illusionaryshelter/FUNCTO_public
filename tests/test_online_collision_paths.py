@@ -9,7 +9,6 @@ from manipulation.online_geometry import FrozenPrimitives, OnlinePlanningScene
 from manipulation.planning_problem import PosePath
 from manipulation.planning_scene import Attachment, CollisionOwner, ObservedSpace
 from test_online_self_pair_cache import make_scene as hand_scene
-from test_initial_support import scene as initial_support_scene
 from test_online_contact import field as contact_field, rule as contact_rule
 
 
@@ -138,7 +137,7 @@ def test_uncertain_fingers_use_fixed_radius_and_do_not_change_known_arm_modes():
     assert changed_paths['collision/robot/background'].radii[1] == .02
 
 
-def test_contact_side_permission_and_initial_support_have_distinct_mode_keys():
+def test_contact_side_permission_retains_its_mode_key():
     contact = contact_rule(sphere_indices=(0,))
     target = owner()
     target.query = contact_field(points=((-0.006, 0., 0.),))
@@ -153,12 +152,6 @@ def test_contact_side_permission_and_initial_support_have_distinct_mode_keys():
     scene.components(*args, contact_permission_progress=torch.full_like(args[-1], .5),
                      collision_paths_out=altered)
     assert altered['collision/robot/part'].mode_keys[0][0, :, 0].all()
-    support = initial_support_scene()
-    support_args = states((.001,), progress=(.5, 1.))
-    _, support_paths = assert_hard_unchanged(support, support_args)
-    keys = support_paths['collision/payload/support'].mode_keys
-    assert keys[0].squeeze(-1).tolist() == [[1, 1]]  # Continued holding has no release.
-    assert keys[1].squeeze(-1).tolist() == [[True, False]]
 
 
 def test_export_requires_bound_geometry_and_cannot_mix_native_confirmation():

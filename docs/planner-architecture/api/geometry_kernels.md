@@ -20,7 +20,7 @@ Numba `njit(fastmath=False, cache=True)` 编译这些固定维数运算，NumPy 
 | `box_distance(low_a, high_a, low_b, high_b)` | 两个同坐标系范围 | 向外舍入的非负分离下界；`implicit_distance.box_distance` 保留既有范围对输入接口 |
 | `projection_lower(low, high, direction, native_low, native_high, length)` | 范围、投影方向、原生实体完整投影区间、方向范数 | 原生实体与范围在该方向上的非负分离下界；由 `native_field_distance._projection_gap` 消费 |
 
-调用链为 `OnlinePlanningScene` 的成对几何查询进入 `query_distance/query_native_field`，再调用范围距离及 `PairPermission` 分类；原生形状查询还通过 `_projection_gap` 调用 Coal 取得方向及原生投影区间，然后调用 `projection_lower`。`initial_support` 通过其原有 `implicit_distance.box_distance` 导入使用同一实现。
+调用链为 `OnlinePlanningScene` 的成对几何查询进入 `query_distance/query_native_field`，再调用范围距离及 `PairPermission` 分类；原生形状查询还通过 `_projection_gap` 调用 Coal 取得方向及原生投影区间，然后调用 `projection_lower`。
 
 ## 3. 运算及边界语义
 
@@ -34,4 +34,4 @@ Numba `njit(fastmath=False, cache=True)` 编译这些固定维数运算，NumPy 
 
 ## 4. 验证范围
 
-`tests/test_geometry_numerics.py` 以原 NumPy 向量归约核对半空间边界及其相邻浮点、只读/非连续数组、范围距离和投影间隙。完整实体查询由 `test_implicit_distance.py`、`test_native_field_distance.py`、`test_geometry_query_bounds.py` 等测试覆盖；初始支撑和连续区间分别沿其现有 API 验证。实验复刻的数据、性能和物理结果位于项目外阶段记录。
+`tests/test_geometry_numerics.py` 以原 NumPy 向量归约核对半空间边界及其相邻浮点、只读/非连续数组、范围距离和投影间隙。完整实体查询由 `test_implicit_distance.py`、`test_native_field_distance.py`、`test_geometry_query_bounds.py` 等测试覆盖；连续区间沿其实际 API 验证。实验复刻的数据、性能和物理结果位于项目外阶段记录。

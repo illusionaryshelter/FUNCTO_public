@@ -66,30 +66,20 @@ def save_observation_partitions(scene, output):
 # END saved original masks preserve ownership without another segmentation call.
 
 
-# BEGIN typed initial support is a separate recorded declaration channel.
+# BEGIN finite source contacts retain one recorded declaration channel.
 def load_contact_bindings(path):
-    """Validate recorded contact input and construct independent support facts.
-
-    Ordinary contact features bind through explicit source task declarations.
-    Initial support carries observed plane evidence and an existing interval;
-    its entrance geometry and height baseline belong to scene construction.
-    """
-    from manipulation.initial_support import InitialSupportRelation
-
+    """Read finite contact features and their source task declarations."""
     inputs = json.loads(Path(path).read_text())
     required = {"contacts", "source"}
-    optional = {"grasp_activations", "initial_support_relations"}
+    optional = {"grasp_activations"}
     if (not isinstance(inputs, dict) or not required <= set(inputs)
             or set(inputs)-required-optional):
         raise ValueError("Contact bindings need contacts, source and optional "
-                         "grasp_activations/initial_support_relations")
+                         "grasp_activations")
     if not isinstance(inputs["source"], str) or not inputs["source"].strip():
         raise ValueError("Contact bindings require a current evidence source")
-    declarations = inputs.get("initial_support_relations", [])
-    if not isinstance(declarations, list) or any(not isinstance(row, dict) for row in declarations):
-        raise ValueError("Initial support declarations must be a list of typed relation records")
-    return inputs, tuple(InitialSupportRelation(**row) for row in declarations)
-# END no nominal penetration or source-component inventory is caller supplied.
+    return inputs
+# END collision-free inheritance is supplied through the scene entrance input.
 
 
 # BEGIN explicit joint reference is guidance with no saved authorization.
@@ -489,18 +479,17 @@ def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
         from robot_validation_fixture import tool_geometry_names
         tool_members = tool_geometry_names(fixture)
         report["tool_geometry_names"] = list(tool_members)
-        contacts, initial_support_relations = (), ()
+        contacts = ()
         report["contact_binding"] = {"policies": []}
         if args.contact_bindings is not None:
             from manipulation.planning_scene import ContactRule
-            contact_inputs, initial_support_relations = load_contact_bindings(args.contact_bindings)
+            contact_inputs = load_contact_bindings(args.contact_bindings)
             contacts = tuple(ContactRule(**row) for row in contact_inputs["contacts"])
             if any(row.get("kind") == "grasp_contact_activation" for row in problem.conditions):
                 from manipulation.contact_binding import bind_grasp_contact_rules
                 bind_grasp_contact_rules(problem, contacts, contact_inputs["grasp_activations"])
             report["contact_binding"] = {"source": contact_inputs["source"],
-                "rule_ids": [row.rule_id for row in contacts],
-                "initial_support_relation_ids": [row.relation_id for row in initial_support_relations]}
+                "rule_ids": [row.rule_id for row in contacts]}
         # END Attachment supplies internal membership without material permissions.
         report["requirement_consumption"] = problem.requirement_consumption
         # END permissions affect software collision legality, never native physical contact.
@@ -606,7 +595,10 @@ def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
             tool_geometry_names=tool_members,
             gripper=hand,
             observed_owners=observed_owners, contacts=contacts,
-            initial_support_relations=initial_support_relations, task_owner_ids=task_owners,
+            # BEGIN reuse the accepted predecessor's exact robot boundary.
+            inherited_initial_state=(None if args.inherited_initial_state is None else
+                json.loads(args.inherited_initial_state.read_text())), task_owner_ids=task_owners,
+            # END this declaration changes no observed samples or future pair rules.
             fine_regions=fine_regions, unknown_policy=json.loads(args.unknown_policy.read_text()),
             max_mapping_bytes=args.mapping_memory_mib*1024**2,
             max_host_rss_bytes=args.max_host_rss_mib*1024**2,
@@ -760,6 +752,10 @@ def parse_args(argv=None):
                         metavar=("VIEW_ID", "MASK_PATH"))
     # END existing entity models do not require placeholder masks.
     parser.add_argument("--observed-owner", type=Path)
+    # BEGIN an optional inherited boundary is explicit task-sequence input.
+    parser.add_argument("--inherited-initial-state", type=Path,
+        help="Accepted predecessor robot feedback; declares the initial observed scene collision-free")
+    # END fresh tasks retain their ordinary observed-scene entrance query.
     parser.add_argument("--center", type=float, nargs=3, required=True)
     parser.add_argument("--extent", type=float, nargs=3, required=True)
     # BEGIN only the coarser environment spacing remains an experiment input.

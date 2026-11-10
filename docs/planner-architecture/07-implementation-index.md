@@ -6,7 +6,7 @@
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **70 个文件、1076 个定义**。
+覆盖 **69 个文件、1067 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -31,7 +31,6 @@
 | [manipulation/collision_records.py](api/collision_records.md) | 4 | [02](02-observation-and-collision.md) |
 | [manipulation/observations.py](api/observations.md) | 16 | [02](02-observation-and-collision.md) |
 | [manipulation/contact_binding.py](api/contact_binding.md) | 2 | [03](03-attachment-contact-and-hand.md) |
-| [manipulation/initial_support.py](api/initial_support.md) | 9 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_state.py](api/gripper_state.md) | 3 | [03](03-attachment-contact-and-hand.md) |
 | [manipulation/gripper_trajectory.py](api/gripper_trajectory.md) | 37 | [11](11-device-control-and-evaluation.md) |
 | [manipulation/planning.py](api/planning.md) | 161 | [05](05-acceptance-and-execution.md) |

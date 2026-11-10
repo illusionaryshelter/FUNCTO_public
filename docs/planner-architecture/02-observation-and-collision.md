@@ -2,7 +2,7 @@
 
 观测场算法基线：`be44b54`；官方机器人距离批处理与资源估计的代码基线：`12e0ef5`；通用距离函数当前代码为 `99eae0c`，详见 [implicit_distance API](api/implicit_distance.md)。本次文档引用提交与 `99eae0c` 的相关生产代码相同。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-`implicit_distance.box_distance(a,b)` 接收同一查询坐标系内两个轴对齐包围盒的上下界，每个端点为长度三的 binary64 数组。函数计算逐轴间隔的欧氏范数，按原端点数值规模减去算术舍入余量，再向负无穷舍入，返回非负距离下界。端点规模由 `np.concatenate((a[0],a[1],b[0],b[1]))` 按原顺序连接后求绝对值最大值。该函数用于观测场、官方机器人实体与观测场、初始支撑的查询；包围盒下界描述空间范围的分离程度，实体碰撞结论仍来自各查询的实际表示与证据。
+`implicit_distance.box_distance(a,b)` 接收同一查询坐标系内两个轴对齐包围盒的上下界，每个端点为长度三的 binary64 数组。函数计算逐轴间隔的欧氏范数，按原端点数值规模减去算术舍入余量，再向负无穷舍入，返回非负距离下界。端点规模由 `np.concatenate((a[0],a[1],b[0],b[1]))` 按原顺序连接后求绝对值最大值。该函数用于观测场及官方机器人实体与观测场的查询；包围盒下界描述空间范围的分离程度，实体碰撞结论仍来自各查询的实际表示与证据。
 
 本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
 
@@ -46,7 +46,7 @@
 | `intersection` | 原表示中已确认存在共同占据的开邻域，即体积交叠 |
 | `unresolved` | 未发现上述交叠证据，但仍有域在当前数值精度或许可边界下无法判定 |
 
-`_geometry_kernels` 承担范围距离、半空间分类和方向投影中的三维数值运算。`implicit_distance.box_distance`、`PairPermission._classify` 与 `native_field_distance._projection_gap` 直接消费共同实现，`initial_support` 的既有导入自然使用相同范围距离。输入为同一坐标系内的 float64 端点和半空间；Numba 关闭快速数学重排，保留 x/y/z 运算次序及原 `_GAMMA` 和 `nextafter` 舍入。首次签名编译计入触发请求的耗时，缓存保存编译代码。原空间树、许可域、注册实体、预算回调和证据仍属于原调用者。完整 API、数组布局和公式见[三维数值内核](api/geometry_kernels.md)。
+`_geometry_kernels` 承担范围距离、半空间分类和方向投影中的三维数值运算。`implicit_distance.box_distance`、`PairPermission._classify` 与 `native_field_distance._projection_gap` 直接消费共同实现。输入为同一坐标系内的 float64 端点和半空间；Numba 关闭快速数学重排，保留 x/y/z 运算次序及原 `_GAMMA` 和 `nextafter` 舍入。首次签名编译计入触发请求的耗时，缓存保存编译代码。原空间树、许可域、注册实体、预算回调和证据仍属于原调用者。完整 API、数组布局和公式见[三维数值内核](api/geometry_kernels.md)。
 
 `PairPermission` 描述允许的点对域。完全许可的框对被排除，其余继续查询；混合许可框采用按进入顺序展开，明确未许可框优先细化。见证必须属于未许可域。该顺序不改变原场及许可范围。
 
@@ -78,7 +78,7 @@ SciPy 四元数转换给出数值旋转。代码计算 `δ≥||BᵀB-I||∞`，�
 
 有限点优化目标具有明确计算范围。原支持域和许可边界定义分段分支，最近特征切换处可能不可微；常值零场和常值负场内部的原空间梯度为零；有限点之间的交叠可能未进入目标。`report_out` 保存这些范围及实际查询计数。原实体体积交叠、required contact、覆盖及连续时间区间仍由各自原查询给出证据。
 
-`sample(excluded_cells=...)` 在目标查询时移除初始支撑声明的原第二实体单元；反向点集按同一单元 ID 删除对应材料。共享边界仍可由未删除邻格提供原值。有限接触仍由原 `_permission` 的实际半空间定义，两个重叠点端点分别测试。required contact 的偏好取固定原零点相对声明区域的最小超差；实际接触状态仍由 `query_region_intersection` 提供。
+`sample(excluded_cells=...)` 按调用方明确提供的原单元身份计算局部查询域；反向点集使用相同身份。有限接触仍由原 `_permission` 的实际半空间定义，两个重叠点端点分别测试。required contact 的偏好取固定原零点相对声明区域的最小超差；实际接触状态仍由 `query_region_intersection` 提供。
 
 每个实体对的临时点梯度先归约到两实体十四个位姿分量，再连回调用者的 FK 和三次轨迹变量。轨迹图按实体对及状态保存位姿导数，不按材料点数量保存整段点图。`estimated_workspace_allocation` 将 CPU 需求分为三项：`cpu_resident` 记录已驻留的原场、当前原生配对表及已构造材料数组；`cpu_pending_shared` 记录尚未构造的固定材料与配对表上界；`cpu_live` 记录原生数值块、一次实体对计算的临时数据与保留的位姿图。材料对象按身份去重，构造后其实际数组字节转入驻留项；每个材料对象的两个三维上下界数组最多占 96 字节，同时进入构造前上界和构造后实际计数。每份观测材料的原单元范围与中心偏差新增 `16C+24` 字节，同样在构造前计待分配、构造后计驻留；场景 clone 共享该不可变对象。一次方向查询的原 `256N` 临时上界增加 `64N+96C`，覆盖展开索引及重复缓冲、所选坐标、活动索引映射，以及中心树结果转换、中心与逐轴掩码、范围排序和偏移数组；它与材料构造、接触零点的临时上界取最大值，不按轨迹长度重复计材料数组。原场和已分配样本由 RSS 统计，新增准入使用待分配项与临时项；GPU 项仅计点查询中具名关节、连杆位姿及其梯度的张量传送缓存。该目标是一阶接口，供同一 SLSQP 内核计算目标与雅可比。
 
@@ -108,13 +108,13 @@ SciPy 四元数转换给出数值旋转。代码计算 `δ≥||BᵀB-I||∞`，�
 
 `query_native_field(..., native_bounds=(local,world))` 可直接消费同一原生实体的局部与世界投影范围。场景构造时保存不可变形状的局部范围；`components` 在本次调用内按实体和状态计算一次世界范围，供不同场配对复用。空场无需构造对应世界范围。required contact 使用的作用实体矩阵也在整批转换一次，然后按状态读取。这些范围和矩阵只复用相同几何计算，实体查询仍使用原形状和原任务场。
 
-完整范围的 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。主约束求解器通过独立 `optimization_objective` 取得固定有限目标，通过 `components` 与连续区间接口取得原实体证据，具体输入和作用见[场景接口](api/online_geometry.md)。`evaluate` 汇总所有非 conditional 原分项并保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留 `geometry_scope`、分类计数和有限见证；`nonclear_pairs` 按硬分项各选取物理时间最早与配对残差最大的记录，若两者相同则合并为一条。每条记录同时保留 `state_index`、`time_s`、任务 `progress`、接触许可 `permission_progress` 和选择原因。残差最大只在同一分项内部比较：机器人自身配对使用原生穿透距离，实体场配对使用原有交叠分类值。该显示选择直接消费已有查询证据；连续区间验收的完整 `geometry_evidence_out` 仍覆盖每个状态的每个要求配对。场配对的未决只进入查询报告。原生自身的 `numerical_boundary`、required contact、初始支撑高度与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
+完整范围的 `OnlinePlanningScene.components` 计算原生机器人自身、机器人与观测场、运动实体与背景、实体之间的配对，返回相同硬分项。主约束求解器通过独立 `optimization_objective` 取得固定有限目标，通过 `components` 与连续区间接口取得原实体证据，具体输入和作用见[场景接口](api/online_geometry.md)。`evaluate` 汇总所有非 conditional 原分项并保留独立硬证据。`describe` 和查询报告以 `collision_rule='nonpenetration'` 说明实际规则。`last_query_report` 保留 `geometry_scope`、分类计数和有限见证；`nonclear_pairs` 按硬分项各选取物理时间最早与配对残差最大的记录，若两者相同则合并为一条。每条记录同时保留 `state_index`、`time_s`、任务 `progress`、接触许可 `permission_progress` 和选择原因。残差最大只在同一分项内部比较：机器人自身配对使用原生穿透距离，实体场配对使用原有交叠分类值。该显示选择直接消费已有查询证据；连续区间验收的完整 `geometry_evidence_out` 仍覆盖每个状态的每个要求配对。场配对的未决只进入查询报告。原生自身的 `numerical_boundary`、required contact 与覆盖按各自硬条件计算，conditional 分项只作为条件报告。
 
 区间几何调用显式提供 `PairBatch` 类型的 `geometry_evidence_out`，接收每个状态的完整实体对证据，包含原实体 ID、硬状态、距离范围、许可种类、内部组合体和未建模运动；该记录不受显示报告的有限条数限制。`first/second` 保存显示名称，`geometry_entity_key` 的两个同名字段分别保存 `robot/<geometry ID>`、`owner/<owner ID>` 或 `background`。带类别的实体键连接距离证据、运动界、配对缓存和交叠去重，也用于筛选依赖未建模手指运动的机器人实体；同名机器人组件与任务实体保留独立身份。
 
 原生机器人实体对的分离下界由 `NativePairTable.query` 在同一距离循环中对两个完整形状作支持投影，并采用外向区间运算。方向范数取上界，投影间隙和除法取下界；零方向给出零分离下界。Coal 查询法向只提供投影方向，原生求解容差不被解释为距离误差界。区间检查如何将端点状态的几何证据与运动界结合，见[验收组件](05-acceptance-and-execution.md)。
 
-每次 `components` 调用从完整关节张量和各实体位置张量构造一次形状与进度一致的零值张量。条件未知跳过项、组合体内部跳过项及分类残差复用其中对应样本的标量。机器人自碰撞保留原生 signed distance 及刚体见证导数，初始支撑保留最小高度区间及其见证；这两个有量纲计算保持其原数值语义；新的有限优化接口另对原值与长度尺度构造确定的平方目标。
+每次 `components` 调用从完整关节张量和各实体位置张量构造一次形状与进度一致的零值张量。条件未知跳过项、组合体内部跳过项及分类残差复用其中对应样本的标量。机器人自碰撞保留原生 signed distance 及刚体见证导数；有限优化接口以原值与长度尺度构造平方目标。
 
 在每个实际进度样本，场景先以 `Attachment.active(progress)` 确定当前附着实体，再从任务场配对中排除两类内部对：`tool_geometry_names` 中任一工具实体与当前附着实体，以及同一 TCP 上两个当前附着实体。内部对不调用几何查询，`internal_assembly_pair_count` 记录排除的配对样本数。所有成员保留自己的原形状、位姿和观测支持，继续参与对背景、组合体外实体和其余机器人部件的查询。机器人自身仍由原生配对策略处理。有限接触的 `contact_permission_progress` 仅决定任务许可，不改变附着生效时刻。
 

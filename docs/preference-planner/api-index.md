@@ -306,7 +306,7 @@ Reuse full FK and original relation producers at exact record times.
 
 Recreate the existing pair domain from current poses and declarations.
 
-[定义](../../manipulation/preference_planner/geometry.py#L255)。直接调用：`PairPermission`, `any`, `bool`, `first.removeprefix`, `first.startswith`, `model.permission`, `name.removeprefix`, `name.startswith`, `np.asarray`, `policy['bounds'][0, column].detach`, `policy['bounds'][0, column].detach().numpy`, `policy['normals'][0, column].detach`, `policy['normals'][0, column].detach().numpy`, `regions.append`, `relation.active`, `second.removeprefix`, `second.startswith`, `self.scene._initial_support_models.values`。
+[定义](../../manipulation/preference_planner/geometry.py#L255)。直接调用：`PairPermission`, `any`, `bool`, `first.removeprefix`, `first.startswith`, `name.removeprefix`, `name.startswith`, `np.asarray`, `policy['bounds'][0, column].detach`, `policy['bounds'][0, column].detach().numpy`, `policy['normals'][0, column].detach`, `policy['normals'][0, column].detach().numpy`, `regions.append`, `relation.active`, `second.removeprefix`, `second.startswith`。
 
 ### `GeometryConstraints._native_interior_witness(self, native, native_matrix, field, field_matrix, world, permission, excluded)`
 

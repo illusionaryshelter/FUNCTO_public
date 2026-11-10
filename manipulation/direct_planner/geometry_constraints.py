@@ -319,10 +319,11 @@ class BoundGeometry:
                            and rule.robot_body == first[6:]) or
                           (actor != 'robot' and {rule.actor, rule.target_owner} == {actor, target})
                           for rule in owner.scene.contacts)
-            support = any(model.relation.actor == actor and model.relation.target_owner == target
-                          for model in owner.scene._initial_support_models.values())
-            if attachment or contact or support:
+            # BEGIN exact entrance rows inherit the scene's declared premise.
+            inherited = owner.scene.inherited_initial_state is not None and record['time_s'] == 0.
+            if attachment or contact or inherited:
                 permission_rows.append(ordinal)
+            # END future pair rows retain their original numerical constraints.
         self.permission_rows = np.asarray(permission_rows, dtype=np.int64)
         self.hand_rows = np.asarray(hand_rows, dtype=np.int64)
         # END trial signs never change these registered structural dependencies.

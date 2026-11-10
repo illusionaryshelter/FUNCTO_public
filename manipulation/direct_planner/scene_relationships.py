@@ -1,7 +1,7 @@
 """Declared scene relationship preferences on the existing physical queries.
 
-The scene owns observed material, contact declarations, attachment/release
-poses and prepared initial-support models. This module composes their existing
+The scene owns observed material, contact declarations and attachment/release
+poses. This module composes their existing
 differentiable APIs into the original state-count mean. GeometryConstraints
 binds the shared MaterialSamples inventory before a candidate is scored.
 """
@@ -16,7 +16,7 @@ from manipulation.sampled_geometry_objective import contact_objective
 def scene_relationship_objective(scene, position, quaternion, progress,
         joint_position, joint_names, *, trajectory_time, material_samples,
         report_out=None):
-    """Return the original required-contact and initial-support scalar sum.
+    """Return the declared required-contact scalar sum.
 
     Poses use the scene reference frame, metres and unit wxyz quaternions.
     ``progress`` and ``trajectory_time`` retain the caller's complete ordinary
@@ -27,16 +27,15 @@ def scene_relationship_objective(scene, position, quaternion, progress,
     trajectory objective applies constraint_weight once to the returned value.
     """
     required = tuple(rule for rule in scene.contacts if rule.required)
-    models = tuple(scene._initial_support_models.values())
     zero = position.sum() * 0 + quaternion.sum() * 0 + joint_position.sum() * 0
-    report = dict(scope='declared_required_contact_and_initial_support',
+    report = dict(scope='declared_required_contact',
         normalization='sum_over_all_query_states_divided_by_state_count',
         state_count=progress.numel(), required_contact_count=len(required),
-        initial_support_count=len(models), active_contact_state_count=0,
+        active_contact_state_count=0,
         conditional_contact_state_count=0, contact_without_zero_samples=[],
         relationship_components={})
     values = []
-    if required or models:
+    if required:
         relationship_components = {}
         poses = scene._owner_poses(position, quaternion, progress, None,
                                    relationship_components)
@@ -63,12 +62,6 @@ def scene_relationship_objective(scene, position, quaternion, progress,
                     values.append(normal[index].square() + contact_objective(samples,
                         policy['normals'][index], policy['bounds'][index]))
                     report['active_contact_state_count'] += 1
-        for model in models:
-            components = model.components(poses[model.relation.actor],
-                poses[model.relation.target_owner], progress,
-                check_request=scene.check_request)
-            values.append((components[f'initial_support/{model.relation.relation_id}']
-                           / model.actor_field.voxel_size).square().sum())
         report['relationship_components'] = {key: value.detach().cpu().tolist()
                                               for key, value in relationship_components.items()}
     result = zero + (torch.stack(values).sum() / progress.numel() if values else zero)

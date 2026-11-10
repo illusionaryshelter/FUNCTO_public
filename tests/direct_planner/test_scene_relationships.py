@@ -1,6 +1,6 @@
 """Original scene relationship values, derivatives, events and hand certainty.
 
-Maintained generic fields, ContactRule, PreparedInitialSupport and nominal
+Maintained generic fields, ContactRule and nominal
 finger APIs provide the numerical evidence. No recorded task scene is loaded.
 """
 
@@ -20,11 +20,9 @@ sys.path[:0] = [str(Path(__file__).resolve().parents[2]),
                  str(Path(__file__).resolve().parents[2] / 'tests/planning')]
 
 from geometry_objective_fixtures import _moving_scene
-from manipulation.initial_support import PreparedInitialSupport
 from manipulation.planning_scene import Attachment, ContactRule
 from manipulation.sampled_geometry_objective import MaterialSamples
 from manipulation.direct_planner.scene_relationships import scene_relationship_objective
-import test_initial_support as support_fixture
 
 
 def contact_rule():
@@ -96,37 +94,6 @@ def test_required_contact_matches_original_value_gradient_and_first_release(tmp_
 
     assert torch.autograd.gradcheck(objective, (values.detach().requires_grad_(),),
                                     eps=1e-6, atol=1e-7, rtol=1e-5)
-
-
-def test_initial_support_matches_original_relationship_mean_and_gradient(tmp_path, monkeypatch):
-    import manipulation.sampled_geometry_objective as original
-    scene = _moving_scene(tmp_path)
-    actor, target = support_fixture.owners()
-    scene.owners = (actor, target)
-    model = PreparedInitialSupport(support_fixture.relation(), actor, target, 1e-6)
-    scene._initial_support_models = {model.relation.relation_id: model}
-    progress = torch.tensor([[.1, .5, 1.]], dtype=torch.float64)
-    height = torch.tensor([-.001, -.002, -.003], dtype=torch.float64, requires_grad=True)
-    position = torch.stack((height*0, height*0, height), -1)[None]
-    quaternion = height.new_tensor([1., 0., 0., 0.]).expand(1, 3, 4)
-    q = height.new_tensor([.04, -.02]).expand(1, 3, 2)
-    names = ('left_slide', 'right_slide')
-    arguments = position, quaternion, progress, q, names
-    # Isolate the existing relation branch inside the original complete
-    # objective. The maintained support model and its derivatives run intact.
-    monkeypatch.setattr(original, 'pair_objective', lambda *args, **kwargs: position.sum()*0)
-    monkeypatch.setattr(original, 'native_pair_objective', lambda *args, **kwargs: position.sum()*0)
-    expected = scene.optimization_objective(*arguments, trajectory_time=progress,
-        robot_link_poses=scene.kinematics.poses(q, names))
-    report = {}
-    actual = scene_relationship_objective(scene, *arguments,
-        trajectory_time=progress, material_samples={}, report_out=report)
-    torch.testing.assert_close(actual, expected, rtol=0., atol=1e-16)
-    expected_gradient, = torch.autograd.grad(expected, height, retain_graph=True)
-    gradient, = torch.autograd.grad(actual, height)
-    torch.testing.assert_close(gradient, expected_gradient, rtol=0., atol=1e-12)
-    assert actual > 0. and gradient[0] < 0. and gradient[1] < 0. and gradient[2] == 0.
-    assert report['initial_support_count'] == 1 and report['state_count'] == 3
 
 
 def test_nominal_hand_certainty_retains_conditional_and_missing_surface_diagnostics(tmp_path):

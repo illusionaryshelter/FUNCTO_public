@@ -13,8 +13,11 @@ from dataclasses import dataclass
 import numpy as np
 
 
-CLEAR, INTERSECTION, UNRESOLVED, UNMODELLED, INTERNAL = range(5)
-STATUS_NAMES = ("clear", "intersection", "unresolved", "unmodelled_motion", "internal_assembly")
+# BEGIN inherited entrance evidence is a declared state, not a measured distance.
+CLEAR, INTERSECTION, UNRESOLVED, UNMODELLED, INTERNAL, INHERITED = range(6)
+STATUS_NAMES = ("clear", "intersection", "unresolved", "unmodelled_motion", "internal_assembly",
+                "inherited_initial_state")
+# END all original measured/query statuses retain their meaning.
 STATUS_CODES = {name: index for index, name in enumerate(STATUS_NAMES)}
 NONE, FINITE_REGION, RIGID_ASSEMBLY = range(3)
 PERMISSION_NAMES = ("none", "finite_region", "declared_rigid_assembly")
@@ -308,7 +311,7 @@ def selected_witness_records(*, states=None, batch=None):
     for block, source, pair, time, progress in sources():
         total += 1
         status = block.status[source, pair]
-        if status in (UNMODELLED, INTERNAL):
+        if status in (UNMODELLED, INTERNAL, INHERITED):
             continue
         if status == INTERSECTION:
             intersections.append((block, source, pair, time, progress))

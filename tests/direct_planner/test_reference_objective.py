@@ -75,7 +75,6 @@ class EmptyRelationshipScene:
     """Declare an empty relation set and reject any collision-soft-cost call."""
 
     contacts = ()
-    _initial_support_models = {}
     gripper = None
 
     def optimization_objective(self, position, quaternion, progress, q, names, *,
@@ -169,7 +168,7 @@ def test_shared_objective_weights_once_and_keeps_material_event():
         key: float(value.detach()) for key, value in components.items()}
     assert 'observed_geometry' not in components and float(components['scene_relations'].detach()) == 0.
     assert produced == ['objective_base', 'scene_relations', 'reference_prior', 'tool_angular_motion']
-    assert relation_report['required_contact_count'] == relation_report['initial_support_count'] == 0
+    assert relation_report['required_contact_count'] == 0
     report = bound.report(100000.)
     assert report['relative_weight'] == .3 and report['effective_absolute_weight'] == 30000.
 # END candidate and solver values retain the same one-time weights.

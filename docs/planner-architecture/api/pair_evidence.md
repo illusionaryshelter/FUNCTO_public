@@ -1,13 +1,11 @@
 # `manipulation/pair_evidence.py` 实现契约
 
-代码基线：`8b0e326`。
-共享验收的数据所有权及调用次序见[共享验收组件](../10-shared-candidate-validation.md)。
-
+代码基线：`本轮继承初态实现，提交后登记实际编号`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `PairDescriptor`
 
-[定义位置](../../../manipulation/pair_evidence.py#L25)。
+[定义位置](../../../manipulation/pair_evidence.py#L28)。
 
 ```python
 class PairDescriptor():
@@ -35,7 +33,7 @@ policy_source: str = None
 
 ## `PairDescriptor.key`
 
-[定义位置](../../../manipulation/pair_evidence.py#L42)。
+[定义位置](../../../manipulation/pair_evidence.py#L45)。
 
 输入签名：
 
@@ -67,7 +65,7 @@ self.entity_second
 
 ## `PairDescriptor.display`
 
-[定义位置](../../../manipulation/pair_evidence.py#L45)。
+[定义位置](../../../manipulation/pair_evidence.py#L48)。
 
 输入签名：
 
@@ -105,7 +103,7 @@ self.entity_second
 
 ## `PairBatch`
 
-[定义位置](../../../manipulation/pair_evidence.py#L51)。
+[定义位置](../../../manipulation/pair_evidence.py#L54)。
 
 ```python
 class PairBatch():
@@ -128,7 +126,7 @@ class PairBatch():
 
 ## `PairBatch.__init__`
 
-[定义位置](../../../manipulation/pair_evidence.py#L62)。
+[定义位置](../../../manipulation/pair_evidence.py#L65)。
 
 输入签名：
 
@@ -162,7 +160,7 @@ self._query_layout_bound
 
 ## `PairBatch.bind_clock`
 
-[定义位置](../../../manipulation/pair_evidence.py#L71)。
+[定义位置](../../../manipulation/pair_evidence.py#L74)。
 
 输入签名：
 
@@ -237,7 +235,7 @@ np.zeros
 
 ## `PairBatch.native_pair_count`
 
-[定义位置](../../../manipulation/pair_evidence.py#L83)。
+[定义位置](../../../manipulation/pair_evidence.py#L86)。
 
 输入签名：
 
@@ -271,7 +269,7 @@ self.native_count
 
 ## `PairBatch._register`
 
-[定义位置](../../../manipulation/pair_evidence.py#L87)。
+[定义位置](../../../manipulation/pair_evidence.py#L90)。
 
 输入签名：
 
@@ -310,7 +308,7 @@ self.descriptors.append
 
 ## `PairBatch.begin_native`
 
-[定义位置](../../../manipulation/pair_evidence.py#L93)。
+[定义位置](../../../manipulation/pair_evidence.py#L96)。
 
 输入签名：
 
@@ -369,7 +367,7 @@ PairDescriptor
 
 ## `PairBatch.retain_native_chunk`
 
-[定义位置](../../../manipulation/pair_evidence.py#L109)。
+[定义位置](../../../manipulation/pair_evidence.py#L112)。
 
 输入签名：
 
@@ -408,7 +406,7 @@ len
 
 ## `PairBatch.append_observed`
 
-[定义位置](../../../manipulation/pair_evidence.py#L115)。
+[定义位置](../../../manipulation/pair_evidence.py#L118)。
 
 输入签名：
 
@@ -470,7 +468,7 @@ np.ravel_multi_index
 
 ## `PairBatch.seal`
 
-[定义位置](../../../manipulation/pair_evidence.py#L135)。
+[定义位置](../../../manipulation/pair_evidence.py#L138)。
 
 输入签名：
 
@@ -602,7 +600,7 @@ tuple
 
 ## `PairBatch.set_query_layout`
 
-[定义位置](../../../manipulation/pair_evidence.py#L197)。
+[定义位置](../../../manipulation/pair_evidence.py#L200)。
 
 输入签名：
 
@@ -657,7 +655,7 @@ np.asarray(side, dtype=np.int8).reshape
 
 ## `PairBatch.materialize`
 
-[定义位置](../../../manipulation/pair_evidence.py#L204)。
+[定义位置](../../../manipulation/pair_evidence.py#L207)。
 
 输入签名：
 
@@ -732,7 +730,7 @@ self.query_index[state].tolist
 
 ## `EvidenceState`
 
-[定义位置](../../../manipulation/pair_evidence.py#L238)。
+[定义位置](../../../manipulation/pair_evidence.py#L241)。
 
 ```python
 class EvidenceState():
@@ -760,7 +758,7 @@ source_rows: tuple
 
 ## `EvidenceState.pair_columns`
 
-[定义位置](../../../manipulation/pair_evidence.py#L254)。
+[定义位置](../../../manipulation/pair_evidence.py#L257)。
 
 输入签名：
 
@@ -792,7 +790,7 @@ self.batch
 
 ## `EvidenceState.source`
 
-[定义位置](../../../manipulation/pair_evidence.py#L258)。
+[定义位置](../../../manipulation/pair_evidence.py#L261)。
 
 输入签名：
 
@@ -822,7 +820,7 @@ self.source_rows
 
 ## `EvidenceState.tokens`
 
-[定义位置](../../../manipulation/pair_evidence.py#L261)。
+[定义位置](../../../manipulation/pair_evidence.py#L264)。
 
 输入签名：
 
@@ -866,7 +864,7 @@ len
 
 ## `EvidenceState.pair_record`
 
-[定义位置](../../../manipulation/pair_evidence.py#L270)。
+[定义位置](../../../manipulation/pair_evidence.py#L273)。
 
 输入签名：
 
@@ -906,7 +904,7 @@ row.items
 
 ## `_geometry_query_states`
 
-[定义位置](../../../manipulation/pair_evidence.py#L275)。
+[定义位置](../../../manipulation/pair_evidence.py#L278)。
 
 输入签名：
 
@@ -966,7 +964,7 @@ groups.items
 
 ## `selected_witness_records`
 
-[定义位置](../../../manipulation/pair_evidence.py#L289)。
+[定义位置](../../../manipulation/pair_evidence.py#L292)。
 
 输入签名：
 
@@ -1054,7 +1052,7 @@ row.get
 
 ## `selected_witness_records.sources`
 
-[定义位置](../../../manipulation/pair_evidence.py#L299)。
+[定义位置](../../../manipulation/pair_evidence.py#L302)。
 
 输入签名：
 

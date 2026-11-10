@@ -2,7 +2,7 @@
 
 `manipulation.direct_planner` 将完整工具参考、具名机器人入口、任务关系和现场观测模型组成一次整段 C² 关节轨迹优化。其公开输出为原 `PlanningResult`：接受的关节/手指曲线、原执行绑定、请求账本，以及能够定位数值失败与几何条件的诊断记录。
 
-当前实现代码基线为 `d4f0f33`；本次文档提交仅登记基线，生产与测试代码内容保持相同。性能实现来源为独立实验 `50e4954`，其支撑半空间预消元、解析 Jacobian 批量填槽及一阶运动学计算现由本库维护。公开配置与通用输入共同确定求解；日期验收记录位于 `sim-version-plans/2026-11-02-functo-presolve-integration`。
+数值主线代码基线为 `d4f0f33`；场景初态继承与场景关系目标的当前实现基线见[已接受初态组件](../planner-architecture/13-inherited-initial-state.md)。性能实现来源为独立实验 `50e4954`，其支撑半空间预消元、解析 Jacobian 批量填槽及一阶运动学计算现由本库维护。公开配置与通用输入共同确定求解；日期验收记录位于 `sim-version-plans/2026-11-02-functo-presolve-integration`。
 
 本组件使用 CasADi/IPOPT/MUMPS 完成数值优化；SciPy 提供有界最小二乘、区间求根及稀疏计算；Pinocchio 提供机器人运动学，Coal 提供官方机器人实体距离，Warp/Torch 提供场批量查询，Numba 编译最近点到关节的一阶导数；mpmath.iv 对支撑半空间的静态蕴含上界进行区间计算。FUNCTO 原任务、参考、曲线、连续关节域、声明关系、机器人模型、预算和执行绑定承担各自数据职责。
 
@@ -35,6 +35,8 @@ flowchart TD
 全部模块、输入/输出和函数签名见 [API 与实现索引](api.md)。以下各节定义实际计算及相互调用。
 
 ## 数据、坐标与时间
+
+场景中的 `inherited_initial_state` 将已接受前置执行的具名 q/dq 与当前固定入口绑定。数值几何与候选结果共同使用精确 t=0 的现场无碰撞前提，正时间继续计算原配对；具体字段、API、证据与该部分实际代码基线见[已接受初态组件](../planner-architecture/13-inherited-initial-state.md)。
 
 `T_A_B` 将 B 中的列坐标变换到 A。机器人 FK 的输出为请求参考系下的具名连杆位姿；`base_pose` 是参考系到机器人根连杆的标定，`tool_transform` 是参考连杆到 TCP 的固定变换。长度为 m，角度为 rad，时间为从本次入口开始的物理秒。关节列由 `joint_names` 定义，滑动关节采用 m。四元数计算采用 wxyz，显示时明确转换为旋转矩阵或角轴。
 
@@ -80,7 +82,7 @@ flowchart TD
 
 `reference_objective.ReferenceObjective` 明确声明位置尺度、姿态尺度、相对权重、原关节状态代价倍率和工具角速度平方积分权重。事件拟合尺度由初始化声明独立提供，实际任务事件容差由任务表示提供。`bind` 在原普通物理查询时刻冻结参考值及归一化梯形积分权重；`bind_clock` 为一个明确的候选时钟调用原 `BoundToolReference`。`BoundReferenceObjective.cost` 对平移平方误差和旋转矩阵弦距平方作时间平均。姿态项为 `||R−Rref||²_F/2 = 4 sin²(θ/2)`，以相对四元数的归一化向量部平方计算，正负四元数表示产生相同值；其局部二阶尺度为 `θ²`，在 π 处光滑。硬事件的实际角度容差及事后旋转误差保留原主值角定义。
 
-`trajectory_objective_components` 组合六项：乘显式倍率的原关节运动代价、原任务偏好、显式位姿先验、声明场景关系、完整参考偏好和工具角速度代价。`BoundReferenceObjective.angular_motion_cost` 计算相邻查询姿态的主值相对旋转向量，将其平方除以物理时间间隔与总时长后求和，得到分段旋转速度平方的时间平均。该项的秒平方权重保持显式，梯度通过原共同位姿计算传递。`constraint_weight` 在同一组合点乘一次；当前求解器直接使用这些显式尺度，不按初始目标或初始梯度重新缩放。`scene_relationship_objective` 调用原要求接触和初始支撑关系计算；归一化分母为原查询状态数，关系生效状态由声明时钟确定。
+`trajectory_objective_components` 组合六项：乘显式倍率的原关节运动代价、原任务偏好、显式位姿先验、声明场景关系、完整参考偏好和工具角速度代价。`BoundReferenceObjective.angular_motion_cost` 计算相邻查询姿态的主值相对旋转向量，将其平方除以物理时间间隔与总时长后求和，得到分段旋转速度平方的时间平均。该项的秒平方权重保持显式，梯度通过原共同位姿计算传递。`constraint_weight` 在同一组合点乘一次；当前求解器直接使用这些显式尺度，不按初始目标或初始梯度重新缩放。`scene_relationship_objective` 调用原要求接触关系计算；归一化分母为原查询状态数，关系生效状态由声明时钟确定。
 
 `DirectComputation.shared_context` 建立共同状态，`task_linearization` 调用通用任务 API；`objective_components` 在同一状态上求上述目标。`BoundComputation` 一次绑定固定的任务、几何和物理行结构。`ConstraintEnvelope` 按原注册实体对与声明条件合并几何时刻行：原 gₖ 全部不大于零与组内最大值不大于零等价。每组保留原行身份、全部可能系数列的并集和当前胜出行，`select` 返回最大值，`jacobian_values` 将胜出原行的导数写入该并集。相等时选择原顺序第一行；切换处使用该活动分支的一阶值。原 `GeometryPoint` 仍保存所有时刻、事件侧及区间见证，候选报告直接读取这些未合并数值。`evaluate` 返回 `ComputationPoint`，后者保留目标值、任务行、几何行、关节行以及用于候选结果的独立数值状态。`objective_gradient/jacobian_values` 按需计算一次并缓存；导数消费后释放 Torch 计算图，候选诊断只保留已分离的数值。
 
@@ -134,7 +136,7 @@ flowchart TD
 
 `_Oracle.point` 对每个完整点按保留行检查原零界限并保存本次调用中目标最低的可行点；`feasible_improvements` 记录实际目标、时间、试点身份和约化系数。求解继续使用声明迭代预算与原 IPOPT 停止条件。`solve_trajectory` 优先交付最低目标可行点；若全部点不可行，则交付末点及其数值失败记录，由候选出口按各条件的职责形成结果。数值收敛状态、库停止原因和选择可行状态分别记录。当前点的状态、原几何结果和全控制系数共同交给候选出口。
 
-`DirectPreferencePlanner.evaluate_candidate` 显式调用 `candidate_result.evaluate_candidate`，读取本次求解保留的同一系数、机器人状态和几何结果。原任务残差给出米制/弧度错误，原 `_candidate_domain_validation` 给出连续关节极值，`_hold_polynomial_report` 检查原终端后缀。`scene_conditions` 计算声明接触、初始支撑、名义手指及运动实体的观测/条件未知区域。该候选出口形成一次原执行绑定所需的验证元数据，并将选中点自己的完整几何报告设为本次导出记录，使网页空间见证与交付曲线相同。几何结论覆盖原有限物理查询与固定局部坐标，关节范围覆盖连续多项式。候选结果直接使用这一计算范围及相应空间见证。
+`DirectPreferencePlanner.evaluate_candidate` 显式调用 `candidate_result.evaluate_candidate`，读取本次求解保留的同一系数、机器人状态和几何结果。原任务残差给出米制/弧度错误，原 `_candidate_domain_validation` 给出连续关节极值，`_hold_polynomial_report` 检查原终端后缀。`scene_conditions` 计算声明接触、名义手指及运动实体的观测/条件未知区域。该候选出口形成一次原执行绑定所需的验证元数据，并将选中点自己的完整几何报告设为本次导出记录，使网页空间见证与交付曲线相同。几何结论覆盖原有限物理查询与固定局部坐标，关节范围覆盖连续多项式。候选结果直接使用这一计算范围及相应空间见证。
 
 位姿事件的 `function_pose:*` 超限单独进入 `pose_accuracy`：`status` 为 `within_tolerance` 或 `warning`，`residuals` 保留原超限，`maximum_absolute_measurements` 保留每个事件的米制位置与弧度旋转误差，`goals` 保留事件身份、进度与原分量容差。这是候选完成后的精度分析；优化中的高精度名义约束继续由同一任务生产函数提供。正式 `residuals` 和执行绑定 `validation.violations` 使用其余任务、连续关节、入口及现场条件。目标有限且这些条件满足时交付曲线，位姿警告与候选历史一同归档。
 

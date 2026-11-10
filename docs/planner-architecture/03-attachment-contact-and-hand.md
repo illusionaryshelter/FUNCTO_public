@@ -40,11 +40,11 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 场景快照保存工具成员与各注册实体的 `Attachment`，包括活动区间与释放身份。任务的 `declared_attachment` 还可为功能关系提供载体坐标；是否建立独立碰撞实体由观测场景的实体注册表达。执行入口在完整结果绑定核对后，将原条件全部字段及工具成员写入 `declared_attachment_bindings`。模型几何关系由上述 `validate_problem` 处理；物理接触与任务效果由各自的观察或事后评价记录。
 
-## 4. 初始支撑
+## 4. 已接受初态的继承
 
-`PreparedInitialSupport` 消费两个原始场、入口关系和已声明平面。它用同一非穿透查询逐个检查原支撑单元；只有入口已确认体积交叠、返回 `intersection` 的原单元进入 `selected_cells`，未决单元另存于 `unresolved_cells`。单纯触面不构成选格依据，也不需要为非穿透规则新增豁免。`PairPermission.excluded_second_cells` 仅排除该实体对中已选的原始单元；邻接单元继续接受普通非穿透查询，许可没有额外距离范围。
+已接受的前置执行可以向 `OnlinePlanningScene.inherited_initial_state` 提供同一具名机器人边界。`validate_problem` 将声明的 q/dq 按 `PlanningProblem.joint_names` 重排，与本次固定入口逐值核对。该声明赋予物理时间 t=0 的现场实体对无碰撞前提；机器人官方自身配对保留原检查。正时间的运动继续使用原实体表示、有限材料接触和距离计算。
 
-`query_minimum_height` 为整个已表示实体相对支撑平面求高度区间。后续高度下界高于入口基线上界减数值容差时确认满足；后续上界低于入口下界减容差时报告下降违反量和局部梯度，其余为未决。基线两端截断到不大于零。活动区间采用左闭右开，记录类型为 `initial_observed_support_v2`。
+记录式入口通过 `--inherited-initial-state` 读取该数据；`build_scene_from_rgbd` 将它与原观测模型一并交给场景。数值几何、场景查询、候选元数据和执行绑定采用同一声明。完整输入字段、计算范围、API 和执行关系见[已接受初态接口](13-inherited-initial-state.md)。
 
 ## 5. 指令、名义几何与反馈
 

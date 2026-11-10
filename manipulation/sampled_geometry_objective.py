@@ -68,7 +68,7 @@ class MaterialSamples:
     """Fixed original occupied material and zero-edge points of one entity.
 
     Observed sample cell identities are retained, including duplicate points
-    shared by adjacent cells, so an initial-support declaration removes only
+    shared by adjacent cells, so a finite cell-domain selection removes only
     its selected original cells. Native points are constructed by the existing
     feasible-point API from the local projection box's 3-by-3-by-3 grid. The
     box only proposes coordinates; it never supplies collision material.

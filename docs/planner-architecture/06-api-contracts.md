@@ -99,7 +99,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 | `pair_objective/native_pair_objective` | 两原实体、同刻可导位姿和有限许可 | 实际负场值/原生负距离的归一化平方及其位姿一阶导数；统一约束求解器 |
 | `contact_objective` | 原场固定零点和当前声明区域半空间 | 零点到区域的最小平方超差；required contact 的有限偏好 |
 | `query_region_intersection` | 原场、位姿、有限半空间 | 受支持零表面 contact/missing_contact/unresolved；required接触 |
-| `query_minimum_height` | 原场、位姿与声明平面 | 整体最低高度区间及见证；初始支撑 |
+| `query_minimum_height` | 原场、位姿与声明平面 | 整体有向高度区间及见证；显式几何诊断 |
 | `robot_self_filter.classify_depth` | 原深度、采集时FK放置的原生组件、明确shadow padding | SELF/AMBIGUOUS_SHADOW/ENVIRONMENT、原自由射线及来源；建图 |
 | `ObservedSpace/query_coverage` | 原自由射线格、运动实体场及条件区域 | covered/unknown_witness/unresolved；场景按明确策略解释条件区域及未知 |
 | `NativeSolid/NativePrimitive` | 原凸组件顶点或解析尺寸、所属连杆、固定变换和来源 | 原生机器人实体；共享检查器 |
@@ -115,7 +115,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 | `native_query_resident_nbytes` / `native_query_storage_nbytes` / `native_query_temporary_nbytes` | 当前表 / 模型实体和配对容量 | 已驻留字节 / 待构造表上界 / 每次查询临时容量；场景资源准入 |
 | `OnlinePlanningScene._robot_self_components` | 已准备的完整具名关节、可微机器人位姿及同值矩阵、手部状态、原 required_pairs | 官方机器人自身穿透与数值边界硬分项、原见证导数及查询报告；robot/full 两种 components 范围共用 |
 | `OnlinePlanningScene.components/evaluate` | 同时刻关节、工具位姿、进度、时间与 geometry_scope | robot 范围计算官方机器人自身与手部，full 范围继续计算任务场；components 返回原分项，evaluate 汇总非 conditional 项，原证据独立保留 |
-| `OnlinePlanningScene.optimization_objective` | 轨迹位置、单位四元数、进度、具名关节、物理时刻与必填 robot_link_poses | 固定材料点几何、原生自身、required contact 和初始支撑的标量目标；SLSQP 消费一阶导数，report_out 解释有限目标范围 |
+| `OnlinePlanningScene.optimization_objective` | 轨迹位置、单位四元数、进度、具名关节、物理时刻与必填 robot_link_poses | 固定材料点几何、原生自身、required contact 的标量目标；SLSQP 消费一阶导数，report_out 解释有限目标范围 |
 | `OnlinePlanningScene.components(..., geometry_evidence_out=...)` | 同一实际场景查询及显式 PairBatch 证据容器 | 全量逐实体对的状态、当前距离下界、许可与内部关系；geometry_entity_key 以 robot/、owner/ 或 background 区分实体类别，供区间检查 |
 | `describe/to_execution_binding` | 场景已有输入、工具成员及实体附着 | `collision_rule='nonpenetration'`、`tool_geometry_names` 描述与 `native_robot_observed_scene_v1` 快照；结果绑定 |
 | `clone_for_rollout/with_release_history` | 同一原始场及已选搜索前缀，或固定候选的释放锚点 FK | 私有关系状态、共享不可变场；搜索前缀与候选区间几何复用预测释放位姿 |
@@ -131,7 +131,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 | `bind_grasp_contact_rules/validate_grasp_contact_arrival` | 原名义目标、close事件和明确规则身份 | 条件绑定/一致性验证；任务及场景 |
 | `build_material_contact_rules` | 原任务特征、robot_body和明确目标许可 | ContactRule记录；任务接触绑定 |
 | `check_grasp_region_compatibility` | 源特征、当前工具/目标坐标和连续手指区间 | compatible/contradicted/unresolved及假设手指见证；抓取候选任务域 |
-| `PreparedInitialSupport.components/permission/record` | 原始作用场、支撑场、入口关系、平面及当前位姿 | 原单元许可、高度违反/未决和记录；场景 |
+| `OnlinePlanningScene.inherited_initial_state/validate_problem` | 已接受前置记录的具名q/dq、反馈身份、时刻和来源；同一任务固定入口 | 精确t=0现场无碰撞前提、原配对状态与绑定快照；场景与数值几何共同消费 |
 | `FixedFingerTargets.from_mapping/bind` | 具名手指目标、原事件和设备范围 | 时间命令；规划与执行 |
 | `FingerTrajectory.build/sample/sample_torch` | 入口q/dq、命令、时长与设备限制 | 同一物理时钟的指令曲线及样本；设备与名义几何 |
 | `FingerTrajectory.describe/from_mapping/validate_execution` | 曲线、原事件与设备声明 | 曲线记录、恢复或一致性检查；执行 |
@@ -204,11 +204,11 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 
 `collision_records.encode_array/decode_array` 保存 dtype、形状和压缩数组；消费者据其真实尺寸检查资源，再恢复同一数组。`slice_layer_selection` 从分层证据中选取指定样本。`tensor_cpu_snapshot` 将完成的张量复制到 CPU 报告，`runtime_profiling` 记录请求阶段的时间及资源。这些数据接口服务可复现记录。
 
-`implicit_distance` 对同一原场完成非穿透分类并保留有范围定义的距离界。`observed_collision` 返回原分类、有限接触和最低高度证据。`sampled_geometry_objective` 保存原材料点，在每次试探计算实际原场值或原生有符号距离及同一标量的一阶导数；当原点范围与原负值范围的坐标变换区间能证明两个方向均为零时，返回相同零值和零导数。原场材料点通过已有单元中心树和原点连续索引筛选；反向坐标包围含两次前向变换舍入与旋转非正交误差，选中点保持原顺序、cell 身份和完整点数分母。机器人原生距离非负时仅返回零标量，场景统一连接所有控制量的零梯度。报告单列跳过的零贡献配对数，支持与未知计数仅覆盖实际查询点。`observed_coverage` 解释实体是否处于原自由射线或明确条件区域。`observed_robot` 将完整具名关节映射为机器人连杆位姿。`native_field_distance` 连接固定机器人官方实体与原任务场，双方保留各自表示及共同世界坐标。场配对未决保存在查询证据中，原生自身数值边界、任务接触、初始支撑和覆盖各有独立硬条件。
+`implicit_distance` 对同一原场完成非穿透分类并保留有范围定义的距离界。`observed_collision` 返回原分类、有限接触和最低高度证据。`sampled_geometry_objective` 保存原材料点，在每次试探计算实际原场值或原生有符号距离及同一标量的一阶导数；当原点范围与原负值范围的坐标变换区间能证明两个方向均为零时，返回相同零值和零导数。原场材料点通过已有单元中心树和原点连续索引筛选；反向坐标包围含两次前向变换舍入与旋转非正交误差，选中点保持原顺序、cell 身份和完整点数分母。机器人原生距离非负时仅返回零标量，场景统一连接所有控制量的零梯度。报告单列跳过的零贡献配对数，支持与未知计数仅覆盖实际查询点。`observed_coverage` 解释实体是否处于原自由射线或明确条件区域。`observed_robot` 将完整具名关节映射为机器人连杆位姿。`native_field_distance` 连接固定机器人官方实体与原任务场，双方保留各自表示及共同世界坐标。场配对未决保存在查询证据中，原生自身数值边界、任务接触和覆盖各有独立硬条件。
 
 `resource_admission.require_host_memory/require_device_memory` 输入新增存储需求、当前物理占用与明确上限，返回准入记录或类型化 `ResourceLimitError`。`optimizer_device_checks.require_tensor` 同步消费标量布尔张量，条件为真时返回 `None`，否则抛出声明的异常。手指曲线、任务定义与物理域在读取对应输入时使用该接口。`constant_tensor` 把声明的模型常量直接转换到消费者的 dtype/device，保留张量原有求导关系。预算、诊断和数值错误共享同一 eager 请求生命周期。
 
-实验运行器位于 `tests/planning`。`run_recorded_skill.run_prepared` 接收已编译问题，读取已有实体，再为本次需要建图的实体读取 mask、深度与采集时反馈。`robot_validation_fixture` 构造已知机器人验证器和图像过滤组件；其 `tool_geometry_names(fixture)` 从声明手指机构的公共父子树返回工具成员元组，写入运行报告并传给场景。`observed_robot_fixture` 恢复已有任务实体。`load_contact_bindings` 读取必填 `contacts/source` 和可选 `grasp_activations/initial_support_relations`，分别提供原有限任务接触与初始支撑记录。`recorded_task_planning.plan_and_record` 调用后端并保存曲线、结果和 `native_robot_observed_scene_v1` 来源快照。`load_saved_trajectory` 恢复正式执行输入；该操作不重建可查询场景。具体命令与数据字段见[记录入口说明](../../tests/planning/README.md)。
+实验运行器位于 `tests/planning`。`run_recorded_skill.run_prepared` 接收已编译问题，读取已有实体，再为本次需要建图的实体读取 mask、深度与采集时反馈。`robot_validation_fixture` 构造已知机器人验证器和图像过滤组件；其 `tool_geometry_names(fixture)` 从声明手指机构的公共父子树返回工具成员元组，写入运行报告并传给场景。`observed_robot_fixture` 恢复已有任务实体。`load_contact_bindings` 读取必填 `contacts/source` 和可选 `grasp_activations`，提供完整有限任务接触及原抓取激活记录；`--inherited-initial-state` 独立传递已接受前置执行的机器人边界。`recorded_task_planning.plan_and_record` 调用后端并保存曲线、结果和 `native_robot_observed_scene_v1` 来源快照。`load_saved_trajectory` 恢复正式执行输入；该操作不重建可查询场景。具体命令与数据字段见[记录入口说明](../../tests/planning/README.md)。
 
 跨阶段读写时，调用者需要同时保留几何记录、其坐标变换、对象身份、任务区域、原事件与机器人入口。各接口按上述结构解释数据；原生模型恢复与本次回放见[阶段对照](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
 

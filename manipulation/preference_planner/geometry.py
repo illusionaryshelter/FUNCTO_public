@@ -263,6 +263,10 @@ class GeometryConstraints:
                 return None, "unmodelled_motion"
         if first.startswith("robot/") and second.startswith("robot/"):
             return None, "active"
+        # BEGIN all numerical geometry consumers use the same inherited state.
+        if self.scene.inherited_initial_state is not None and record['time_s'] == 0.:
+            return None, "inherited_initial_state"
+        # END official robot self pairs and positive times remain active.
         actor = "robot" if first.startswith("robot/") else first.removeprefix("owner/")
         target = second.removeprefix("owner/")
         progress = record["progress"]
@@ -283,11 +287,6 @@ class GeometryConstraints:
                 bounds = policy["bounds"][0, column].detach().numpy() + normals @ matrix[:3, 3]
                 regions.append(((normals, bounds), (normals, bounds)))
         permission = PairPermission(regions) if regions else None
-        for model in self.scene._initial_support_models.values():
-            relation = model.relation
-            if (relation.actor == actor and relation.target_owner == target
-                    and relation.interval[0] <= record["permission_progress"] < relation.interval[1]):
-                permission = model.permission(context["matrices"][second][0, column], additional=permission)
         return permission, "active"
 
     def _native_interior_witness(self, native, native_matrix, field, field_matrix,

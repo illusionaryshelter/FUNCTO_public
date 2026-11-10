@@ -60,9 +60,10 @@
 | `input-manifest.json` | 工作根目录、技能段、候选及图像/场景路径 | 记录入口选择明确任务与文件；清单本身不是几何 |
 | `scene.json` | 当前对象身份、功能绑定、入口、目标、名义附着、任务点、支撑几何与任务容差 | `prepare_candidate/build_planning_problem` 或实验 `build_problem`；形成完整参考、明确硬要求及软偏好 |
 | `feedback.json`、`robot_feedback.json` | 具名机器人 `q/dq`、手指状态、设备时间和标定 FK | 固定规划入口、机器人/手指几何与执行续接 |
+| `inherited-initial-state.json`（可选） | 已接受前置执行的 `joint_names/q/dq/feedback_id/timestamp_s/source` | 记录入口交给场景；与本次固定入口逐值绑定，精确 t=0 观测实体对继承无碰撞前提 |
 | `robot-fixture.json`、纯运动学 YAML/URDF | 关节树、坐标、标定、关节限制及明确实体对策略 | cuRobo FK/IK、Pinocchio FK 和设备绑定 |
 | robot-only 模型及其引用的官方机器人组件 | 当前固定机器人的官方原形状、局部变换、原生逐实体配对、固定安装身份及固定手指机构拓扑 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape` 与 `tool_geometry_names`；跨任务复用，供规划、机器人检查、图像过滤及工具成员声明 |
-| `contact-bindings.json` | 必填 `contacts/source`，可选 `grasp_activations/initial_support_relations`；完整源任务特征、有限目标区域、实体身份及活动区间 | `load_contact_bindings` → `ContactRule`、原抓取条件绑定及初始支撑关系；原任务特征和当前区域分别保留 |
+| `contact-bindings.json` | 必填 `contacts/source`，可选 `grasp_activations`；完整源任务特征、有限目标区域、实体身份及活动区间 | `load_contact_bindings` → `ContactRule`、原抓取条件绑定；原任务特征和当前区域分别保留 |
 | `observed-owner.json` 与所引用原始场 | 已保存实体模型、局部坐标、位姿路径与固定附着 | `load_observed_owner` 直接读取，后续技能复用相同场 |
 | `unknown-policy.json`、`fine-regions` JSON（可选） | 未知空间的明确处理策略；指定局部细化请求 | 场景构造和覆盖查询；策略允许尝试不表示该区域已观测为空 |
 | `finger-targets.json`、`execution-limits.json` | 原事件对应手指目标；设备、跟踪、停止及事件约束 | 手指曲线、候选检查和执行绑定 |

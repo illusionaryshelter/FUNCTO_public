@@ -54,7 +54,7 @@ def test_task_and_model_verdicts_are_explicit():
 
 
 @pytest.mark.parametrize("component", ["collision/robot/self", "collision/entity/background",
-    "contact/declared_relation", "initial_support/declared_relation", "gripper/controller"])
+    "contact/declared_relation", "gripper/controller"])
 def test_registered_definite_failure_ranks_after_qualified_member(component):
     rows = [report(model_valid=False, scene_components={component: {"maximum": .01}}), report()]
     assert select([[.01], [.8]], rows) == [1]
