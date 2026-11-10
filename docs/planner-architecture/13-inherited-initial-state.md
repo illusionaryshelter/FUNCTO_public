@@ -1,6 +1,6 @@
 # 已接受初态与连续任务衔接
 
-代码基线：本轮实现提交，提交完成后登记实际编号。本文对应 `online_geometry.py`、`planning_observation.py`、`pair_evidence.py`、两个规划器的几何消费接口及记录式场景入口。数值关系目标继续由源任务的有限接触声明定义。
+代码基线：`b91b0c8`。本次文档登记保持该提交的组件实现内容。本文对应 `online_geometry.py`、`planning_observation.py`、`pair_evidence.py`、两个规划器的几何消费接口及记录式场景入口。数值关系目标继续由源任务的有限接触声明定义。
 
 ## 研究对象与输入
 

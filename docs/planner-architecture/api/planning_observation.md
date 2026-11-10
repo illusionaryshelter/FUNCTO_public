@@ -1,6 +1,6 @@
 # `manipulation/planning_observation.py` 实现契约
 
-代码基线：`本轮继承初态实现，提交后登记实际编号`。
+代码基线：`b91b0c8`。
 职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_views`

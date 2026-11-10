@@ -1,6 +1,6 @@
 # `tests/planning/run_recorded_skill.py` 实现契约
 
-代码基线：`本轮继承初态实现，提交后登记实际编号`。
+代码基线：`b91b0c8`。
 职责和数据语义见[组件说明](../05-acceptance-and-execution.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `save_observation_partitions`
