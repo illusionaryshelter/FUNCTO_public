@@ -1,6 +1,6 @@
 # 直接规划器 API 与实现索引
 
-实际代码基线与完整数学定义见 [组件架构](README.md)；场景初态与关系接口见[已接受初态组件](../planner-architecture/13-inherited-initial-state.md)。本页的函数签名和包内依赖由当前源码生成；模块契约说明数据输入、计算职责及返回内容。
+实际代码基线与完整数学定义见 [组件架构](README.md)。本页的函数签名和包内依赖由当前源码生成；模块契约说明数据输入、计算职责及返回内容。
 
 公开包入口为 `DirectPreferenceBackend`、`DirectPreferencePlanner`、`ReferenceObjective`、`plan_trajectory` 与原 `bind_pose_objectives`。内部模块通过包内相对导入组合，实验文件读取由调用方负责。
 
@@ -54,7 +54,7 @@
 
 计算和输出：完成输入绑定、初始化、求解、候选资格及原执行绑定，返回包含曲线或失败原因的 PlanningResult 和累计账本。
 
-直接包内依赖：原 FUNCTO / 数值库接口。包内调用组件：`direct_preference`。
+直接包内依赖：`candidate_result`。包内调用组件：`direct_preference`。
 
 | API 签名 | 调用作用 |
 |---|---|
@@ -410,15 +410,16 @@
 
 ## candidate_result：同点候选条件与正式验证元数据
 
-[源码](../../manipulation/direct_planner/candidate_result.py)。输入：求解器保留的 ComputationPoint、其原曲线、任务/场景声明、连续关节域和统一目标。
+[源码](../../manipulation/direct_planner/candidate_result.py)。输入：求解器保留的 ComputationPoint、其原曲线、任务/场景声明、连续关节域和统一目标；完整候选标量残差及未知空间策略。
 
-计算和输出：消费同点原任务与几何值，补齐原连续域、末段及声明关系信息，形成原绑定接口消费的接受/拒绝结果及具体证据。
+计算和输出：消费同点任务与几何值，形成绑定接口消费的接受/拒绝结果；candidate_failure 按标量硬条件区分普通拒绝与仅未知覆盖导致的策略结果。
 
-直接包内依赖：原 FUNCTO / 数值库接口。包内调用组件：`direct_preference`。
+直接包内依赖：原 FUNCTO / 数值库接口。包内调用组件：`direct_lifecycle`, `direct_preference`。
 
 | API 签名 | 调用作用 |
 |---|---|
-| `_maximum(value)` | 消费同点原任务与几何值，补齐原连续域、末段及声明关系信息，形成原绑定接口消费的接受/拒绝结果及具体证据。 |
+| `_maximum(value)` | 消费同点任务与几何值，形成绑定接口消费的接受/拒绝结果；candidate_failure 按标量硬条件区分普通拒绝与仅未知覆盖导致的策略结果。 |
+| `candidate_failure(report, policy)` | Classify a rejected candidate from its completed scalar conditions. |
 | `scene_conditions(point)` | Evaluate declared relationship and unknown policy on retained states. |
 | `evaluate_candidate(planner, trajectory, *, record_work, objective)` | Form one finite-query verdict and the exact curve's binding metadata. |
 

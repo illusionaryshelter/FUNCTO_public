@@ -23,6 +23,7 @@
 | 组件 | 输入、计算和输出 |
 |---|---|
 | [输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md) | 源区域、轨迹、功能坐标、相对关系和事件经过 grounding 与参考生成，形成 `PlanningProblem` |
+| [物体对应与几何参考](docs/planner-architecture/api/reference_transfer.md) | 明确物体预测、目标区域、源静态任务关系和原TSDF先构造目标，再迁移完整源运动并输出原工具参考接口 |
 | [观测与碰撞](docs/planner-architecture/02-observation-and-collision.md) | RGB-D 建立实体 TSDF 及观测支持域；官方机器人实体和任务原场提供几何目标及独立验收证据 |
 | [关系、接触与手指](docs/planner-architecture/03-attachment-contact-and-hand.md) | 声明关系使用事件固定锚点预测原场运动；有限接触、工具成员和手指曲线共用物理时钟 |
 | [求解与搜索](docs/planner-architecture/04-solver-and-search.md) | cuRobo IK 产生参考关节样本，最小二乘转为三次系数；SciPy SLSQP 联合求解任务和连续关节约束，OMPL 提供预算内几何路径提议 |

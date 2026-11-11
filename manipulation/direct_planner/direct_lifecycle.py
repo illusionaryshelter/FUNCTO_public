@@ -23,6 +23,9 @@ from manipulation.planning import (
     _unknown_policy_failure, _validate_bound_event_times, _verified_dependency_outcomes,
 )
 from manipulation.planning_problem import TimeBindingError, event_occurrence_key
+# BEGIN completed direct candidates use their own scalar residual contract.
+from .candidate_result import candidate_failure
+# END the measured entrance still uses the existing shared entrance report.
 
 
 def plan_trajectory(problem, scene, *, backend, budget, continuation=None,
@@ -381,14 +384,15 @@ def plan_trajectory(problem, scene, *, backend, budget, continuation=None,
         diagnostics.update(attempt, route=planner.route, recovery=None, used_ompl=False)
         # END all rejection evidence refers to this returned numerical curve.
         # BEGIN completed finite search reports its selected failure evidence.
-        diagnostics.update(failure=(_unknown_policy_failure(attempt, scene.unknown_policy)
-            or "no_feasible_solution_found"), diagnostic_trajectory=trajectory,
+        # BEGIN classify the completed direct producer without a legacy shape conversion.
+        diagnostics.update(failure=candidate_failure(attempt, scene.unknown_policy), diagnostic_trajectory=trajectory,
             diagnostic_candidate_source=completed_candidate_source, diagnostic_validation_status="completed",
             diagnostic_candidate_report={**deepcopy(attempt), "source": completed_candidate_source,
                                          "validation_status": "completed"},
             failure_scope="The selected candidate failed the declared requirements or unknown-space policy; "
                 "its component evidence does not establish that every route to the fixed target fails")
         return outcome
+        # END scalar rejection evidence remains attached to this same curve.
         # END an executable result requires the completed qualification and binding above.
     except Exception as error:
         # BEGIN every error precedes completed delivery and retains its own type.

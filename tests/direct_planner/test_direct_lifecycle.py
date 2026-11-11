@@ -238,11 +238,32 @@ def test_failed_retry_retains_cumulative_work_and_requires_a_new_solve(monkeypat
     result = run(monkeypatch, planner, request_ledger=failed.request_ledger)
     assert result.success, result.diagnostics
     assert failed.request_ledger == saved
+    # BEGIN retry ledger assertions stay with the retry's saved ledger and planner.
     assert result.request_ledger["request_id"] == saved["request_id"]
     assert result.request_ledger["binding_records"][-1]["mode"] == "planning_retry"
     assert result.request_ledger["consumed_planning"]["trajectory_solves"] == 2
     assert result.request_ledger["consumed_planning"]["validation_passes"] == 2
     assert planner.calls == ["seed", "solve", "export"]
+    # END the independent rejection test uses its own scalar candidate inputs.
+
+
+# BEGIN completed scalar geometry rejection survives lifecycle reporting.
+def test_scalar_scene_rejection_retains_curve_and_failure_without_exception(monkeypatch):
+    class ScalarScenePlanner(CountingPlanner):
+        def evaluate_candidate(self, curve, **kwargs):
+            curve, report, count = super().evaluate_candidate(curve, **kwargs)
+            report.update(residuals={'gripper/controller': 0., 'process_scene': 13.8},
+                          scene_components={'gripper/controller': 0.})
+            return curve, report, count
+
+    result = run(monkeypatch, ScalarScenePlanner(proposals=((3., False),)))
+    assert result.success is False and result.execution_binding is None
+    assert result.diagnostics['failure'] == 'no_feasible_solution_found'
+    assert result.diagnostics['diagnostic_validation_status'] == 'completed'
+    assert result.diagnostics['diagnostic_candidate_report']['residuals']['process_scene'] == 13.8
+    assert result.diagnostics['diagnostic_trajectory'].test_number == 1
+    assert 'error_type' not in result.diagnostics
+# END a reporting result cannot replace or authorize the rejected curve.
 
 
 def test_verified_continuation_keeps_actual_clock_and_remaining_work(monkeypatch):

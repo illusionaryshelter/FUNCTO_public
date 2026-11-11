@@ -204,8 +204,13 @@ def _initial_rotation_offset(nominal, functional, current, flags):
     carries the full SO(3) relative motion, including noncommuting rotations.
     For a yaw-only selection, D is a pure F-z rotation throughout the path.
     """
-    frame = functional.sample_numpy(0.)[:3, :3]
-    nominal_initial = frame.T @ nominal.sample_numpy(0.)[:3, :3]
+    # BEGIN the same entry arithmetic also serves target construction before paths.
+    # These operands are initial poses, rather than path objects. This keeps
+    # the existing RPY selection identical when a caller determines a static
+    # task target before generating the complete source motion.
+    frame = np.asarray(functional)[:3, :3]
+    nominal_initial = frame.T @ np.asarray(nominal)[:3, :3]
+    # END the selection still occurs once in the declared functional frame.
     current_initial = frame.T @ current[:3, :3]
     nominal_rpy = Rotation.from_matrix(nominal_initial).as_euler("xyz")
     current_rpy = Rotation.from_matrix(current_initial).as_euler("xyz")
@@ -415,8 +420,11 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                 original = _component_path(Q, times, path_times,
                     source="source chart-invariant relative displacement",
                     parent=function_path(path_times), attachment=_inverse(Qc))
+                # BEGIN pass entry poses to the shared target/reference rotation rule.
                 correction, result["rotation_transfer"] = _initial_rotation_offset(
-                    original, function_path(path_times), current_body @ L_body, rotation_flags)
+                    original.sample_numpy(0.), function_path(path_times).sample_numpy(0.),
+                    current_body @ L_body, rotation_flags)
+                # END no reference or planner rotation convention changes here.
             def material_path(clock):
                 functional = function_path(clock)
                 nominal = _component_path(Q, times, clock, source="source chart-invariant relative displacement",

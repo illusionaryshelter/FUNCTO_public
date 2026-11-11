@@ -97,6 +97,8 @@ manipulation 的功能位姿参考可在技能表示中声明 `is_initial_relati
 
 续接区间位于最后一个声明拼接之后，或本区间唯一拼接位于零时刻时，返回原名义后缀，并以 `entrance_twist_bound=false` 记录当前区间的入口连接范围。存在未来声明拼接时，实际机器人入口连接到该拼接，并在已声明边界提供一阶连续性。原零时刻事件继续保留其技能表示和任务接口职责；参考对象提供该物理时钟上的名义位姿，当前 FK 与名义目标之差用于事后解释。
 
+几何目标优先的参考入口为 [reference_transfer](api/reference_transfer.md)。它从明确相机间物体预测与源技能图像位姿得到J，保留事件锚定A；先以源交互/释放静态关系和原RPY声明决定目标旋转，再以当前TSDF体积中心和连续最低高度决定有限支撑目标，随后调用完整generate_reference。输出仍为原工具MotionPhase及边界；中心要求通过PoseEventRequirement的A K局部关系表达。该组件的实际代码基线以其API页为准。
+
 ## 3. 当前 program 的几何绑定
 
 `program.ground_program(program, scene)` 是技能编译所实际调用的入口。抓取分支调用 `grasp.ground_grasp`，得到当前末端参考、独立抓取目标和开闭事件。持物分支读取声明的 `T_carrier_eef`，检查 `initial_pose @ T_carrier_eef = eef_pose`，然后调用 `_object_reference` 生成物体参考，再通过 `attached_eef_reference` 得到工具参考。该等式检查输入所声明的物体坐标、工具坐标与附着变换之间的代数一致性。

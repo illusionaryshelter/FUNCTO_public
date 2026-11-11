@@ -21,6 +21,27 @@ def _maximum(value):
     return float(np.max(array)) if np.isfinite(array).all() else float('inf')
 
 
+# BEGIN direct candidate outcomes consume their scalar residual contract.
+def candidate_failure(report, policy):
+    """Classify a rejected candidate from its completed scalar conditions.
+
+    This candidate producer places every hard task, joint, collision and
+    forbidden-coverage condition in ``residuals``. Only positive forbidden
+    coverage conditions, with every other condition finite and satisfied,
+    identify an observation/policy outcome. The classification neither runs
+    another query nor changes candidate acceptance or execution authority.
+    """
+    residuals = report['residuals']
+    failed = [name for name, value in residuals.items() if value > 0.]
+    only_coverage = (failed and all(np.isfinite(value) for value in residuals.values())
+                     and all(name.startswith('unknown/forbidden/') for name in failed))
+    action = policy['outside_regions']
+    if only_coverage and action != 'allow_attempt':
+        return 'needs_observation' if action == 'require_observation' else 'unknown_space_forbidden'
+    return 'no_feasible_solution_found'
+# END nested entrance diagnostics retain their separate shared producer API.
+
+
 def scene_conditions(point):
     """Evaluate declared relationship and unknown policy on retained states."""
     geometry, context = point.geometry, point.geometry.context
