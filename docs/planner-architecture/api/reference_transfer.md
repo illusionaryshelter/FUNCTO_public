@@ -33,4 +33,4 @@
 
 返回记录保留完整源帧、时间、H_m、C_D、事件、原连续路径、释放右变换、当前几何目标、工具/物体路径及两类边界。源路径经`PosePath`逐组件采样，旋转选择沿用`RotationOffsetPath`。所有数值依赖均为既有NumPy、SciPy及本库观测查询；有限区域投影复用既有SLSQP平移求解器。
 
-实际调用为`continue_held_motion.build_reference → generate_observed_reference → observed_manipulation_targets → estimate_occupied_volume_center/place_observed_on`，目标确定后调用`generate_reference`及连续右组合。`continue_held_motion.build_problem`把结果组成原任务接口；`update_held_reference_html.update`仅采样、绑定和显示同一参考。
+实际调用为`continue_held_motion.build_reference → generate_observed_reference → observed_manipulation_targets → estimate_occupied_volume_center/place_observed_on`，目标确定后调用`generate_reference`及连续右组合。`continue_held_motion.build_problem`把结果组成原任务接口；统一执行入口为`run_held_case.run`，`publish_held_result.publish`读取本次参考与已保存结果，使用共享场景模板显示完整位姿和独立仿真记录。
