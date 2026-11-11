@@ -1,6 +1,6 @@
 # `manipulation/observed_support.py`：原观测占据体积的中心与有限支撑几何
 
-代码基线：`CODE_BASELINE_PENDING`。
+代码基线：`dbb6c1d`。
 
 代码入口为 [observed_support.py](../../../manipulation/observed_support.py)，回归入口为 [test_observed_support.py](../../../tests/test_observed_support.py)。本组件依赖原[连续占据集查询](observed_collision.md)和[观测场表示](../../../manipulation/implicit_distance.py)。
 

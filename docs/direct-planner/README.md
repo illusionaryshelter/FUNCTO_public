@@ -2,7 +2,7 @@
 
 `manipulation.direct_planner` 将完整工具参考、具名机器人入口、任务关系和现场观测模型组成一次整段 C² 关节轨迹优化。其公开输出为原 `PlanningResult`：接受的关节/手指曲线、原执行绑定、请求账本，以及能够定位数值失败与几何条件的诊断记录。
 
-数值主线代码基线为 `d4f0f33`；候选失败分类与生命周期修正代码基线为 `CODE_BASELINE_PENDING`；场景初态继承与场景关系目标的当前实现基线见[已接受初态组件](../planner-architecture/13-inherited-initial-state.md)。性能实现来源为独立实验 `50e4954`，其支撑半空间预消元、解析 Jacobian 批量填槽及一阶运动学计算现由本库维护。公开配置与通用输入共同确定求解；日期验收记录位于 `sim-version-plans/2026-11-02-functo-presolve-integration`。
+数值主线代码基线为 `d4f0f33`；候选失败分类与生命周期修正代码基线为 `dbb6c1d`；场景初态继承与场景关系目标的当前实现基线见[已接受初态组件](../planner-architecture/13-inherited-initial-state.md)。性能实现来源为独立实验 `50e4954`，其支撑半空间预消元、解析 Jacobian 批量填槽及一阶运动学计算现由本库维护。公开配置与通用输入共同确定求解；日期验收记录位于 `sim-version-plans/2026-11-02-functo-presolve-integration`。
 
 本组件使用 CasADi/IPOPT/MUMPS 完成数值优化；SciPy 提供有界最小二乘、区间求根及稀疏计算；Pinocchio 提供机器人运动学，Coal 提供官方机器人实体距离，Warp/Torch 提供场批量查询，Numba 编译最近点到关节的一阶导数；mpmath.iv 对支撑半空间的静态蕴含上界进行区间计算。FUNCTO 原任务、参考、曲线、连续关节域、声明关系、机器人模型、预算和执行绑定承担各自数据职责。
 
@@ -177,4 +177,3 @@ finally:
 `BoundComputation.produce` 的计数覆盖同一数值问题的初始化评分与主求解。`snapshot_producers` 在 solver_binding、initialization_scored 和 main_started/main_finished 保存计数与时间快照，其差值对应实际阶段开销。IPOPT 入口计时记录实际值/导数回调；同点共享会把计算计入首先请求它的入口。目标子项包含于目标父项，几何子阶段包含于几何父项。生命周期墙钟分别记录绑定、入口核验、初始化、主求解及候选交付；调用方另行记录输入准备与写盘。
 
 求解器的最优性停止状态、原约束可行性和实际候选交付为不同字段。几何条件对应原查询时刻、有限材料点与被括住的机器人距离驻点；关节条件对应连续三次多项式。完整曲线与参考的全程形态由已归档位姿和中间记录分析。实际物理执行及其事后结果由设备/评价组件产生，规划结果保持自身来源和范围。
-

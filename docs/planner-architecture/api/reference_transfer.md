@@ -1,6 +1,6 @@
 # 物体对应、几何目标与完整参考迁移
 
-代码基线：`CODE_BASELINE_PENDING`。实现为 [reference_transfer.py](../../../manipulation/reference_transfer.py)，连续路径运算见 [representation](representation.md)，观测几何见 [observed_support](observed_support.md)。
+代码基线：`dbb6c1d`。实现为 [reference_transfer.py](../../../manipulation/reference_transfer.py)，连续路径运算见 [representation](representation.md)，观测几何见 [observed_support](observed_support.md)。
 
 ## 研究对象与坐标
 

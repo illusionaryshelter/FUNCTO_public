@@ -1,6 +1,6 @@
 # 完整源表示与连续参考
 
-代码基线：`CODE_BASELINE_PENDING`。实现为 [representation.py](../../../manipulation/representation.py)，任务及边界消费者见 [输入与任务模型](../01-inputs-and-task-model.md)和 [timed_reference](timed_reference.md)。
+代码基线：`dbb6c1d`。实现为 [representation.py](../../../manipulation/representation.py)，任务及边界消费者见 [输入与任务模型](../01-inputs-and-task-model.md)和 [timed_reference](timed_reference.md)。
 
 ## 坐标与职责
 
