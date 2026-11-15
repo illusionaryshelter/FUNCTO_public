@@ -1,6 +1,6 @@
 # 跨实例区域对应与功能坐标
 
-代码基线：FUNCTO `96ee2dc`。本文件描述 `transfer/cross_instance/` 当前工作区实现；集成提交形成后，由集成者将这里更新为该实际实现提交。实验数值依据是 `2026-11-02-functo-presolve-integration` 的 `grounding_inputs.py`、`native_world_response.py`、`candidate_context.py`、`context_relations.py` 和 `neural_refinement.py` 中实际运行的数组计算。正式运行依赖本目录、库内公共组件及现有第三方依赖。
+代码基线：FUNCTO `c568b75`。本文描述该实现中的 `transfer/cross_instance/`；当前文档提交仅登记实现引用。实验数值依据是 `2026-11-02-functo-presolve-integration` 的 `grounding_inputs.py`、`native_world_response.py`、`candidate_context.py`、`context_relations.py` 和 `neural_refinement.py` 中实际运行的数组计算。正式运行依赖本目录、库内公共组件及现有第三方依赖。
 
 ## 1. 研究对象和计算职责
 

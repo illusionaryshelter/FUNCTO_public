@@ -1,6 +1,6 @@
 # `transfer/cross_instance/pipeline.py` 实现契约
 
-代码基线：`96ee2dc-working-tree`。
+代码基线：`c568b75`。
 职责和数据语义见[组件说明](../../../transfer/cross_instance/ARCHITECTURE.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `run_arrays`

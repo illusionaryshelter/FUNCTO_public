@@ -1,6 +1,6 @@
 # 跨实例抓取、官方机器人几何与观测场
 
-代码基线为 FUNCTO `561f768`。本文描述本轮集成工作树中的实际实现；新增代码的集成提交引用由总架构入口在提交时统一登记。对应源码为 [cross_instance_grasp.py](../../manipulation/cross_instance_grasp.py)、[grasp_pose_refinement.py](../../manipulation/grasp_pose_refinement.py)、[grounding_robot_geometry.py](../../manipulation/grounding_robot_geometry.py) 与 [grounding_geometry_evidence.py](../../manipulation/grounding_geometry_evidence.py)。模型进程接口见 [local_models/ARCHITECTURE.md](../../local_models/ARCHITECTURE.md)。
+代码基线：FUNCTO `c568b75`。本文描述该实现中的 [cross_instance_grasp.py](../../manipulation/cross_instance_grasp.py)、[grasp_pose_refinement.py](../../manipulation/grasp_pose_refinement.py)、[grounding_robot_geometry.py](../../manipulation/grounding_robot_geometry.py) 与 [grounding_geometry_evidence.py](../../manipulation/grounding_geometry_evidence.py)。当前文档提交仅登记实现引用。模型进程接口见 [local_models/ARCHITECTURE.md](../../local_models/ARCHITECTURE.md)。
 
 ## 研究对象与坐标
 

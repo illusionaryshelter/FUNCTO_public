@@ -1,6 +1,6 @@
 # 完整技能 grounding 与实例关系分派
 
-实现位置为 `manipulation/skill_grounding.py`、`grounding_observations.py`、`instance_relation.py`、`grounding_records.py`，以及既有 `skill.py`、`selection.py`、`representation.py` 的共用接口。当前实现位于本轮工作树；提交前代码基线为 `96ee2dc`，实际实现提交在集成验证后回填。跨实例区域的数值定义见 [区域组件](../../transfer/cross_instance/ARCHITECTURE.md)，抓取与观测几何见 [抓取组件](16-cross-instance-grasp.md)，规划及选择见 [规划候选组件](14-grounding-planning-portfolio.md)。
+代码基线：`c568b75`。实现位置为 `manipulation/skill_grounding.py`、`grounding_observations.py`、`instance_relation.py`、`grounding_records.py`，以及既有 `skill.py`、`selection.py`、`representation.py` 的共用接口。本文描述该实现，当前文档提交仅登记实现引用。跨实例区域的数值定义见 [区域组件](../../transfer/cross_instance/ARCHITECTURE.md)，抓取与观测几何见 [抓取组件](16-cross-instance-grasp.md)，规划及选择见 [规划候选组件](14-grounding-planning-portfolio.md)。
 
 ## 研究对象、坐标与输入职责
 

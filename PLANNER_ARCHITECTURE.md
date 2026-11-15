@@ -2,6 +2,8 @@
 
 求解与观测场算法基线为 `be44b54`，官方机器人距离批处理基线为 `12e0ef5`；候选交付、通用三维几何数值核与执行绑定数据转换分别以 [planning API](docs/planner-architecture/api/planning.md)、[几何内核 API](docs/planner-architecture/api/geometry_kernels.md) 和 [execution_binding API](docs/planner-architecture/api/execution_binding.md) 所列代码提交为准。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
+技能 grounding、跨实例区域/抓取及规划候选编排的当前实现代码基线为 `c568b75`。当前文档提交仅登记该实现引用；各组件正文及API索引对应实际源码。
+
 各组件 API 页记录实际代码基线；仅文档提交保持所引用组件的生产代码内容。设备执行、手指命令衔接及仿真评价的当前调用、控制公式和数据职责见[设备控制组件](docs/planner-architecture/11-device-control-and-evaluation.md)，各 API 页登记实际代码引用。
 
 当前时间预算配置对应实际代码提交 `9602ebb`，本次文档回填保持该实现内容。`PlanningBudget.planning_seconds` 的全局默认值为 60 s，记录式 CLI 和诊断准备入口直接读取这一字段。
@@ -72,7 +74,7 @@ flowchart TD
 
 `BoundToolReference` 把完整名义工具参考与测得 TCP 入口位姿、速度绑定。grounding 用原源区间的经过秒数生成从当前夹爪出发的完整参考；规划以自身请求时钟重新绑定原名义操作数，供参考 IK 产生数值样本。名义路径与绑定结果分别归档，保存的绑定记录可由同一接口恢复。具有任务语义的过程关系、功能区域和事件由 `PlanningProblem` 单独保留。搜索目标由原 STATE 关节运动成本、`optimizer_preferences(phase='feasibility')` 的过程关系与方向偏好，以及固定材料点几何目标组成；硬任务要求以逐分量有符号条件表达。固定进度和声明作用域确定的常量行在核对原值后从求解矩阵消去，完整原条件用于验收。候选的固定质量评分单独记录，其有限性属于资格条件。
 
-manipulation 功能位姿参考中的 `is_initial_relative_rotation_rpy` 选择材料功能坐标的初始旋转基准。三个布尔值按功能参考坐标中的 XYZ 外禀 RPY 排列：真值选择运行初态，假值选择原名义初态；完整矩阵组合保留源相对旋转。连续材料位置保持原函数，物体与工具位姿由固定局部变换逐次计算。交互边界、释放终点和参考 IK 查询同一生成路径，grasp 直接组合当前抓取功能坐标与原 `H_g`，完整保留其旋转。grounding 入口绑定、连续归档和场景位姿显示代码基线为 `0620320`；具体接口见[输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md)。
+manipulation 功能位姿参考中的 `is_initial_relative_rotation_rpy` 选择材料功能坐标的初始旋转基准。三个布尔值按功能参考坐标中的 XYZ 外禀 RPY 排列：真值选择运行初态，假值选择原名义初态；完整矩阵组合保留源相对旋转。连续材料位置保持原函数，物体与工具位姿由固定局部变换逐次计算。交互边界、释放终点和参考 IK 查询同一生成路径，grasp 直接组合当前抓取功能坐标与原 `H_g`，完整保留其旋转。grounding 公共入口、跨实例迁移、完整参考候选、规划选择及场景位姿显示代码基线为 `c568b75`；具体接口见[输入与任务模型](docs/planner-architecture/01-inputs-and-task-model.md)。
 
 该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
 

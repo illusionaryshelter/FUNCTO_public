@@ -1,6 +1,6 @@
 # Grounding参考的独立规划、完成记录与固定偏好选择
 
-代码引用：本组件的正式实现提交由本次合入主流程统一登记；合入前代码基线为 `96ee2dc`。本页描述当前 `planning_request.py`、`planning_inputs.py`、`planning_records.py`、`planning_portfolio.py`、`trajectory_metrics.py` 与 `trajectory_selection.py` 的实际调用。
+代码基线：`c568b75`。本文描述该实现中的 `planning_request.py`、`planning_inputs.py`、`planning_records.py`、`planning_portfolio.py`、`trajectory_metrics.py` 与 `trajectory_selection.py` 的实际调用；当前文档提交仅登记实现引用。
 
 ## 研究对象与数据职责
 

@@ -2,7 +2,7 @@
 
 观测场与求解算法接口基线为 `be44b54`，官方机器人距离批处理接口基线为 `12e0ef5`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-grounding 的当前公共入口、联合实例选择、跨实例区域、完整参考候选及规划选择分别见[技能 grounding](15-skill-grounding.md)、[跨实例抓取](16-cross-instance-grasp.md)与[规划候选组件](14-grounding-planning-portfolio.md)。这些组件说明保存各阶段前置数据、实际调用及实现提交。
+grounding、完整参考候选与规划选择的代码基线为 `c568b75`。当前公共入口、联合实例选择、跨实例区域、完整参考候选及规划选择分别见[技能 grounding](15-skill-grounding.md)、[跨实例抓取](16-cross-instance-grasp.md)与[规划候选组件](14-grounding-planning-portfolio.md)。这些组件说明保存各阶段前置数据、实际调用及实现提交。
 
 该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
 
