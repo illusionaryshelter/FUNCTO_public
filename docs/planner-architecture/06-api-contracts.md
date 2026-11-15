@@ -2,7 +2,7 @@
 
 观测场与求解算法接口基线为 `be44b54`，官方机器人距离批处理接口基线为 `12e0ef5`；候选交付及执行绑定的当前实现分别见 [planning API](api/planning.md) 与 [execution_binding API](api/execution_binding.md) 的代码引用。组件正文描述当前实现；阶段验证位于项目外 `sim-version-plans`。
 
-grounding 入口绑定、连续归档与场景位姿显示代码基线为 `0620320`；各组件正文描述上述对应提交的当前调用。
+grounding 的当前公共入口、联合实例选择、跨实例区域、完整参考候选及规划选择分别见[技能 grounding](15-skill-grounding.md)、[跨实例抓取](16-cross-instance-grasp.md)与[规划候选组件](14-grounding-planning-portfolio.md)。这些组件说明保存各阶段前置数据、实际调用及实现提交。
 
 该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
 
@@ -20,10 +20,13 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 |---|---|---|
 | `representation.build_representation` | 建立源示教的相对功能运动；各位姿须共用源世界坐标 | 帧/时间、源物体/工具位姿、功能局部变换、事件 → 相对关系与来源记录；`generate_reference` |
 | `sample_poses` | 在源时间轴上插值位姿 | 有序时刻及位姿、查询时刻 → 刚体变换序列；参考适配 |
-| `generate_reference` | 将源功能运动组合到当前功能坐标，在 manipulation 中按显式布尔字段选择初始旋转基准，并声明工具/物体入口和名义事件 | 表示及 manipulation 可选 `is_initial_relative_rotation_rpy`、当前功能位姿、坐标对应 `J`、附着 `A`、当前入口 → 完整名义组合路径、采样数组、显式 `*_boundaries`、`rotation_transfer` 及缺失状态；任务适配器与 reference_phase |
+| `generate_reference` | 将完整源功能运动组合到当前坐标；抓取工具运动使用显式锚点 B，任务功能坐标 F 独立保留；manipulation 按声明选择初始旋转基准 | 表示、当前功能位姿、可选抓取 `tool_reference_anchor`、manipulation 可选 `is_initial_relative_rotation_rpy`、坐标对应 `J`、附着 `A`、当前入口 → 完整名义连续路径、采样数组、`*_boundaries`、旋转诊断及缺失状态；公共 grounding 与 reference_phase |
 | `_initial_rotation_offset` | 在同一功能参考坐标 F 中选择移动材料坐标 M 的初始 RPY 来源 | 原连续材料路径、功能路径、当前材料位姿、三个布尔值 → 固定左旋转 D 及入口选择记录；generate_reference |
 | `RotationOffsetPath.__init__/sample` | 保持材料功能点位置，逐次求值后在 F 中施加固定旋转 D | 原材料路径、功能路径、D、来源及查询进度/侧别 → 连续位置与 wxyz 四元数，保留进度导数；物体/工具子路径与边界求值 |
-| `config.ground_skill.ground_skill` | 从当前 RGB-D 实体观测得到功能区域并生成同一声明的参考 | 技能目录、场景目录、输出目录、任务指令、J/A 及来源 → 区域、nominal-reference 数值/连续函数、入口绑定后的 reference 数值/连续函数、报告与网页；当前 eef_pose/eef_twist 提供入口，源经过秒数提供参考时钟；命令行入口 |
+| `config.ground_skill.ground_skill` | 加载文件并调用同一公共技能 grounding 接口 | 技能/场景/输出目录、指令、具名视图与显式参数 → 完整候选集、各自名义与入口绑定参考、真实区域证据及网页；文件适配器 |
+| `skill_grounding.ground_skill` | 对加载技能与当前 RGB-D 执行一次联合语义选择，再按显式实例关系完成区域与完整参考 | 完整技能、RGB-D/标定、机器人反馈、任务关系和模型设置 → 选择证据、区域、抓取或操作关系、完整参考候选及逐阶段状态；文件适配器及程序调用方 |
+| `skill_grounding.ground_prepared_skill` | 从显式已完成的感知证据执行同一计算流程 | 完整技能、原观测身份/特征、独立 owner 和背景、实例关系证据及反馈 → 同一候选合同；固定输入重放 |
+| `planning_portfolio.plan_grounding_hypotheses` | 为各完整候选建立独立问题并执行原规划器，收齐结果后按固定标定评分 | grounding 结果、任务/现场/反馈、资源预算及偏好标定 → 原正式曲线、原接受或失败证据、固定评分与选中身份；规划调用方 |
 | `program.ground_program` | 按程序声明绑定当前几何；持物声明与入口须代数一致 | `program,scene` → 工具参考、事件及几何诊断；`build_planning_problem` |
 | `ground_object_program` | 生成当前物体参考 | 物体程序、当前关系与功能绑定 → 物体路径；持物参考调用者 |
 | `function_motion.optimize_trajectory/transfer_function_motion` | 对已有参考施加明确的入口和功能关键帧 | 位姿序列、静态/当前入口、功能目标 → 适配位姿；`program` |
@@ -208,7 +211,7 @@ grounding 入口绑定、连续归档与场景位姿显示代码基线为 `06203
 
 `resource_admission.require_host_memory/require_device_memory` 输入新增存储需求、当前物理占用与明确上限，返回准入记录或类型化 `ResourceLimitError`。`optimizer_device_checks.require_tensor` 同步消费标量布尔张量，条件为真时返回 `None`，否则抛出声明的异常。手指曲线、任务定义与物理域在读取对应输入时使用该接口。`constant_tensor` 把声明的模型常量直接转换到消费者的 dtype/device，保留张量原有求导关系。预算、诊断和数值错误共享同一 eager 请求生命周期。
 
-实验运行器位于 `tests/planning`。`run_recorded_skill.run_prepared` 接收已编译问题，读取已有实体，再为本次需要建图的实体读取 mask、深度与采集时反馈。`robot_validation_fixture` 构造已知机器人验证器和图像过滤组件；其 `tool_geometry_names(fixture)` 从声明手指机构的公共父子树返回工具成员元组，写入运行报告并传给场景。`observed_robot_fixture` 恢复已有任务实体。`load_contact_bindings` 读取必填 `contacts/source` 和可选 `grasp_activations`，提供完整有限任务接触及原抓取激活记录；`--inherited-initial-state` 独立传递已接受前置执行的机器人边界。`recorded_task_planning.plan_and_record` 调用后端并保存曲线、结果和 `native_robot_observed_scene_v1` 来源快照。`load_saved_trajectory` 恢复正式执行输入；该操作不重建可查询场景。具体命令与数据字段见[记录入口说明](../../tests/planning/README.md)。
+实验运行器位于 `tests/planning`。`run_recorded_skill.run_prepared` 接收已编译问题，读取已有实体，再为本次需要建图的实体读取 mask、深度与采集时反馈。`grounding_robot_geometry` 构造已知机器人验证器和图像过滤组件；其 `tool_geometry_names(fixture)` 从声明手指机构的公共父子树返回工具成员元组，写入运行报告并传给场景。`observed_robot_fixture` 恢复已有任务实体。`load_contact_bindings` 读取必填 `contacts/source` 和可选 `grasp_activations`，提供完整有限任务接触及原抓取激活记录；`--inherited-initial-state` 独立传递已接受前置执行的机器人边界。`recorded_task_planning.plan_and_record` 调用后端并保存曲线、结果和 `native_robot_observed_scene_v1` 来源快照。`load_saved_trajectory` 恢复正式执行输入；该操作不重建可查询场景。具体命令与数据字段见[记录入口说明](../../tests/planning/README.md)。
 
 跨阶段读写时，调用者需要同时保留几何记录、其坐标变换、对象身份、任务区域、原事件与机器人入口。各接口按上述结构解释数据；原生模型恢复与本次回放见[阶段对照](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
 

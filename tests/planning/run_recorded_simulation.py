@@ -33,7 +33,9 @@ from manipulation.execution_binding import rebind_execution_result
 from manipulation.evidence_archive import write_evidence_json
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
 from recorded_task_planning import save_curve
-from robot_validation_fixture import build_robot_validator
+# BEGIN consume the shared official robot geometry implementation.
+from manipulation.grounding_robot_geometry import build_robot_validator
+# END source geometry and native pair policy remain unchanged.
 # END production execution and explicit recording adapter.
 from recorded_skill_evaluation import NativeSkillPhysicsEvaluator
 

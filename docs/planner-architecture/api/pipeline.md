@@ -1,6 +1,6 @@
 # `manipulation/pipeline.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `motion_kind`
@@ -46,7 +46,7 @@ task['motion']
 
 ## `serializable`
 
-[定义位置](../../../manipulation/pipeline.py#L44)。
+[定义位置](../../../manipulation/pipeline.py#L48)。
 
 输入签名：
 
@@ -97,7 +97,7 @@ value.items
 
 ## `write_json`
 
-[定义位置](../../../manipulation/pipeline.py#L57)。
+[定义位置](../../../manipulation/pipeline.py#L61)。
 
 输入签名：
 
@@ -131,7 +131,7 @@ serializable
 
 ## `_matrix`
 
-[定义位置](../../../manipulation/pipeline.py#L62)。
+[定义位置](../../../manipulation/pipeline.py#L66)。
 
 输入签名：
 
@@ -181,7 +181,7 @@ np.linalg.det
 
 ## `_surface`
 
-[定义位置](../../../manipulation/pipeline.py#L73)。
+[定义位置](../../../manipulation/pipeline.py#L77)。
 
 输入签名：
 
@@ -216,7 +216,7 @@ value.get
 
 ## `_interior`
 
-[定义位置](../../../manipulation/pipeline.py#L79)。
+[定义位置](../../../manipulation/pipeline.py#L83)。
 
 输入签名：
 
@@ -253,7 +253,7 @@ InteriorRegion.from_vertices
 
 ## `run_stage`
 
-[定义位置](../../../manipulation/pipeline.py#L89)。
+[定义位置](../../../manipulation/pipeline.py#L93)。
 
 输入签名：
 
@@ -385,7 +385,7 @@ geometry.to_dict
 
 ## `_move_scene_geometry`
 
-[定义位置](../../../manipulation/pipeline.py#L255)。
+[定义位置](../../../manipulation/pipeline.py#L265)。
 
 输入签名：
 
@@ -445,7 +445,7 @@ np.column_stack
 
 ## `run_sequence`
 
-[定义位置](../../../manipulation/pipeline.py#L275)。
+[定义位置](../../../manipulation/pipeline.py#L285)。
 
 输入签名：
 
@@ -541,7 +541,7 @@ output.append
 
 ## `run_prepared`
 
-[定义位置](../../../manipulation/pipeline.py#L333)。
+[定义位置](../../../manipulation/pipeline.py#L343)。
 
 输入签名：
 

@@ -1,129 +1,43 @@
 # `config/ground_skill.py` 实现契约
 
-代码基线：`0620320`。
-
-该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
-
-## `_plain`
-
-[定义位置](../../../config/ground_skill.py#L27)。
-
-输入签名：
-
-```python
-def _plain(value):
-```
-
-显式输出分支：
-
-```python
-value.tolist()
-value.item()
-{key: _plain(item) for (key, item) in value.items()}
-[_plain(item) for item in value]
-value
-```
-
-读取的对象属性：
-
-```python
-np.ndarray
-value.tolist
-np.generic
-value.item
-value.items
-```
-
-写入目标：
-
-```python
-key
-item
-```
-
-直接调用符号：
-
-```python
-isinstance
-value.tolist
-value.item
-_plain
-value.items
-```
 
 ## `ground_skill`
 
-[定义位置](../../../config/ground_skill.py#L39)。
+[定义位置](../../../config/ground_skill.py#L21)。
 
 输入签名：
 
 ```python
-def ground_skill(skill_directory, scene_directory, output, *, instruction, relations=None):
+def ground_skill(skill_directory, scene_directory, output, *, instruction, relations=None, view_ids=None, parameters=None):
 ```
 
 实现说明：
 
-> Save every stage and return the native region/reference status.
+> Read one capture and call the same public API used by programmatic callers.
 >
-> ``relations`` may provide explicitly sourced J/A records; it does not
-> provide a target region. Missing A preserves an object-only reference.
-> The current scene supplies actual robot feedback, calibrated RGB-D and an
-> acquisition-state record. ``eef_twist`` is the measured world-frame TCP
-> [linear, angular] velocity in m/s and rad/s. The tool reference is bound
-> on source elapsed seconds; a planner rebinds its nominal operands when
-> choosing another request clock. The scene's segmentation truth is never opened.
+> parameters supplies explicit region/grasp model settings, current
+> relation/model declarations and prerequisite context. view_ids names
+> the actual sensor folders; when omitted the capture's calibrated folders
+> define their deterministic order. Native simulation files are not opened.
 
 显式输出分支：
 
 ```python
-record
+save(result, request, output)
 ```
 
 读取的对象属性：
 
 ```python
 output.mkdir
-json.loads
-(scene_directory / 'robot_feedback.json').read_text
-(scene_directory / 'layout.json').read_text
-(folder / 'calibration.json').read_text
-Image.open
-opened.convert
-views.append
-np.load
-np.asarray
+folder.name
+scene_directory.iterdir
+folder.is_dir
+(folder / 'calibration.json').is_file
 Path(skill_directory).resolve
-scene_directory.resolve
-relations.get
-feedback.get
-record['stages'].append
-semantic_client.model
-semantic_client.base_url
-association['views'].items
-association.get
-selected.items
-view.update
-np.savez_compressed
-Image.fromarray(prepared['crop_rgb']).save
-Image.fromarray
-view['image'].crop
-record.update
-transfer.get
-outputs['result']['diagnostics'].get
-reference.items
-np.ndarray
-reference.get
-tool_reference.sample_numpy
-tool_reference.initial_pose
-tool_reference.initial_twist
-tool_reference.to_record
-np.linspace
-np.save
-tool_reference.diagnostics
-type(error).__name__
-(output / 'error.txt').write_text
-traceback.format_exc
+parameters.get
 ```
 
 写入目标：
@@ -132,57 +46,15 @@ traceback.format_exc
 skill
 scene_directory
 output
-feedback
-layout
-views
-name
+parameters
+view_ids
 folder
-calibration
-opened
-rgb
-record
-transfer
-reference
-tool_reference
-stage
-relations
-field
+capture
+binding_id
 context
-semantic_client
-record['semantic_model']
-detection_views
-observed
-view
-selection_record
-association
-key
-selection_record[key]
-unique_views
-value
-associated
-selected
-selection_record['views'][name]
-view['missing_reasons']
-prepared
-record['selection']
-view['feature']
-record['runtime']
-same_state
-outputs
-record['region_geometry']
-record['region_warnings']
-record['region_timing_seconds']
-record['functional_frame']
-frame
-arrays
-record['reference_rotation_transfer']
-phase
-source_clock
-elapsed
-poses
-sample
-summary
-record['status']
+entity_id
+request
+result
 ```
 
 直接调用符号：
@@ -191,110 +63,22 @@ record['status']
 load_grounding_skill
 Path
 output.mkdir
-json.loads
-(scene_directory / 'robot_feedback.json').read_text
-(scene_directory / 'layout.json').read_text
-(folder / 'calibration.json').read_text
-Image.open
-opened.convert
-views.append
 dict
-np.load
-np.asarray
+sorted
+scene_directory.iterdir
+folder.is_dir
+(folder / 'calibration.json').is_file
+load_scene
 str
 Path(skill_directory).resolve
-scene_directory.resolve
-relations.get
-ValueError
-feedback.get
-record['stages'].append
-Gemini
-iter
-observe_interaction_reference
-association['views'].items
-len
-association.get
-selected.items
-prepare_selected_observation
-view.update
-np.savez_compressed
-Image.fromarray(prepared['crop_rgb']).save
-Image.fromarray
-write_json
-extract_image
-view['image'].crop
-tuple
-prepare
-run_region_transfer
-record.update
-transfer.get
-list
-outputs['result']['diagnostics'].get
-save_surface
-store_prediction
-_plain
-any
-generate_reference
-reference.items
-isinstance
-plain
-reference.get
-reference_phase
-BoundToolReference
-SimpleNamespace
-float
-tool_reference.sample_numpy
-tool_reference.to_record
-np.linspace
-np.save
-trajectory_summary
-type
-(output / 'error.txt').write_text
-traceback.format_exc
-write_reference_html
-```
-
-## `ground_skill.recorded_detection`
-
-[定义位置](../../../config/ground_skill.py#L99)。
-
-输入签名：
-
-```python
-def recorded_detection(image, labels):
-```
-
-显式输出分支：
-
-```python
-detected
-```
-
-读取的对象属性：
-
-```python
-np.asarray
-```
-
-写入目标：
-
-```python
-view
-detected
-```
-
-直接调用符号：
-
-```python
-next
-detect
-store_detections
-np.asarray
+parameters.get
+ground_loaded_skill
+save
 ```
 
 ## `main`
 
-[定义位置](../../../config/ground_skill.py#L267)。
+[定义位置](../../../config/ground_skill.py#L61)。
 
 输入签名：
 
@@ -312,13 +96,16 @@ def main():
 argparse.ArgumentParser
 parser.add_argument
 parser.parse_args
-args.relations
+arguments.relations
 json.loads
-args.relations.read_text
-args.skill
-args.scene
-args.output
-args.instruction
+arguments.relations.read_text
+arguments.parameters
+arguments.parameters.read_text
+arguments.skill
+arguments.scene
+arguments.output
+arguments.instruction
+arguments.view_ids
 json.dumps
 ```
 
@@ -326,8 +113,9 @@ json.dumps
 
 ```python
 parser
-args
+arguments
 relations
+parameters
 record
 key
 ```
@@ -339,7 +127,8 @@ argparse.ArgumentParser
 parser.add_argument
 parser.parse_args
 json.loads
-args.relations.read_text
+arguments.relations.read_text
+arguments.parameters.read_text
 ground_skill
 print
 json.dumps

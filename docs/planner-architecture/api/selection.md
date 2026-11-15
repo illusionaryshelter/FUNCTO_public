@@ -1,11 +1,11 @@
 # `manipulation/selection.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_selected_owner`
 
-[定义位置](../../../manipulation/selection.py#L145)。
+[定义位置](../../../manipulation/selection.py#L149)。
 
 输入签名：
 
@@ -53,7 +53,7 @@ record['source'].strip
 
 ## `_box`
 
-[定义位置](../../../manipulation/selection.py#L163)。
+[定义位置](../../../manipulation/selection.py#L167)。
 
 输入签名：
 
@@ -101,7 +101,7 @@ yy.max
 
 ## `_highlight`
 
-[定义位置](../../../manipulation/selection.py#L169)。
+[定义位置](../../../manipulation/selection.py#L173)。
 
 输入签名：
 
@@ -148,7 +148,7 @@ _box
 
 ## `_context_crop`
 
-[定义位置](../../../manipulation/selection.py#L177)。
+[定义位置](../../../manipulation/selection.py#L181)。
 
 输入签名：
 
@@ -207,7 +207,7 @@ round
 
 ## `_panels`
 
-[定义位置](../../../manipulation/selection.py#L189)。
+[定义位置](../../../manipulation/selection.py#L193)。
 
 输入签名：
 
@@ -268,14 +268,14 @@ ImageDraw.Draw
 str
 ```
 
-## `_prepare`
+## `prepare_selection_evidence`
 
-[定义位置](../../../manipulation/selection.py#L206)。
+[定义位置](../../../manipulation/selection.py#L210)。
 
 输入签名：
 
 ```python
-def _prepare(source, instruction, views, selection_scope):
+def prepare_selection_evidence(source, instruction, views, selection_scope):
 ```
 
 实现说明：
@@ -285,7 +285,7 @@ def _prepare(source, instruction, views, selection_scope):
 显式输出分支：
 
 ```python
-(prompt, images, prepared)
+(prompt, images, prepared, context)
 ```
 
 读取的对象属性：
@@ -315,7 +315,6 @@ images.append
 image_order.append
 images.extend
 image_order.extend
-json.dumps
 ```
 
 写入目标：
@@ -405,12 +404,11 @@ _selected_owner
 images.extend
 image_order.extend
 _panels
-json.dumps
 ```
 
 ## `select_grounding_candidates`
 
-[定义位置](../../../manipulation/selection.py#L340)。
+[定义位置](../../../manipulation/selection.py#L344)。
 
 输入签名：
 
@@ -482,16 +480,76 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
 显式输出分支：
 
 ```python
+parse_selection_response(response, candidates, selection_scope=selection_scope, vlm_used=called)
+```
+
+读取的对象属性：
+
+```python
+json.dumps
+candidates.values
+_client(client).chat_json
+response.update
+response['views'].values
+```
+
+写入目标：
+
+```python
+rules
+images
+candidates
+context
+schema
+prompt
+called
+response
+name
+decision
+decision['same_owner']
+```
+
+直接调用符号：
+
+```python
+prepare_selection_evidence
+json.dumps
+any
+candidates.values
+_client(client).chat_json
+_client
+response.update
+response['views'].values
+parse_selection_response
+```
+
+## `parse_selection_response`
+
+[定义位置](../../../manipulation/selection.py#L429)。
+
+输入签名：
+
+```python
+def parse_selection_response(response, candidates, *, selection_scope, vlm_used, associate=None):
+```
+
+实现说明：
+
+> Resolve supplied candidate IDs and preserve semantic association evidence.
+>
+> ``associate`` declares whether the response carries current-view identity.
+> The joint binding protocol requires it for every explicit entity binding;
+> local region selection uses its own scope's association contract.
+
+显式输出分支：
+
+```python
 output
 ```
 
 读取的对象属性：
 
 ```python
-candidates.values
-_client(client).chat_json
-response.update
-response['views'].values
 candidates.items
 ', '.join
 reason.strip
@@ -503,17 +561,12 @@ output.update
 写入目标：
 
 ```python
-prompt
-images
-candidates
-called
-response
-name
-decision
-decision['same_owner']
+associate
 response_fields
 result
+name
 items
+decision
 evidence_scope
 required
 ids
@@ -534,13 +587,6 @@ ambiguous
 直接调用符号：
 
 ```python
-_prepare
-any
-candidates.values
-_client(client).chat_json
-_client
-response.update
-response['views'].values
 isinstance
 set
 ValueError
@@ -548,6 +594,7 @@ candidates.items
 ', '.join
 sorted
 reason.strip
+any
 type
 len
 result.items

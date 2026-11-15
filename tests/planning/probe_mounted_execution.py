@@ -27,7 +27,9 @@ from manipulation.execution import ExecutionLimits, FixedFingerTargets, Trajecto
 from manipulation.gripper_trajectory import FingerTrajectory, stationary_finger_command
 from manipulation.planning import JointTrajectory
 from recorded_simulation import restore_recorded_simulation, load_saved_trajectory
-from robot_validation_fixture import build_robot_validator
+# BEGIN consume the shared official robot geometry implementation.
+from manipulation.grounding_robot_geometry import build_robot_validator
+# END source geometry and native pair policy remain unchanged.
 
 
 def read_json(path):

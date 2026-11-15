@@ -91,6 +91,10 @@ _SELECTION_INSTRUCTION = (
     "If a view has no candidates, return [] for it. Do not force an answer from weak "
     "or occluded evidence. Do not merge masks, generate coordinates, geometry, poses "
     "or claim grasp feasibility. This is semantic selection only.\n"
+)
+
+# BEGIN one evidence builder serves local selection and joint instance routing.
+_VIEW_RESPONSE_INSTRUCTION = (
     "Return exactly {\"views\": {view_id: {\"candidate_ids\": [integer_ID, ...] "
     "or null, \"reason\": short_nonempty_string}, ...}}, with exactly the supplied "
     "views; for owner_evidence only, each view decision must also include the "
@@ -123,8 +127,8 @@ _SELECTED_OWNER_INSTRUCTION = (
 
 # BEGIN one shared request associates selected views of an entity or component.
 _REFERENCE_ASSOCIATION_INSTRUCTION = (
-    "\nFor selection_scope=entity or interaction_reference, return exactly views, "
-    "same_entity, and same_entity_reason. "
+    "\nFor selection_scope=entity or interaction_reference, also associate the "
+    "current selected instances with same_entity and same_entity_reason. "
     "Each views record still has only candidate_ids and reason. same_entity is true "
     "only when the unique selected candidate in each selected view depicts the SAME "
     "physical instance of the current semantic task target. For interaction_reference, "
@@ -203,7 +207,7 @@ def _panels(image, candidates):
     return sheet
 
 
-def _prepare(source, instruction, views, selection_scope):
+def prepare_selection_evidence(source, instruction, views, selection_scope):
     """Allowlist semantic evidence; source poses and simulator IDs are not sent."""
     # BEGIN component references retain a scope distinct from exact contacts.
     if selection_scope not in {"entity", "owner", "interaction_region", "interaction_reference", "owner_evidence"}:
@@ -331,10 +335,10 @@ def _prepare(source, instruction, views, selection_scope):
     prompt = (_SELECTION_INSTRUCTION
               + (_SELECTED_OWNER_INSTRUCTION if has_selected_owner else "")
               + (_REFERENCE_ASSOCIATION_INSTRUCTION
-                 if selection_scope in {"entity", "interaction_reference"} else "")
-              + "\nInput data:\n" + json.dumps(context, ensure_ascii=False))
+                 if selection_scope in {"entity", "interaction_reference"} else ""))
     # END optional contextual selection, without skill-name prompt branches.
-    return prompt, images, prepared
+    return prompt, images, prepared, context
+# END evidence construction has no competing response schema.
 
 
 def select_grounding_candidates(source, instruction, views, *, selection_scope, client=None):
@@ -397,7 +401,13 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
     selections retain ``alternatives`` but must report unknown association
     when any view offers interchangeable targets instead of one instance.
     """
-    prompt, images, candidates = _prepare(source, instruction, views, selection_scope)
+    # BEGIN share actual source/candidate preparation with instance routing.
+    rules, images, candidates, context = prepare_selection_evidence(source, instruction, views, selection_scope)
+    schema = (_VIEW_RESPONSE_INSTRUCTION +
+              ("\nInclude exactly views, same_entity, same_entity_reason at the top level."
+               if selection_scope in {"entity", "interaction_reference"} else ""))
+    prompt = rules + schema + "\nInput data:\n" + json.dumps(context, ensure_ascii=False)
+    # END local selection retains its own explicit response contract.
     called = any(candidates.values())
     if called:
         response = _client(client).chat_json(prompt, images=images)
@@ -411,8 +421,22 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
             for decision in response["views"].values():
                 decision["same_owner"] = None
         # END local empty decision, with no fabricated membership assertion.
-    response_fields = ({"views", "same_entity", "same_entity_reason"}
-                       if selection_scope in {"entity", "interaction_reference"} else {"views"})
+    return parse_selection_response(response, candidates, selection_scope=selection_scope,
+                                    vlm_used=called)
+
+
+# BEGIN shared parser consumes actual VLM decisions, without response rewriting.
+def parse_selection_response(response, candidates, *, selection_scope, vlm_used,
+                             associate=None):
+    """Resolve supplied candidate IDs and preserve semantic association evidence.
+
+    ``associate`` declares whether the response carries current-view identity.
+    The joint binding protocol requires it for every explicit entity binding;
+    local region selection uses its own scope's association contract.
+    """
+    if associate is None:
+        associate = selection_scope in {"entity", "interaction_reference"}
+    response_fields = {"views", "same_entity", "same_entity_reason"} if associate else {"views"}
     if (not isinstance(response, dict) or set(response) != response_fields
             or not isinstance(response["views"], dict) or set(response["views"]) != set(candidates)):
         raise ValueError("Selection must return exactly the supplied view IDs")
@@ -450,9 +474,9 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
         if evidence_scope:
             result[name]["same_owner"] = decision["same_owner"]
         # END same-owner evidence; legacy scopes keep their independent alternatives.
-    output = {"selection_scope": selection_scope, "views": result, "vlm_used": called}
+    output = {"selection_scope": selection_scope, "views": result, "vlm_used": vlm_used}
     # BEGIN preserve cross-view entity evidence instead of assigning a shared ID.
-    if selection_scope in {"entity", "interaction_reference"}:
+    if associate:
         association, reason = response["same_entity"], response["same_entity_reason"]
         unique = [name for name, row in result.items() if row["status"] == "selected"]
         ambiguous = any(row["status"] == "alternatives" for row in result.values())
@@ -465,4 +489,5 @@ def select_grounding_candidates(source, instruction, views, *, selection_scope, 
                       associated_views=unique)
     # END uncertain associations stay explicit; their masks are never merged.
     return output
+# END shared parser preserves candidate masks and unresolved associations.
 # END generic grounding selection.

@@ -1,11 +1,11 @@
 # `manipulation/grounding.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_image`
 
-[定义位置](../../../manipulation/grounding.py#L25)。
+[定义位置](../../../manipulation/grounding.py#L32)。
 
 输入签名：
 
@@ -42,7 +42,7 @@ image.convert
 
 ## `_task`
 
-[定义位置](../../../manipulation/grounding.py#L31)。
+[定义位置](../../../manipulation/grounding.py#L38)。
 
 输入签名：
 
@@ -108,7 +108,7 @@ goal.strip
 
 ## `_client`
 
-[定义位置](../../../manipulation/grounding.py#L58)。
+[定义位置](../../../manipulation/grounding.py#L65)。
 
 输入签名：
 
@@ -139,9 +139,7 @@ Gemini
 
 ## `infer_task`
 
-状态：已废弃的原始 RGB-D 语义分类入口。其 `relation/interaction/motion` 分派保留现有计算；当前技能绑定消费已保存技能语义和显式几何数据。共享图像、检测和区域函数继续由独立消费者使用。调用范围见[输入架构](../01-inputs-and-task-model.md#7-输入辅助模块的调用范围)。
-
-[定义位置](../../../manipulation/grounding.py#L66)。
+[定义位置](../../../manipulation/grounding.py#L73)。
 
 输入签名：
 
@@ -201,7 +199,7 @@ _client
 
 ## `_mask`
 
-[定义位置](../../../manipulation/grounding.py#L139)。
+[定义位置](../../../manipulation/grounding.py#L151)。
 
 输入签名：
 
@@ -253,7 +251,7 @@ mask.astype
 
 ## `_detection`
 
-[定义位置](../../../manipulation/grounding.py#L150)。
+[定义位置](../../../manipulation/grounding.py#L162)。
 
 输入签名：
 
@@ -323,7 +321,7 @@ bbox.tolist
 
 ## `_candidate_sheet`
 
-[定义位置](../../../manipulation/grounding.py#L178)。
+[定义位置](../../../manipulation/grounding.py#L190)。
 
 输入签名：
 
@@ -397,7 +395,7 @@ str
 
 ## `select_roles`
 
-[定义位置](../../../manipulation/grounding.py#L201)。
+[定义位置](../../../manipulation/grounding.py#L213)。
 
 输入签名：
 
@@ -486,7 +484,7 @@ np.array_equal
 
 ## `_selected_interaction_evidence`
 
-[定义位置](../../../manipulation/grounding.py#L261)。
+[定义位置](../../../manipulation/grounding.py#L273)。
 
 输入签名：
 
@@ -547,7 +545,7 @@ record['source'].strip
 
 ## `propose_query_regions`
 
-[定义位置](../../../manipulation/grounding.py#L290)。
+[定义位置](../../../manipulation/grounding.py#L302)。
 
 输入签名：
 
@@ -764,7 +762,7 @@ current_scale.tolist
 
 ## `propose_query_regions.owner_panel`
 
-[定义位置](../../../manipulation/grounding.py#L348)。
+[定义位置](../../../manipulation/grounding.py#L360)。
 
 输入签名：
 
@@ -817,7 +815,7 @@ Image.fromarray
 
 ## `propose_query_regions.display_panel`
 
-[定义位置](../../../manipulation/grounding.py#L366)。
+[定义位置](../../../manipulation/grounding.py#L378)。
 
 输入签名：
 
@@ -869,7 +867,7 @@ panel.resize
 
 ## `match_points`
 
-[定义位置](../../../manipulation/grounding.py#L526)。
+[定义位置](../../../manipulation/grounding.py#L538)。
 
 输入签名：
 

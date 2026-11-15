@@ -1,111 +1,11 @@
 # `tests/planning/recorded_simulation.py` 实现契约
 
-代码基线：`3266476`。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
-
-## `load_curve_archive`
-
-[定义位置](../../../tests/planning/recorded_simulation.py#L32)。
-
-输入签名：
-
-```python
-def load_curve_archive(path):
-```
-
-实现说明：
-
-> Inspect exact recorded arrays, including rejected diagnostic curves.
-
-显式输出分支：
-
-```python
-(curve, metadata)
-```
-
-读取的对象属性：
-
-```python
-path.with_suffix
-metadata_path.stat().st_size
-metadata_path.stat
-np.load
-arrays['classification'].item
-arrays['joint_names'].tolist
-arrays['times'].copy
-arrays['position'].copy
-arrays['velocity'].copy
-arrays['progress_u'].copy
-arrays['progress_s'].copy
-curve.events
-arrays.files
-FingerTrajectory.from_mapping
-fingers.duration
-curve.duration
-fingers.executable_until
-curve.executable_until
-arrays['finger_joint_names'].tolist
-fingers.joint_names
-np.array_equal
-fingers.times
-fingers.position
-fingers.velocity
-fingers.events
-original.items
-curve.next_verification
-```
-
-写入目标：
-
-```python
-path
-metadata_path
-metadata
-arrays
-curve
-command_events
-row
-saved_fingers
-finger_arrays
-curve.finger_trajectory
-fingers
-originals
-original
-key
-value
-```
-
-直接调用符号：
-
-```python
-Path
-path.with_suffix
-metadata_path.stat
-ValueError
-read_evidence_json
-np.load
-str
-arrays['classification'].item
-JointTrajectory
-tuple
-arrays['joint_names'].tolist
-arrays['times'].copy
-arrays['position'].copy
-arrays['velocity'].copy
-arrays['progress_u'].copy
-arrays['progress_s'].copy
-set
-FingerTrajectory.from_mapping
-arrays['finger_joint_names'].tolist
-np.array_equal
-len
-any
-original.items
-```
 
 ## `load_saved_trajectory`
 
-[定义位置](../../../tests/planning/recorded_simulation.py#L93)。
+[定义位置](../../../tests/planning/recorded_simulation.py#L32)。
 
 输入签名：
 
@@ -164,7 +64,7 @@ check_result
 
 ## `restore_recorded_simulation`
 
-[定义位置](../../../tests/planning/recorded_simulation.py#L124)。
+[定义位置](../../../tests/planning/recorded_simulation.py#L63)。
 
 输入签名：
 

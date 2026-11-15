@@ -1,12 +1,10 @@
 # 实现符号索引
 
-各组件实际代码基线以对应 API 页为准；本索引覆盖下表所列当前组件及实验适配器。各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
-
-本次文档引用回填不改变代码；上述实现提交与本次文档提交的相关生产代码相同。
+代码基线：`96ee2dc-working-tree`。本索引覆盖下表所列当前组件及实验适配器；各阶段职责、必要输入和调用关系见[API 契约](06-api-contracts.md)。
 
 `build_api_index.py` 从源码语法树生成每个类、函数、方法和局部定义。签名、显式返回、属性读取、写入目标和直接调用均保留源码表达式。属性可能在函数内部建立；调用前置条件由组件正文解释。正常执行至函数末尾时隐式返回 None。
 
-覆盖 **69 个文件、1067 个定义**。
+覆盖 **89 个文件、1191 个定义**。
 
 | 模块 | 定义数 | 组件说明 |
 |---|---:|---|
@@ -17,13 +15,13 @@
 | [manipulation/function_motion.py](api/function_motion.md) | 5 | [01](01-inputs-and-task-model.md) |
 | [manipulation/goals.py](api/goals.md) | 14 | [01](01-inputs-and-task-model.md) |
 | [manipulation/grasp.py](api/grasp.md) | 8 | [01](01-inputs-and-task-model.md) |
-| [manipulation/skill.py](api/skill.md) | 13 | [01](01-inputs-and-task-model.md) |
+| [manipulation/skill.py](api/skill.md) | 14 | [01](01-inputs-and-task-model.md) |
 | [manipulation/planning_problem.py](api/planning_problem.md) | 118 | [01](01-inputs-and-task-model.md) |
 | [manipulation/regions.py](api/regions.md) | 21 | [01](01-inputs-and-task-model.md) |
 | [manipulation/support_grounding.py](api/support_grounding.md) | 4 | [01](01-inputs-and-task-model.md) |
 | [manipulation/pipeline.py](api/pipeline.md) | 10 | [01](01-inputs-and-task-model.md) |
 | [manipulation/grounding.py](api/grounding.md) | 13 | [01](01-inputs-and-task-model.md) |
-| [manipulation/selection.py](api/selection.md) | 7 | [01](01-inputs-and-task-model.md) |
+| [manipulation/selection.py](api/selection.md) | 8 | [01](01-inputs-and-task-model.md) |
 | [manipulation/planning_observation.py](api/planning_observation.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/robot_self_filter.py](api/robot_self_filter.md) | 6 | [02](02-observation-and-collision.md) |
 | [manipulation/online_geometry.py](api/online_geometry.md) | 24 | [02](02-observation-and-collision.md) |
@@ -46,8 +44,8 @@
 | [manipulation/robot_validation.py](api/robot_validation.md) | 11 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robot_geometry_check.py](api/robot_geometry_check.md) | 19 | [02](02-observation-and-collision.md) |
 | [manipulation/robosuite_execution.py](api/robosuite_execution.md) | 30 | [11](11-device-control-and-evaluation.md) |
-| [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 13 | [11](11-device-control-and-evaluation.md) |
-| [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 5 | [05](05-acceptance-and-execution.md) |
+| [tests/planning/run_recorded_skill.py](api/adapter-run_recorded_skill.md) | 5 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/recorded_task_planning.py](api/adapter-recorded_task_planning.md) | 0 | [05](05-acceptance-and-execution.md) |
 | [manipulation/_geometry_kernels.py](api/geometry_kernels.md) | 5 | [02](02-observation-and-collision.md) |
 | [manipulation/implicit_distance.py](api/implicit_distance.md) | 28 | [02](02-observation-and-collision.md) |
 | [manipulation/observed_mapping.py](api/observed_mapping.md) | 10 | [02](02-observation-and-collision.md) |
@@ -59,7 +57,7 @@
 | [manipulation/native_field_distance.py](api/native_field_distance.md) | 9 | [02](02-observation-and-collision.md) |
 | [manipulation/tool_geometry.py](api/tool_geometry.md) | 11 | [02](02-observation-and-collision.md) |
 | [tests/planning/robot_fixture.py](api/adapter-robot_fixture.md) | 31 | [02](02-observation-and-collision.md) |
-| [tests/planning/robot_validation_fixture.py](api/adapter-robot_validation_fixture.md) | 6 | [02](02-observation-and-collision.md) |
+| [manipulation/grounding_robot_geometry.py](api/grounding_robot_geometry.md) | 14 | [02](02-observation-and-collision.md) |
 | [manipulation/sampled_geometry_objective.py](api/sampled_geometry_objective.md) | 15 | [02](02-observation-and-collision.md) |
 | [manipulation/geometry_motion_bound.py](api/geometry_motion_bound.md) | 13 | [05](05-acceptance-and-execution.md) |
 | [manipulation/interval_geometry.py](api/interval_geometry.md) | 12 | [05](05-acceptance-and-execution.md) |
@@ -68,18 +66,34 @@
 | [manipulation/unified_solver.py](api/unified_solver.md) | 18 | [04](04-solver-and-search.md) |
 | [manipulation/cubic_constraints.py](api/cubic_constraints.md) | 11 | [04](04-solver-and-search.md) |
 | [manipulation/pin_kinematics.py](api/pin_kinematics.md) | 13 | [04](04-solver-and-search.md) |
-| [config/ground_skill.py](api/adapter-ground_skill.md) | 4 | [01](01-inputs-and-task-model.md) |
+| [config/ground_skill.py](api/adapter-ground_skill.md) | 2 | [01](01-inputs-and-task-model.md) |
 | [manipulation/progress_clock.py](api/progress_clock.md) | 6 | [05](05-acceptance-and-execution.md) |
-
-原生固定配对数值接口与舍入语义见 [NativePairTable](api/native_pair_table.md)，实现位于 `manipulation/_coal_scene_batch.cpp`。
 | [manipulation/pair_evidence.py](api/pair_evidence.md) | 22 | [05](05-acceptance-and-execution.md) |
 | [manipulation/validation_kinematics.py](api/validation_kinematics.md) | 9 | [05](05-acceptance-and-execution.md) |
 | [manipulation/robot_gravity.py](api/robot_gravity.md) | 3 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/run_recorded_simulation.py](api/adapter-run_recorded_simulation.md) | 11 | [11](11-device-control-and-evaluation.md) |
-| [tests/planning/recorded_simulation.py](api/adapter-recorded_simulation.md) | 3 | [11](11-device-control-and-evaluation.md) |
+| [tests/planning/recorded_simulation.py](api/adapter-recorded_simulation.md) | 2 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/recorded_skill_evaluation.py](api/adapter-recorded_skill_evaluation.md) | 23 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/continuous_simulation.py](api/adapter-continuous_simulation.md) | 7 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/simulation_snapshot.py](api/adapter-simulation_snapshot.md) | 2 | [11](11-device-control-and-evaluation.md) |
 | [tests/planning/prepare_recorded_task.py](api/adapter-prepare_recorded_task.md) | 14 | [11](11-device-control-and-evaluation.md) |
-
-共享请求入口 `run_preference_request`、物理模型构造 `simulation_model`、当前模型目录 `current_catalog`、参考入口转换 `recorded_entrance` 与结果显示 `visualize_preference_result` 的逐项接口说明见[通用运行适配](12-shared-runtime-adapters.md)。
+| [manipulation/planning_request.py](api/planning_request.md) | 5 | [14](14-grounding-planning-portfolio.md) |
+| [manipulation/planning_inputs.py](api/planning_inputs.md) | 10 | [14](14-grounding-planning-portfolio.md) |
+| [manipulation/planning_records.py](api/planning_records.md) | 8 | [14](14-grounding-planning-portfolio.md) |
+| [manipulation/planning_portfolio.py](api/planning_portfolio.md) | 9 | [14](14-grounding-planning-portfolio.md) |
+| [manipulation/trajectory_metrics.py](api/trajectory_metrics.md) | 9 | [14](14-grounding-planning-portfolio.md) |
+| [manipulation/trajectory_selection.py](api/trajectory_selection.md) | 3 | [14](14-grounding-planning-portfolio.md) |
+| [manipulation/skill_grounding.py](api/skill_grounding.md) | 7 | [15](15-skill-grounding.md) |
+| [manipulation/grounding_observations.py](api/grounding_observations.md) | 3 | [15](15-skill-grounding.md) |
+| [manipulation/instance_relation.py](api/instance_relation.md) | 2 | [15](15-skill-grounding.md) |
+| [manipulation/grounding_records.py](api/grounding_records.md) | 2 | [15](15-skill-grounding.md) |
+| [manipulation/cross_instance_grasp.py](api/cross_instance_grasp.md) | 9 | [16](16-cross-instance-grasp.md) |
+| [manipulation/grasp_pose_refinement.py](api/grasp_pose_refinement.md) | 6 | [16](16-cross-instance-grasp.md) |
+| [manipulation/grounding_geometry_evidence.py](api/grounding_geometry_evidence.md) | 6 | [16](16-cross-instance-grasp.md) |
+| [transfer/segmentation.py](api/grounding_segmentation.md) | 14 | [15](15-skill-grounding.md) |
+| [transfer/cross_instance/evidence.py](api/cross_instance_evidence.md) | 2 | [17](../../transfer/cross_instance/ARCHITECTURE.md) |
+| [transfer/cross_instance/response.py](api/cross_instance_response.md) | 6 | [17](../../transfer/cross_instance/ARCHITECTURE.md) |
+| [transfer/cross_instance/context.py](api/cross_instance_context.md) | 9 | [17](../../transfer/cross_instance/ARCHITECTURE.md) |
+| [transfer/cross_instance/coarse.py](api/cross_instance_coarse.md) | 6 | [17](../../transfer/cross_instance/ARCHITECTURE.md) |
+| [transfer/cross_instance/refinement.py](api/cross_instance_refinement.md) | 12 | [17](../../transfer/cross_instance/ARCHITECTURE.md) |
+| [transfer/cross_instance/pipeline.py](api/cross_instance_pipeline.md) | 2 | [17](../../transfer/cross_instance/ARCHITECTURE.md) |

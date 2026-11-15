@@ -189,7 +189,9 @@ def test_source_pair_policy_keeps_world_weld_pair_and_individual_geom_masks():
     import mujoco
 
     sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
-    from robot_validation_fixture import _native_pair_policies
+    # BEGIN consume the shared official robot geometry implementation.
+    from manipulation.grounding_robot_geometry import _native_pair_policies
+    # END source geometry and native pair policy remain unchanged.
 
     native = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body name="fixed">
       <geom name="base_geom" type="box" size=".1 .1 .1" contype="3" conaffinity="3"/>
@@ -221,7 +223,9 @@ def test_source_pair_policy_rejects_disabled_contact_physics(flag_name):
     import mujoco
 
     sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
-    from robot_validation_fixture import _native_pair_policies
+    # BEGIN consume the shared official robot geometry implementation.
+    from manipulation.grounding_robot_geometry import _native_pair_policies
+    # END source geometry and native pair policy remain unchanged.
 
     native = mujoco.MjModel.from_xml_string("""<mujoco><worldbody>
       <geom name="first" type="box" size=".1 .1 .1"/>

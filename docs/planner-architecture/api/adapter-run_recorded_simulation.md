@@ -1,11 +1,11 @@
 # `tests/planning/run_recorded_simulation.py` 实现契约
 
-代码基线：`3266476`。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../11-device-control-and-evaluation.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_read`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L41)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L43)。
 
 输入签名：
 
@@ -46,7 +46,7 @@ path.read_text
 
 ## `_one`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L48)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L50)。
 
 输入签名：
 
@@ -80,7 +80,7 @@ ValueError
 
 ## `_goal_identity`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L56)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L58)。
 
 输入签名：
 
@@ -125,7 +125,7 @@ int
 
 ## `_TrialVideos`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L66)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L68)。
 
 ```python
 class _TrialVideos():
@@ -141,7 +141,7 @@ class _TrialVideos():
 
 ## `_TrialVideos.__init__`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L69)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L71)。
 
 输入签名：
 
@@ -232,7 +232,7 @@ self.close
 
 ## `_TrialVideos.capture`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L121)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L123)。
 
 输入签名：
 
@@ -289,7 +289,7 @@ float
 
 ## `_TrialVideos.close`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L135)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L137)。
 
 输入签名：
 
@@ -329,7 +329,7 @@ np.asarray
 
 ## `run`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L159)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L161)。
 
 输入签名：
 
@@ -659,7 +659,7 @@ write_evidence_json
 
 ## `run.mark_wallclock`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L209)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L211)。
 
 输入签名：
 
@@ -693,7 +693,7 @@ time.monotonic
 
 ## `run.evidence_failure`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L262)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L264)。
 
 输入签名：
 
@@ -734,7 +734,7 @@ str
 
 ## `run.observe`
 
-[定义位置](../../../tests/planning/run_recorded_simulation.py#L476)。
+[定义位置](../../../tests/planning/run_recorded_simulation.py#L478)。
 
 输入签名：
 

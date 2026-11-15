@@ -41,6 +41,14 @@ def inputs(directory):
     return package, scene
 
 
+# BEGIN current entry consumes the single joint semantic response protocol.
+def joint_response(selection):
+    return {"bindings": {"interaction_reference": {**selection,
+        "source_target_relation": "same_instance",
+        "relation_reason": "The supplied visual fixture depicts the same source instance."}}}
+# END local-selection protocol tests remain in test_manipulation_selection.
+
+
 def test_transport_failure_preserves_both_actual_detector_results(tmp_path, monkeypatch):
     package, scene = inputs(tmp_path)
     detector = Mock(return_value=[detection("container")])
@@ -66,7 +74,9 @@ def test_unconfirmed_two_view_identity_never_enters_region_registration(tmp_path
     response = {"views": {name: {"candidate_ids": [17], "reason": "One visible candidate"}
                            for name in ("view_a", "view_b")},
                 "same_entity": False, "same_entity_reason": "These are distinct instances"}
-    monkeypatch.setattr("local_models.gemini.Gemini.chat_json", Mock(return_value=response))
+    # BEGIN one model call includes current association and source relation.
+    monkeypatch.setattr("local_models.gemini.Gemini.chat_json", Mock(return_value=joint_response(response)))
+    # END source sameness cannot override the false current association.
     feature = Mock(side_effect=AssertionError("Unassociated instances cannot request features"))
     registration = Mock(side_effect=AssertionError("Unassociated instances cannot enter registration"))
     monkeypatch.setattr("local_models.marco.extract_image", feature)
@@ -113,33 +123,38 @@ def test_successful_entry_exports_bound_tool_and_retains_nominal_operands(tmp_pa
     selection = {"views": {name: {"candidate_ids": [17], "reason": "Same observed fixture"}
                              for name in ("view_a", "view_b")},
                  "same_entity": True, "same_entity_reason": "Shared fixture identity"}
-    monkeypatch.setattr("local_models.gemini.Gemini.chat_json", Mock(return_value=selection))
+    # BEGIN the file adapter delegates to the public joint-routing pipeline.
+    monkeypatch.setattr("local_models.gemini.Gemini.chat_json", Mock(return_value=joint_response(selection)))
     monkeypatch.setattr("local_models.marco.extract_image", Mock(return_value=np.ones((1, 3, 4, 4))))
     monkeypatch.setattr("transfer.dual_view.pipeline.prepare", Mock(return_value={"scope": "CPU fixture"}))
     region_call = Mock(return_value={
         "status": "accepted_observed_region", "reasons": [],
         "reference_frame": {"T_world_region": function}, "outputs": None})
-    monkeypatch.setattr("config.ground_skill.run_region_transfer", region_call)
+    monkeypatch.setattr("manipulation.skill_grounding.run_region_transfer", region_call)
+    # END numerical same-instance transfer is injected at its production call.
     output = tmp_path / "success"
     report = ground_skill(package, scene, output, instruction="Use the observed container")
+    # BEGIN every reference is archived by stable identity, including one.
+    reference_directory = output / "hypotheses" / "interaction_reference"
+    # END the common manifest links to the full per-hypothesis artifacts.
     # Missing measured velocity must remain a failed binding, with the nominal
     # diagnostic still available. It cannot silently become a zero-velocity entry.
     if not with_twist:
         assert report["status"] == "failed" and report["failed_stage"] == "bind_reference"
         assert report["reference_status"] == "unbound"
         assert report["error"] == "'eef_twist'"
-        assert (output / "nominal-reference.npz").is_file()
-        assert not (output / "reference.npz").exists()
+        assert (reference_directory / "nominal-reference.npz").is_file()
+        assert not (reference_directory / "reference.npz").exists()
         assert "工具参考：unbound" in (output / "index.html").read_text()
         return
     assert report["status"] == "completed" and report["reference_status"] == "reference"
     assert region_call.call_args.kwargs["skill_kind"] == "grasp"
-    with np.load(output / "nominal-reference.npz", allow_pickle=False) as saved:
+    with np.load(reference_directory / "nominal-reference.npz", allow_pickle=False) as saved:
         nominal_start = saved["eef_poses"][0].copy()
         assert np.linalg.norm(nominal_start - actual) > .1
         np.testing.assert_allclose(saved["eef_poses"][-1], function, atol=1e-12)
         np.testing.assert_allclose(saved["eef_poses"], saved["bound_eef_poses"], atol=1e-12)
-    with np.load(output / "reference.npz", allow_pickle=False) as saved:
+    with np.load(reference_directory / "reference.npz", allow_pickle=False) as saved:
         np.testing.assert_allclose(saved["eef_poses"][0], actual, atol=1e-12)
         np.testing.assert_allclose(saved["eef_poses"][-1], function, atol=1e-12)
         np.testing.assert_array_equal(saved["initial_twist"], feedback["eef_twist"])
@@ -153,16 +168,16 @@ def test_successful_entry_exports_bound_tool_and_retains_nominal_operands(tmp_pa
     np.testing.assert_allclose(boundary["initial_pose"], actual, atol=1e-12)
     np.testing.assert_allclose(boundary["goals"][0]["pose"], function, atol=1e-12)
     assert boundary["goals"][0]["progress"] == 1.
-    np.testing.assert_allclose(np.load(output / "reference-samples.npy")[0], actual, atol=1e-12)
+    np.testing.assert_allclose(np.load(reference_directory / "reference-samples.npy")[0], actual, atol=1e-12)
     html = (output / "index.html").read_text()
     panels = json.loads(html.split("const panels=", 1)[1].split(";const images=", 1)[0])
     # BEGIN serialized and displayed full poses share the production reference.
     from manipulation.timed_reference import BoundToolReference
     from tests.test_timed_reference import twist_at
-    record = json.loads((output / "reference-paths.json").read_text())
+    record = json.loads((reference_directory / "reference-paths.json").read_text())
     restored = BoundToolReference.from_record(record["tool_reference"])
     np.testing.assert_array_equal(restored.sample_numpy(np.linspace(0., restored.duration, 21)),
-                                  np.load(output / "reference-samples.npy"))
+                                  np.load(reference_directory / "reference-samples.npy"))
     np.testing.assert_allclose(twist_at(restored, [0.])[0], feedback["eef_twist"], atol=1e-12)
     source_times = panels[0]["paths"]["eef"]["times"]
     assert "当前实际物理轨迹：缺失" in html

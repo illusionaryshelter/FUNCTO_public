@@ -249,7 +249,9 @@ def update_minima(minima, state_index, state, result, uncertain_names):
 def audit(snapshot_path, fixture_path, output):
     """Run all captured queries within the separate finite diagnostic budget."""
     from recorded_simulation import load_curve_archive
-    from robot_validation_fixture import build_robot_validator
+    # BEGIN consume the shared official robot geometry implementation.
+    from manipulation.grounding_robot_geometry import build_robot_validator
+    # END source geometry and native pair policy remain unchanged.
 
     started = time.monotonic()
     output = Path(output)

@@ -169,7 +169,9 @@ class GroundingCandidateSelectionTest(unittest.TestCase):
             self.assertNotIn("mask", nested_keys(data))
             self.assertNotIn("T_world_object", nested_keys(data))
             self.assertNotIn("DO_NOT_SEND_SOURCE_INSTANCE_ID", client.chat_json.call_args.args[0])
-        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION] * 2)
+        # BEGIN semantic rules and this API's response schema are separate.
+        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION + selection._VIEW_RESPONSE_INSTRUCTION] * 2)
+        # END both task requests use the same automatically assembled prompt.
 
     def test_scopes_are_explicit_data_with_the_same_fixed_prompt_and_distinct_masks(self):
         source, views = fixture()
@@ -188,7 +190,9 @@ class GroundingCandidateSelectionTest(unittest.TestCase):
             self.assertEqual(data["source_evidence"]["description"], source["description"])
             np.testing.assert_array_equal(result["views"]["left"]["regions"][0]["mask"],
                                           views["left"]["candidates"][0]["mask"])
-        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION] * 2)
+        # BEGIN scope data shares the same local-selection schema.
+        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION + selection._VIEW_RESPONSE_INSTRUCTION] * 2)
+        # END joint instance routing supplies its own outer binding schema.
         # The common rules must name both meanings; scope selection belongs to
         # explicit data, not a task-name branch or a silently changed template.
         self.assertIn("owner", prefixes[0])
@@ -540,7 +544,9 @@ class GroundingOwnerEvidenceSelectionTest(unittest.TestCase):
             self.assertNotIn("body_id", nested_keys(data))
             self.assertNotIn("T_world_body", nested_keys(data))
             self.assertNotIn("DO_NOT_SEND_SIMULATOR_BODY_ID", client.chat_json.call_args.args[0])
-        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION] * 2)
+        # BEGIN evidence selection retains the local response contract.
+        self.assertEqual(prefixes, [selection._SELECTION_INSTRUCTION + selection._VIEW_RESPONSE_INSTRUCTION] * 2)
+        # END semantic allowlisting is independent of the response envelope.
         self.assertIn("same_owner=true", prefixes[0])
         self.assertIn("not evidence of one rigid owner", prefixes[0])
         self.assertIn("NOT interchangeable target alternatives", prefixes[0])

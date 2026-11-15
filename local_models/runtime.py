@@ -71,6 +71,24 @@ def run_file_worker(kind: str, paths: list[Path], options: dict) -> dict[str, np
         return _run_file_worker(kind, [str(path) for path in paths], options, Path(directory))
 
 
+# BEGIN typed RGB-D/point-array transport for isolated grasp and pose models.
+def run_array_worker(kind: str, arrays: dict[str, np.ndarray], options: dict) -> dict[str, np.ndarray]:
+    """Return CPU arrays after one declared array-input model has exited.
+
+    NPZ retains input dtypes, row identities and masks. Each worker reads the
+    local request once; the shared worker lock and memory budget also apply to
+    the image and tracking adapters above.
+    """
+    if kind not in {"anygrasp", "unopose"}:
+        raise ValueError(f"Unknown array-based local model: {kind}")
+    with tempfile.TemporaryDirectory(prefix=f"functo-{kind}-") as directory:
+        directory = Path(directory)
+        input_path = directory / "inputs.npz"
+        np.savez(input_path, **arrays)
+        return _run_file_worker(kind, [], dict(options, input_arrays_path=str(input_path)), directory)
+# END typed RGB-D/point-array transport.
+
+
 def _run_file_worker(kind, paths, options, directory):
     """Single checked subprocess boundary shared by image and video inference."""
     # BEGIN serial worker lifetime includes CPU result materialization.
@@ -224,6 +242,17 @@ def main() -> None:
         from .tapip3d import worker_main
         worker_main(paths, output, **request["options"])
     # END TAPIP3D point tracker.
+    # BEGIN independently released grasp and relative-pose workers.
+    elif request["kind"] in {"anygrasp", "unopose"}:
+        options = dict(request["options"])
+        with np.load(options.pop("input_arrays_path"), allow_pickle=False) as saved:
+            arrays = {name: saved[name] for name in saved.files}
+        if request["kind"] == "anygrasp":
+            from .anygrasp import worker_main
+        else:
+            from .unopose import worker_main
+        worker_main(arrays, output, **options)
+    # END each model releases its complete GPU lifetime before the next stage.
     else:
         raise ValueError(f"Unknown worker: {request['kind']}")
     print(json.dumps({"local_model": request["kind"],

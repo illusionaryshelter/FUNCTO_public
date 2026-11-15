@@ -24,70 +24,9 @@ from manipulation.gripper_trajectory import FingerTrajectory
 from manipulation.robosuite_execution import RobosuiteExecutionBackend
 
 # BEGIN use the same complete formal archive bound as its writer.
-from recorded_task_planning import MAX_CURVE_METADATA_BYTES
+from manipulation.planning_records import MAX_CURVE_METADATA_BYTES, load_curve_archive
 from manipulation.evidence_archive import read_evidence_json
 # END ordinary input-document and per-array limits remain separate.
-
-# BEGIN archive inspection is separate from execution authorization.
-def load_curve_archive(path):
-    """Inspect exact recorded arrays, including rejected diagnostic curves."""
-    from manipulation.planning import JointTrajectory
-
-    path = Path(path)
-    # BEGIN bound the complete formal scene archive before its first read.
-    # Exact ESDF bytes and validation evidence are larger than ordinary input
-    # metadata. Preserve them intact under a separate explicit archive limit;
-    # reject oversized input before allocating text or decoding JSON.
-    metadata_path = path.with_suffix(".json")
-    if metadata_path.stat().st_size > MAX_CURVE_METADATA_BYTES:
-        raise ValueError(f"Trajectory metadata exceeds the bounded 512 MiB archive size: {metadata_path}")
-    # BEGIN count and read each shared completed record once with this archive.
-    metadata = read_evidence_json(metadata_path, max_bytes=MAX_CURVE_METADATA_BYTES)
-    # END the restored binding retains immutable numerical evidence.
-    # END the archive is parsed once, without geometry or evidence truncation.
-    with np.load(path, allow_pickle=False) as arrays:
-        if str(arrays["classification"].item()) != metadata["classification"]:
-            raise ValueError("Saved trajectory arrays and metadata disagree on planner status")
-        curve = JointTrajectory(tuple(arrays["joint_names"].tolist()), arrays["times"].copy(),
-            arrays["position"].copy(), arrays["velocity"].copy(), arrays["progress_u"].copy(),
-            arrays["progress_s"].copy(), tuple(metadata["events"]), tuple(metadata["conditions"]),
-            metadata["residuals"],
-            # BEGIN preserve verified prefix obligations before deriving the next barrier.
-            satisfied_dependencies=tuple(metadata["satisfied_dependencies"]))
-            # END reloaded blocks cannot reactivate an already consumed barrier.
-        # BEGIN load the exact planner finger polynomial and cross-check its arrays.
-        command_events = [row for row in curve.events if row["kind"] in ("open", "close", "hold")]
-        if "finger_trajectory" not in metadata:
-            raise ValueError("Saved trajectories must explicitly declare their finger_trajectory field")
-        saved_fingers = metadata["finger_trajectory"]
-        finger_arrays = {"finger_joint_names", "finger_times", "finger_position", "finger_velocity"}
-        if saved_fingers is None:
-            if command_events or finger_arrays & set(arrays.files):
-                raise ValueError("Finger command events require the complete saved planning finger reference")
-            curve.finger_trajectory = None
-        else:
-            if not finger_arrays <= set(arrays.files):
-                raise ValueError("Saved finger reference requires all named polynomial arrays")
-            fingers = FingerTrajectory.from_mapping(saved_fingers)
-            if (fingers.duration != curve.duration or fingers.executable_until != curve.executable_until
-                    or tuple(arrays["finger_joint_names"].tolist()) != fingers.joint_names
-                    or not np.array_equal(arrays["finger_times"], fingers.times)
-                    or not np.array_equal(arrays["finger_position"], fingers.position)
-                    or not np.array_equal(arrays["finger_velocity"], fingers.velocity)):
-                raise ValueError("Saved arm/finger arrays and metadata must describe the same original clock and polynomial")
-            originals = {(row["skill_id"], row["event_id"]): row for row in command_events}
-            if len(originals) != len(command_events) or set(originals) != {
-                    (row["skill_id"], row["event_id"]) for row in fingers.events}:
-                raise ValueError("Saved finger reference event identities differ from the original arm trajectory")
-            for row in fingers.events:
-                original = originals[(row["skill_id"], row["event_id"])]
-                if any(key not in row or row[key] != value for key, value in original.items()):
-                    raise ValueError("Saved finger events changed an original command, time or progress anchor")
-            curve.finger_trajectory = fingers
-        # END reload never generates a replacement finger trajectory.
-    if curve.next_verification != metadata["next_verification"]:
-        raise ValueError("The saved evidence barrier must be preserved exactly")
-    return curve, metadata
 
 
 def load_saved_trajectory(path):

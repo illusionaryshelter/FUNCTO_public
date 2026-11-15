@@ -1,6 +1,6 @@
 # `manipulation/skill.py` 实现契约
 
-代码基线：`be44b54`。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_semantics`
@@ -694,19 +694,19 @@ _representation
 _source_motion_agreement
 ```
 
-## `observe_interaction_reference`
+## `prepare_interaction_candidates`
 
 [定义位置](../../../manipulation/skill.py#L289)。
 
 输入签名：
 
 ```python
-def observe_interaction_reference(skill, instruction, views, *, detector=None, client=None):
+def prepare_interaction_candidates(skill, instruction, views, *, detector=None):
 ```
 
 实现说明：
 
-> Detect and semantically select the reference chosen during extraction.
+> Detect the explicitly stored reference for one loaded skill binding.
 >
 > Each view supplies an ``image`` and may supply separately observed
 > ``selected_owner`` context for a part. The detector receives precisely the
@@ -720,7 +720,7 @@ def observe_interaction_reference(skill, instruction, views, *, detector=None, c
 显式输出分支：
 
 ```python
-{'interaction_reference': deepcopy(reference), 'owner_role': metadata['owner_role'], 'sam_queries': labels, 'selection_scope': scope, 'detections': detections, 'selection': selection}
+{'interaction_reference': deepcopy(reference), 'owner_role': metadata['owner_role'], 'sam_queries': labels, 'selection_scope': scope, 'detections': detections, 'source_evidence': source, 'selection_views': selection_views}
 ```
 
 读取的对象属性：
@@ -767,7 +767,6 @@ number
 detections[name]
 selection_views[name]
 selection_views[name]['selected_owner']
-selection
 ```
 
 直接调用符号：
@@ -792,6 +791,52 @@ type
 used.add
 rows.append
 _detection
-select_grounding_candidates
 deepcopy
+```
+
+## `observe_interaction_reference`
+
+[定义位置](../../../manipulation/skill.py#L357)。
+
+输入签名：
+
+```python
+def observe_interaction_reference(skill, instruction, views, *, detector=None, client=None):
+```
+
+实现说明：
+
+> Select one demonstrated reference in the supplied current images.
+>
+> This local selection API remains useful without source/current instance
+> routing. The public skill-grounding pipeline uses the same candidates in
+> its joint binding request instead of performing a second semantic call.
+
+显式输出分支：
+
+```python
+{key: value for (key, value) in prepared.items() if key not in {'source_evidence', 'selection_views'}} | {'selection': selection}
+```
+
+读取的对象属性：
+
+```python
+prepared.items
+```
+
+写入目标：
+
+```python
+prepared
+selection
+key
+value
+```
+
+直接调用符号：
+
+```python
+prepare_interaction_candidates
+select_grounding_candidates
+prepared.items
 ```

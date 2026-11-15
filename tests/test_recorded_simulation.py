@@ -404,7 +404,7 @@ class SavedExecutionContractTests(unittest.TestCase):
         simulation, curve, _ = _fixture()
         with TemporaryDirectory() as temporary:
             path = Path(temporary)/"oversized.npz"
-            with patch("recorded_task_planning.MAX_CURVE_METADATA_BYTES", 1):
+            with patch("manipulation.planning_records.MAX_CURVE_METADATA_BYTES", 1):
                 with self.assertRaisesRegex(ValueError, "archive size"):
                     save_curve(path, curve, classification="rejected_diagnostic_not_executable",
                                execution_limits=_limits(simulation, curve).describe())

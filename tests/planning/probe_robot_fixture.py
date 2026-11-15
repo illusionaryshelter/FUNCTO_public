@@ -27,7 +27,9 @@ def load_probe_fixture(fixture_path, *, reference_frame, T_reference_base=None,
     posture; a separate explicit nominal hand model must accompany planning.
     """
     from robot_fixture import _pose
-    from robot_validation_fixture import build_robot_validator
+    # BEGIN consume the shared official robot geometry implementation.
+    from manipulation.grounding_robot_geometry import build_robot_validator
+    # END source geometry and native pair policy remain unchanged.
 
     fixture = json.loads(Path(fixture_path).read_text())
     robot = yaml.safe_load(Path(fixture["robot_config_path"]).read_text())
@@ -199,14 +201,15 @@ def fixed_probe_hand(fixture, robot, problem, *, device, full_current_positions,
         return NominalFingerGeometry.from_reference(reference, valid_until_s=duration, source=source)
         # END no default whole-clock geometry contract is inferred for other hands.
 
+    # BEGIN bind commands and nominal fingers through the current hand interface.
+    # Registered robot solids remain in the independent robot model. This
+    # controller owns only named actuator coordinates and the declared clock.
     hand = PrismaticGripper(controller="binary", joint_names=fingers, current_positions=current,
         joint_limits=geometry["joint_limits"], joint_bounds=None,
         coupling_matrix=np.empty((0, len(fingers))), coupling_offset=np.empty(0),
-        sphere_indices=geometry["sphere_indices"], local_spheres=geometry["local_spheres"],
-        sphere_joint_translation=geometry["sphere_joint_translation"],
-        self_collision_pairs=geometry["self_collision_pairs"], commands=commands,
-        source=source, control_timestep_s=control_timestep_s, nominal_finger_trajectory_factory=nominal,
-        self_collision_geometry=geometry['self_collision_geometry'])
+        commands=commands, source=source, control_timestep_s=control_timestep_s,
+        nominal_finger_trajectory_factory=nominal)
+    # END official geometry and command timing retain their separate owners.
     original_links = {row["link"] for row in fixture["collision_geometries"]}
     owners, owner_report = create_fixed_installation_owners(fixture, device_cfg=device,
         T_output_base=problem.base_pose, sphere_indices_by_link={name: indices for name, indices in

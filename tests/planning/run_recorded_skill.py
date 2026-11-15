@@ -26,44 +26,13 @@ sys.path.insert(0, str(PROJECT))
 
 from manipulation.planning import MotionBackend
 
-
-# BEGIN persist reusable semantic masks separately from fusion decisions.
-def save_observation_partitions(scene, output):
-    """Save original entity/background masks and the admitted fusion mask.
-
-    Future --owner-mask inputs use the saved semantic entity files and
-    --background-mask uses the saved background candidate. The fusion
-    background records this run's filtering and one-pixel boundary; feeding
-    it back as a candidate would incorrectly grow the excluded boundary.
-    A reused background field produces no new fusion-background mask.
-    """
-    result = {}
-    for name, masks in scene.observation_partition_masks.items():
-        folder = Path(output)/"observations"/name
-        folder.mkdir(parents=True, exist_ok=True)
-        row = {'owner_masks': {}, 'background_candidate_mask_path': None,
-               'background_mask_path': None,
-               'mask_roles': {
-                   'owner_masks': 'Original semantic entity masks; reusable --owner-mask inputs',
-                   'background_candidate_mask_path': 'Original semantic background candidate; reusable --background-mask input',
-                   'background_mask_path': 'Actual fusion mask after robot filtering and one boundary exclusion; not a semantic input',
-               },
-               'endpoint_partition':deepcopy(scene.observation_report['endpoint_partition'][name])}
-        for index, (identity, mask) in enumerate(masks['owner_masks'].items()):
-            path = folder/f"owner-{index:03d}-semantic-mask.npy"
-            np.save(path, mask)
-            row['owner_masks'][identity] = str(path.resolve())
-        for key, filename, report_key in (
-                ('background_candidate', 'background-candidate-mask.npy', 'background_candidate_mask_path'),
-                ('background', 'background-mask.npy', 'background_mask_path')):
-            if masks[key] is not None:
-                path = folder/filename
-                np.save(path, masks[key])
-                row[report_key] = str(path.resolve())
-        (folder/"partition-report.json").write_text(json.dumps(row, indent=2)+"\n")
-        result[name] = row
-    return result
-# END saved original masks preserve ownership without another segmentation call.
+# BEGIN recorded CLI resolves files while production owns common task bindings.
+from manipulation.planning_inputs import (
+    save_observation_partitions, finger_trajectory_factory, load_joint_reference,
+    position_controlled_hand, require_feedback_identity,
+    owner_observation_inputs as recorded_owner_observation_inputs,
+)
+# END actual arrays and file handles retain the caller's observation identities.
 
 
 # BEGIN finite source contacts retain one recorded declaration channel.
@@ -80,220 +49,6 @@ def load_contact_bindings(path):
         raise ValueError("Contact bindings require a current evidence source")
     return inputs
 # END collision-free inheritance is supplied through the scene entrance input.
-
-
-# BEGIN explicit joint reference is guidance with no saved authorization.
-def load_joint_reference(path, problem):
-    """Read a bounded named q/dq recording without changing current task goals.
-
-    All coordinates and timestamps come from the supplied record. Shape,
-    ordering and finite-value checks prevent malformed guidance from entering
-    a native seed fit; goal/domain acceptance still belongs to the backend.
-    """
-    from manipulation.planning import JointTrajectory
-    if path is None:
-        return None
-    path = Path(path)
-    if path.stat().st_size > 16 * 1024**2:
-        raise ValueError("Joint reference exceeds its 16 MiB input bound")
-    with np.load(path, allow_pickle=False) as record:
-        if set(record.files) != {"joint_names", "times", "position", "velocity", "progress"}:
-            raise ValueError("Joint reference requires names, times, position, velocity and progress")
-        names = tuple(record["joint_names"].tolist())
-        t, q, dq, progress = (np.asarray(record[key], float).copy()
-                             for key in ("times", "position", "velocity", "progress"))
-    if (names != problem.joint_names or t.ndim != 1 or not 2 <= len(t) <= 8192
-            or t[0] != 0 or np.any(np.diff(t) <= 0)
-            or q.shape != (len(t), len(names)) or dq.shape != q.shape or progress.shape != t.shape
-            or np.any(np.diff(progress) <= 0) or progress[0] != problem.start_progress
-            or progress[-1] != problem.phase_count
-            or not all(np.isfinite(value).all() for value in (t, q, dq, progress))):
-        raise ValueError("Joint reference requires finite increasing time/progress and exact named layout")
-    return JointTrajectory(names, t, q, dq, t/t[-1], progress, (), (), {})
-# END a recorded reference never substitutes for the current measured entrance.
-
-
-# BEGIN independent finger reference on the planner's exact physical clock.
-def finger_trajectory_factory(problem, feedback, finger_targets, *, incoming_command, timestep, ctrlrange,
-                              position_limits, velocity_limits, acceleration_limits):
-    """Bind original events once the native formal duration/map are known.
-
-    Actual-position protection bounds are deliberately absent from this
-    constructor. They continue guarding measured feedback in the executor;
-    they cannot predict a hand shape or replace the original position goals.
-    The returned reference continues the explicitly supplied active command.
-    Measured q/dq remain separate entrance observations, including when contact
-    prevents the physical fingers from reaching the issued target.
-    """
-    from manipulation.gripper_trajectory import FingerTrajectory
-
-    names = tuple(feedback["finger_joint_names"])
-    measured = dict(zip(feedback["joint_names"], feedback["start_q"]))
-    speeds = dict(zip(feedback["joint_names"], feedback["start_dq"]))
-
-    def build(duration_s, progress_map):
-        events = []
-        for identity, clock in progress_map.event_clock.items():
-            # BEGIN consume the sole device-quantized source/event binding.
-            from manipulation.planning_problem import event_occurrence_key
-            event = deepcopy(clock["event"])
-            if event_occurrence_key(event) != identity:
-                raise ValueError("A finger reference needs the exact bound event occurrence metadata")
-            events.append({**event, **{key: deepcopy(value) for key, value in clock.items() if key != "event"}})
-            # END hand commands cannot independently invert or retime progress.
-        barriers = [row["time"] for row in events if row["requires_evidence"] is not None]
-        stop = min(barriers) if barriers else duration_s
-        commands = finger_targets.bind(SimpleNamespace(events=events, duration=duration_s),
-            finger_joint_names=names, ctrlrange=ctrlrange)
-        velocity = np.asarray([velocity_limits[name] for name in names])
-        acceleration = np.asarray([acceleration_limits[name] for name in names])
-        # BEGIN separate active device command and measured finger entrance.
-        return FingerTrajectory.build(joint_names=names, incoming_command=incoming_command,
-            measured_initial_position=[measured[name] for name in names],
-            measured_initial_velocity=[speeds[name] for name in names], commands=commands,
-            duration=duration_s, executable_until=stop, timestep=timestep,
-            position_limits=np.asarray([position_limits[name] for name in names]).T,
-            velocity_limits=np.stack((-velocity, velocity)),
-            acceleration_limits=np.stack((-acceleration, acceleration)),
-            source=(f"Original explicit actuator targets: {finger_targets.source}; C1 command reference "
-                    "under native planner acceleration bounds, not calibrated actual acceleration/tracking limits"),
-            feedback_id=feedback["feedback_id"], timestamp_s=feedback["sim_time_s"])
-        # END bound events retain their sole native clock.
-
-    # BEGIN expose the already bound device tick to the planning clock owner.
-    build.timestep = float(timestep)
-    # END this is device metadata, never a per-skill retiming rule.
-    return build
-# END full mechanical intervals no longer select future hand geometry.
-
-
-# BEGIN share unchanged native FK calibration with source-backed planning probes.
-def position_controlled_hand(robot, feedback, problem, *, device, execution_limits,
-                             position_limits, velocity_limits, trajectory_factory, fixture, execution_events=None):
-    """Bind independent command reference after checking actual execution limits.
-
-    The shared test adapter calibrates exactly the same native spheres and
-    prismatic translations. This recorded boundary still owns the measured
-    q/dq checks, execution policy, command identities and reference factory.
-    """
-    from manipulation.planning_scene import PrismaticGripper
-
-    execution_events = problem.events if execution_events is None else execution_events
-    measured = dict(zip(feedback["joint_names"], feedback["start_q"]))
-    finger_names = tuple(feedback["finger_joint_names"])
-    binding = execution_limits.bind(
-        SimpleNamespace(joint_names=problem.joint_names, events=[asdict(event) for event in execution_events]),
-        joint_names=feedback["joint_names"], arm_joint_names=feedback["arm_joint_names"],
-        finger_joint_names=finger_names,
-        native_joint_ranges=[position_limits[name] for name in feedback["joint_names"]],
-        named_velocity_limits=velocity_limits)
-    actual_fingers = np.asarray([measured[name] for name in finger_names])
-    actual_dq = dict(zip(feedback["joint_names"], feedback["start_dq"]))
-    initial_bounds = np.asarray(binding["initial_fingers"]["position_bounds"])
-    if (np.any(actual_fingers < initial_bounds[:, 0]) or np.any(actual_fingers > initial_bounds[:, 1])
-            or np.any(np.abs([actual_dq[name] for name in finger_names])
-                      > np.asarray(binding["initial_fingers"]["maximum_speed"]))):
-        raise ValueError("Measured initial fingers violate the shared execution bounds")
-    # BEGIN geometry uses the already-created command and original bound clock.
-    def nominal_geometry(duration_s, progress_map, command_reference):
-        from manipulation.gripper_trajectory import bind_nominal_finger_geometry
-        if command_reference.duration != duration_s:
-            raise ValueError("Nominal geometry and command must share the original bound duration")
-        return bind_nominal_finger_geometry(command_reference, problem.conditions,
-            progress_map.event_clock, progress_interval=(progress_map.s[0], progress_map.s[-1]))
-    # END measured Holding shape never overwrites the actual command q/dq.
-    hand = PrismaticGripper(
-        controller="timed_reference", joint_names=finger_names,
-        current_positions=actual_fingers, joint_limits=[position_limits[name] for name in finger_names],
-        joint_bounds=None, finger_trajectory_factory=trajectory_factory,
-        nominal_finger_trajectory_factory=nominal_geometry,
-        control_timestep_s=trajectory_factory.timestep,
-        coupling_matrix=np.empty((0, len(finger_names))), coupling_offset=np.empty(0),
-        commands=tuple({"event_id": event.event_id, "skill_id": event.skill_id,
-                        "occurrence": event.occurrence, "command": event.kind, "progress": event.progress}
-                       for event in execution_events if event.kind in {"open", "close", "hold"}),
-        source=f"Measured fingers and synchronous command reference: {execution_limits.source}")
-    report = {"current_fingers": actual_fingers.tolist(),
-        "mechanical_limits": [position_limits[name] for name in finger_names],
-        "controller": "timed_reference", "execution_limits": execution_limits.describe(),
-        "geometry_scope": "Named nominal finger coordinates feed the complete robot FK; observations stay link-local"}
-    return hand, report
-# END execution semantics stay here; only measured native geometry is shared.
-
-
-# BEGIN explicit snapshot, owner-mask and hand-permission input contracts.
-def require_feedback_identity(feedback):
-    """Keep the capture adapter's identity across planning and execution.
-
-    A file path only names storage and can change when a capture is copied.
-    It cannot replace the ID already carried by current Holding evidence.
-    """
-    identity = feedback.get("feedback_id")
-    if not isinstance(identity, str) or not identity.strip():
-        raise ValueError("The input adapter must supply an explicit current feedback_id")
-    return identity
-
-
-def recorded_owner_observation_inputs(problem, scene_input, views, mask_rows, *, source, observed_owners=()):
-    """Resolve masks only for entities selected for RGB-D reconstruction.
-
-    Existing models retain their registered identity and motion. They do not
-    participate in the new observation-mask contract, including under complete
-    occlusion. New entity coordinates come from the explicit task binding.
-    """
-    from manipulation.motion import _pose_array
-    from observed_robot_fixture import problem_owner_binding
-
-    carrier = scene_input["carrier_id"]
-    initial, _ = problem_owner_binding(problem, carrier)
-    frames = {carrier: {"T_output_owner": initial, "source": source}}
-    if "reference_id" in scene_input or "reference_pose" in scene_input:
-        reference = scene_input.get("reference_id")
-        if (not isinstance(reference, str) or not reference.strip() or reference == carrier
-                or "reference_pose" not in scene_input):
-            raise ValueError("A reference partition requires its distinct reference_id and current reference_pose")
-        frames[reference] = {"T_output_owner": _pose_array(scene_input["reference_pose"],
-                            "current reference-owner pose"), "source": source}
-    # BEGIN explicit static observations can participate without becoming goals.
-    # These are current collision partitions, not additional task references or
-    # moving attachments. Each owns its original RGB-D pixels and a declared
-    # coordinate frame. The common mapper retains all remaining background.
-    observations = scene_input.get("observation_owners", [])
-    if not isinstance(observations, list):
-        raise ValueError("Additional observation owners must be an explicit list")
-    for record in observations:
-        if not isinstance(record, dict) or set(record) != {"owner_id", "T_output_owner", "source"}:
-            raise ValueError("An observation owner requires exactly owner_id, T_output_owner and source")
-        identity, evidence = record["owner_id"], record["source"]
-        if (not isinstance(identity, str) or not identity.strip()
-                or identity in frames or identity in {"robot", "background", "observed_background"}
-                or not isinstance(evidence, str) or not evidence.strip()):
-            raise ValueError("Observation owners need distinct physical identities and explicit current sources")
-        frames[identity] = {"T_output_owner": _pose_array(record["T_output_owner"],
-                            "current observation-owner frame"), "source": evidence}
-    # BEGIN existing entities are geometry inputs, independently of visibility.
-    existing = {owner.owner_id for owner in observed_owners}
-    if not existing <= set(frames):
-        raise ValueError("Existing models must identify entities in the task scene")
-    frames = {identity: frame for identity, frame in frames.items() if identity not in existing}
-    # END only entities being reconstructed need observation masks.
-    view_ids = [view["id"] for view in views]
-    if len(set(view_ids)) != len(view_ids) or not view_ids:
-        raise ValueError("Current RGB-D views require distinct explicit IDs")
-    masks = {}
-    for row in mask_rows:
-        if len(row) != 3:
-            raise ValueError("Each owner mask requires OWNER_ID VIEW_ID MASK_PATH")
-        owner, view, path = row
-        if (owner, view) in masks:
-            raise ValueError("Every current owner/view mask must be supplied exactly once")
-        masks[owner, view] = Path(path)
-    if set(masks) != {(owner, view) for owner in frames for view in view_ids}:
-        raise ValueError("Supply exactly one current owner mask for every explicit owner and view")
-    return frames, masks
-
-
-# END input identities never supply simulated object geometry or contact truth.
 
 
 # BEGIN execution consumes an explicitly prepared current problem.
@@ -414,13 +169,16 @@ def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
             raise ValueError("Recorded world camera calibration requires a world-frame planning problem")
         # BEGIN load existing geometry before deciding which observations to build.
         from observed_robot_fixture import load_observed_owner
-        from robot_validation_fixture import build_robot_validator, robot_self_filter_shapes
+        # BEGIN consume the shared official robot geometry implementation.
+        from manipulation.grounding_robot_geometry import build_robot_validator, robot_self_filter_shapes
+        # END source geometry and native pair policy remain unchanged.
         mark_wallclock("existing_owner_load_started")
         observed_owners = (() if args.observed_owner is None else
                            (load_observed_owner(args.observed_owner),))
         mark_wallclock("existing_owner_load_completed")
         owner_frames, supplied_masks = recorded_owner_observation_inputs(
-            problem, scene_input, segment["snapshot"]["views"], args.owner_mask,
+            problem, scene_input, segment["snapshot"]["views"],
+            [(owner, view, Path(path)) for owner, view, path in args.owner_mask],
             source=str(root/candidate["scene_path"]), observed_owners=observed_owners)
         task_owners = scene_task_owner_ids(scene_input)
         owner_resolutions = observation_resolutions((*owner_frames, *(owner.owner_id for owner in observed_owners)),
@@ -476,7 +234,9 @@ def run_prepared(args, *, problem, provenance, backend_factory=MotionBackend):
             velocity_limits=fixture["velocity_limits"], trajectory_factory=reference_factory, fixture=fixture)
         report["gripper"] = hand_report
         # BEGIN tool assembly membership comes from the same robot model.
-        from robot_validation_fixture import tool_geometry_names
+        # BEGIN consume the shared official robot geometry implementation.
+        from manipulation.grounding_robot_geometry import tool_geometry_names
+        # END source geometry and native pair policy remain unchanged.
         tool_members = tool_geometry_names(fixture)
         report["tool_geometry_names"] = list(tool_members)
         contacts = ()

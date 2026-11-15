@@ -268,6 +268,34 @@ def prepare_selected_observation(rgb, depth_m, K, T_world_camera_cv, selected,
 # END selected-entity preparation has no score-based identity decision.
 
 
+# BEGIN an independently supplied observation mask is not a fabricated detection.
+def prepare_mask_observation(rgb, depth_m, K, T_world_camera_cv, mask, *,
+                             source, crop_margin_fraction=0.15):
+    """Backproject an existing observed mask with its own explicit provenance.
+
+    This accepts current owner evidence already supplied by another semantic
+    binding. It uses the same pixel order, calibration and crop computation
+    as selected SAM observations, while retaining its separate mask and source.
+    No detector score, candidate ID or complete hidden shape is manufactured.
+    """
+    image, depth, mask = _rgb(rgb), np.asarray(depth_m), np.asarray(mask)
+    if depth.shape != image.shape[:2] or depth.dtype.kind not in "fiu":
+        raise ValueError("Mask observation requires aligned metric optical depth")
+    if mask.dtype != np.bool_ or mask.shape != depth.shape:
+        raise ValueError("Observation mask must be Boolean at original RGB-D resolution")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("An independent observation mask requires its source")
+    K, T = _calibration(K, T_world_camera_cv)
+    result = dict(prepared=False, reasons=[], observation=None, crop_rgb=None,
+        crop_xyxy=None, source_evidence_mask=None,
+        selection=dict(policy="provided_observation_mask", source=source),
+        diagnostics=dict(role="target", mask_source=source,
+                         crop_margin_fraction=float(crop_margin_fraction)))
+    return _selected_geometry(image, depth, K, T, {"mask": mask}, np.zeros_like(mask),
+        source=False, crop_margin_fraction=crop_margin_fraction, result=result)
+# END all point identities come from the same existing sensor computation.
+
+
 def prepare_observation(rgb, depth_m, K, T_world_camera_cv, detections, *,
                         prompt, source_region_mask=None, crop_margin_fraction=0.15):
     """Bind one predicted instance and backproject the permitted RGB-D evidence.

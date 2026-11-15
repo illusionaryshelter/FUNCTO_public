@@ -19,7 +19,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from manipulation.execution import ExecutionLimits
 from recorded_simulation import load_saved_trajectory, restore_recorded_simulation
-from robot_validation_fixture import build_robot_validator
+# BEGIN consume the shared official robot geometry implementation.
+from manipulation.grounding_robot_geometry import build_robot_validator
+# END source geometry and native pair policy remain unchanged.
 
 
 def run(args):

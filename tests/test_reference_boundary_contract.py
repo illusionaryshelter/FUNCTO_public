@@ -67,6 +67,41 @@ def bound_at_time(reference, name, times):
 # END source geometry is distinct from its physically timed correction.
 
 
+# BEGIN task frame F and grasp-motion anchor B are independent physical data.
+def test_explicit_grasp_anchor_preserves_task_frame_and_non_node_event_motion():
+    times = np.array([1., 1.4, 2.3, 3.])
+    relative = np.array([pose((.02, -.03, .1), (.2, -.1, .3)),
+        pose((.04, .01, .08), (-.15, .3, .55)),
+        pose((.09, .05, .02), (.1, .2, .8)),
+        pose((.12, .02, -.01), (-.3, .1, 1.))])
+    F = pose((.7, -.2, .6), (.1, .4, -.5))
+    B = pose((-.2, .3, .9), (-.2, .1, .7))
+    interaction, release = 2.05, 2.65
+    representation = dict(kind="grasp", frame_indices=np.array([2, 5, 11, 19]),
+        timestamps=times, H_g=relative, approach_time=1.2,
+        interaction_time=interaction, release_time=release,
+        events=[dict(timestamp=release, kind="release", source="Recorded source event")])
+    reference = generate_reference(representation, T_world_function=F,
+        tool_reference_anchor=B, T_world_eef=pose((.1, -.4, .8)))
+    queries = np.array([1., 1.27, interaction, 2.51, release])
+    expected = B @ interpolate_track(times, relative, queries)
+    np.testing.assert_allclose(at_time(reference, "eef", queries), expected, atol=2e-15)
+    np.testing.assert_array_equal(reference["T_world_function"], F)
+    np.testing.assert_array_equal(reference["tool_reference_anchor"], B)
+    np.testing.assert_array_equal(reference["H_g"], relative)
+    np.testing.assert_array_equal(reference["timestamps"], times)
+    assert reference["events"] == representation["events"]
+    assert reference["eef_timestamps"][-1] == release
+    np.testing.assert_allclose(reference["eef_boundaries"]["goals"][0]["pose"], expected[2], atol=2e-15)
+    # The complete composed path survives its actual production serializer.
+    from manipulation.planning_problem import PosePath
+    from manipulation.execution_binding import plain
+    restored = PosePath.from_record(plain(reference["eef_path"]))
+    np.testing.assert_array_equal(restored.sample_numpy((queries-times[0])/(release-times[0])),
+        at_time(reference, "eef", queries))
+# END this checks task/anchor separation through continuous generation and I/O.
+
+
 class ReferenceBoundaryContractTest(unittest.TestCase):
     def setUp(self):
         # Nonuniform time, a non-node interaction and a non-node release catch

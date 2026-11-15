@@ -286,8 +286,8 @@ def load_grounding_skill(directory):
 
 
 # BEGIN semantic observation from the version-2 source evidence.
-def observe_interaction_reference(skill, instruction, views, *, detector=None, client=None):
-    """Detect and semantically select the reference chosen during extraction.
+def prepare_interaction_candidates(skill, instruction, views, *, detector=None):
+    """Detect the explicitly stored reference for one loaded skill binding.
 
     Each view supplies an ``image`` and may supply separately observed
     ``selected_owner`` context for a part. The detector receives precisely the
@@ -347,9 +347,24 @@ def observe_interaction_reference(skill, instruction, views, *, detector=None, c
         selection_views[name] = {"image": image, "candidates": rows}
         if "selected_owner" in views[name]:
             selection_views[name]["selected_owner"] = views[name]["selected_owner"]
-    selection = select_grounding_candidates(
-        source, instruction, selection_views, selection_scope=scope, client=client)
     return {"interaction_reference": deepcopy(reference),
             "owner_role": metadata["owner_role"], "sam_queries": labels,
-            "selection_scope": scope, "detections": detections, "selection": selection}
+            "selection_scope": scope, "detections": detections,
+            "source_evidence": source, "selection_views": selection_views}
+
+
+# BEGIN source/candidate construction is shared by both actual semantic APIs.
+def observe_interaction_reference(skill, instruction, views, *, detector=None, client=None):
+    """Select one demonstrated reference in the supplied current images.
+
+    This local selection API remains useful without source/current instance
+    routing. The public skill-grounding pipeline uses the same candidates in
+    its joint binding request instead of performing a second semantic call.
+    """
+    prepared = prepare_interaction_candidates(skill, instruction, views, detector=detector)
+    selection = select_grounding_candidates(prepared["source_evidence"], instruction,
+        prepared["selection_views"], selection_scope=prepared["selection_scope"], client=client)
+    return {key: value for key, value in prepared.items()
+            if key not in {"source_evidence", "selection_views"}} | {"selection": selection}
+# END one detector pass per current view and no duplicate semantic selection.
 # END semantic observation from the version-2 source evidence.

@@ -4,7 +4,7 @@
 
 ## 输入、计算与坐标
 
-适配层位于 `tests/planning`。它将显式请求中的完整技能表示、标定 RGB-D、机器人关节反馈和固定机器人参数交给生产规划器，并保存该次返回结果。物理模型及其评价目录只在仿真运行侧使用。所有技能共用同一构造与调用接口；约定的 grasp/manipulation 分类仍由源程序和原评价接口解释。
+公共 grounding 参考的任务装配与独立规划位于 `manipulation.planning_request` 和 `manipulation.planning_portfolio`，完整接口及当前代码引用见[参考规划与固定选择](14-grounding-planning-portfolio.md)。记录式文件和仿真适配层继续位于 `tests/planning`。两种入口将完整技能表示、标定 RGB-D、机器人关节反馈和固定机器人参数交给原生产规划器；被动保存和共享手指/观测输入分别由 `manipulation.planning_records` 与 `manipulation.planning_inputs` 提供。物理模型及其评价目录只在仿真运行侧使用。任务差异由源程序和既有 typed scene 表达。
 
 世界坐标 W 由标定定义；`T_A_B` 把 B 中坐标变换到 A，平移单位为 m、转角单位为 rad。具名机械臂关节采用 rad，棱柱手指采用 m；速度与加速度分别使用对应单位除以 s、s²。正式轨迹时间从本次曲线入口计起，物理时间由仿真后端提供，源演示时间由保存的进度映射提供。
 
@@ -14,7 +14,7 @@
 
 `run_recorded_skill.run_prepared(args,problem,provenance,backend_factory=MotionBackend)` 负责 RGB-D 自体过滤、TSDF 与观测支持域、设备与机器人绑定、预算及结果归档。`backend_factory(robot,robot_validator=...,budget=...)` 创建这一次请求使用的驻留后端；preference 入口提供 `PreferenceMotionBackend`，默认入口沿用 `MotionBackend`。该后端的 `plan` 产生结果，其 `close` 在拥有它的调用结束时释放资源。函数返回同一结果，不再次构造任务或重采样参考。
 
-`recorded_task_planning.plan_and_record` 调用传入后端的 `plan` 一次，再按完成状态保存正式轨迹、拒绝诊断曲线、完整执行绑定和累计请求账本。preference 诊断中的 `joint_problem` 与 `objective_trials` 分别写入 `planner-internals/joint-problem.json` 和 `objective-trials.json`。失败曲线保留原拒绝来源，规划未产生曲线时保留缺失状态。此步骤只消费完成证据。
+`manipulation.planning_records.plan_and_record` 调用传入后端的 `plan` 一次，再按完成状态保存正式轨迹、拒绝诊断曲线、完整执行绑定和累计请求账本。记录式测试适配器直接导入该实现。preference 诊断中的 `joint_problem` 与 `objective_trials` 分别写入 `planner-internals/joint-problem.json` 和 `objective-trials.json`。失败曲线保留原拒绝来源，规划未产生曲线时保留缺失状态。此步骤只消费完成证据。
 
 普通参考 IK 的运行设置由 [native_setup](../preference-planner/native-setup.md) 管理。原生模型只构造一次，数值预算、事件目标与任务几何继续由原接口传递。
 

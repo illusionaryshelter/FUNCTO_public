@@ -34,7 +34,7 @@
 | 文件 | 内容与含义 | 直接读取及计算 |
 |---|---|---|
 | `rgb.png`、`depth_m.npy`、`calibration.json` | 当前彩色图、米制深度、相机内参 `K` 与 `T_world_camera_cv` | 回投影、区域迁移、自过滤与 TSDF 建图 |
-| 检测目录、`selection.json`、`*-owner-mask.npy` | 当前图像检测结果、所选对象身份与像素归属 | `load_detections/prepare_selected_observation`；规划入口据此分配对象和背景 |
+| 检测目录、`selection.json`、`selected-regions.npz` | 当前检测池、一次联合语义请求的真实响应、各 binding 的实例关系及原候选 mask | `prepare_interaction_candidates/select_bindings` 产生；`grounding_observations.prepare` 保留逐视图选择与独立 owner 证据 |
 | `observations/<view>/owner-*-semantic-mask.npy` | 本次传入的新建实体原始语义 mask；包括过滤未接纳的原语义像素 | `save_observation_partitions` 写出；可作为以后 `--owner-mask` 输入 |
 | `observations/<view>/background-candidate-mask.npy` | 原始背景候选，尚未应用机器人过滤与边缘保护 | `save_observation_partitions` 写出；可作为以后 `--background-mask` 输入 |
 | `observations/<view>/background-mask.npy` | 本次经过机器人过滤与一次边缘排除的实际积分分区 | 建图决策诊断；复用背景模型时无新分区输出 |
@@ -42,11 +42,11 @@
 | `*-observation.npz`、`*-feature.npz` | 回投影点、原像素、有效性与实体归属；MARCO 图像特征 | 区域候选、图像对应和评分；是感知计算结果 |
 | `surface.npz` | 多视角表面元素、观测像素、视图身份、观测与元素对应 | 区域几何和各图的区域投影 |
 | `region.npz` | 选定功能区域的表面元素掩码等结果 | 当前功能区域、支撑面选择与可视化 |
-| grounding 的 `report.json.functional_frame` | 迁移所得当前功能坐标 `T_world_region` | 实验 `reference_inputs` 实际读取并传给 `generate_reference`；该字段是计算输入 |
-| grounding 的 `report.json.reference_rotation_transfer` | manipulation 的布尔选择、功能坐标中的原名义/当前/选定入口 RPY，以及固定旋转修正矩阵 | `config.ground_skill` 保存 `generate_reference.rotation_transfer`；用于解释生成结果及复核参考运算 |
-| grounding 的 `nominal-reference.npz` 与 `nominal-reference-paths.json` | 原功能坐标组合的物体/工具名义路径及入口/事件声明 | `generate_reference` 生成；作为后续规划重新绑定的原操作数 |
-| grounding 的 `reference.npz` | 绑定后的工具位姿、源时刻、参考经过秒数、入口位姿/速度及原源帧/时间 | `BoundToolReference.sample_numpy` 生成，网页使用同一绑定函数 |
-| grounding 的 `reference-paths.json` | 原帧/时间/事件、源时间原点及完整工具绑定记录 | `BoundToolReference.to_record` 保存名义路径、阶段边界、时钟、入口；`from_record` 恢复相同连续函数 |
+| grounding 的 `region.json.region_frame.T_world_region` | 跨实例数值链得到的当前功能坐标 F | `skill_grounding` 将 F 传给共享 `generate_reference`，并在每个假设中独立保留任务 F、工具 E 与工具运动锚点 B |
+| grounding 的 `hypotheses/<id>/report.json.reference_diagnostics` | 单个参考的名义/绑定状态及旋转选择；失败阶段与该候选对应 | `grounding_records.save` 保存该候选自己的诊断；网页和规划交接读取各自候选 |
+| grounding 的 `hypotheses/<id>/nominal-reference.npz` 与 `nominal-reference-paths.json` | 原功能坐标和独立工具锚点组合的物体/工具名义路径及原事件 | 共享 `generate_reference` 生成，`grounding_records` 保存；公共规划请求使用该完整连续表达式 |
+| grounding 的 `hypotheses/<id>/reference.npz` | 该候选绑定后的工具位姿、源时刻、经过秒数、入口位姿/速度及原源帧/时间 | `BoundToolReference.sample_numpy` 生成，网页使用同一绑定函数 |
+| grounding 的 `hypotheses/<id>/reference-paths.json` | 原帧/时间/事件、源时间原点及完整工具绑定记录 | `BoundToolReference.to_record` 保存名义路径、阶段边界、时钟和入口；`from_record` 恢复相同连续函数 |
 | grounding 输入 `robot_feedback.json.eef_twist` | 工具原点在世界坐标下的 `[v_W,omega_W]`，单位 m/s 与 rad/s | 具名关节反馈、固定机器人模型及标定 → 速度生产；ground_skill → BoundToolReference 入口导数 |
 | 关系 JSON 中的 `J`、`A` | `J` 为当前物体坐标到源物体坐标的明确对应；`A=T_eef_body` 为名义附着 | 参考生成、任务点坐标与附着模型 |
 | `reference.npz` | 保存采样后的工具/物体参考、时间和相关数组 | 用于结果保存及指定入口的对照；连续表达式另由 `PosePath.to_record` 保存，`PosePath.from_record` 恢复原插值、机构和组合运算 |
@@ -62,7 +62,7 @@
 | `feedback.json`、`robot_feedback.json` | 具名机器人 `q/dq`、手指状态、设备时间和标定 FK | 固定规划入口、机器人/手指几何与执行续接 |
 | `inherited-initial-state.json`（可选） | 已接受前置执行的 `joint_names/q/dq/feedback_id/timestamp_s/source` | 记录入口交给场景；与本次固定入口逐值绑定，精确 t=0 观测实体对继承无碰撞前提 |
 | `robot-fixture.json`、纯运动学 YAML/URDF | 关节树、坐标、标定、关节限制及明确实体对策略 | cuRobo FK/IK、Pinocchio FK 和设备绑定 |
-| robot-only 模型及其引用的官方机器人组件 | 当前固定机器人的官方原形状、局部变换、原生逐实体配对、固定安装身份及固定手指机构拓扑 | `robot_validation_fixture` → `RobotGeometryChecker` / `RobotCollisionShape` 与 `tool_geometry_names`；跨任务复用，供规划、机器人检查、图像过滤及工具成员声明 |
+| robot-only 模型及其引用的官方机器人组件 | 当前固定机器人的官方原形状、局部变换、原生逐实体配对、固定安装身份及固定手指机构拓扑 | `grounding_robot_geometry` → `RobotGeometryChecker` / `RobotCollisionShape` 与 `tool_geometry_names`；跨任务复用，供规划、机器人检查、图像过滤及工具成员声明 |
 | `contact-bindings.json` | 必填 `contacts/source`，可选 `grasp_activations`；完整源任务特征、有限目标区域、实体身份及活动区间 | `load_contact_bindings` → `ContactRule`、原抓取条件绑定；原任务特征和当前区域分别保留 |
 | `observed-owner.json` 与所引用原始场 | 已保存实体模型、局部坐标、位姿路径与固定附着 | `load_observed_owner` 直接读取，后续技能复用相同场 |
 | `unknown-policy.json`、`fine-regions` JSON（可选） | 未知空间的明确处理策略；指定局部细化请求 | 场景构造和覆盖查询；策略允许尝试不表示该区域已观测为空 |

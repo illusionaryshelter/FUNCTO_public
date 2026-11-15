@@ -8,7 +8,7 @@
 
 `run_recorded_skill.run_prepared` 是接收已编译 `PlanningProblem` 的实验入口。使用现有 recovery 环境，运行命令设置 `PYTHONNOUSERSITE=1`。输入包含 manifest、具名机器人反馈、已知机器人 fixture 记录、手指目标、执行限制、未知区域策略和输出目录。manifest 的 `snapshot.feedback_path` 是图像采集时的机器人反馈，规划入口反馈独立保存。
 
-`robot_validation_fixture.build_robot_validator` 读取 robot-only 原模型、显式实体清单、纯运动学 URDF、原生配对策略及控制参数。运行器将同一纯运动学配置交给 cuRobo。`--self-padding-scale`、`--self-padding-offset-m` 明确图像阴影过滤参数；它们不改变规划碰撞实体。`--observed-owner` 读取已有实体场及其位姿和附着关系。`--owner-mask` 仅提供本次需要从 RGB-D 建图的实体；`--background-mask` 明确指定静态背景端点分区。复用实体无需当前图像中可见，也无需重新分割。
+`grounding_robot_geometry.build_robot_validator` 读取 robot-only 原模型、显式实体清单、纯运动学 URDF、原生配对策略及控制参数。运行器将同一纯运动学配置交给 cuRobo。`--self-padding-scale`、`--self-padding-offset-m` 明确图像阴影过滤参数；它们不改变规划碰撞实体。`--observed-owner` 读取已有实体场及其位姿和附着关系。`--owner-mask` 仅提供本次需要从 RGB-D 建图的实体；`--background-mask` 明确指定静态背景端点分区。复用实体无需当前图像中可见，也无需重新分割。
 
 ## 场景构造与求解
 
@@ -20,7 +20,7 @@
 
 `--contact-bindings` 的必填字段为 `contacts/source`，可选字段为 `grasp_activations`。`ContactRule` 保留原任务特征、有限目标区域、材料身份及活动区间；原抓取激活按完整声明绑定。源任务点、轨迹、区域与事件完整保留。
 
-`robot_validation_fixture.tool_geometry_names` 根据已声明手指关节的机构公共父子树返回完整工具组件，运行器将其写入报告并传给场景。`CollisionOwner` 的有效 `Attachment` 把已有实体场随同一 TCP 刚性运动，并决定组合体内部配对；当前工具五个实体与附着对象、共同附着对象之间不作内部查询，各成员继续用原几何检查外部。无显式释放时，附着包含规划窗口终点。场景报告用 `internal_assembly_pair_count` 记录排除的配对样本数。
+`grounding_robot_geometry.tool_geometry_names` 根据已声明手指关节的机构公共父子树返回完整工具组件，运行器将其写入报告并传给场景。`CollisionOwner` 的有效 `Attachment` 把已有实体场随同一 TCP 刚性运动，并决定组合体内部配对；当前工具五个实体与附着对象、共同附着对象之间不作内部查询，各成员继续用原几何检查外部。无显式释放时，附着包含规划窗口终点。场景报告用 `internal_assembly_pair_count` 记录排除的配对样本数。
 
 `MotionBackend` 组织参考 IK 样本、固定入口样条拟合、SciPy SLSQP 统一约束求解及预算内 OMPL 搜索。工具与场景运动学复用独立验证器的 Pinocchio 模型。固定材料点的原场求值提供几何搜索目标，候选验收读取官方机器人实体和原任务观测场的非穿透证据。已确认体积交叠的分类残差为 1，不是米制穿透深度；场配对未决保留诊断，不作为碰撞正残差。原生自碰撞使用原配对和数值边界，任务接触、支撑及覆盖保持各自条件。任务 TSDF 的 2 mm 样本间距仍定义其网格分辨率。具体数值过程和工作预算见[求解组件](../../docs/planner-architecture/04-solver-and-search.md)。
 
@@ -55,3 +55,5 @@
 `--profile-runtime` 启用已有 cProfile 记录，分析器开销计入请求。实验交付使用可直接打开的本地 HTML，优先展示真实仿真图像上的源示教区域、迁移目标区域和采样点，支持比较与放大，同时保存接受、警告、拒绝、失败和缺失状态。阶段数据放在工作区 `sim-version-plans`。
 
 `--inherited-initial-state` 指向已接受前置执行的具名 q/dq、反馈身份、时间及来源。场景将它与本次固定机器人入口绑定，精确 t=0 的现场实体对直接继承无碰撞前提；正时间配对与官方机器人自身约束沿用相同规则。详见[场景初态接口](../../docs/planner-architecture/13-inherited-initial-state.md)。
+
+`probe_robot_fixture.fixed_probe_hand` 使用当前 `PrismaticGripper` 的命名关节、指令事件和名义手指时间曲线接口。官方机器人实体与原生配对由 `manipulation.grounding_robot_geometry` 构造，手指命令对象持有其控制时钟和关节曲线。

@@ -43,7 +43,9 @@ def test_loader_retains_supplied_named_posture_and_source_transform(tmp_path):
     validator = SimpleNamespace(checker=SimpleNamespace(joint_limits=fixture["position_limits"]))
     base = np.eye(4)
     base[1, 3] = .8
-    with patch("robot_validation_fixture.build_robot_validator", return_value=validator) as build:
+    # BEGIN patch the directly consumed production geometry factory.
+    with patch("manipulation.grounding_robot_geometry.build_robot_validator", return_value=validator) as build:
+    # END the probe retains its explicit named model inputs.
         loaded, robot, actual = load_probe_fixture(manifest, reference_frame="measured_frame",
             T_reference_base=base, full_current_positions=positions)
     assert actual is validator and loaded == fixture

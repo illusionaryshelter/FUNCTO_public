@@ -114,7 +114,9 @@ def test_source_topology_includes_palm_and_pads_but_not_the_arm(tmp_path):
     from pathlib import Path
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent / "planning"))
-    from robot_validation_fixture import tool_geometry_names
+    # BEGIN consume the shared official robot geometry implementation.
+    from manipulation.grounding_robot_geometry import tool_geometry_names
+    # END source geometry and native pair policy remain unchanged.
     path = tmp_path / "tool.xml"
     path.write_text("""<mujoco><worldbody><body name="arm">
       <geom name="arm_shape" type="box" size=".01 .01 .01"/>

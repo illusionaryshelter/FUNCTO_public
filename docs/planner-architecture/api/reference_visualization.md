@@ -1,8 +1,6 @@
 # `manipulation/reference_visualization.py` 实现契约
 
-代码基线：`0620320`。
-
-该编号为实际代码提交；本次文档提交仅回填引用，相关生产代码与此基线相同。
+代码基线：`96ee2dc-working-tree`。
 职责和数据语义见[组件说明](../01-inputs-and-task-model.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
 ## `_project`
@@ -248,6 +246,7 @@ report.get
 (directory / 'reference-paths.json').is_file
 html.replace('CARDS', cards).replace('DETAILS', escape(details)).replace
 html.replace('CARDS', cards).replace
+' · '.join
 (directory / 'index.html').write_text
 ```
 
@@ -285,6 +284,9 @@ image
 picture
 modes
 _
+evidence
+matched
+pixel
 filename
 paths
 path
@@ -308,6 +310,8 @@ failure
 warnings
 warning_text
 status
+links
+row
 ```
 
 直接调用符号：
@@ -337,12 +341,12 @@ transfer.get
 enumerate
 outputs['result'].get
 region_picture
+_project
 view.get
 picture.save
 len
 tool_reference.sample_numpy
 path.sample_numpy
-_project
 reference['eef_path'].sample_numpy
 markers.extend
 markers.append
@@ -361,5 +365,6 @@ report.get
 (directory / 'reference-paths.json').is_file
 html.replace('CARDS', cards).replace('DETAILS', escape(details)).replace
 html.replace('CARDS', cards).replace
+' · '.join
 (directory / 'index.html').write_text
 ```

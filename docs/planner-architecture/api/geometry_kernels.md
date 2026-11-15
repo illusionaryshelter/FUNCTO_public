@@ -1,37 +1,251 @@
-# 三维几何数值内核
+# `manipulation/_geometry_kernels.py` 实现契约
 
-代码基线：`858d011`。本文的后续文档提交登记该代码基线，生产代码与该实现提交相同。实现为 [`manipulation/_geometry_kernels.py`](../../../manipulation/_geometry_kernels.py)，调用者为 [`implicit_distance`](implicit_distance.md) 与 [`native_field_distance`](native_field_distance.md)。
+代码基线：`96ee2dc-working-tree`。
+职责和数据语义见[组件说明](../02-observation-and-collision.md)及[API 契约](../06-api-contracts.md)。[返回目录](../07-implementation-index.md)。
 
-## 1. 职责、输入与依赖
+## `_plane_sums`
 
-本组件计算包围范围和有限半空间的数值关系。输入范围端点为有限 float64 三维数组，满足逐坐标 lower≤upper；一组计算的坐标均属于调用者给定的同一笛卡尔坐标系。几何查询通常使用标定世界坐标 W。数组可以连续、非连续或只读，函数只读取输入。范围表示搜索域的包围，不表示新的实体材料。
+[定义位置](../../../manipulation/_geometry_kernels.py#L19)。
 
-Numba `njit(fastmath=False, cache=True)` 编译这些固定维数运算，NumPy 提供二进制浮点类型、平方根和 `nextafter`。首次实际调用按数组布局和只读属性形成所需编译签名，时间属于触发它的请求；之后复用编译代码。Numba 的缓存只保存代码，不保存实体判定、距离或查询历史。几何表示、空间树、预算回调与返回证据均由调用者持有。
+输入签名：
 
-`_EPS` 为 float64 机器精度，`_GAMMA=32*_EPS/(1-32*_EPS)` 为当前坐标计算的前向舍入余量。它与模型几何余量的职责不同：前者随算术量级形成误差界，后者是场景声明中的物理数据。
+```python
+def _plane_sums(low, high, normal):
+```
 
-## 2. API 与实际调用关系
+实现说明：
 
-| API | 输入 | 输出与调用作用 |
-|---|---|---|
-| `_plane_sums(low, high, normal)` | 三维范围和一行法向 | 最小/最大投影及对应乘积绝对值之和；由分类和投影下界共同调用 |
-| `classify_box(low, high, normals, bounds)` | 范围、`normals[N,3]`、`bounds[N]`，半空间为 n·x≤b | `1` 表示全部可靠地位于域内，`-1` 表示至少一行可靠地在域外，`0` 表示混合；`PairPermission._classify` 转为既有字符串 |
-| `norm3(x,y,z)` | 三个分量 | `sqrt((x*x+y*y)+z*z)`；范围距离和原生形状投影使用同一三项运算次序 |
-| `box_distance(low_a, high_a, low_b, high_b)` | 两个同坐标系范围 | 向外舍入的非负分离下界；`implicit_distance.box_distance` 保留既有范围对输入接口 |
-| `projection_lower(low, high, direction, native_low, native_high, length)` | 范围、投影方向、原生实体完整投影区间、方向范数 | 原生实体与范围在该方向上的非负分离下界；由 `native_field_distance._projection_gap` 消费 |
+> Keep x/y/z multiplication and addition order for one halfspace.
+>
+> Each row has exactly three coordinates. The original NumPy calculation
+> reduces this length-three axis; the probe compares its four sums directly
+> as well as the final classification. Error sums use the same selected
+> products, and no fused multiply-add or reassociation is requested.
 
-调用链为 `OnlinePlanningScene` 的成对几何查询进入 `query_distance/query_native_field`，再调用范围距离及 `PairPermission` 分类；原生形状查询还通过 `_projection_gap` 调用 Coal 取得方向及原生投影区间，然后调用 `projection_lower`。
+显式输出分支：
 
-## 3. 运算及边界语义
+```python
+(minimum, maximum, low_absolute, high_absolute)
+```
 
-对半空间每一行，按照法向符号逐轴选择最小和最大端点，按 x、y、z 次序累加乘积与乘积绝对值。最大投影加误差仍不超过边界时该行可靠地在内；最小投影减误差严格超过边界时该行可靠地在外。优先判断全部在内，再判断至少一行在外，其余为混合。零行半空间表示整个空间。
+读取的对象属性：
 
-范围距离令 `g_i=max(0, a_low[i]-b_high[i], b_low[i]-a_high[i])`，`d=norm3(g)`，`m` 为十二个端点分量的最大绝对值，返回 `max(0,nextafter(d-GAMMA*(d+m),-inf))`。逐轴访问四个端点可直接消费不同只读属性和不同步长的数组。
+无显式条目。
 
-投影下界先将范围投影向外扩展 `GAMMA` 误差，再与原生完整投影区间计算间隙，对误差扣减和除以方向长度的结果向负无穷舍入。`_projection_gap` 的 Coal 调用决定方向，原生支持投影决定实体区间。零方向在调用者处给出零下界。
+写入目标：
 
-显式三项范数保留当前 NumPy 一维 `sqrt(dot(v,v))` 的计算次序；Numba 通用 `linalg.norm` 使用的缩放范数具有不同的舍入、溢出与下溢行为，因此此接口采用三项表达式。所有核关闭快速数学重排。
+```python
+minimum
+maximum
+low_absolute
+high_absolute
+axis
+coefficient
+low_term
+high_term
+```
 
-## 4. 验证范围
+直接调用符号：
 
-`tests/test_geometry_numerics.py` 以原 NumPy 向量归约核对半空间边界及其相邻浮点、只读/非连续数组、范围距离和投影间隙。完整实体查询由 `test_implicit_distance.py`、`test_native_field_distance.py`、`test_geometry_query_bounds.py` 等测试覆盖；连续区间沿其实际 API 验证。实验复刻的数据、性能和物理结果位于项目外阶段记录。
+```python
+range
+abs
+njit
+```
+
+## `classify_box`
+
+[定义位置](../../../manipulation/_geometry_kernels.py#L47)。
+
+输入签名：
+
+```python
+def classify_box(low, high, normals, bounds):
+```
+
+实现说明：
+
+> Return 1=inside, -1=outside, 0=mixed with original precedence.
+>
+> A region is a conjunction of halfspaces. The caller supplies its complete
+> finite rows; zero rows represent the whole space, matching NumPy all([]).
+
+显式输出分支：
+
+```python
+1
+-1
+0
+```
+
+读取的对象属性：
+
+```python
+normals.shape
+```
+
+写入目标：
+
+```python
+inside
+outside
+plane
+minimum
+maximum
+low_absolute
+high_absolute
+low_error
+high_error
+```
+
+直接调用符号：
+
+```python
+range
+_plane_sums
+njit
+```
+
+## `norm3`
+
+[定义位置](../../../manipulation/_geometry_kernels.py#L73)。
+
+输入签名：
+
+```python
+def norm3(x, y, z):
+```
+
+实现说明：
+
+> Use the original length-three sqrt(dot(v,v)) operation order.
+>
+> NumPy's one-dimensional norm takes this dot/sqrt path. Numba's generic
+> norm instead calls a scaled BLAS nrm2, which is a different computation
+> for underflow/overflow and can round differently at ordinary magnitudes.
+> Explicit products and left-to-right additions implement that three-term
+> formula. Boundary probes and actual-query comparisons establish equality
+> for this environment; a different BLAS reduction is a distinct baseline.
+
+显式输出分支：
+
+```python
+np.sqrt(x * x + y * y + z * z)
+```
+
+读取的对象属性：
+
+```python
+np.sqrt
+```
+
+写入目标：
+
+无显式条目。
+
+直接调用符号：
+
+```python
+np.sqrt
+njit
+```
+
+## `box_distance`
+
+[定义位置](../../../manipulation/_geometry_kernels.py#L87)。
+
+输入签名：
+
+```python
+def box_distance(low_a, high_a, low_b, high_b):
+```
+
+实现说明：
+
+> Lower-bound complete box separation with the original error allowance.
+
+显式输出分支：
+
+```python
+max(0.0, np.nextafter(value - error, -np.inf))
+```
+
+读取的对象属性：
+
+```python
+np.nextafter
+np.inf
+```
+
+写入目标：
+
+```python
+gx
+gy
+gz
+value
+magnitude
+axis
+error
+```
+
+直接调用符号：
+
+```python
+max
+norm3
+range
+abs
+np.nextafter
+njit
+```
+
+## `projection_lower`
+
+[定义位置](../../../manipulation/_geometry_kernels.py#L105)。
+
+输入签名：
+
+```python
+def projection_lower(low, high, direction, native_low, native_high, length):
+```
+
+实现说明：
+
+> Project a complete box using original xyz sums and outward rounding.
+
+显式输出分支：
+
+```python
+max(0.0, np.nextafter((gap - error) / (length * (1.0 + _GAMMA)), -np.inf))
+```
+
+读取的对象属性：
+
+```python
+np.nextafter
+np.inf
+```
+
+写入目标：
+
+```python
+minimum
+maximum
+low_absolute
+high_absolute
+box_low
+box_high
+gap
+error
+```
+
+直接调用符号：
+
+```python
+_plane_sums
+np.nextafter
+max
+abs
+njit
+```

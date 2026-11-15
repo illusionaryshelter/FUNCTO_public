@@ -28,7 +28,9 @@ from manipulation.execution import ExecutionLimits
 from manipulation.planning import PlanningBudget
 from manipulation.planning_problem import MotionPhase, PlanningProblem, PosePath, PoseEventRequirement
 from recorded_task_planning import _json_value, plan_and_record
-from robot_validation_fixture import build_robot_validator
+# BEGIN consume the shared official robot geometry implementation.
+from manipulation.grounding_robot_geometry import build_robot_validator
+# END source geometry and native pair policy remain unchanged.
 from probe_robot_fixture import fixed_probe_hand, empty_background
 
 

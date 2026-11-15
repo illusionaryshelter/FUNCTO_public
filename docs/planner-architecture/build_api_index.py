@@ -17,6 +17,12 @@ CHAPTERS = {
  '03': '03-attachment-contact-and-hand.md', '04': '04-solver-and-search.md',
  '05': '05-acceptance-and-execution.md',
  '11': '11-device-control-and-evaluation.md',
+ # BEGIN production grounding-reference planning and completed selection.
+ '14': '14-grounding-planning-portfolio.md',
+ '15': '15-skill-grounding.md',
+ '16': '16-cross-instance-grasp.md',
+ '17': '../../transfer/cross_instance/ARCHITECTURE.md',
+ # END this chapter describes the public data and lifecycle contracts.
 }
 # These modules describe retired task-field conversion and contact bindings.
 # Known robot geometry adapters remain part of the current component call graph.
@@ -29,7 +35,7 @@ RETIRED = {
  'robot_coverage', 'online_native_confirmation', 'local_geometry_model',
   'adapter-recorded_owner_geometry',
  'adapter-recorded_observation', 'adapter-robot_coverage_fixture',
- 'adapter-contact_fixture',
+ 'adapter-contact_fixture', 'adapter-robot_validation_fixture',
 
 
 }
@@ -116,16 +122,42 @@ def main():
                             ('interval_geometry','05'), ('unified_solver','04'),
                             ('cubic_constraints','04'), ('pin_kinematics','04'),
                             ('timed_reference','01'), ('reference_visualization','01'),
-                            ('progress_clock','05')]:
+                            ('progress_clock','05'), ('grounding_robot_geometry','02')]:
         row = (f'manipulation/{module}.py', module, chapter)
         if row not in modules:
             modules.append(row)
+    # BEGIN include actual production request, recording and portfolio APIs.
+    for module in ('planning_request', 'planning_inputs', 'planning_records',
+                   'planning_portfolio', 'trajectory_metrics', 'trajectory_selection'):
+        row = (f'manipulation/{module}.py', module, '14')
+        if row not in modules:
+            modules.append(row)
+    # END recorded CLI definitions remain indexed at their current locations.
+    # BEGIN public grounding and native cross-instance grasp APIs.
+    for module in ('skill_grounding', 'grounding_observations', 'instance_relation', 'grounding_records'):
+        row = (f'manipulation/{module}.py', module, '15')
+        if row not in modules:
+            modules.append(row)
+    for module in ('cross_instance_grasp', 'grasp_pose_refinement', 'grounding_geometry_evidence'):
+        row = (f'manipulation/{module}.py', module, '16')
+        if row not in modules:
+            modules.append(row)
+    # END numeric region definitions are inventoried in their package architecture.
+    # BEGIN current sensor geometry and cross-instance numerical definitions.
+    row = ('transfer/segmentation.py', 'grounding_segmentation', '15')
+    if row not in modules:
+        modules.append(row)
+    for module in ('evidence', 'response', 'context', 'coarse', 'refinement', 'pipeline'):
+        row = (f'transfer/cross_instance/{module}.py', f'cross_instance_{module}', '17')
+        if row not in modules:
+            modules.append(row)
+    # END each current function is read directly from its actual source.
     # END generation reads the current component source without imports.
     row = ('tests/planning/observed_robot_fixture.py', 'adapter-observed_robot_fixture', '05')
     if row not in modules:
         modules.append(row)
     # BEGIN index the direct consumers of the reusable native robot asset.
-    for module in ('robot_validation_fixture', 'robot_fixture'):
+    for module in ('robot_fixture',):
         row = (f'tests/planning/{module}.py', f'adapter-{module}', '02')
         if row not in modules:
             modules.append(row)

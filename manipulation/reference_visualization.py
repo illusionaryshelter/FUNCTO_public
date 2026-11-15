@@ -108,7 +108,9 @@ def write_reference_html(directory, skill, views, transfer, reference, report, *
                    axes=_axes(source_frame, source["observation"]), paths=source_paths,
                    world_frame="源示教世界坐标 W_D")]
     outputs = transfer.get("outputs") if transfer else None
-    frame = transfer.get("reference_frame") if transfer else None
+    # BEGIN both region strategies publish the same task-frame meaning.
+    frame = transfer.get("reference_frame", transfer.get("region_frame")) if transfer else None
+    # END the numerical strategy retains its own result/evidence structure.
     for index, view in enumerate(views):
         image = np.asarray(view["image"])
         picture = Image.fromarray(image)
@@ -118,6 +120,22 @@ def write_reference_html(directory, skill, views, transfer, reference, report, *
                 # The first native mode is the primary region (accepted or
                 # diagnostic). Its actual status is displayed independently.
                 picture, _ = region_picture(image, outputs["surface"], modes[0], index)
+        # BEGIN cross-instance output retains mapped rows and observed matches.
+        elif transfer and "arrays" in transfer:
+            evidence = transfer["arrays"]
+            draw = ImageDraw.Draw(picture, "RGBA")
+            if "matching_target_indices" in evidence:
+                matched = evidence["target_points_world_m"][evidence["matching_target_indices"]]
+                for pixel in _project(matched, view):
+                    if pixel is not None:
+                        x, y = pixel
+                        draw.ellipse((x-4, y-4, x+4, y+4), fill=(65, 205, 230, 115))
+            if "mapped_points_world_m" in evidence:
+                for pixel in _project(evidence["mapped_points_world_m"], view):
+                    if pixel is not None:
+                        x, y = pixel
+                        draw.ellipse((x-1, y-1, x+1, y+1), fill=(255, 218, 70, 255))
+        # END these marks display the actual region result, including failure data.
         filename = view["id"] + "-region.png"
         if view.get("observation") is not None:
             picture = _entity_outline(picture, view["observation"]["object_mask"])
@@ -211,7 +229,8 @@ for(const p of panels)images[p.id]=new Image();for(const p of panels){images[p.i
     # END preserve the native status without presenting missing as rejection.
     # BEGIN a nominal-only diagnostic cannot claim a completed entrance binding.
     status = (report["reference_status"] if tool_reference is not None
-              else "unbound" if reference and "eef_path" in reference else "missing")
+              else "unbound" if reference and "eef_path" in reference
+              else f"{len(report['reference_links'])} 个完整候选" if report.get("reference_links") else "missing")
     html = html.replace("REFERENCE_STATUS", escape(status))
     # END the reference stage is explicit even in a failed or archived nominal view.
     html = html.replace("REFERENCE_LINK", ' · <a href="reference.npz">参考数值</a>'
@@ -219,4 +238,10 @@ for(const p of panels)images[p.id]=new Image();for(const p of panels){images[p.i
                            if (directory / "reference-paths.json").is_file() else "")
                         if (directory / "reference.npz").is_file() else "")
     html = html.replace("CARDS", cards).replace("DETAILS", escape(details)).replace("DATA", data)
+    # BEGIN every complete reference has its own explicit artifact identity.
+    if report.get("reference_links"):
+        links = " · ".join(f'<a href="{escape(row["directory"], quote=True)}/index.html">'
+                           f'{escape(row["id"])}：完整参考与证据</a>' for row in report["reference_links"])
+        html = html.replace('<div class="grid">', f'<p>{links}</p><div class="grid">', 1)
+    # END the report writer never chooses among alternative references.
     (directory / "index.html").write_text(html, encoding="utf-8")

@@ -233,7 +233,8 @@ def _initial_rotation_offset(nominal, functional, current, flags):
 def generate_reference(representation, *, T_world_function=None, J=None, A=None,
                        T_world_eef=None, T_world_body=None, motion_model=None,
                        source_coordinates=None, current_coordinates=None,
-                       contact_motion=False, held_until_time=None):
+                       contact_motion=False, held_until_time=None,
+                       tool_reference_anchor=None):
     """Bind complete nominal source motion and declare entry/event boundaries.
 
     J maps current body coordinates B_N into demonstrated coordinates B_D;
@@ -249,7 +250,12 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     named boundaries enter BoundToolReference
     only after the planner has bound physical time and measured TCP velocity.
 
-    Grasp motion composes F_G and H_g directly; the initial-relative rotation
+    # BEGIN independent task geometry and transferred tool-motion anchor.
+    Grasp motion composes tool_reference_anchor B and the full H_g. When B is
+    omitted, its native functional relation uses F_G. T_world_function remains
+    the task's actual functional frame: a transferred TCP anchor never changes
+    task geometry. The initial-relative rotation
+    # END grasp placement and task coordinates have independent operands.
     declaration belongs to manipulation's material-frame pose reference.
     Grasp motion requires actual E. A scalar mechanism instead uses its current
     model and current coordinate, preserving its physical manifold and winding.
@@ -267,6 +273,15 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
     kind = representation["kind"]
     if kind not in {"grasp", "manipulation"}:
         raise ValueError("Unknown representation kind")
+    # BEGIN explicit tool anchor belongs to the grasp relation it places.
+    if tool_reference_anchor is not None:
+        if kind != "grasp":
+            raise ValueError("tool_reference_anchor places the H_g grasp relation")
+        result["tool_reference_anchor"] = (
+            _pose_array(tool_reference_anchor, "tool_reference_anchor")
+            if np.asarray(tool_reference_anchor).shape == (4, 4)
+            else _aligned_poses(tool_reference_anchor, times, "tool_reference_anchor"))
+    # END source H_g, task F and interaction timing remain intact.
     if A is not None and contact_motion:
         raise ValueError("Choose a rigid attachment model or time-varying contact, not both")
     extra = [representation.get(key) for key in ("approach_time", "interaction_time", "release_time")]
@@ -336,8 +351,10 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
         result["summaries"][name] = _sampled_summary(sample, approach, interaction)
 
     if kind == "grasp":
-        if "H_g" not in result or T_world_function is None:
-            result["missing"]["eef_poses"] = "Grasp reference needs H_g and current F_G"
+        # BEGIN B places only the tool relation; F remains available to tasks.
+        anchor = result.get("tool_reference_anchor", result.get("T_world_function"))
+        if "H_g" not in result or anchor is None:
+            result["missing"]["eef_poses"] = "Grasp reference needs H_g and its current tool-motion anchor"
         elif current_eef is None:
             result["missing"]["eef_poses"] = "Grasp reference needs the actual current EEF pose"
         else:
@@ -345,7 +362,9 @@ def generate_reference(representation, *, T_world_function=None, J=None, A=None,
             # Current E is an entrance boundary; it does not replace any
             # nominal grasp rotation component during geometric transfer.
             raw = _component_path(result["H_g"], times, path_times,
-                                  source="bound source grasp relation", parent=function_path(path_times))
+                source="bound source grasp relation",
+                parent=_component_path(anchor, times, path_times, source="current tool-motion anchor B"))
+            # END only the grasp composition consumes the explicit anchor.
             # END initial-relative rotation selection belongs to manipulation.
             diagnostic("eef", raw, path_times)
             publish("eef", raw, current_eef, raw.sample_numpy(event_progress))

@@ -33,7 +33,7 @@
 | `execution_events` | 调用者明确指定的动作、停止或独立证据依赖 | `PlanningEvent` 编译相应事件 |
 | `coordinate_directions` | 机构坐标在给定区间的方向、净变化或局部速度要求 | `CoordinateDirectionRequirement` |
 
-`tests/planning` 中的实验运行器 `run_recorded_skill.run_prepared` 将编译后的问题与机器人记录连接。`robot_validation_fixture.build_robot_validator` 读取已知机器人组件、关节树、标定及原生实体对策略；`observed_robot_fixture.load_observed_owner` 读取已有任务实体场与固定关系。实验适配器与当前持物计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
+`tests/planning` 中的实验运行器 `run_recorded_skill.run_prepared` 将编译后的问题与机器人记录连接。`grounding_robot_geometry.build_robot_validator` 读取已知机器人组件、关节树、标定及原生实体对策略；`observed_robot_fixture.load_observed_owner` 读取已有任务实体场与固定关系。实验适配器与当前持物计划的对应关系见[架构与计划差异审查](../../../sim-version-plans/2026-10-19-put-planner-audit/2026-10-20-model-restoration-plan.md)。
 
 ## 2. 固定坐标下的示教表示
 
@@ -51,11 +51,11 @@ H_m(t) = inv(L_R) inv(T_world_reference(t)) T_world_carrier(t)
 
 `generate_reference` 接收以上表示及当前功能坐标 `T_world_function`、当前到示教的物体坐标对应 `J`、声明附着 `A`、当前工具/物体位姿，以及可选机构模型与坐标。该接口以 `body` 命名被操作物体的表示坐标。`A=T_eef_body` 是物体坐标在工具坐标中的位姿，满足 `T_world_body=T_world_eef A`；`J=T_demo_body_current_body` 将当前物体坐标中的点映到示教物体坐标。将该表示绑定到 `program` 接口的同一 `carrier` 坐标后，`A=inv(scene.holding.T_carrier_eef)`。
 
-抓取名义路径由源抓取关系和当前功能坐标直接组合：`T_W_E(t)=T_W_FG(t) H_g(t)`。其中 `W` 为当前世界坐标、`E` 为标定工具坐标、`F_G` 为迁移得到的抓取功能坐标；`H_g` 完整保留原相对位置与旋转。当前工具反馈单独进入入口边界声明。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数依次组合当前功能路径、`Q(t)`、`Q(t_c)⁻¹` 和 `L_body_material⁻¹`，得到完整名义物体路径。给定声明附着 `A` 后，名义工具路径由该物体路径右乘 `A⁻¹` 唯一确定。父路径与固定右乘在每次求值时组合，旋转引起的 TCP 杆臂运动由同一函数保留。
+抓取名义路径由完整源关系与工具运动锚点组合：`T_W_E(t)=B(t) H_g(t)`；未给独立 anchor 时 B=F_G。其中 `W` 为当前世界坐标、`E` 为标定工具坐标、`F_G` 为迁移得到的抓取功能坐标；`H_g` 完整保留原相对位置与旋转。当前工具反馈单独进入入口边界声明。对于自由持物路径，记源序列入口为 `t₀`、交互时刻为 `t_c`，函数首先构造目标功能坐标中的相对运动 `Q(t)=H_m(t)H_m(t₀)⁻¹`。由于同一物体坐标重定义会在这两个因子中相消，`Q` 保留相同的几何运动。随后定义附着在当前物体上的材料坐标 `M`：它在名义交互时刻与当前目标功能坐标重合，其局部变换为 `L_body_material=T_body_M=J⁻¹H_m(t₀)⁻¹Q(t_c)⁻¹`。函数依次组合当前功能路径、`Q(t)`、`Q(t_c)⁻¹` 和 `L_body_material⁻¹`，得到完整名义物体路径。给定声明附着 `A` 后，名义工具路径由该物体路径右乘 `A⁻¹` 唯一确定。父路径与固定右乘在每次求值时组合，旋转引起的 TCP 杆臂运动由同一函数保留。
 
 对于转动或移动机构，输入提供源标量坐标与当前坐标。参考在标量坐标中保留源运动增量与累计转角，再通过当前机构模型的正运动学生成位姿。`contact_motion=True` 与固定附着 `A` 是互斥输入分支，分别对应时变接触关系与刚性附着关系；同时给定时产生 `ValueError`。
 
-manipulation 的功能位姿参考可在技能表示中声明 `is_initial_relative_rotation_rpy`。grasp 的参考生成只组合原 `H_g` 与当前 `F_G`；旋转字段的解析与运算由 manipulation 分支消费。该字段必须为三个布尔值，顺序为 roll、pitch、yaw，表示初始朝向的分量来源。旋转分量使用功能参考坐标 F 中的 XYZ 外禀约定，即 `R=Rz(yaw) Ry(pitch) Rx(roll)`。`true` 选择本次运行初态的对应分量，`false` 选择原功能参考迁移入口的对应分量。选择发生在入口；后续运动通过完整旋转矩阵保留相对于入口的旋转变化。标量机构参考的姿态由其正运动学定义，该声明适用于功能位姿参考。
+manipulation 的功能位姿参考可在技能表示中声明 `is_initial_relative_rotation_rpy`。grasp 的参考生成组合完整 `H_g` 与 `tool_reference_anchor`，任务 `F_G` 独立保存；旋转字段的解析与运算由 manipulation 分支消费。该字段必须为三个布尔值，顺序为 roll、pitch、yaw，表示初始朝向的分量来源。旋转分量使用功能参考坐标 F 中的 XYZ 外禀约定，即 `R=Rz(yaw) Ry(pitch) Rx(roll)`。`true` 选择本次运行初态的对应分量，`false` 选择原功能参考迁移入口的对应分量。选择发生在入口；后续运动通过完整旋转矩阵保留相对于入口的旋转变化。标量机构参考的姿态由其正运动学定义，该声明适用于功能位姿参考。
 
 对于物体运动，旋转对象是上述固定材料功能坐标 M。记原名义路径为 `T_W_M(s)`，功能路径为 `T_W_F(s)`，技能进度为 s。原初始旋转在 F 中为 `R_n0=R_W_F(0)^T R_W_M(0)`，当前初始旋转为 `R_c=R_W_F(0)^T R_W_body(0) R_body_M`。当前物体模型位姿由已有观测或 `T_W_E A` 给出。`_initial_rotation_offset` 将二者转换为上述 RPY，按布尔值选定入口 `R_a`，计算固定修正 `D=R_a R_n0^T`，同时返回选择依据与修正矩阵。
 
@@ -65,7 +65,7 @@ manipulation 的功能位姿参考可在技能表示中声明 `is_initial_relati
 
 `generate_reference` 在 manipulation 的实际消费处校验布尔类型与长度，返回的 `rotation_transfer` 保存布尔数组、RPY 约定、两种入口、选定入口和 D。未声明旋转选择的功能参考按原功能坐标组合。物体原始 `H_m`、工具原始关系、时间与事件仍是源表示；`bound_*`、生产路径、交互目标和释放终点共同使用生成后的名义旋转。位姿要求和执行条件分别由其原接口声明。
 
-`config.ground_skill.ground_skill` 读取技能、当前 RGB-D 与标定、机器人反馈及明确的 J/A 关系，调用图像实体选择、特征提取和 `run_region_transfer(..., skill_kind=representation["kind"])` 获得 `T_world_region`，再传给 `generate_reference`。名义数组保存为 `nominal-reference.npz`；`nominal-reference-paths.json` 使用 `plain` 和 `PosePath.to_record` 保存全部连续物体/工具路径、原时刻、事件及边界。manipulation 声明旋转选择时，依据写入 `report.json.reference_rotation_transfer`。
+`config.ground_skill.ground_skill` 是文件适配器，加载完整技能、具名RGB-D与标定、机器人反馈和明确关系，再调用 `manipulation.skill_grounding.ground_skill`。公共入口使用一次联合语义请求选择当前实体并判断源—目标实例关系，分别调用原同实例区域或新跨实例区域计算。完整参考通过共享 `generate_reference` 生成，跨实例抓取单独传入工具运动锚点B，任务功能坐标F继续用于任务几何。每个候选保存到 `hypotheses/<id>/`：`nominal-reference.npz` 和连续路径文件保存原名义表达式，`reference.npz` 和绑定记录保存该候选的source-clock入口绑定。manipulation的旋转选择来源保存在该候选的参考诊断中。公共数据、API及完整调用见[技能grounding组件](15-skill-grounding.md)。
 
 当名义工具路径可用时，入口继续调用 `reference_phase` 和 `BoundToolReference`。grounding 的绑定时钟明确采用受控源区间的经过秒数：`t=t_D-t_D0`，`duration=t_D_end-t_D0`，进度节点为 `u=[0,1]`、`s=[0,1]`。这里 `t_D` 为源示教绝对时间，`t` 为本次参考的经过时间。当前 `robot_feedback.eef_pose` 与 `eef_twist=[v_W,omega_W]` 给出工具入口位姿和世界坐标速度，速度单位分别为 m/s 与 rad/s。反馈生产方根据具名 q/dq、固定官方机器人运动学及标定计算这两个量；本入口直接消费它们。缺少 `eef_twist` 时记录 `bind_reference` 失败，已有名义结果继续作为诊断产物保存。
 
@@ -246,4 +246,4 @@ normal    = ‖R n_b+n‖₂ − 2 sin(ε_θ/2)
 
 两个构造器通过 `_region_frame_record` 输出 `T_world_region`、原源功能坐标、源所属实体与采集时间、支持候选身份。显式提供当前区域所属刚体位姿时，记录同状态依据，并计算 `L_body_region = inverse(T_world_body) @ T_world_region`；世界坐标和实体局部坐标指向同一 F。交互区域结果另有 `construction`，记录中心和方向的实际来源。源区域、源功能坐标、完整示教运动和交互/释放事件仍是技能表示；本步骤只构造其当前参考坐标。
 
-`config.ground_skill` 将该 F 交给 `generate_reference`，后者继续使用原 H_m、J、A、当前机器人反馈及已声明的初始相对旋转规则构造名义物体和工具路径。`reference_phase` 传递路径及事件边界；grounding 以源经过秒数、当前工具位姿与速度调用 `BoundToolReference`，导出完整工具参考。规划则以原名义函数、该请求的 FK 入口及请求时钟调用同一绑定接口。`frame_from_deformation` 是已有的同索引点变形输出局部刚体拟合接口，输入为粗对齐源点、变形后的同索引点、源区域索引和粗功能坐标，输出局部刚体修正与拟合残差；本次双视角区域路径不调用它。
+`skill_grounding` 将该 F 交给 `generate_reference`，后者继续使用原 H_m、J、A、当前机器人反馈及已声明的初始相对旋转规则构造名义物体和工具路径。`reference_phase` 传递路径及事件边界；grounding 以源经过秒数、当前工具位姿与速度调用 `BoundToolReference`，导出完整工具参考。规划则以原名义函数、该请求的 FK 入口及请求时钟调用同一绑定接口。`frame_from_deformation` 是已有的同索引点变形输出局部刚体拟合接口，输入为粗对齐源点、变形后的同索引点、源区域索引和粗功能坐标，输出局部刚体修正与拟合残差；本次双视角区域路径不调用它。

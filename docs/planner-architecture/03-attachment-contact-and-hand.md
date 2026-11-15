@@ -32,7 +32,7 @@ required 接触调用 `query_region_intersection`，寻找有限区域内受支�
 
 ## 3. 工具与附着实体组成的组合体
 
-`OnlinePlanningScene` 必填的 `tool_geometry_names` 给出完整工具组件的已注册几何实体 ID。记录入口调用 `robot_validation_fixture.tool_geometry_names(fixture)`：适配器读取已知 robot-only 模型与 fixture 声明的手指关节，求这些关节所属机构的公共父节点，再选取该节点子树中明确登记的碰撞实体。当前机器人得到掌体、两指体和两指腹五个成员。通用场景直接消费这些 ID，机器人其余部件保留各自身份。
+`OnlinePlanningScene` 必填的 `tool_geometry_names` 给出完整工具组件的已注册几何实体 ID。记录入口调用 `grounding_robot_geometry.tool_geometry_names(fixture)`：适配器读取已知 robot-only 模型与 fixture 声明的手指关节，求这些关节所属机构的公共父节点，再选取该节点子树中明确登记的碰撞实体。当前机器人得到掌体、两指体和两指腹五个成员。通用场景直接消费这些 ID，机器人其余部件保留各自身份。
 
 当前实体的 `Attachment.active(progress)` 为真时，该实体与工具组件属于同一组合体。场景排除工具成员与该实体的内部配对；两个实体同时附着于本场景同一 TCP 时，也排除它们之间的内部配对。排除发生在原几何查询之前，按状态样本累计到 `internal_assembly_pair_count`。组合体各成员仍分别保留原生形状或原始观测场、局部坐标和位姿，继续对背景、未附着实体及其余机器人部件进行原几何查询。机器人自身配对继续使用其独立模型策略。
 
